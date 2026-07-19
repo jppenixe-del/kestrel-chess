@@ -9,19 +9,27 @@ mas as decisões e o trabalho são meus). Este ficheiro existe precisamente
 para eu (ou outra instância minha) saber o que fazer sem precisar que ele
 volte a explicar.
 
-## ATENÇÃO: dois ambientes diferentes, caminhos diferentes
+## ATENÇÃO: a máquina local vai ficar desligada -- o servidor é agora o ambiente principal
 
-Este projeto existe em **duas máquinas**, cada uma com os SEUS PRÓPRIOS
+A partir de 2026-07-20, o PC local vai ficar desligado por tempo
+indeterminado. **Isto significa que `/mnt/d/Kestrel` (máquina local) deixa
+de estar acessível, e todo o desenvolvimento seguinte tem de acontecer no
+servidor remoto `root@10.0.0.1`, em `/root/kestrel_joao/Kestrel`.** Esse
+caminho remoto é, a partir de agora, a fonte de verdade -- não assumir que
+a máquina local está disponível para sincronizar de volta.
+
+Histórico (para contexto, caso a máquina local volte a ligar-se um dia):
+este projeto existiu em **duas máquinas**, cada uma com os SEUS PRÓPRIOS
 caminhos -- não misturar:
 
 - **Máquina local** (a máquina de trabalho principal, com GPU RTX 5060,
-  WSL/Windows): repo em `/mnt/d/Kestrel`. Arena em
+  WSL/Windows, **agora desligada**): repo em `/mnt/d/Kestrel`. Arena em
   `/mnt/c/half2kbot_lc0pond`, porta 8765.
 - **Servidor remoto** `root@10.0.0.1` (sem GPU, **partilhado com outro
   trabalho** -- outra sessão Claude, benchmarks cutechess-cli, um
-  serviço próprio na porta 8765): repo em `/root/kestrel_joao/Kestrel`
-  (mesmo git history, sincronizado por `rsync -az .git/`). Arena em
-  `/root/kestrel_joao`, porta **8766** (a 8765 já está ocupada lá).
+  serviço próprio na porta 8765) -- **ambiente ativo a partir de agora**:
+  repo em `/root/kestrel_joao/Kestrel`. Arena em `/root/kestrel_joao`,
+  porta **8766** (a 8765 já está ocupada lá).
 
 Se abrir este projeto no servidor remoto e não encontrar algo que este
 ficheiro menciona com caminho `/mnt/d/...`, é porque essa referência é da
@@ -243,14 +251,23 @@ Abre `http://10.0.0.1:8766` no browser. Só tem `kestrel` (perfil próprio)
 contra `stockfish` (v17, não v18 -- é o que está instalado lá) e
 `troller`. Sirius/Ethereal/Reckless não estão instalados no servidor --
 o utilizador autorizou instalar o Sirius se fizer sentido (`git clone` +
-compilar, o servidor já tem Rust). Para atualizar o kestrel no servidor
-depois de mexer no código local:
+compilar, o servidor já tem Rust).
+
+**Agora que a maquina local esta desligada, o fluxo normal e' trabalhar
+DIRETAMENTE no servidor** -- editar em `/root/kestrel_joao/Kestrel/src/`,
+compilar ali mesmo, sem rsync nenhum:
 
 ```bash
-rsync -az /mnt/d/Kestrel/src/ root@10.0.0.1:/root/kestrel_joao/Kestrel/src/
-ssh root@10.0.0.1 "source \$HOME/.cargo/env && cd /root/kestrel_joao/Kestrel && cargo build --release"
-ssh root@10.0.0.1 "cp /root/kestrel_joao/polgar_book.bin /root/kestrel_joao/Kestrel/target/release/ 2>/dev/null; /root/kestrel_joao/arena.sh restart"
+ssh root@10.0.0.1
+cd /root/kestrel_joao/Kestrel
+source $HOME/.cargo/env
+cargo build --release
+cp polgar_book.bin target/release/ 2>/dev/null   # so' se o livro nao estiver la ainda
+/root/kestrel_joao/arena.sh restart
 ```
+
+(A secção abaixo com `rsync -az /mnt/d/Kestrel/...` só se aplica se a
+máquina local voltar a ligar-se e quiser voltar a sincronizar dali.)
 
 (Só recompilar remotamente com `cargo build`, nunca copiar o binário
 `target/release/kestrel` diretamente -- `target-cpu=native` é específico
