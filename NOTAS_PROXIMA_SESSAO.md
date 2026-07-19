@@ -9,6 +9,60 @@ mas as decisões e o trabalho são meus). Este ficheiro existe precisamente
 para eu (ou outra instância minha) saber o que fazer sem precisar que ele
 volte a explicar.
 
+## ATENÇÃO: dois ambientes diferentes, caminhos diferentes
+
+Este projeto existe em **duas máquinas**, cada uma com os SEUS PRÓPRIOS
+caminhos -- não misturar:
+
+- **Máquina local** (a máquina de trabalho principal, com GPU RTX 5060,
+  WSL/Windows): repo em `/mnt/d/Kestrel`. Arena em
+  `/mnt/c/half2kbot_lc0pond`, porta 8765.
+- **Servidor remoto** `root@10.0.0.1` (sem GPU, **partilhado com outro
+  trabalho** -- outra sessão Claude, benchmarks cutechess-cli, um
+  serviço próprio na porta 8765): repo em `/root/kestrel_joao/Kestrel`
+  (mesmo git history, sincronizado por `rsync -az .git/`). Arena em
+  `/root/kestrel_joao`, porta **8766** (a 8765 já está ocupada lá).
+
+Se abrir este projeto no servidor remoto e não encontrar algo que este
+ficheiro menciona com caminho `/mnt/d/...`, é porque essa referência é da
+máquina local -- o equivalente remoto é `/root/kestrel_joao/...`. Já
+aconteceu uma vez (2026-07-20) um agente à procura deste ficheiro em
+`/mnt/d/Kestrel` no servidor remoto, onde não existia -- **antes de
+concluir que algo falta, confirmar em qual das duas máquinas está.**
+
+## Instalação no servidor remoto (o que já lá está, o que falta)
+
+Já instalado e confirmado a funcionar em `root@10.0.0.1`:
+- Rust (via rustup, `$HOME/.cargo/env`) -- suficiente para compilar o
+  kestrel (`cargo build --release` dentro de `/root/kestrel_joao/Kestrel`).
+- `/usr/local/bin/stockfish` (via apt, pacote `stockfish`, **versão 17**,
+  não a 18 que está na máquina local -- diferença pequena mas real).
+- Flask (via `pip install flask --break-system-packages`) -- necessário
+  para `arena_server.py`.
+- `python-chess` (já vinha instalado).
+- CPU com AVX2 e BMI2 -- confirmado compatível com o
+  `target-cpu=native` do `.cargo/config.toml`.
+
+**Não tem GPU** -- por isso só faz sentido lá instalar motores CPU-only:
+`stockfish` (já está), `troller` (Python, já está), e os que ainda faltam
+mas são perfeitamente viáveis (nenhum precisa de GPU):
+- **Sirius**: `git clone` do repo (ver `/mnt/d/Sirius` na máquina local
+  para referência do processo de build -- é Rust, compila com cargo,
+  binário final chama-se `sirius-engine`).
+- **Ethereal**: `git clone` + `make` (C, ver `/mnt/d/Ethereal` local).
+- **Reckless**: `git clone` + `cargo build --release` (Rust, ver
+  `/mnt/d/Reckless` local).
+
+Os motores GPU-dependentes (`pond`, `vanilla`, `pond_sf18`, `bluemoon` --
+todos baseados no lc0 com backend `cuda-fp16`) **não fazem sentido** no
+servidor remoto sem GPU -- nem tentar.
+
+Para adicionar um motor novo à arena remota: instalar o binário, depois
+editar `/root/kestrel_joao/engine_arena.py` (dict `OPPONENTS`), adicionar
+uma entrada `"nome": {"cmd": [...], "options": {...}}` seguindo o padrão
+das existentes, e `./arena.sh restart` (arena remota) para o Flask
+apanhar a mudança.
+
 ## O que é
 
 Motor de xadrez clássico, do zero, em Rust. Não é NNUE, não é o Pond
