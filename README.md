@@ -68,6 +68,19 @@ cargo build --release
 ./target/release/kestrel perft 5   # sanity check: should print 4865609
 ```
 
+## 🙏 Acknowledgements
+
+Some architectural ideas (search-tree pruning techniques, move-ordering
+structure) were adapted after reading the source of two real, strong
+open-source engines — full credit to their authors:
+
+- [Sirius](https://github.com/mcthouacbb/Sirius) — hand-crafted evaluation,
+  C++.
+- [Reckless](https://github.com/codedeliveryservice/Reckless) — NNUE, Rust.
+
+No code was copied verbatim; every implementation here was written from
+scratch for Kestrel's own architecture.
+
 ## 📄 License
 
 MIT — see [LICENSE](LICENSE).
