@@ -105,6 +105,37 @@ fn score_from_tt(score: i32, ply: i32) -> i32 {
 }
 
 impl<'a> Searcher<'a> {
+    /// Reconstructs the full principal variation by walking the TT's
+    /// best-move chain from `board` forward. Not a dedicated PV table --
+    /// cheap and good enough for UCI `info ... pv` output and for
+    /// verifying deep/forced lines (e.g. long mates) actually hold up
+    /// move by move, not just at the root. Defensive against a stale or
+    /// hash-collided entry pointing at an illegal move (stops the line
+    /// there instead of applying it) and against cycles (a repetition
+    /// loop in a corrupted chain would otherwise iterate forever).
+    pub fn extract_pv(&self, board: &Board, max_len: usize) -> Vec<Move> {
+        let mut pv = Vec::new();
+        let mut b = board.clone();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..max_len {
+            let hash = self.zob.hash(&b);
+            if !seen.insert(hash) {
+                break;
+            }
+            let mv = match self.tt.probe(hash).and_then(|e| e.best) {
+                Some(m) => m,
+                None => break,
+            };
+            let legal = generate_legal(&b, self.atk);
+            if !legal.contains(&mv) {
+                break;
+            }
+            b.make_move(&mv);
+            pv.push(mv);
+        }
+        pv
+    }
+
     fn time_up(&mut self) -> bool {
         if self.stop {
             return true;
@@ -334,11 +365,19 @@ impl<'a> Searcher<'a> {
                 -700 - self.book_bonus(&book_entries, m)
             } else if Some(*m) == killers[1] {
                 -600 - self.book_bonus(&book_entries, m)
-            } else if Some(*m) == countermove {
-                -550 - self.book_bonus(&book_entries, m)
             } else {
+                // Countermove folded in as an ADDITIVE bonus on top of
+                // history, not a hard priority slot -- a single recorded
+                // reply can be wrong; letting it outrank every other
+                // quiet move unconditionally (as a fixed slot did) can
+                // force a bad move to the front. Real engines (see
+                // Sirius's "continuation history") treat this as a
+                // weighted signal blended into the ordinary history
+                // score, not a rigid tier -- same idea here, simplified
+                // to a single ply-lag instead of Sirius's multi-lag sum.
                 let h = self.history_scores[side][m.from as usize][m.to as usize];
-                -h - self.book_bonus(&book_entries, m)
+                let cm_bonus = if Some(*m) == countermove { 2000 } else { 0 };
+                -h - cm_bonus - self.book_bonus(&book_entries, m)
             }
         });
         moves
@@ -552,9 +591,12 @@ impl<'a> Searcher<'a> {
             && beta.abs() < MATE_SCORE - MAX_PLY as i32
             && self.has_non_pawn_material(board)
         {
-            const NULL_R: i32 = 2;
+            // Adaptive R: a deeper reduction pays off at high depth (the
+            // reduced-depth probe is still informative enough relative to
+            // a bigger remaining tree), same idea as adaptive LMR below.
+            let null_r = if depth > 6 { 3 } else { 2 };
             let undo = board.make_null_move();
-            let score = -self.negamax(board, depth - 1 - NULL_R, -beta, -beta + 1, ply + 1);
+            let score = -self.negamax(board, depth - 1 - null_r, -beta, -beta + 1, ply + 1);
             board.unmake_null_move(&undo);
             if self.stop {
                 return 0;
@@ -579,6 +621,23 @@ impl<'a> Searcher<'a> {
                 if q <= alpha {
                     return q;
                 }
+            }
+        }
+
+        // Internal Iterative Deepening: sem lance da TT para ordenar por
+        // (tipico em nos que nunca foram visitados a esta profundidade),
+        // uma pesquisa reduzida barata da' um lance de ordenacao muito
+        // melhor do que a ordem crua do gerador -- mais cortes beta mais
+        // cedo no loop principal abaixo. So' compensa a profundidades
+        // razoaveis (a reducao tem de deixar sobrar pesquisa real) e nunca
+        // em xeque (ja' e' extendido, o proprio xeque restringe as opcoes).
+        if tt_move.is_none() && depth >= 4 && !in_check {
+            self.negamax(board, depth - 2, alpha, beta, ply);
+            if self.stop {
+                return 0;
+            }
+            if let Some(e) = self.tt.probe(hash) {
+                tt_move = e.best;
             }
         }
 
@@ -649,7 +708,19 @@ impl<'a> Searcher<'a> {
                     && mv.promotion.is_none()
                     && !gives_check
                 {
-                    1
+                    // Adaptive: lances mais tardios e nos mais profundos
+                    // toleram uma reducao maior -- a probabilidade deste
+                    // lance ser o melhor cai com a posicao na ordenacao,
+                    // e a arvore restante e' grande o suficiente para a
+                    // reducao extra ainda deixar profundidade real.
+                    let mut r = 1;
+                    if depth >= 6 {
+                        r += 1;
+                    }
+                    if i >= 10 {
+                        r += 1;
+                    }
+                    r.min(depth - 1)
                 } else {
                     0
                 };

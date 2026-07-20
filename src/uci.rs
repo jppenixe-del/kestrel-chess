@@ -186,13 +186,32 @@ impl Engine {
         let side_white = self.board.side == crate::types::Color::White;
         let (my_time, my_inc) = if side_white { (wtime, winc) } else { (btime, binc) };
 
+        // `soft_budget_ms` tracks the real per-move time budget derived
+        // from wtime/btime specifically (None for movetime/infinite/depth
+        // requests, which aren't live-clock scenarios) -- used below as a
+        // hard safety gate on the optional advisor: a real game clock
+        // that leaves less than ADVISOR_MIN_BUDGET_MS for this move is
+        // bullet-speed territory, where an LLM round-trip (hundreds of ms
+        // even best-case) is unsafe regardless of what the external
+        // bridge/caller believes the time control to be.
+        //
+        // ADVISOR_RESERVE_MS is reserved from the SEARCH's own deadline
+        // (not added on top of it) whenever the advisor is active, so
+        // search-time + advisor-round-trip together still respect the
+        // clock's real budget for this move -- otherwise every advisor
+        // consultation would silently overspend the move's allotment.
+        const ADVISOR_RESERVE_MS: i64 = 1500;
+        let advisor_enabled = crate::advisor::Advisor::from_env().is_some();
+        let mut soft_budget_ms: Option<i64> = None;
         let deadline: Option<Instant> = if let Some(mt) = movetime {
             Some(Instant::now() + Duration::from_millis(mt.max(1) as u64))
         } else if infinite || (my_time == 0 && movetime.is_none() && depth.is_none()) {
             None
         } else {
             let (soft, _hard) = compute_time_budget(my_time, my_inc, self.board.fullmove, movestogo, self.last_score);
-            Some(Instant::now() + Duration::from_millis(soft.max(1) as u64))
+            soft_budget_ms = Some(soft);
+            let search_ms = if advisor_enabled { (soft - ADVISOR_RESERVE_MS).max(1) } else { soft };
+            Some(Instant::now() + Duration::from_millis(search_ms.max(1) as u64))
         };
 
         let max_depth = depth.unwrap_or(64);
@@ -213,10 +232,26 @@ impl Engine {
             style_book: self.style_book.as_ref(),
         };
 
+        // Optional LLM tie-breaker (see advisor.rs): entirely opt-in via
+        // KESTREL_ADVISOR_HOST. When set, always search at least 3 root
+        // lines internally (regardless of what the UCI caller asked for
+        // via "multipv"), so there is something real to consult when the
+        // engine itself is indifferent between candidates. When the env
+        // var is unset -- the default for every deployment, including
+        // the live bot unless explicitly configured -- `advisor` is
+        // `None` and `effective_multipv` equals whatever was requested
+        // (1 by default): zero behavior change from before this feature
+        // existed.
+        const ADVISOR_MIN_BUDGET_MS: i64 = 2000;
+        let advisor_time_ok = soft_budget_ms.map(|ms| ms >= ADVISOR_MIN_BUDGET_MS).unwrap_or(true);
+        let advisor = crate::advisor::Advisor::from_env().filter(|_| advisor_time_ok);
+        let effective_multipv = if advisor.is_some() { multipv.max(3) } else { multipv };
+
         let t0 = Instant::now();
         let mut top_move: Option<crate::moves::Move> = None;
         let mut nodes_total: u64 = 0;
-        for pv_index in 1..=multipv {
+        let mut collected: Vec<(char, crate::moves::Move, i32)> = Vec::new();
+        for pv_index in 1..=effective_multipv {
             let (best, score, depth_reached, nodes_searched) = searcher.iterative_deepening(&mut self.board);
             nodes_total += nodes_searched;
             if pv_index == 1 {
@@ -233,11 +268,20 @@ impl Engine {
             };
             match best {
                 Some(mv) => {
-                    let _ = writeln!(
-                        out,
-                        "info depth {} multipv {} score {} nodes {} nps {} time {} pv {}",
-                        depth_reached, pv_index, score_str, nodes_total, nps, dt.as_millis(), mv.to_uci()
-                    );
+                    collected.push((((b'A' + (pv_index - 1) as u8)) as char, mv, score));
+                    if pv_index <= multipv {
+                        let pv_line = searcher.extract_pv(&self.board, depth_reached.max(1) as usize + 4);
+                        let pv_str = if pv_line.is_empty() {
+                            mv.to_uci()
+                        } else {
+                            pv_line.iter().map(|m| m.to_uci()).collect::<Vec<_>>().join(" ")
+                        };
+                        let _ = writeln!(
+                            out,
+                            "info depth {} multipv {} score {} nodes {} nps {} time {} pv {}",
+                            depth_reached, pv_index, score_str, nodes_total, nps, dt.as_millis(), pv_str
+                        );
+                    }
                     // MultiPV via exclusion: this line's move is dropped
                     // from the root move list before the next call, so
                     // the search finds the next-best line instead of
@@ -246,11 +290,35 @@ impl Engine {
                 }
                 None => break, // fewer legal root moves than requested lines
             }
-            if multipv > 1 {
+            if effective_multipv > 1 {
                 searcher.stop = false;
             }
         }
         let _ = out.flush();
+
+        // Optional advisor consultation: only when enabled AND the top
+        // lines are close enough to call it a tie -- the engine's own
+        // search remains the sole decision-maker otherwise. Any failure
+        // here (unreachable host, malformed response, no candidate
+        // named) silently keeps `top_move` as the engine's own line 1.
+        if let Some(adv) = &advisor {
+            if collected.len() > 1 {
+                let top_score = collected[0].2;
+                let tied: Vec<(char, String, i32)> = collected
+                    .iter()
+                    .filter(|(_, _, sc)| (sc - top_score).abs() <= 30)
+                    .map(|(lab, mv, sc)| (*lab, mv.to_uci(), *sc))
+                    .collect();
+                if tied.len() > 1 {
+                    let fen = self.board.to_fen();
+                    if let Some(chosen_label) = adv.ask(&fen, &tied) {
+                        if let Some((_, mv, _)) = collected.iter().find(|(lab, _, _)| *lab == chosen_label) {
+                            top_move = Some(*mv);
+                        }
+                    }
+                }
+            }
+        }
 
         // Rede de seguranca absoluta: mesmo que a busca nao tenha
         // conseguido terminar profundidade nenhuma (relogio esgotado
