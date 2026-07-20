@@ -36,7 +36,17 @@ fn compute_time_budget(
         estimate.clamp(12, 45)
     });
     let base = safe_time / moves_left + my_inc * 3 / 4;
-    let mut soft = base.clamp(10, safe_time / 2);
+    // 2026-07-20 (BUG REAL/CRASH corrigido -- encontrado ao testar
+    // manualmente "go depth N" sem wtime, um pedido perfeitamente valido
+    // do protocolo UCI, ex.: ferramentas de analise/debug): com
+    // safe_time pequeno (ex. my_time=0, o "else" de cmd_go so' evita
+    // este caminho quando "depth" tambem esta ausente -- ver uci.rs
+    // cmd_go), "safe_time/2" podia ficar ABAIXO de 10, e
+    // "base.clamp(10, safe_time/2)" entra em PANIC em Rust quando
+    // min>max (nao e' um clamp normal, e' um erro fatal). Corrigido:
+    // o limite superior nunca fica abaixo do limite inferior.
+    let soft_max = (safe_time / 2).max(10);
+    let mut soft = base.clamp(10, soft_max);
     let mut hard_cap = (safe_time * 3 / 10).max(soft); // nunca mais de ~30% do relogio numa jogada
 
     let clearly_winning = last_score.map(|s| s >= 400).unwrap_or(false);
