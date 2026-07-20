@@ -12,6 +12,12 @@ use std::time::Instant;
 pub const MATE_SCORE: i32 = 30000;
 pub const MAX_PLY: usize = 128;
 
+/// Limite de saturacao da history heuristic (bonus/malus acumulados por
+/// [cor][from][to]) -- evita que um par from/to muito bem sucedido
+/// domine a ordenacao para sempre, sem precisar de "aging"/decay mais
+/// complexo.
+const HISTORY_MAX: i32 = 16000;
+
 pub struct SearchLimits {
     pub deadline: Option<Instant>,
     pub max_depth: i32,
@@ -27,6 +33,16 @@ pub struct Searcher<'a> {
     pub stop: bool,
     pub history: Vec<u64>, // hashes da partida real ate' agora (para repeticao)
     pub killers: [[Option<Move>; 2]; MAX_PLY],
+    /// History heuristic ("butterfly boards" classicos): [cor][from][to],
+    /// bonus quando um lance tranquilo causa um corte beta, malus nos
+    /// lances tranquilos experimentados antes dele no MESMO no' que nao
+    /// cortaram -- peca canonica que faltava por completo (so' havia
+    /// TT-move/MVV-LVA/killers/livro; todos os outros lances tranquilos
+    /// ficavam sem NENHUM sinal de ordenacao). 2026-07-20, ver
+    /// project_kestrel_achados_2026-07-20.md. Zerada uma vez por `go`
+    /// (o Searcher e' reconstruido a cada `go` em uci.rs), nunca a meio
+    /// da busca -- a mesma licao do bug de killers corrigido antes.
+    pub history_scores: [[[i32; 64]; 64]; 2],
     pub root_best: Option<Move>,
     // Livro de "assinatura" da Judit Polgar (ver book.rs) -- so' influencia
     // a ORDEM em que a busca experimenta os lances, nunca substitui a
@@ -151,8 +167,18 @@ impl<'a> Searcher<'a> {
         0
     }
 
+    /// Aplica bonus/malus de history heuristic -- ver campo `history_scores`.
+    /// `depth*depth` e' a formula classica (peso maior quanto mais fundo o
+    /// corte, um corte a profundidade alta diz muito mais sobre a
+    /// qualidade real do lance do que um corte raso).
+    fn update_history(&mut self, side: usize, mv: &Move, delta: i32) {
+        let v = &mut self.history_scores[side][mv.from as usize][mv.to as usize];
+        *v = (*v + delta).clamp(-HISTORY_MAX, HISTORY_MAX);
+    }
+
     fn order_moves(&self, board: &Board, mut moves: Vec<Move>, tt_move: Option<Move>, ply: usize, hash: Option<u64>) -> Vec<Move> {
         let killers = self.killers[ply];
+        let side = board.side.idx();
         let book_entries: Vec<(u16, u32)> = match (self.style_book, hash) {
             (Some(b), Some(h)) => b.lookup(h),
             _ => Vec::new(),
@@ -167,7 +193,8 @@ impl<'a> Searcher<'a> {
             } else if Some(*m) == killers[1] {
                 -600 - self.book_bonus(&book_entries, m)
             } else {
-                -self.book_bonus(&book_entries, m)
+                let h = self.history_scores[side][m.from as usize][m.to as usize];
+                -h - self.book_bonus(&book_entries, m)
             }
         });
         moves
@@ -314,6 +341,10 @@ impl<'a> Searcher<'a> {
 
         let mut best_score = -MATE_SCORE - 1;
         let mut best_move = None;
+        // Lances tranquilos experimentados neste no' ate' agora, para
+        // aplicar malus de history heuristic se um lance POSTERIOR causar
+        // o corte beta (ver update_history/history_scores).
+        let mut quiets_tried: Vec<Move> = Vec::new();
         self.history.push(hash);
         for (i, mv) in moves.iter().enumerate() {
             let undo = board.make_move(mv);
@@ -349,6 +380,9 @@ impl<'a> Searcher<'a> {
                 s
             };
             board.unmake_move(mv, &undo);
+            if !mv.is_capture() {
+                quiets_tried.push(*mv);
+            }
 
             // BUG corrigido (2026-07-20, achado num jogo real na Arena --
             // "bestmove 0000" a meio de uma posicao completamente ganha):
@@ -381,6 +415,18 @@ impl<'a> Searcher<'a> {
                     if k[0] != Some(*mv) {
                         k[1] = k[0];
                         k[0] = Some(*mv);
+                    }
+                    // History heuristic: bonus para o lance que cortou,
+                    // malus para os lances tranquilos anteriores neste
+                    // no' que NAO cortaram (quiets_tried inclui `mv` como
+                    // ultimo elemento, ja' que foi empurrado logo acima --
+                    // excluido do malus).
+                    let bonus = (depth * depth).min(HISTORY_MAX);
+                    let side = board.side.idx();
+                    self.update_history(side, mv, bonus);
+                    let n = quiets_tried.len().saturating_sub(1);
+                    for qm in &quiets_tried[..n] {
+                        self.update_history(side, qm, -bonus);
                     }
                 }
                 break;
