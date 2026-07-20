@@ -234,59 +234,93 @@ fn king_zone(king_sq: Square) -> Bitboard {
     atk().king[king_sq as usize] | bb(king_sq)
 }
 
-/// Peso de ataque por tipo de peca contra a zona do rei inimigo -- pecas
-/// maiores pesam mais (uma torre ou dama a apontar ao rei e' mais grave
-/// que um cavalo). Isto e' a tradução computavel do "estilo Polgar" que
-/// pediram: nao e' a visao literal da Judit Polgar, mas um vies deliberado
-/// a favor de pressao ativa sobre o rei inimigo, tatica e iniciativa, em
-/// vez de uma avaliacao puramente material/estatica -- o oposto de um
-/// estilo tipo Petrosian/profilatico.
-fn king_attack_weight(pt: PieceType) -> i32 {
-    match pt {
-        PieceType::Pawn => 1,
-        PieceType::Knight => 3,
-        PieceType::Bishop => 3,
-        PieceType::Rook => 4,
-        PieceType::Queen => 6,
-        PieceType::King => 0,
-    }
-}
+// Constantes tunadas do Sirius v9.0 (eval_constants.h) -- afinadas EM
+// CONJUNTO com o MATERIAL e as PSQT acima por Texel Tuning. Portar as
+// tabelas sem estas constantes deixa duas escalas em conflito (as
+// tabelas na escala Sirius, os pesos "posicionais" a olho na escala
+// PeSTO). Layout ScorePair = (mg, eg); interpolados pela fase do jogo
+// em positional_terms(). Nomes na convencao do proprio Sirius --
+// facilita cross-check contra o ficheiro fonte quando houver
+// actualizacoes.
+const BISHOP_PAIR: (i32, i32) = (22, 65);
+const LONG_DIAG_BISHOP: (i32, i32) = (12, 12);
+const MINOR_BEHIND_PAWN: (i32, i32) = (2, 9);
+const KNIGHT_OUTPOST: (i32, i32) = (18, 18);
+const ROOK_OPEN: [(i32, i32); 2] = [(29, 2), (19, -1)]; // [0]=aberta, [1]=semi-aberta
+const TEMPO: (i32, i32) = (28, 20);
+
+// MOBILITY[piece][count] -- Sirius: Knight 0..=8, Bishop 0..=13, Rook
+// 0..=14, Queen 0..=27. Usamos 4 tabelas com o comprimento maximo
+// possivel (a Dama). Portagem literal.
+const MOBILITY_KNIGHT: [(i32, i32); 28] = [
+    (-20,-101),(-34,-46),(-19,-9),(-8,8),(2,18),(8,28),(17,33),(24,36),(34,27),
+    (0,0),(0,0),(0,0),(0,0),(0,0),(0,0),(0,0),(0,0),(0,0),(0,0),(0,0),(0,0),(0,0),(0,0),(0,0),(0,0),(0,0),(0,0),(0,0),
+];
+const MOBILITY_BISHOP: [(i32, i32); 28] = [
+    (-25,-111),(-41,-59),(-21,-27),(-10,-6),(-4,5),(0,15),(2,22),(5,26),(5,28),(9,29),(7,30),(13,23),(18,23),(48,-8),
+    (0,0),(0,0),(0,0),(0,0),(0,0),(0,0),(0,0),(0,0),(0,0),(0,0),(0,0),(0,0),(0,0),(0,0),
+];
+const MOBILITY_ROOK: [(i32, i32); 28] = [
+    (-58,-89),(-48,-66),(-16,-40),(-8,-23),(0,-12),(4,-2),(4,9),(6,14),(7,17),(9,23),(12,29),(13,35),(14,39),(17,41),(44,21),
+    (0,0),(0,0),(0,0),(0,0),(0,0),(0,0),(0,0),(0,0),(0,0),(0,0),(0,0),(0,0),(0,0),
+];
+const MOBILITY_QUEEN: [(i32, i32); 28] = [
+    (-29,-65),(-48,-72),(-59,-67),(-36,-132),(-24,-94),(-11,-55),(-3,-39),(1,-20),(1,-2),(2,11),(5,18),(5,28),(7,33),(7,41),
+    (9,45),(10,44),(9,49),(10,49),(12,49),(14,44),(17,41),(22,28),(21,28),(31,12),(20,23),(25,0),(21,-27),(-23,4),
+];
+
+// KING_ATTACKER_WEIGHT[Knight, Bishop, Rook, Queen]
+const KING_ATTACKER_WEIGHT: [(i32, i32); 4] = [(54, -2), (22, -2), (22, -7), (4, -9)];
+const KING_ATTACKS: (i32, i32) = (7, 0);
+
+// Peoes -- todas as tabelas indexadas por rank (0=1a, 7=8a; entrada 0 e
+// 7 sao 0 porque peoes nao existem la, mantidos para simplicidade de
+// index).
+const PAWN_PHALANX: [(i32, i32); 8] = [
+    (0,0),(4,-5),(11,0),(18,10),(40,34),(70,135),(104,178),(0,0)
+];
+const DEFENDED_PAWN: [(i32, i32); 8] = [
+    (0,0),(0,0),(16,7),(10,10),(18,24),(38,57),(71,119),(0,0)
+];
+// ISOLATED_PAWN[4] no Sirius e indexed por count acumulado de peoes
+// isolados; simplificamos para "peso por peao isolado individualmente"
+// usando o slot 0 (single isolated pawn).
+const ISOLATED_PAWN: (i32, i32) = (-6, 6);
+// DOUBLED_PAWN[4] no Sirius indexed por file (a/h=0, b/g=1, c/f=2,
+// d/e=3). Usamos a media por simplicidade.
+const DOUBLED_PAWN: (i32, i32) = (-3, -32);
+// PASSED_PAWN[defended][blocked][rank]; simplificamos usando o slot
+// mais comum (undefended, unblocked) e indexed by rank.
+const PASSED_PAWN: [(i32, i32); 8] = [
+    (0,0),(0,0),(0,0),(-31,-30),(-11,26),(22,140),(115,229),(0,0)
+];
 
 /// Avalia mobilidade, pressao sobre o rei inimigo, par de bispos, torres
-/// em colunas abertas/semi-abertas e peoes passados -- termos que uma
-/// engine puramente material+PST nao capta, e que sao exatamente o que
-/// diferencia um estilo agressivo/tatico (Polgar) de um estilo estatico.
-/// Devolve a pontuacao da perspetiva das BRANCAS (score_white - score_black),
-/// e' o chamador (evaluate) que converte para a convencao negamax.
+/// em colunas abertas/semi-abertas e estrutura de peoes usando os pesos
+/// tunados do Sirius v9.0 (ver constantes acima) -- consistente com as
+/// tabelas PSQT/MATERIAL desta seccao. Acumula (mg, eg) e interpola pela
+/// fase do jogo (mesma logica de material_pst). Devolve da perspetiva
+/// das BRANCAS (score_white - score_black), interpolado; o chamador
+/// (evaluate) converte para a convencao negamax.
 fn positional_terms(board: &Board) -> i32 {
     let a = atk();
     let occ = board.occ_all;
-    let mut score = 0i32;
+    let mut mg = 0i32;
+    let mut eg = 0i32;
 
     let white_king_zone = king_zone(board.king_sq(Color::White));
     let black_king_zone = king_zone(board.king_sq(Color::Black));
-
-    // Tabela de densidade de ataque (estilo "unidades de ataque" do
-    // Stockfish classico) -- cresce SUPER-linearmente com o numero de
-    // pecas distintas a atacar a zona do rei inimigo. Isto e' o que
-    // traduz o lado "sacrificios out-of-the-box" da Judit Polgar: um
-    // unico atacante vale pouco (defende-se facilmente), mas 3-4 pecas a
-    // apontar ao rei valem muito mais do que a soma das partes -- por
-    // isso a busca fica disposta a aceitar um deficit material temporario
-    // se isso construir esta configuracao.
-    const ATTACK_DENSITY: [i32; 8] = [0, 10, 40, 100, 190, 300, 420, 550];
 
     for c in [Color::White, Color::Black] {
         let sign = if c == Color::White { 1 } else { -1 };
         let own = board.occ_color[c.idx()];
         let enemy_king_zone = if c == Color::White { black_king_zone } else { white_king_zone };
-        let mut attacker_count = 0usize;
-        let mut attack_units = 0i32;
+        let mut king_attackers = 0i32;
+        let mut king_attack_units = (0i32, 0i32);
 
-        // Par de bispos: recompensa manter os dois -- tipico de jogadores
-        // que valorizam pecas de longo alcance para abrir o jogo.
         if count(board.pieces[c.idx()][PieceType::Bishop.idx()]) >= 2 {
-            score += sign * 30;
+            mg += sign * BISHOP_PAIR.0;
+            eg += sign * BISHOP_PAIR.1;
         }
 
         for pt in [PieceType::Knight, PieceType::Bishop, PieceType::Rook, PieceType::Queen] {
@@ -301,190 +335,176 @@ fn positional_terms(board: &Board) -> i32 {
                     PieceType::Queen => queen_attacks(s, occ),
                     _ => 0,
                 };
-                let mobility = count(attacks & !own) as i32;
-                // Mobilidade pesada com vies agressivo: vale mais para
-                // pecas maiores (dama/torre) do que o classico "conta
-                // lances" neutro -- recompensa atividade, nao so' opcoes.
-                score += sign * mobility * 2;
+                let mobility = count(attacks & !own) as usize;
+                let mob_table = match pt {
+                    PieceType::Knight => &MOBILITY_KNIGHT,
+                    PieceType::Bishop => &MOBILITY_BISHOP,
+                    PieceType::Rook => &MOBILITY_ROOK,
+                    PieceType::Queen => &MOBILITY_QUEEN,
+                    _ => &MOBILITY_KNIGHT,
+                };
+                let m = mob_table[mobility.min(27)];
+                mg += sign * m.0;
+                eg += sign * m.1;
 
-                // Pressao sobre a zona do rei inimigo -- o termo "Polgar":
-                // cada peca nossa que ataca a zona do rei adversario soma,
-                // pesada pelo tipo de peca, e conta para a densidade de
-                // ataque (ver ATTACK_DENSITY acima).
+                // Ataques a zona do rei -- pesados por tipo de peca +
+                // conta de ataques (KING_ATTACKS por casa atacada).
                 let hits = count(attacks & enemy_king_zone) as i32;
                 if hits > 0 {
-                    score += sign * hits * king_attack_weight(pt);
-                    attacker_count += 1;
-                    attack_units += hits * king_attack_weight(pt);
+                    king_attackers += 1;
+                    let widx = match pt {
+                        PieceType::Knight => 0,
+                        PieceType::Bishop => 1,
+                        PieceType::Rook => 2,
+                        PieceType::Queen => 3,
+                        _ => 0,
+                    };
+                    let w = KING_ATTACKER_WEIGHT[widx];
+                    king_attack_units.0 += w.0 + hits * KING_ATTACKS.0;
+                    king_attack_units.1 += w.1 + hits * KING_ATTACKS.1;
                 }
 
-                // Torre em coluna aberta/semi-aberta: peca de Polgar tipica
-                // -- abrir linhas para as torres em vez de as deixar presas.
+                // Torre em coluna aberta / semi-aberta.
                 if pt == PieceType::Rook {
                     let file_mask = FILE_A << file_of(s);
                     let own_pawns_on_file = board.pieces[c.idx()][PieceType::Pawn.idx()] & file_mask;
                     let enemy_pawns_on_file = board.pieces[c.opp().idx()][PieceType::Pawn.idx()] & file_mask;
                     if own_pawns_on_file == 0 {
-                        score += sign * if enemy_pawns_on_file == 0 { 20 } else { 10 };
+                        let idx = if enemy_pawns_on_file == 0 { 0 } else { 1 };
+                        mg += sign * ROOK_OPEN[idx].0;
+                        eg += sign * ROOK_OPEN[idx].1;
                     }
                 }
 
+                // Menor "atras" de um peao proprio.
                 if pt == PieceType::Knight || pt == PieceType::Bishop {
-                    // Menor "atras" de um peao proprio (mesma coluna, uma
-                    // fileira a frente da peca no sentido do avanco) --
-                    // abrigo tipico antes de reorganizar o desenvolvimento.
                     let f = file_of(s) as i32;
                     let r = rank_of(s) as i32;
                     let front_r = if c == Color::White { r + 1 } else { r - 1 };
                     if (0..8).contains(&front_r)
                         && board.pieces[c.idx()][PieceType::Pawn.idx()] & bb(sq(f as u8, front_r as u8)) != 0
                     {
-                        score += sign * 5;
+                        mg += sign * MINOR_BEHIND_PAWN.0;
+                        eg += sign * MINOR_BEHIND_PAWN.1;
                     }
 
-                    // Outpost: casa avancada (4a-6a fileira do lado
-                    // proprio), defendida por peao proprio, e onde nenhum
-                    // peao inimigo nas colunas adjacentes pode alguma vez
-                    // capturar a peca -- classico posto avancado, dificil
-                    // de expulsar.
-                    let own_side_rank = if c == Color::White { r } else { 7 - r };
-                    if (3..=5).contains(&own_side_rank) {
-                        let defended = a.pawn[c.opp().idx()][s as usize] & board.pieces[c.idx()][PieceType::Pawn.idx()] != 0;
-                        let mut ever_attackable = false;
-                        for adj in [f - 1, f + 1] {
-                            if (0..8).contains(&adj) && board.pieces[c.opp().idx()][PieceType::Pawn.idx()] & (FILE_A << adj) != 0 {
-                                ever_attackable = true;
+                    // Knight outpost (o Sirius nao tem outpost para
+                    // bispo separado, so' para cavalo).
+                    if pt == PieceType::Knight {
+                        let own_side_rank = if c == Color::White { r } else { 7 - r };
+                        if (3..=5).contains(&own_side_rank) {
+                            let defended = a.pawn[c.opp().idx()][s as usize] & board.pieces[c.idx()][PieceType::Pawn.idx()] != 0;
+                            let mut ever_attackable = false;
+                            for adj in [f - 1, f + 1] {
+                                if (0..8).contains(&adj) && board.pieces[c.opp().idx()][PieceType::Pawn.idx()] & (FILE_A << adj) != 0 {
+                                    ever_attackable = true;
+                                }
                             }
-                        }
-                        if defended && !ever_attackable {
-                            score += sign * if pt == PieceType::Knight { 25 } else { 15 };
+                            if defended && !ever_attackable {
+                                mg += sign * KNIGHT_OUTPOST.0;
+                                eg += sign * KNIGHT_OUTPOST.1;
+                            }
                         }
                     }
                 }
 
+                // Bispo na longa diagonal central.
                 if pt == PieceType::Bishop {
-                    // Bispo na grande diagonal central: ataca pelo menos 2
-                    // das 4 casas centrais (d4/e4/d5/e5) -- diagonal aberta
-                    // e influente, mais do que um bispo generico de
-                    // fianchetto.
                     let center: Bitboard = bb(sq(3, 3)) | bb(sq(4, 3)) | bb(sq(3, 4)) | bb(sq(4, 4));
                     if count(attacks & center) >= 2 {
-                        score += sign * 10;
+                        mg += sign * LONG_DIAG_BISHOP.0;
+                        eg += sign * LONG_DIAG_BISHOP.1;
                     }
-
-                    // "Bispo mau": penaliza peoes proprios na mesma cor de
-                    // casa do bispo -- bloqueiam o proprio alcance, tipico
-                    // de estruturas fechadas onde este bispo fica preso.
-                    let bishop_sq_color = (file_of(s) + rank_of(s)) % 2;
-                    let mut own_pawns_iter = board.pieces[c.idx()][PieceType::Pawn.idx()];
-                    let mut same_color_pawns = 0i32;
-                    while own_pawns_iter != 0 {
-                        let ps = own_pawns_iter.trailing_zeros() as Square;
-                        own_pawns_iter &= own_pawns_iter - 1;
-                        if (file_of(ps) + rank_of(ps)) % 2 == bishop_sq_color {
-                            same_color_pawns += 1;
-                        }
-                    }
-                    score -= sign * same_color_pawns * 2;
                 }
             }
         }
 
-        // Bonus de densidade: quantas pecas DISTINTAS (nao quantas casas)
-        // apontam a zona do rei inimigo. Nao-linear de proposito -- e' o
-        // que faz a busca preferir juntar 3 atacantes a manter material
-        // extra parado, o "sacrificio especulativo" caracteristico.
-        let idx = attacker_count.min(ATTACK_DENSITY.len() - 1);
-        if idx > 0 {
-            score += sign * (ATTACK_DENSITY[idx] + attack_units / 4);
+        // Bonus de ataque ao rei: acumulado, escalado por numero de
+        // atacantes distintos (peso principal ja' aplicado por peca).
+        if king_attackers >= 2 {
+            mg += sign * king_attack_units.0;
+            eg += sign * king_attack_units.1;
         }
 
-        // Peoes passados: sem peao inimigo a bloquear na mesma coluna ou
-        // colunas adjacentes, a frente do peao -- bonus crescente com o
-        // avanco (empurrar peoes passados e' iniciativa concreta).
-        let mut pawns = board.pieces[c.idx()][PieceType::Pawn.idx()];
+        // Estrutura de peoes.
+        let own_pawns = board.pieces[c.idx()][PieceType::Pawn.idx()];
+        let enemy_pawns = board.pieces[c.opp().idx()][PieceType::Pawn.idx()];
+        let mut pawns = own_pawns;
         while pawns != 0 {
             let s = pawns.trailing_zeros() as Square;
             pawns &= pawns - 1;
             let f = file_of(s) as i32;
             let r = rank_of(s) as i32;
+            let rel_rank = if c == Color::White { r as usize } else { (7 - r) as usize };
+
+            // Peao passado.
             let mut blocked = false;
-            let enemy_pawns = board.pieces[c.opp().idx()][PieceType::Pawn.idx()];
             for adj in (f - 1)..=(f + 1) {
-                if !(0..8).contains(&adj) {
-                    continue;
-                }
-                // mascara "a frente" (na coluna adj, a partir do peao):
-                // calculada por percurso simples de fileiras, robusta e
-                // facil de verificar (evita bit-tricks frageis).
+                if !(0..8).contains(&adj) { continue; }
                 let mut m: Bitboard = 0;
                 if c == Color::White {
-                    for rr in (r + 1)..8 {
-                        m |= bb(sq(adj as u8, rr as u8));
-                    }
+                    for rr in (r + 1)..8 { m |= bb(sq(adj as u8, rr as u8)); }
                 } else {
-                    for rr in 0..r {
-                        m |= bb(sq(adj as u8, rr as u8));
-                    }
+                    for rr in 0..r { m |= bb(sq(adj as u8, rr as u8)); }
                 }
-                if enemy_pawns & m != 0 {
-                    blocked = true;
-                    break;
-                }
+                if enemy_pawns & m != 0 { blocked = true; break; }
             }
             if !blocked {
-                let advance = if c == Color::White { r } else { 7 - r };
-                score += sign * (10 + advance * advance);
+                mg += sign * PASSED_PAWN[rel_rank].0;
+                eg += sign * PASSED_PAWN[rel_rank].1;
             }
 
-            // Peao isolado: nenhum peao proprio nas colunas adjacentes,
-            // em qualquer fileira -- fraqueza estrutural classica, nao
-            // pode ser defendido por outro peao.
-            let mut has_neighbor_file = false;
+            // Peao isolado.
+            let mut has_neighbor = false;
             for adj in (f - 1)..=(f + 1) {
-                if adj == f || !(0..8).contains(&adj) {
-                    continue;
-                }
-                if board.pieces[c.idx()][PieceType::Pawn.idx()] & (FILE_A << adj) != 0 {
-                    has_neighbor_file = true;
-                    break;
-                }
+                if adj == f || !(0..8).contains(&adj) { continue; }
+                if own_pawns & (FILE_A << adj) != 0 { has_neighbor = true; break; }
             }
-            if !has_neighbor_file {
-                score -= sign * 15;
+            if !has_neighbor {
+                mg += sign * ISOLATED_PAWN.0;
+                eg += sign * ISOLATED_PAWN.1;
             }
 
-            // Peao defendido por outro peao proprio (cadeia/falange) --
-            // truque da tabela de ataque de peao invertida (mesma ideia
-            // do SEE em search.rs): as casas de onde um peao proprio
-            // atacaria `s` sao as casas atacadas por um peao INIMIGO
-            // hipotetico em `s`.
-            if a.pawn[c.opp().idx()][s as usize] & board.pieces[c.idx()][PieceType::Pawn.idx()] != 0 {
-                score += sign * 6;
+            // Peao defendido por outro peao proprio (usa mesmo truque
+            // reversed pawn-attack table do SEE em search.rs).
+            if a.pawn[c.opp().idx()][s as usize] & own_pawns != 0 {
+                mg += sign * DEFENDED_PAWN[rel_rank].0;
+                eg += sign * DEFENDED_PAWN[rel_rank].1;
             }
 
-            // Falange de peoes: outro peao proprio na mesma fileira, na
-            // coluna adjacente -- apoiam-se mutuamente no avanco, tipico
-            // de estruturas agressivas de centro.
+            // Falange (outro peao proprio na mesma fileira, coluna
+            // adjacente).
             for adj in [f - 1, f + 1] {
-                if (0..8).contains(&adj) && board.pieces[c.idx()][PieceType::Pawn.idx()] & bb(sq(adj as u8, r as u8)) != 0 {
-                    score += sign * 5;
+                if (0..8).contains(&adj) && own_pawns & bb(sq(adj as u8, r as u8)) != 0 {
+                    mg += sign * PAWN_PHALANX[rel_rank].0;
+                    eg += sign * PAWN_PHALANX[rel_rank].1;
                     break;
                 }
             }
         }
 
-        // Peoes dobrados: mais de um peao proprio na mesma coluna --
-        // penaliza-se uma vez por peao excedente (contado por coluna,
-        // nao por peao, para nao repetir a mesma fraqueza duas vezes).
+        // Peoes dobrados (por peao excedente na mesma coluna).
         for file in 0..8 {
-            let n = count(board.pieces[c.idx()][PieceType::Pawn.idx()] & (FILE_A << file)) as i32;
+            let n = count(own_pawns & (FILE_A << file)) as i32;
             if n > 1 {
-                score -= sign * 12 * (n - 1);
+                mg += sign * DOUBLED_PAWN.0 * (n - 1);
+                eg += sign * DOUBLED_PAWN.1 * (n - 1);
             }
         }
     }
-    score
+
+    // Tempo -- bonus para quem tem a jogar. Aplicado como (mg,eg) do
+    // ponto de vista das brancas: se e' a vez das brancas, +TEMPO; se
+    // e' a vez das pretas, -TEMPO. Sirius aplica assim mesmo.
+    let tempo_sign = if board.side == Color::White { 1 } else { -1 };
+    mg += tempo_sign * TEMPO.0;
+    eg += tempo_sign * TEMPO.1;
+
+    // Interpolacao final pela fase actual do board (mesma logica de
+    // material_pst; fase mantida incrementalmente em add_piece/
+    // remove_piece).
+    let phase = board.phase.min(MAX_PHASE);
+    (mg * phase + eg * (MAX_PHASE - phase)) / MAX_PHASE
 }
 
 /// Avaliacao: material + PST + termos posicionais/taticos ("estilo
