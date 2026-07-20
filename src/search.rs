@@ -657,7 +657,12 @@ impl<'a> Searcher<'a> {
                 return if in_check { -MATE_SCORE + ply as i32 } else { 0 };
             }
         }
-        let moves = self.order_moves(board, moves, tt_move, ply.min(MAX_PLY - 1), Some(hash));
+        // Staged move picker: substitui o `order_moves` + `for mv in
+        // moves` que pontuava TUDO upfront antes de sequer tentar o
+        // primeiro lance. Ver `MovePicker` no fim deste ficheiro para as
+        // fases e a motivacao (port directo do padrao do Sirius).
+        let killers = self.killers[ply.min(MAX_PLY - 1)];
+        let mut picker = MovePicker::new(moves, tt_move, killers);
 
         let mut best_score = -MATE_SCORE - 1;
         let mut best_move = None;
@@ -667,7 +672,8 @@ impl<'a> Searcher<'a> {
         let mut quiets_tried: Vec<Move> = Vec::new();
         let mut futility_eval: Option<i32> = None;
         self.history.push(hash);
-        for (i, mv) in moves.iter().enumerate() {
+        let mut i: usize = 0;
+        while let Some(mv) = picker.next_move(self, board, ply.min(MAX_PLY - 1), hash) {
             // Futility pruning: a profundidade baixa, lances tranquilos
             // que nem com uma margem generosa da avaliacao estatica
             // conseguem bater alfa raramente valem a pena explorar --
@@ -684,10 +690,11 @@ impl<'a> Searcher<'a> {
                 let margin = 100 * depth;
                 let fe = *futility_eval.get_or_insert_with(|| crate::eval::evaluate_fast(board));
                 if fe + margin <= alpha {
+                    i += 1;
                     continue;
                 }
             }
-            let undo = board.make_move(mv);
+            let undo = board.make_move(&mv);
             if ply + 1 < MAX_PLY {
                 if let Some((moved_pt, _)) = board.piece_at(mv.to) {
                     self.ply_last_move[ply + 1] = Some((moved_pt, mv.to));
@@ -736,9 +743,9 @@ impl<'a> Searcher<'a> {
                 }
                 s
             };
-            board.unmake_move(mv, &undo);
+            board.unmake_move(&mv, &undo);
             if !mv.is_capture() {
-                quiets_tried.push(*mv);
+                quiets_tried.push(mv);
             }
 
             // BUG corrigido (2026-07-20, achado num jogo real na Arena --
@@ -754,9 +761,9 @@ impl<'a> Searcher<'a> {
             // so' se para de explorar MAIS lances depois disso.
             if score > best_score {
                 best_score = score;
-                best_move = Some(*mv);
+                best_move = Some(mv);
                 if ply == 0 {
-                    self.root_best = Some(*mv);
+                    self.root_best = Some(mv);
                 }
             }
             if self.stop {
@@ -769,9 +776,9 @@ impl<'a> Searcher<'a> {
             if alpha >= beta {
                 if !mv.is_capture() && ply < MAX_PLY {
                     let k = &mut self.killers[ply];
-                    if k[0] != Some(*mv) {
+                    if k[0] != Some(mv) {
                         k[1] = k[0];
-                        k[0] = Some(*mv);
+                        k[0] = Some(mv);
                     }
                     // History heuristic: bonus para o lance que cortou,
                     // malus para os lances tranquilos anteriores neste
@@ -780,7 +787,7 @@ impl<'a> Searcher<'a> {
                     // excluido do malus).
                     let bonus = (depth * depth).min(HISTORY_MAX);
                     let side = board.side.idx();
-                    self.update_history(side, mv, bonus);
+                    self.update_history(side, &mv, bonus);
                     let n = quiets_tried.len().saturating_sub(1);
                     for qm in &quiets_tried[..n] {
                         self.update_history(side, qm, -bonus);
@@ -791,11 +798,12 @@ impl<'a> Searcher<'a> {
                     // ply_last_move) -- read back in order_moves() the
                     // next time that exact context appears.
                     if let Some((ctx_pt, ctx_to)) = self.ply_last_move[ply] {
-                        self.countermoves[ctx_pt.idx()][ctx_to as usize] = Some(*mv);
+                        self.countermoves[ctx_pt.idx()][ctx_to as usize] = Some(mv);
                     }
                 }
                 break;
             }
+            i += 1;
         }
         self.history.pop();
 
@@ -880,5 +888,303 @@ impl<'a> Searcher<'a> {
             }
         }
         (best_move, best_score, last_depth, self.nodes)
+    }
+}
+
+/// Staged move picker -- port directo do padrao usado no Sirius
+/// (move_ordering.cpp `MovePickStage`, ver esse ficheiro para as fases
+/// exactas). Ideia: em vez de pontuar TODOS os lances legais upfront
+/// (SEE em todas as capturas, history+livro+countermove em todos os
+/// quietos) antes de sequer tentar o primeiro, devolver os lances por
+/// fases e pontuar SO' o subconjunto que a fase actual precisa. Se um
+/// corte beta acontece no TT-move (muito comum quando a TT tem info),
+/// nao pagamos NENHUM SEE nem lookup de history. Se um good-noisy corta,
+/// nao pagamos NENHUM history nem lookup de livro.
+///
+/// Correccao preservada: gera todos os lances LEGAIS uma vez a
+/// construcao (mesmo `generate_legal` de antes), so' muda a ordem/
+/// timing de pontuacao. `MovePicker::next` devolve `None` quando todos
+/// os lances foram devolvidos -- o chamador so' precisa de saber quantos
+/// devolveu para distinguir mate/stalemate de fim de loop normal.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum PickerStage {
+    TtMove,
+    ScoreNoisy,
+    GoodNoisy,
+    Killer1,
+    Killer2,
+    ScoreQuiet,
+    Quiet,
+    BadNoisy,
+    Done,
+}
+
+pub struct MovePicker {
+    stage: PickerStage,
+    tt_move: Option<Move>,
+    killer1: Option<Move>,
+    killer2: Option<Move>,
+    /// noisy = capturas + promocoes. Pontuado com SEE (ver `score_noisy`)
+    /// so' quando entramos em `ScoreNoisy`. Cada entrada guarda o lance
+    /// e o SEE score correspondente; SEE>=0 vao primeiro (GoodNoisy),
+    /// SEE<0 vao no fim (BadNoisy).
+    noisy: Vec<(Move, i32)>,
+    noisy_idx: usize,
+    /// Marca onde acabam os good noisy (SEE>=0) e comecam os bad noisy
+    /// (SEE<0). Definido quando `ScoreNoisy` termina.
+    good_noisy_end: usize,
+    /// quiet = tudo o que nao e' captura nem promocao. Pontuado com
+    /// history + livro + countermove (ver `score_quiet`) so' quando
+    /// entramos em `ScoreQuiet`.
+    quiet: Vec<(Move, i32)>,
+    quiet_idx: usize,
+}
+
+impl MovePicker {
+    /// `excluded` (usado no MultiPV, ver `excluded_root_moves`) tem de ser
+    /// filtrado ANTES da construcao do picker -- basta o chamador passar
+    /// `moves` ja' filtrado; o picker nao conhece MultiPV.
+    pub fn new(moves: Vec<Move>, tt_move: Option<Move>, killers: [Option<Move>; 2]) -> Self {
+        // Separa capturas/promocoes de quietos numa unica passagem.
+        // MoveFlag::EnPassant e captura; promocoes contam sempre como
+        // noisy (mesmo sem captura -- a promocao propria e "material").
+        let mut noisy: Vec<(Move, i32)> = Vec::with_capacity(moves.len() / 4);
+        let mut quiet: Vec<(Move, i32)> = Vec::with_capacity(moves.len());
+        for m in moves {
+            if m.is_capture() || m.promotion.is_some() {
+                noisy.push((m, 0));
+            } else {
+                quiet.push((m, 0));
+            }
+        }
+        MovePicker {
+            stage: PickerStage::TtMove,
+            tt_move,
+            killer1: killers[0],
+            killer2: killers[1],
+            noisy,
+            noisy_idx: 0,
+            good_noisy_end: 0,
+            quiet,
+            quiet_idx: 0,
+        }
+    }
+
+    /// Devolve o proximo lance ou `None` quando nao ha mais nada.
+    /// `searcher` e usado para SEE (na fase ScoreNoisy) e para
+    /// history/livro/countermove (na fase ScoreQuiet). `ply`/`hash` sao
+    /// os do no' actual (para lookup de livro por posicao, igual ao
+    /// order_moves antigo).
+    pub fn next_move(
+        &mut self,
+        searcher: &Searcher,
+        board: &Board,
+        ply: usize,
+        hash: u64,
+    ) -> Option<Move> {
+        loop {
+            match self.stage {
+                PickerStage::TtMove => {
+                    self.stage = PickerStage::ScoreNoisy;
+                    if let Some(tm) = self.tt_move {
+                        // TT-move so' e valido se estiver na lista real
+                        // de lances legais (a TT pode conter lixo por
+                        // colisao de hash). Procura em noisy+quiet.
+                        if self.contains_move(tm) {
+                            return Some(tm);
+                        }
+                    }
+                }
+                PickerStage::ScoreNoisy => {
+                    // Pontua SEE de cada captura, uma unica vez. Nao ha
+                    // MVV-LVA em separado -- SEE ja engloba a ideia de
+                    // "captura de peca grande com peca pequena", e ainda
+                    // rejeita capturas que aparentam ganhar mas perdem no
+                    // full exchange (Bxf7 defendido).
+                    for i in 0..self.noisy.len() {
+                        let m = self.noisy[i].0;
+                        if Some(m) == self.tt_move {
+                            self.noisy[i].1 = i32::MIN; // marca para saltar depois
+                            continue;
+                        }
+                        self.noisy[i].1 = searcher.see(board, &m);
+                    }
+                    // Nao ordenamos o vector agora -- selection-sort
+                    // in-place em `GoodNoisy` e `BadNoisy` extrai o
+                    // maior de cada vez, evitando O(n log n) upfront
+                    // quando muitas vezes so' precisamos do primeiro.
+                    self.stage = PickerStage::GoodNoisy;
+                }
+                PickerStage::GoodNoisy => {
+                    if let Some(m) = self.pick_best_noisy(true) {
+                        return Some(m);
+                    }
+                    // Terminou os good noisy; a partir daqui o
+                    // `noisy_idx` marca o inicio dos bad noisy (que
+                    // ficam para o fim).
+                    self.good_noisy_end = self.noisy_idx;
+                    self.stage = PickerStage::Killer1;
+                }
+                PickerStage::Killer1 => {
+                    self.stage = PickerStage::Killer2;
+                    if let Some(k) = self.killer1 {
+                        if Some(k) != self.tt_move && self.quiet_contains(k) {
+                            self.mark_quiet_used(k);
+                            return Some(k);
+                        }
+                    }
+                }
+                PickerStage::Killer2 => {
+                    self.stage = PickerStage::ScoreQuiet;
+                    if let Some(k) = self.killer2 {
+                        if Some(k) != self.tt_move
+                            && Some(k) != self.killer1
+                            && self.quiet_contains(k)
+                        {
+                            self.mark_quiet_used(k);
+                            return Some(k);
+                        }
+                    }
+                }
+                PickerStage::ScoreQuiet => {
+                    // Livro e' pesquisado por posicao (nao por lance),
+                    // por isso uma unica vez aqui em vez de N vezes
+                    // no loop.
+                    let side = board.side.idx();
+                    let book_entries: Vec<(u16, u32)> = match searcher.style_book {
+                        Some(b) => b.lookup(hash),
+                        None => Vec::new(),
+                    };
+                    let countermove = searcher
+                        .ply_last_move
+                        .get(ply)
+                        .and_then(|x| *x)
+                        .and_then(|(pt, to)| searcher.countermoves[pt.idx()][to as usize]);
+                    for i in 0..self.quiet.len() {
+                        let m = self.quiet[i].0;
+                        if m.from == m.to {
+                            // marcador "ja usado" (killer, ver mark_quiet_used)
+                            self.quiet[i].1 = i32::MIN;
+                            continue;
+                        }
+                        if Some(m) == self.tt_move {
+                            self.quiet[i].1 = i32::MIN;
+                            continue;
+                        }
+                        // Mesma formula do order_moves antigo (para nao
+                        // regredir a ordenacao entre iteracoes):
+                        // history + countermove bonus + livro.
+                        let h = searcher.history_scores[side][m.from as usize][m.to as usize];
+                        let cm_bonus = if Some(m) == countermove { 2000 } else { 0 };
+                        let book = searcher.book_bonus(&book_entries, &m);
+                        self.quiet[i].1 = h + cm_bonus + book;
+                    }
+                    self.stage = PickerStage::Quiet;
+                }
+                PickerStage::Quiet => {
+                    if let Some(m) = self.pick_best_quiet() {
+                        return Some(m);
+                    }
+                    self.stage = PickerStage::BadNoisy;
+                }
+                PickerStage::BadNoisy => {
+                    if let Some(m) = self.pick_best_noisy(false) {
+                        return Some(m);
+                    }
+                    self.stage = PickerStage::Done;
+                }
+                PickerStage::Done => return None,
+            }
+        }
+    }
+
+    /// Se `m` (o lance sugerido) ainda estiver nas listas geradas,
+    /// devolve true. Serve para validar TT-move e killers antes de os
+    /// emitir -- ambos podem ser lixo (TT colisao ou killer stale que
+    /// ja nao aplica a esta posicao).
+    fn contains_move(&self, m: Move) -> bool {
+        self.noisy.iter().any(|(x, _)| *x == m) || self.quiet.iter().any(|(x, _)| *x == m)
+    }
+    fn quiet_contains(&self, m: Move) -> bool {
+        self.quiet.iter().any(|(x, _)| *x == m)
+    }
+
+    /// Marca um quiet como "ja usado" (usei-o como killer, nao repetir
+    /// mais tarde no stage Quiet). Truque: guardar `from == to`, que
+    /// nunca acontece num lance real; o loop de ScoreQuiet trata como
+    /// score = MIN e o pick_best_quiet salta-o.
+    fn mark_quiet_used(&mut self, m: Move) {
+        for entry in self.quiet.iter_mut() {
+            if entry.0 == m {
+                entry.0 = Move {
+                    from: 0,
+                    to: 0,
+                    promotion: None,
+                    flag: MoveFlag::Quiet,
+                };
+                return;
+            }
+        }
+    }
+
+    /// Selection-sort in-place: encontra o de maior score a partir de
+    /// `noisy_idx`, faz swap para essa posicao, avanca. Devolve o lance;
+    /// respeita a fase (good_only=true so' devolve SEE>=0, senao so'
+    /// devolve SEE<0). Se nao ha mais na fase actual, devolve None.
+    fn pick_best_noisy(&mut self, good_only: bool) -> Option<Move> {
+        while self.noisy_idx < self.noisy.len() {
+            let mut best_i = self.noisy_idx;
+            let mut best_score = self.noisy[best_i].1;
+            for i in (self.noisy_idx + 1)..self.noisy.len() {
+                if self.noisy[i].1 > best_score {
+                    best_score = self.noisy[i].1;
+                    best_i = i;
+                }
+            }
+            self.noisy.swap(self.noisy_idx, best_i);
+            let (m, score) = self.noisy[self.noisy_idx];
+            // score == i32::MIN significa "e' o TT-move, salta"
+            if score == i32::MIN {
+                self.noisy_idx += 1;
+                continue;
+            }
+            // Boundary entre good e bad: good tem SEE>=0.
+            if good_only {
+                if score < 0 {
+                    return None;
+                }
+            } else if score >= 0 {
+                // Nao devia acontecer (todos os good_noisy ja foram
+                // devolvidos), mas por defesa, salta -- os good ja
+                // foram devolvidos por definicao.
+                self.noisy_idx += 1;
+                continue;
+            }
+            self.noisy_idx += 1;
+            return Some(m);
+        }
+        None
+    }
+
+    fn pick_best_quiet(&mut self) -> Option<Move> {
+        while self.quiet_idx < self.quiet.len() {
+            let mut best_i = self.quiet_idx;
+            let mut best_score = self.quiet[best_i].1;
+            for i in (self.quiet_idx + 1)..self.quiet.len() {
+                if self.quiet[i].1 > best_score {
+                    best_score = self.quiet[i].1;
+                    best_i = i;
+                }
+            }
+            self.quiet.swap(self.quiet_idx, best_i);
+            let (m, score) = self.quiet[self.quiet_idx];
+            if score == i32::MIN {
+                self.quiet_idx += 1;
+                continue;
+            }
+            self.quiet_idx += 1;
+            return Some(m);
+        }
+        None
     }
 }
