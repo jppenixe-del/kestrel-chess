@@ -1,11 +1,12 @@
-use crate::attacks::Attacks;
+use crate::attacks::{bishop_attacks, rook_attacks, Attacks};
+use crate::bitboard::bb;
 use crate::board::Board;
 use crate::book::{encode_move, Book};
 use crate::eval::evaluate;
 use crate::movegen::generate_legal;
-use crate::moves::Move;
+use crate::moves::{Move, MoveFlag};
 use crate::tt::{Bound, TranspositionTable};
-use crate::types::PieceType;
+use crate::types::{file_of, rank_of, sq, Color, PieceType};
 use crate::zobrist::Zobrist;
 use std::time::Instant;
 
@@ -145,6 +146,111 @@ impl<'a> Searcher<'a> {
         victim * 16 - attacker
     }
 
+    /// Todas as pecas (ambas as cores) que atacam `sq` dada uma
+    /// ocupacao HIPOTETICA `occ` (nao necessariamente `board.occ_all`
+    /// -- usado pelo SEE para simular a troca a medida que remove
+    /// pecas). Ataques de peao usam a tabela do lado CONTRARIO (truque
+    /// classico: "que casas atacaria um peao preto aqui" = "que peoes
+    /// brancos atacam aqui", por simetria do padrao diagonal).
+    fn attackers_to(&self, board: &Board, s: crate::types::Square, occ: crate::bitboard::Bitboard) -> crate::bitboard::Bitboard {
+        let a = self.atk;
+        let mut att = 0u64;
+        att |= a.pawn[Color::Black.idx()][s as usize] & board.pieces[Color::White.idx()][PieceType::Pawn.idx()];
+        att |= a.pawn[Color::White.idx()][s as usize] & board.pieces[Color::Black.idx()][PieceType::Pawn.idx()];
+        att |= a.knight[s as usize]
+            & (board.pieces[Color::White.idx()][PieceType::Knight.idx()] | board.pieces[Color::Black.idx()][PieceType::Knight.idx()]);
+        att |= a.king[s as usize]
+            & (board.pieces[Color::White.idx()][PieceType::King.idx()] | board.pieces[Color::Black.idx()][PieceType::King.idx()]);
+        let diag = board.pieces[Color::White.idx()][PieceType::Bishop.idx()]
+            | board.pieces[Color::Black.idx()][PieceType::Bishop.idx()]
+            | board.pieces[Color::White.idx()][PieceType::Queen.idx()]
+            | board.pieces[Color::Black.idx()][PieceType::Queen.idx()];
+        att |= bishop_attacks(s, occ) & diag;
+        let orth = board.pieces[Color::White.idx()][PieceType::Rook.idx()]
+            | board.pieces[Color::Black.idx()][PieceType::Rook.idx()]
+            | board.pieces[Color::White.idx()][PieceType::Queen.idx()]
+            | board.pieces[Color::Black.idx()][PieceType::Queen.idx()];
+        att |= rook_attacks(s, occ) & orth;
+        att & occ
+    }
+
+    fn least_valuable_attacker(
+        &self,
+        board: &Board,
+        attackers: crate::bitboard::Bitboard,
+        side: Color,
+    ) -> Option<(crate::types::Square, PieceType)> {
+        for pt in [
+            PieceType::Pawn,
+            PieceType::Knight,
+            PieceType::Bishop,
+            PieceType::Rook,
+            PieceType::Queen,
+            PieceType::King,
+        ] {
+            let bbp = attackers & board.pieces[side.idx()][pt.idx()];
+            if bbp != 0 {
+                return Some((bbp.trailing_zeros() as crate::types::Square, pt));
+            }
+        }
+        None
+    }
+
+    /// Static Exchange Evaluation: simula a sequencia completa de
+    /// capturas/recapturas na casa `mv.to`, sempre com o atacante menos
+    /// valioso de cada lado (a jogada optima para ambos), e devolve o
+    /// ganho material líquido assumindo optimo jogo de ambos os lados
+    /// (cada lado escolhe parar ou continuar a troca, o que for melhor
+    /// para si -- minimax classico sobre a "swap list"). Nao verifica
+    /// se a recaptura deixaria o proprio rei em xeque (limitacao
+    /// standard/aceite de SEE simples, presente em praticamente todos
+    /// os motores). So' chamar em lances de captura (incl. en passant).
+    fn see(&self, board: &Board, mv: &Move) -> i32 {
+        let to = mv.to;
+        let Some((attacker_pt0, attacker_color0)) = board.piece_at(mv.from) else {
+            return 0;
+        };
+        let victim_val0 = if mv.flag == MoveFlag::EnPassant {
+            PieceType::Pawn.value()
+        } else {
+            match board.piece_at(to) {
+                Some((pt, _)) => pt.value(),
+                None => return 0,
+            }
+        };
+
+        let mut occ = board.occ_all;
+        occ &= !bb(mv.from);
+        if mv.flag == MoveFlag::EnPassant {
+            let ep_captured = sq(file_of(to), rank_of(mv.from));
+            occ &= !bb(ep_captured);
+        }
+
+        let mut gains: Vec<i32> = vec![victim_val0];
+        let mut attacker_val = attacker_pt0.value();
+        let mut side = attacker_color0.opp();
+
+        loop {
+            let attackers = self.attackers_to(board, to, occ);
+            let side_attackers = attackers & board.occ_color[side.idx()];
+            let Some((lva_sq, lva_pt)) = self.least_valuable_attacker(board, side_attackers, side) else {
+                break;
+            };
+            gains.push(attacker_val - *gains.last().unwrap());
+            attacker_val = lva_pt.value();
+            occ &= !bb(lva_sq);
+            side = side.opp();
+            if gains.len() > 32 {
+                break;
+            }
+        }
+
+        for i in (1..gains.len()).rev() {
+            gains[i - 1] = (-gains[i]).min(gains[i - 1]);
+        }
+        gains[0]
+    }
+
     /// Bonus de ordenacao para lances que a Judit Polgar realmente jogou
     /// nesta posicao exata (1825 jogos reais, ver book.rs) -- cresce com
     /// a frequencia mas satura, para nunca competir com uma captura
@@ -187,7 +293,19 @@ impl<'a> Searcher<'a> {
             if Some(*m) == tt_move {
                 -1_000_000
             } else if m.is_capture() {
-                -100_000 - self.mvv_lva(board, m)
+                // SEE substitui o MVV-LVA puro na ordenacao: capturas
+                // boas/neutras (SEE>=0) vao para o topo (ordenadas por
+                // valor real da troca, nao so' "peca maior primeiro"),
+                // capturas MAS (SEE<0, perdem material na troca
+                // completa) descem para depois dos lances tranquilos --
+                // MVV-LVA nao distinguia "Bxf7" de um bispo protegido
+                // (perde a peca) de uma captura genuinamente boa.
+                let see = self.see(board, m);
+                if see >= 0 {
+                    -200_000 - see
+                } else {
+                    100_000 - see
+                }
             } else if Some(*m) == killers[0] {
                 -700 - self.book_bonus(&book_entries, m)
             } else if Some(*m) == killers[1] {
@@ -225,6 +343,14 @@ impl<'a> Searcher<'a> {
 
         let mut moves = generate_legal(board, self.atk);
         moves.retain(|m| m.is_capture() || m.promotion == Some(PieceType::Queen));
+        // Poda por SEE: uma captura que perde material na troca completa
+        // (SEE negativo) quase nunca vale a pena dentro da quiescence --
+        // e' exactamente o tipo de "captura mal calculada" que antes
+        // era sempre pesquisada (MVV-LVA nao filtra nada, so' ordena).
+        // Promocoes de dama ficam sempre (mv.to nao e' captura nesse
+        // caso, is_capture()==false, so' entram aqui por causa do
+        // OR acima -- SEE nao se aplica, `is_capture()` protege isso).
+        moves.retain(|m| !m.is_capture() || self.see(board, m) >= 0);
         let moves = self.order_moves(board, moves, None, ply.min(MAX_PLY - 1), None);
 
         for mv in moves {
@@ -250,13 +376,33 @@ impl<'a> Searcher<'a> {
             return 0;
         }
 
+        let mut beta = beta;
+
         let hash = self.zob.hash(board);
         if ply > 0 && self.is_repetition_or_fifty(board, hash) {
             return 0;
         }
 
+        // Mate distance pruning: se um mate mais curto do que o melhor
+        // possivel a este ply ja' esta' garantido/impossivel de bater,
+        // aperta a janela -- corte trivial e sempre correcto (nao
+        // interfere com scores normais, so' com scores de mate).
+        let mating_value = MATE_SCORE - ply as i32;
+        if mating_value < beta {
+            beta = mating_value;
+            if alpha >= mating_value {
+                return mating_value;
+            }
+        }
+        let mated_value = -MATE_SCORE + ply as i32;
+        if mated_value > alpha {
+            alpha = mated_value;
+            if beta <= mated_value {
+                return mated_value;
+            }
+        }
+
         let orig_alpha = alpha;
-        let mut beta = beta;
         let mut tt_move = None;
         if let Some(e) = self.tt.probe(hash) {
             tt_move = e.best;
@@ -338,6 +484,25 @@ impl<'a> Searcher<'a> {
 
         let in_check = board.in_check(board.side, self.atk);
 
+        // Reverse futility pruning (static null move): se a avaliacao
+        // estatica rapida ja' esta' tao acima de beta que nem uma
+        // margem generosa por profundidade a apanha, a posicao e' boa
+        // demais para precisar de busca real -- corta. So' em nos nao-
+        // raiz, fora de xeque, profundidade baixa (a margem cresce
+        // linear com a profundidade, torna-se pouco fiavel depressa) e
+        // longe de scores de mate (nao mascarar mates reais).
+        if !in_check
+            && ply > 0
+            && depth <= 6
+            && beta.abs() < MATE_SCORE - MAX_PLY as i32
+        {
+            let margin = 90 * depth;
+            let static_eval = crate::eval::evaluate_fast(board);
+            if static_eval - margin >= beta {
+                return static_eval - margin;
+            }
+        }
+
         // Null-move pruning: se mesmo passando a vez ao adversario ainda
         // ficamos >= beta numa busca reduzida, a posicao e' tao boa que
         // podemos cortar ja'. Condicoes de seguranca:
@@ -365,6 +530,24 @@ impl<'a> Searcher<'a> {
             }
         }
 
+        // Razoring: a profundidade muito baixa, se a avaliacao estatica
+        // mais uma margem generosa ainda fica abaixo de alfa, e' muito
+        // improvavel que exista um lance tranquilo que recupere a
+        // diferenca -- verifica-se com uma chamada real a quiescence
+        // (nao um corte cego) e so' se aceita o resultado se confirmar
+        // o fail-low, para nunca perder uma tactica real.
+        if !in_check && ply > 0 && depth <= 3 {
+            let margin = 150 + 100 * (depth - 1);
+            let static_eval = crate::eval::evaluate_fast(board);
+            if static_eval + margin <= alpha {
+                let full_stand_pat = evaluate(board);
+                let q = self.quiescence_from(board, alpha, beta, ply, full_stand_pat);
+                if q <= alpha {
+                    return q;
+                }
+            }
+        }
+
         let moves = generate_legal(board, self.atk);
         if moves.is_empty() {
             return if in_check { -MATE_SCORE + ply as i32 } else { 0 };
@@ -377,8 +560,28 @@ impl<'a> Searcher<'a> {
         // aplicar malus de history heuristic se um lance POSTERIOR causar
         // o corte beta (ver update_history/history_scores).
         let mut quiets_tried: Vec<Move> = Vec::new();
+        let mut futility_eval: Option<i32> = None;
         self.history.push(hash);
         for (i, mv) in moves.iter().enumerate() {
+            // Futility pruning: a profundidade baixa, lances tranquilos
+            // que nem com uma margem generosa da avaliacao estatica
+            // conseguem bater alfa raramente valem a pena explorar --
+            // salta-os sem pesquisar. Nunca no 1o lance (pode ser o
+            // melhor), nunca em xeque/captura/promocao, nunca perto de
+            // scores de mate (a avaliacao estatica nao e' fiavel ai).
+            if i > 0
+                && !in_check
+                && depth <= 6
+                && !mv.is_capture()
+                && mv.promotion.is_none()
+                && alpha.abs() < MATE_SCORE - MAX_PLY as i32
+            {
+                let margin = 100 * depth;
+                let fe = *futility_eval.get_or_insert_with(|| crate::eval::evaluate_fast(board));
+                if fe + margin <= alpha {
+                    continue;
+                }
+            }
             let undo = board.make_move(mv);
             let extend = if in_check { 1 } else { 0 };
             let score = if i == 0 {
@@ -480,13 +683,49 @@ impl<'a> Searcher<'a> {
         best_score
     }
 
+    /// Busca na raiz com aspiration windows: profundidade 1 usa sempre
+    /// janela total (referencia inicial). Profundidades seguintes tentam
+    /// primeiro uma janela estreita centrada no score da iteracao
+    /// anterior -- corta muito mais no resto da arvore -- e alarga
+    /// (dobra o delta) e repete se falhar por baixo ou por cima, ate'
+    /// obter um score dentro da janela ou o tempo esgotar. Testada
+    /// isoladamente com resultado negativo (33%); reintroduzida em lote
+    /// com futility/RFP/razoring/mate-distance-pruning para testar
+    /// possivel sinergia (pedido explicito do utilizador -- pecas
+    /// individuais podem parecer negativas isoladas mas positivas em
+    /// conjunto).
+    fn search_root(&mut self, board: &mut Board, depth: i32, prev_score: i32) -> i32 {
+        if depth <= 1 {
+            return self.negamax(board, depth, -MATE_SCORE - 1, MATE_SCORE + 1, 0);
+        }
+        let mut delta: i32 = 25;
+        let mut alpha = (prev_score - delta).max(-MATE_SCORE - 1);
+        let mut beta = (prev_score + delta).min(MATE_SCORE + 1);
+        loop {
+            let score = self.negamax(board, depth, alpha, beta, 0);
+            if self.stop {
+                return score;
+            }
+            if score <= alpha {
+                alpha = (alpha - delta).max(-MATE_SCORE - 1);
+                delta *= 2;
+            } else if score >= beta {
+                beta = (beta + delta).min(MATE_SCORE + 1);
+                delta *= 2;
+            } else {
+                return score;
+            }
+        }
+    }
+
     pub fn iterative_deepening(&mut self, board: &mut Board) -> (Option<Move>, i32, i32, u64) {
         let mut best_move = None;
         let mut best_score = 0;
         let mut last_depth = 0;
+        let mut prev_score = 0;
         self.killers = [[None; 2]; MAX_PLY];
         for depth in 1..=self.limits.max_depth {
-            let score = self.negamax(board, depth, -MATE_SCORE - 1, MATE_SCORE + 1, 0);
+            let score = self.search_root(board, depth, prev_score);
             // 2026-07-20 (BUG REAL corrigido -- irmao do bug ja' corrigido
             // dentro do loop de lances de negamax(), "nunca descartar o
             // resultado de um lance-filho ja' terminado so' porque o
@@ -504,6 +743,7 @@ impl<'a> Searcher<'a> {
                 best_move = Some(rb);
                 best_score = score;
                 last_depth = depth;
+                prev_score = score;
             }
             if self.stop {
                 break;
