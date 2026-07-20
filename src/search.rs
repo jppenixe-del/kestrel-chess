@@ -266,7 +266,34 @@ impl<'a> Searcher<'a> {
             let tt_score = score_from_tt(e.score, ply as i32);
             if e.depth >= depth {
                 match e.bound {
-                    Bound::Exact => return tt_score,
+                    Bound::Exact => {
+                        // 2026-07-20 (BUG REAL corrigido -- achado por
+                        // instrumentacao directa num jogo real onde o
+                        // motor jogou o "primeiro lance legal gerado" em
+                        // vez do lance realmente escolhido pela busca,
+                        // numa posicao completamente ganha): quando a TT
+                        // ja tem um bound Exact suficiente para a raiz
+                        // (ply==0), esta funcao retorna aqui SEM NUNCA
+                        // passar pelo loop de lances mais abaixo -- que e'
+                        // o unico sitio onde `self.root_best` era
+                        // definido. Em jogos longos (TT acumulada ao
+                        // longo de muitos `go`), isto podia fazer VARIAS
+                        // iteracoes da iterative deepening (todas com
+                        // `e.depth` >= profundidade pedida) devolverem
+                        // sem NUNCA definir root_best, deixando toda a
+                        // decisao do lance final refem da ULTIMA
+                        // iteracao -- e se essa tambem fosse interrompida
+                        // a meio (ver bug irmao em iterative_deepening()),
+                        // `root_best` ficava None e o motor caia no
+                        // fallback "primeiro lance legal", ignorando
+                        // completamente o que a busca sabia.
+                        if ply == 0 {
+                            if let Some(tm) = tt_move {
+                                self.root_best = Some(tm);
+                            }
+                        }
+                        return tt_score;
+                    }
                     Bound::Lower => {
                         if tt_score > alpha {
                             alpha = tt_score;
@@ -288,6 +315,11 @@ impl<'a> Searcher<'a> {
                     }
                 }
                 if alpha >= beta {
+                    if ply == 0 {
+                        if let Some(tm) = tt_move {
+                            self.root_best = Some(tm);
+                        }
+                    }
                     return tt_score;
                 }
             }
@@ -455,13 +487,23 @@ impl<'a> Searcher<'a> {
         self.killers = [[None; 2]; MAX_PLY];
         for depth in 1..=self.limits.max_depth {
             let score = self.negamax(board, depth, -MATE_SCORE - 1, MATE_SCORE + 1, 0);
-            if self.stop && depth > 1 {
-                break;
-            }
-            best_score = score;
-            last_depth = depth;
+            // 2026-07-20 (BUG REAL corrigido -- irmao do bug ja' corrigido
+            // dentro do loop de lances de negamax(), "nunca descartar o
+            // resultado de um lance-filho ja' terminado so' porque o
+            // relogio esgotou a seguir"): aqui a mesma logica falhava um
+            // nivel acima -- `if self.stop && depth > 1 { break; }`
+            // acontecia ANTES de ler `self.root_best` para `best_move`,
+            // descartando uma iteracao que TINHA encontrado um lance
+            // valido (root_best ja' actualizado dentro de negamax()) so'
+            // porque o relogio esgotou a meio de um lance POSTERIOR dessa
+            // mesma iteracao. Reproduzido num jogo real: motor acabou a
+            // jogar o "primeiro lance legal gerado" (fallback de
+            // uci.rs::cmd_go) em vez do lance vencedor que a busca ja'
+            // tinha encontrado e guardado em root_best.
             if let Some(rb) = self.root_best {
                 best_move = Some(rb);
+                best_score = score;
+                last_depth = depth;
             }
             if self.stop {
                 break;

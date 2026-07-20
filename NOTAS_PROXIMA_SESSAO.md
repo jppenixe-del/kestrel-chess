@@ -343,3 +343,56 @@ com atenção ao padrão "dama sem plano" / recuos estranhos de peças
 menores -- se persistir com os bugs de TT já corrigidos, é mais provável
 tratar-se de um problema de busca (LMR/null-move demasiado agressivos?
 ordenação de lances?) do que de avaliação estática.
+
+## Atualização 2026-07-20 (continuação, dois bugs de busca reais encontrados e corrigidos)
+
+Confirmado: o lote fresco pós-`91ea1a7` vs Stockfish deu **0V-19D-1E**,
+igual em severidade -- os bugs de TT/panic não eram a causa. Investigação
+continuou directo na busca (não na avaliação), e encontrou dois problemas
+reais, ambos commitados e validados:
+
+**6. BUG REAL: killers resetados a cada profundidade (commit `a008413`).**
+`iterative_deepening()` reiniciava `self.killers` DENTRO do loop de
+profundidades, em vez de uma vez só antes dele. Prática padrão é resetar
+killers uma vez por `go`, não a cada iteração -- apagá-los a cada
+profundidade destrói a continuidade de ordenação e causa **instabilidade
+de PV não-monótona**. Reproduzido numa posição real de um jogo perdido: o
+motor escolhia `O-O` nas profundidades 5-7, `Kf1` (perda de roque, sem
+xeque nenhum) só na profundidade 8, voltando a `O-O` na 9 -- e o
+orçamento de tempo real do jogo calhava exactamente na profundidade
+"azarada". Corrigido; a anomalia desapareceu (depth 8 também escolhe
+O-O). A/B self-play (20 jogos): **8V-7D-5E (score 52.5%)**, sinal positivo
+modesto mas consistente com o mecanismo.
+
+**7. PEÇA CANÓNICA ADICIONADA: history heuristic (commit `95a1046`).**
+`order_moves()` não tinha nenhuma -- só TT-move, MVV-LVA, killers e o
+bónus do livro. Todos os outros lances tranquilos ficavam sem qualquer
+sinal de ordenação, penalizando sobretudo o LMR. Adicionado
+`history_scores[cor][from][to]`, bónus `depth*depth` ao lance que corta
+beta, malus aos lances tranquilos tentados antes dele no mesmo nó (bónus
++ malus, técnica padrão, não só bónus simples). A/B self-play (20 jogos):
+**9V-7D-4E (score 55%)**, sinal positivo modesto.
+
+**8. Metodologia corrigida: Stockfish "cheio" é um sinal fraco.**
+Mesmo com os dois fixes, kestrel continuou a 0V vs Stockfish real --
+mas isso não significa que os fixes não ajudaram: o Stockfish pode
+simplesmente ser forte demais para o kestrel pontuar alguma vez,
+mascarando qualquer melhoria interna de 100-200 Elo (efeito de teto). Por
+isso os A/B dos pontos 6 e 7 foram feitos em **self-play** (binário com
+fix vs sem fix), não contra Stockfish -- é o sinal correcto para validar
+mudanças internas de busca.
+
+**9. Escada de Stockfish graduado (sugestão do utilizador).** Para medir
+progresso ABSOLUTO real (não só relativo entre versões próprias), usar
+Stockfish com força reduzida via **`Skill Level`** (0-20), não
+`UCI_LimitStrength`+`UCI_Elo` -- o próprio utilizador corrigiu isto: o modo
+Elo-forçado injecta erros artificiais que não se parecem com jogo fraco
+real. Entradas `stockfish_skill0/5/10/15/20` em `engine_arena.py`
+(`OPPONENTS`). Começar em `skill0` e subir o degrau conforme o kestrel
+equilibrar (ver resultado mais recente em
+`project_kestrel_achados_2026-07-20.md`).
+
+**Estado do repo a este ponto**: 3 commits nesta sessão sobre o `fd1e3c0`
+original -- `91ea1a7` (TT mate-ply + panic), `a008413` (killers
+persistentes), `95a1046` (history heuristic). Todos validados
+individualmente (perft + mate + NPS + A/B self-play antes de commitar).
