@@ -44,7 +44,23 @@ pub struct Searcher<'a> {
     /// (o Searcher e' reconstruido a cada `go` em uci.rs), nunca a meio
     /// da busca -- a mesma licao do bug de killers corrigido antes.
     pub history_scores: [[[i32; 64]; 64]; 2],
+    /// Countermove heuristic: indexed by [piece type][to square] of the
+    /// move that led INTO this node (the opponent's last move) -> a quiet
+    /// move that previously caused a beta cutoff in reply to that exact
+    /// context. Gives a move-ordering bonus below killers, above plain
+    /// history, when the current candidate matches the recorded reply.
+    pub countermoves: [[Option<Move>; 64]; 6],
+    /// For each ply, the (piece type, to-square) of the move that was
+    /// played to reach that ply (i.e. the opponent's last move as seen
+    /// from this node) -- set by the parent right before recursing, read
+    /// by order_moves() to look up `countermoves`.
+    pub ply_last_move: [Option<(PieceType, crate::types::Square)>; MAX_PLY],
     pub root_best: Option<Move>,
+    /// MultiPV via the "exclusion" method: root moves listed here are
+    /// dropped from the root's legal-move list, so a repeated search at
+    /// the same position finds the next-best line instead of the same
+    /// one. Empty during normal single-PV search (no behavior change).
+    pub excluded_root_moves: Vec<Move>,
     // Livro de "assinatura" da Judit Polgar (ver book.rs) -- so' influencia
     // a ORDEM em que a busca experimenta os lances, nunca substitui a
     // avaliacao real. None se o livro nao carregou (o motor continua a
@@ -289,17 +305,25 @@ impl<'a> Searcher<'a> {
             (Some(b), Some(h)) => b.lookup(h),
             _ => Vec::new(),
         };
+        // Countermove heuristic: look up whether there's a recorded reply
+        // for the exact context that led into this node (the opponent's
+        // last move, piece type + destination square).
+        let countermove = self
+            .ply_last_move
+            .get(ply)
+            .and_then(|x| *x)
+            .and_then(|(pt, to)| self.countermoves[pt.idx()][to as usize]);
         moves.sort_by_key(|m| {
             if Some(*m) == tt_move {
                 -1_000_000
             } else if m.is_capture() {
-                // SEE substitui o MVV-LVA puro na ordenacao: capturas
-                // boas/neutras (SEE>=0) vao para o topo (ordenadas por
-                // valor real da troca, nao so' "peca maior primeiro"),
-                // capturas MAS (SEE<0, perdem material na troca
-                // completa) descem para depois dos lances tranquilos --
-                // MVV-LVA nao distinguia "Bxf7" de um bispo protegido
-                // (perde a peca) de uma captura genuinamente boa.
+                // SEE replaces plain MVV-LVA for ordering: good/neutral
+                // captures (SEE>=0) go to the top, ranked by the real
+                // exchange value (not just "bigger piece first"); bad
+                // captures (SEE<0, lose material in the full exchange)
+                // sink below quiet moves -- MVV-LVA couldn't tell "Bxf7"
+                // against a defended bishop (loses the piece) apart from
+                // a genuinely good capture.
                 let see = self.see(board, m);
                 if see >= 0 {
                     -200_000 - see
@@ -310,6 +334,8 @@ impl<'a> Searcher<'a> {
                 -700 - self.book_bonus(&book_entries, m)
             } else if Some(*m) == killers[1] {
                 -600 - self.book_bonus(&book_entries, m)
+            } else if Some(*m) == countermove {
+                -550 - self.book_bonus(&book_entries, m)
             } else {
                 let h = self.history_scores[side][m.from as usize][m.to as usize];
                 -h - self.book_bonus(&book_entries, m)
@@ -410,7 +436,15 @@ impl<'a> Searcher<'a> {
             // no' onde foi escrito) para a escala deste no' -- ver nota
             // grande junto de score_to_tt/score_from_tt.
             let tt_score = score_from_tt(e.score, ply as i32);
-            if e.depth >= depth {
+            // MultiPV: a stored root entry can point at (or bound around)
+            // a move we're deliberately excluding for this line -- skip
+            // every TT-based shortcut/adjustment at the root while an
+            // exclusion list is active, so the real move loop below
+            // (which already filters excluded_root_moves) is always
+            // reached instead of returning a cached result that ignores
+            // the exclusion.
+            let multipv_guard = ply == 0 && !self.excluded_root_moves.is_empty();
+            if e.depth >= depth && !multipv_guard {
                 match e.bound {
                     Bound::Exact => {
                         // 2026-07-20 (BUG REAL corrigido -- achado por
@@ -548,9 +582,20 @@ impl<'a> Searcher<'a> {
             }
         }
 
-        let moves = generate_legal(board, self.atk);
+        let mut moves = generate_legal(board, self.atk);
         if moves.is_empty() {
             return if in_check { -MATE_SCORE + ply as i32 } else { 0 };
+        }
+        // MultiPV support (simple exclusion method): at the root only,
+        // drop moves already reported by a previous MultiPV line so the
+        // next call finds the next-best line instead of repeating the
+        // same move. No effect on normal single-PV search (the list is
+        // empty then).
+        if ply == 0 && !self.excluded_root_moves.is_empty() {
+            moves.retain(|m| !self.excluded_root_moves.contains(m));
+            if moves.is_empty() {
+                return if in_check { -MATE_SCORE + ply as i32 } else { 0 };
+            }
         }
         let moves = self.order_moves(board, moves, tt_move, ply.min(MAX_PLY - 1), Some(hash));
 
@@ -583,6 +628,11 @@ impl<'a> Searcher<'a> {
                 }
             }
             let undo = board.make_move(mv);
+            if ply + 1 < MAX_PLY {
+                if let Some((moved_pt, _)) = board.piece_at(mv.to) {
+                    self.ply_last_move[ply + 1] = Some((moved_pt, mv.to));
+                }
+            }
             let extend = if in_check { 1 } else { 0 };
             let score = if i == 0 {
                 -self.negamax(board, depth - 1 + extend, -beta, -alpha, ply + 1)
@@ -662,6 +712,14 @@ impl<'a> Searcher<'a> {
                     let n = quiets_tried.len().saturating_sub(1);
                     for qm in &quiets_tried[..n] {
                         self.update_history(side, qm, -bonus);
+                    }
+                    // Countermove heuristic: record this quiet move as
+                    // the reply to whatever context led into this node
+                    // (the opponent's last move, tracked via
+                    // ply_last_move) -- read back in order_moves() the
+                    // next time that exact context appears.
+                    if let Some((ctx_pt, ctx_to)) = self.ply_last_move[ply] {
+                        self.countermoves[ctx_pt.idx()][ctx_to as usize] = Some(*mv);
                     }
                 }
                 break;
