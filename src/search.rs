@@ -406,8 +406,8 @@ impl<'a> Searcher<'a> {
         let mut best_move = None;
         let mut best_score = 0;
         let mut last_depth = 0;
+        self.killers = [[None; 2]; MAX_PLY];
         for depth in 1..=self.limits.max_depth {
-            self.killers = [[None; 2]; MAX_PLY];
             let score = self.negamax(board, depth, -MATE_SCORE - 1, MATE_SCORE + 1, 0);
             if self.stop && depth > 1 {
                 break;
