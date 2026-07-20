@@ -104,6 +104,7 @@ pub struct Engine {
     history: Vec<u64>,
     last_score: Option<i32>, // score (cp, nossa perspetiva) do ultimo "go" -- para os niveis 2/3 de compute_time_budget
     style_book: Option<crate::book::Book>, // "assinatura" da Judit Polgar -- ver book.rs
+    threads: usize, // Lazy SMP -- ver search_mt(). 1 = sem paralelismo (comportamento antigo).
 }
 
 impl Engine {
@@ -119,6 +120,7 @@ impl Engine {
             history: Vec::new(),
             last_score: None,
             style_book,
+            threads: 1,
         }
     }
 
@@ -215,22 +217,10 @@ impl Engine {
         };
 
         let max_depth = depth.unwrap_or(64);
-        let mut searcher = Searcher {
-            atk: &self.atk,
-            zob: &self.zob,
-            tt: &mut self.tt,
-            nodes: 0,
-            limits: SearchLimits { deadline, max_depth, max_nodes: nodes },
-            stop: false,
-            history: self.history.clone(),
-            killers: [[None; 2]; crate::search::MAX_PLY],
-            history_scores: [[[0; 64]; 64]; 2],
-            countermoves: [[None; 64]; 6],
-            ply_last_move: [None; crate::search::MAX_PLY],
-            root_best: None,
-            excluded_root_moves: Vec::new(),
-            style_book: self.style_book.as_ref(),
-        };
+        let limits = SearchLimits { deadline, max_depth, max_nodes: nodes };
+        let board_now = self.board.clone();
+        let history_now = self.history.clone();
+        let mut excluded_root_moves: Vec<crate::moves::Move> = Vec::new();
 
         // Optional LLM tie-breaker (see advisor.rs): entirely opt-in via
         // KESTREL_ADVISOR_HOST. When set, always search at least 3 root
@@ -252,7 +242,8 @@ impl Engine {
         let mut nodes_total: u64 = 0;
         let mut collected: Vec<(char, crate::moves::Move, i32)> = Vec::new();
         for pv_index in 1..=effective_multipv {
-            let (best, score, depth_reached, nodes_searched) = searcher.iterative_deepening(&mut self.board);
+            let (best, score, depth_reached, nodes_searched, pv_line) =
+                self.search_mt(&board_now, &history_now, &excluded_root_moves, limits);
             nodes_total += nodes_searched;
             if pv_index == 1 {
                 self.last_score = Some(score);
@@ -270,7 +261,6 @@ impl Engine {
                 Some(mv) => {
                     collected.push((((b'A' + (pv_index - 1) as u8)) as char, mv, score));
                     if pv_index <= multipv {
-                        let pv_line = searcher.extract_pv(&self.board, depth_reached.max(1) as usize + 4);
                         let pv_str = if pv_line.is_empty() {
                             mv.to_uci()
                         } else {
@@ -286,12 +276,9 @@ impl Engine {
                     // from the root move list before the next call, so
                     // the search finds the next-best line instead of
                     // repeating the same one -- see excluded_root_moves.
-                    searcher.excluded_root_moves.push(mv);
+                    excluded_root_moves.push(mv);
                 }
                 None => break, // fewer legal root moves than requested lines
-            }
-            if effective_multipv > 1 {
-                searcher.stop = false;
             }
         }
         let _ = out.flush();
@@ -339,6 +326,78 @@ impl Engine {
         let _ = out.flush();
     }
 
+    /// Lazy SMP: spawns `self.threads` independent search threads on the
+    /// SAME position, all sharing the lock-free TT (see tt.rs) but each
+    /// with its own move-ordering state (killers/history/countermoves) --
+    /// different threads naturally explore the tree in slightly different
+    /// orders (thread-local heuristics diverge from the first node they
+    /// disagree on), which finds tactics/refutations sooner than a single
+    /// thread alone, on top of raw nodes/sec scaling with core count.
+    /// `threads == 1` degenerates to a single call with thread::scope's
+    /// overhead but otherwise identical behavior to the pre-Lazy-SMP code.
+    ///
+    /// All threads share the SAME `limits.deadline` (real wall-clock
+    /// instant) rather than a cross-thread stop signal -- simpler, and
+    /// sufficient: every thread naturally stops within one time-check
+    /// interval of every other, without needing a shared atomic flag.
+    ///
+    /// Result selection ("best thread"): the thread that reached the
+    /// greatest depth wins (ties broken by score, then by thread index) --
+    /// the standard simplified heuristic (a full implementation would also
+    /// weigh vote consistency across threads; not worth the complexity
+    /// here). Returns the winning thread's own `Searcher` so the caller
+    /// can still call `extract_pv()` against the TT it populated.
+    fn search_mt(
+        &self,
+        board: &Board,
+        history: &[u64],
+        excluded: &[crate::moves::Move],
+        limits: SearchLimits,
+    ) -> (Option<crate::moves::Move>, i32, i32, u64, Vec<crate::moves::Move>) {
+        let n = self.threads.max(1);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..n)
+                .map(|_| {
+                    let mut b = board.clone();
+                    let searcher = Searcher {
+                        atk: &self.atk,
+                        zob: &self.zob,
+                        tt: &self.tt,
+                        nodes: 0,
+                        limits,
+                        stop: false,
+                        history: history.to_vec(),
+                        killers: [[None; 2]; crate::search::MAX_PLY],
+                        history_scores: [[[0; 64]; 64]; 2],
+                        countermoves: [[None; 64]; 6],
+                        ply_last_move: [None; crate::search::MAX_PLY],
+                        root_best: None,
+                        excluded_root_moves: excluded.to_vec(),
+                        style_book: self.style_book.as_ref(),
+                    };
+                    scope.spawn(move || {
+                        let mut searcher = searcher;
+                        let (best, score, depth_reached, nodes) = searcher.iterative_deepening(&mut b);
+                        (best, score, depth_reached, nodes, searcher)
+                    })
+                })
+                .collect();
+            let mut results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+            let mut best_idx = 0;
+            for i in 1..results.len() {
+                let better = results[i].2 > results[best_idx].2
+                    || (results[i].2 == results[best_idx].2 && results[i].1 > results[best_idx].1);
+                if better {
+                    best_idx = i;
+                }
+            }
+            let nodes_total: u64 = results.iter().map(|r| r.3).sum();
+            let (best, score, depth_reached, _, winner) = results.remove(best_idx);
+            let pv_line = winner.extract_pv(board, depth_reached.max(1) as usize + 4);
+            (best, score, depth_reached, nodes_total, pv_line)
+        })
+    }
+
     pub fn run(&mut self) {
         let stdin = io::stdin();
         let mut out = io::stdout();
@@ -357,6 +416,7 @@ impl Engine {
                     let _ = writeln!(out, "id name kestrel");
                     let _ = writeln!(out, "id author claude (fable5), projeto proprio");
                     let _ = writeln!(out, "option name Hash type spin default 64 min 1 max 4096");
+                    let _ = writeln!(out, "option name Threads type spin default 1 min 1 max 64");
                     let _ = writeln!(out, "uciok");
                     let _ = out.flush();
                 }
@@ -368,6 +428,10 @@ impl Engine {
                     if tokens.len() >= 5 && tokens[1] == "name" && tokens[2] == "Hash" && tokens[3] == "value" {
                         if let Ok(mb) = tokens[4].parse::<usize>() {
                             self.tt = TranspositionTable::new(mb.max(1));
+                        }
+                    } else if tokens.len() >= 5 && tokens[1] == "name" && tokens[2] == "Threads" && tokens[3] == "value" {
+                        if let Ok(n) = tokens[4].parse::<usize>() {
+                            self.threads = n.max(1);
                         }
                     }
                 }

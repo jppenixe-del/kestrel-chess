@@ -19,6 +19,7 @@ pub const MAX_PLY: usize = 128;
 /// complexo.
 const HISTORY_MAX: i32 = 16000;
 
+#[derive(Copy, Clone)]
 pub struct SearchLimits {
     pub deadline: Option<Instant>,
     pub max_depth: i32,
@@ -28,7 +29,7 @@ pub struct SearchLimits {
 pub struct Searcher<'a> {
     pub atk: &'a Attacks,
     pub zob: &'a Zobrist,
-    pub tt: &'a mut TranspositionTable,
+    pub tt: &'a TranspositionTable,
     pub nodes: u64,
     pub limits: SearchLimits,
     pub stop: bool,
