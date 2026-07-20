@@ -77,9 +77,16 @@ open-source engines — full credit to their authors:
 - [Sirius](https://github.com/mcthouacbb/Sirius) — hand-crafted evaluation,
   C++.
 - [Reckless](https://github.com/codedeliveryservice/Reckless) — NNUE, Rust.
+- [Berserk](https://github.com/jhonnold/berserk) — hand-crafted evaluation
+  and search, C.
+- [PeSTO's Evaluation Function](https://www.chessprogramming.org/PeSTO%27s_Evaluation_Function)
+  — the tapered mg/eg piece-square tables and piece values are ported
+  directly (only reordered to match this project's board indexing), no
+  values invented or hand-tuned.
 
-No code was copied verbatim; every implementation here was written from
-scratch for Kestrel's own architecture.
+No engine source code was copied; search/eval architectural ideas were
+adapted from Sirius, Reckless, and Berserk, and every implementation here
+was written from scratch for Kestrel's own codebase.
 
 ## 📄 License
 
