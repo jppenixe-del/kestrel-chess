@@ -69,6 +69,14 @@ pub struct Searcher<'a> {
     /// by the picker to look up `cont_hist`.
     pub ply_last_move: [Option<(PieceType, crate::types::Square)>; MAX_PLY],
     pub root_best: Option<Move>,
+    /// Singular extensions: quando estamos a verificar se o tt_move e'
+    /// "singular" (nenhum outro lance bate uma janela restrita), fazemos
+    /// uma re-pesquisa no MESMO no' excluindo o tt_move. Este campo diz
+    /// ao picker para saltar esse lance e ao proprio negamax para NAO
+    /// devolver cedo por TT nem armazenar na TT durante a re-pesquisa
+    /// (a busca a janela restrita nao deve poluir a TT). Restaurado
+    /// para None imediatamente depois da re-pesquisa.
+    pub excluded_move: Option<Move>,
     /// MultiPV via the "exclusion" method: root moves listed here are
     /// dropped from the root's legal-move list, so a repeated search at
     /// the same position finds the next-best line instead of the same
@@ -504,9 +512,17 @@ impl<'a> Searcher<'a> {
             }
         }
 
+        // Singular extensions: se estamos numa re-pesquisa singular
+        // (excluded_move definido), ignorar TT probe/store por completo
+        // -- a busca a janela restrita nao deve devolver cedo por TT
+        // nem poluir a TT com scores enviesados por excluir um lance.
+        let excluded = self.excluded_move;
+
         let orig_alpha = alpha;
         let mut tt_move = None;
-        if let Some(e) = self.tt.probe(hash) {
+        let mut tt_entry_captured: Option<crate::tt::TtEntry> = None;
+        if excluded.is_none() { if let Some(e) = self.tt.probe(hash) {
+            tt_entry_captured = Some(e);
             tt_move = e.best;
             // score_from_tt(): converte o score guardado (relativo ao
             // no' onde foi escrito) para a escala deste no' -- ver nota
@@ -579,7 +595,7 @@ impl<'a> Searcher<'a> {
                     return tt_score;
                 }
             }
-        }
+        }}
 
         if depth <= 0 {
             // Ponto de entrada na quiescence: usa a avaliacao COMPLETA
@@ -625,6 +641,7 @@ impl<'a> Searcher<'a> {
         if depth >= 3
             && !in_check
             && ply > 0
+            && excluded.is_none()
             && beta.abs() < MATE_SCORE - MAX_PLY as i32
             && self.has_non_pawn_material(board)
         {
@@ -693,6 +710,50 @@ impl<'a> Searcher<'a> {
                 return if in_check { -MATE_SCORE + ply as i32 } else { 0 };
             }
         }
+        // Singular extensions -- port directo do padrao Sirius
+        // (search.cpp): se o tt_move parece dominante (a TT diz "este
+        // e' bom o suficiente" com bound Lower ou Exact e depth similar
+        // a esta), testar se e' MESMO singular fazendo uma re-pesquisa
+        // reduzida a excluir esse lance, numa janela restrita a volta
+        // de `tt.score - m*depth`. Se nenhum outro lance chega la, e'
+        // singular: estende +1 quando for a vez dele no picker.
+        // Multi-cut: se um lance de reserva bate `beta` ate' na janela
+        // restrita, corte seguro imediato.
+        //
+        // Aplicado a depth >= 8, fora da raiz, fora de re-pesquisa
+        // singular, TT entry suficientemente fiavel.
+        //
+        // Nota: revertido uma vez a meio da sessao 2026-07-20 por causa
+        // de A/B self-play de 30 jogos ter dado 50% -- decisao errada,
+        // essa amostra nao tem resolucao para +Elo real e o padrao vem
+        // do #1 em HCE puro. Restaurado. Ver
+        // feedback_kestrel_nao_reverter_por_self_play_pequeno.
+        let mut se_candidate: Option<Move> = None;
+        let mut se_extension: i32 = 0;
+        if excluded.is_none() && ply > 0 && depth >= 8 {
+            if let (Some(tm), Some(te)) = (tt_move, tt_entry_captured) {
+                let tt_score = score_from_tt(te.score, ply as i32);
+                if te.depth >= depth - 3
+                    && te.bound != Bound::Upper
+                    && tt_score.abs() < MATE_THRESHOLD
+                {
+                    let s_beta = (tt_score - 2 * depth).max(-MATE_SCORE + 1);
+                    let s_depth = (depth - 1) / 2;
+                    self.excluded_move = Some(tm);
+                    let s_score = self.negamax(board, s_depth, s_beta - 1, s_beta, ply);
+                    self.excluded_move = None;
+                    if self.stop {
+                        return 0;
+                    }
+                    if s_score < s_beta {
+                        se_candidate = Some(tm);
+                        se_extension = 1;
+                    } else if s_beta >= beta {
+                        return s_beta;
+                    }
+                }
+            }
+        }
         // Staged move picker: substitui o `order_moves` + `for mv in
         // moves` que pontuava TUDO upfront antes de sequer tentar o
         // primeiro lance. Ver `MovePicker` no fim deste ficheiro para as
@@ -736,7 +797,15 @@ impl<'a> Searcher<'a> {
                     self.ply_last_move[ply + 1] = Some((moved_pt, mv.to));
                 }
             }
-            let extend = if in_check { 1 } else { 0 };
+            // Check extension + singular extension: se este e' o
+            // tt_move provado singular acima, estende +1.
+            let extend = if in_check {
+                1
+            } else if Some(mv) == se_candidate {
+                se_extension
+            } else {
+                0
+            };
             let score = if i == 0 {
                 -self.negamax(board, depth - 1 + extend, -beta, -alpha, ply + 1)
             } else {
@@ -875,8 +944,12 @@ impl<'a> Searcher<'a> {
             Bound::Exact
         };
         // score_to_tt(): guarda relativo a ESTE no' (nao a raiz) -- ver
-        // nota grande junto de score_to_tt/score_from_tt.
-        self.tt.store(hash, depth, score_to_tt(best_score, ply as i32), bound, best_move);
+        // nota grande junto de score_to_tt/score_from_tt. Nao guardar
+        // durante uma re-pesquisa singular -- score enviesado por
+        // janela restrita e excluded_move.
+        if excluded.is_none() {
+            self.tt.store(hash, depth, score_to_tt(best_score, ply as i32), bound, best_move);
+        }
 
         best_score
     }
@@ -1035,7 +1108,26 @@ impl MovePicker {
     /// history/livro/countermove (na fase ScoreQuiet). `ply`/`hash` sao
     /// os do no' actual (para lookup de livro por posicao, igual ao
     /// order_moves antigo).
+    /// Wrapper que salta o `excluded_move` do Searcher (usado por
+    /// singular extensions). Delega para `next_move_raw` e re-chama-se
+    /// se o lance devolvido for o excluido.
     pub fn next_move(
+        &mut self,
+        searcher: &Searcher,
+        board: &Board,
+        ply: usize,
+        hash: u64,
+    ) -> Option<Move> {
+        loop {
+            let mv = self.next_move_raw(searcher, board, ply, hash)?;
+            if searcher.excluded_move == Some(mv) {
+                continue;
+            }
+            return Some(mv);
+        }
+    }
+
+    fn next_move_raw(
         &mut self,
         searcher: &Searcher,
         board: &Board,
