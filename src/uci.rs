@@ -203,6 +203,7 @@ impl Engine {
             stop: false,
             history: self.history.clone(),
             killers: [[None; 2]; crate::search::MAX_PLY],
+            history_scores: [[[0; 64]; 64]; 2],
             root_best: None,
             style_book: self.style_book.as_ref(),
         };
