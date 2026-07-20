@@ -272,3 +272,74 @@ máquina local voltar a ligar-se e quiser voltar a sincronizar dali.)
 (Só recompilar remotamente com `cargo build`, nunca copiar o binário
 `target/release/kestrel` diretamente -- `target-cpu=native` é específico
 da CPU de cada máquina.)
+
+## Atualização 2026-07-20 (sessão de investigação da queda de resultados)
+
+Sessão dedicada ao item #1 de "Próximos passos" acima. Resultado resumido
+(detalhe completo em memória: `project_kestrel_achados_2026-07-20.md`).
+
+**1. "Será só ruído de amostra pequena?" -- DESCARTADO.** Lote de 20
+jogos kestrel vs stockfish (60+1, binário pré-fix): **0V-17D-0E em 17
+jogos** (parou de acompanhar aqui, sem excepções). Confirma que a queda é
+real e severa, não ruído.
+
+**2. Bugs reais encontrados e corrigidos (commit `91ea1a7`):**
+- TT sem ajuste de mate-score por ply (`score_to_tt`/`score_from_tt` em
+  `search.rs`, aplicados em todos os pontos de leitura/escrita da TT).
+  Também corrigido o ramo `Bound::Upper` que não fazia nada (agora aperta
+  `beta`, simétrico ao ramo `Lower`).
+- Panic real em `go depth N` sem `wtime` (`compute_time_budget`, `clamp`
+  com `min>max` quando `safe_time` pequeno). A arena nunca dispara isto
+  (sempre manda wtime/btime), mas é um crash real de protocolo UCI.
+- Ainda por resolver (baixa prioridade): `hard_cap` de
+  `compute_time_budget()` calculado mas nunca usado; `is_repetition_or_fifty`
+  trata 1 única repetição anterior como empate (`cnt >= 1`), mais
+  agressivo que a regra real de 3 repetições -- não confirmado como bug,
+  só hipótese.
+
+**3. "Os termos de avaliação estão bem calibrados?" -- teste A/B feito,
+resultado ao contrário do esperado.** `KESTREL_EVAL_MODE=material` (env
+var, `src/eval.rs`) isola material+PST puro. 20 jogos `kestrel` (eval
+Polgar completo) vs `kestrel_material` (só material+PST), mesmo tc:
+**11V-6D-3E para o eval completo (score 62.5%, ~2:1 em vitórias
+diretas).** Isto **refuta** a hipótese de que `ATTACK_DENSITY` (bónus
+não-linear por nº de atacantes na zona do rei, `[0,10,40,100,190,300,
+420,550]`) estava a prejudicar a força -- o eval completo ganha mais, não
+menos, contra um adversário da mesma força de busca. A hipótese continua
+tecnicamente válida como "pode estar um pouco descalibrado" (existe uma
+sobreposição parcial de ~25% entre o bónus de densidade e o bónus
+individual por peça, ver `positional_terms()`), mas não é a causa
+principal da queda de resultados vs Stockfish -- **não vale a pena
+reverter ou reequilibrar `ATTACK_DENSITY` com base no que se sabe agora.**
+
+**4. Implicação para as hipóteses restantes.** Como o eval não é (ao que
+tudo indica) a causa principal, as próximas hipóteses a testar por
+prioridade são as que já estavam na lista e ainda não foram tocadas:
+- (c) o livro não distinguir vitórias de derrotas (só conta frequência).
+- (d) gestão de tempo a cortar profundidade demais.
+- Novo candidato desta sessão: leitura qualitativa de 2 PGNs reais
+  (kestrel vs stockfish, pré-fix) mostrou um padrão mais preocupante que
+  desequilíbrio de eval -- num jogo a dama vagueou sem plano claro por
+  ~8 lances (`Qf3→Qg3→Qf3→Qh5→Qh5→Qg5→Qg3→Qh3`), cavalos recuaram
+  estranhamente na abertura, e houve uma troca claramente má (torre por
+  peão+bispo). Isto sugere possível falta de coerência posicional/de
+  busca mais ampla do que um único termo de eval descalibrado -- vale a
+  pena repetir esta leitura qualitativa com o binário JÁ corrigido
+  (commit `91ea1a7`, TT/panic) antes de investigar mais fundo, porque os
+  jogos antigos foram todos jogados com os bugs de TT ainda presentes.
+
+**5. Bug de infraestrutura corrigido (não commitado no git -- `arena.sh`
+não vive no repo do Kestrel):** `arena.sh restart` tinha uma condição de
+corrida (`stop()` não esperava o processo morrer nem a porta libertar
+antes do `start()` seguinte tentar abrir bind, deixando a instância
+ANTIGA viva a servir código desatualizado). Corrigido: `stop()` espera
+activamente (até 10s) o processo morrer, `start()` confirma que o
+processo novo continua vivo e que o log não tem "Address already in use"
+antes de reportar sucesso.
+
+**Próximo passo imediato ao retomar:** correr um lote fresco kestrel
+(binário `91ea1a7`, TT/panic já corrigidos) vs stockfish, e ler os PGNs
+com atenção ao padrão "dama sem plano" / recuos estranhos de peças
+menores -- se persistir com os bugs de TT já corrigidos, é mais provável
+tratar-se de um problema de busca (LMR/null-move demasiado agressivos?
+ordenação de lances?) do que de avaliação estática.
