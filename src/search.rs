@@ -35,6 +35,42 @@ pub struct Searcher<'a> {
     pub style_book: Option<&'a Book>,
 }
 
+/// Limiar a partir do qual um score e' considerado "de mate" (nao so'
+/// avaliacao normal) -- MATE_SCORE menos a profundidade maxima possivel,
+/// para nao confundir avaliacoes normais muito altas com mates reais.
+const MATE_THRESHOLD: i32 = MATE_SCORE - MAX_PLY as i32;
+
+/// 2026-07-20 (BUG REAL encontrado por auditoria -- investigacao da
+/// queda de resultados, ver NOTAS_PROXIMA_SESSAO.md): a TT guardava e
+/// lia scores de mate em BRUTO, sem ajustar pela distancia (ply) entre
+/// o no' onde a entrada foi escrita e o no' onde e' reaproveitada --
+/// bug classico de "corrupcao de mate score" em qualquer motor
+/// alfa-beta com TT. Um "mate em N" escrito a um ply e' relativo a ESSE
+/// ply; reaproveitado sem ajuste noutro ply, o motor pode "ver" mates
+/// que nao existem dali, ou avaliar mal posicoes decisivas perto de
+/// mate -- exatamente onde um estilo agressivo (Polgar) mais precisa de
+/// avaliacoes corretas. Converte para "distancia ao no' ATUAL" antes de
+/// guardar, converte de volta para "distancia a partir da raiz real"
+/// (ou seja, para a escala que negamax() usa) ao ler.
+fn score_to_tt(score: i32, ply: i32) -> i32 {
+    if score >= MATE_THRESHOLD {
+        score + ply
+    } else if score <= -MATE_THRESHOLD {
+        score - ply
+    } else {
+        score
+    }
+}
+fn score_from_tt(score: i32, ply: i32) -> i32 {
+    if score >= MATE_THRESHOLD {
+        score - ply
+    } else if score <= -MATE_THRESHOLD {
+        score + ply
+    } else {
+        score
+    }
+}
+
 impl<'a> Searcher<'a> {
     fn time_up(&mut self) -> bool {
         if self.stop {
@@ -193,25 +229,39 @@ impl<'a> Searcher<'a> {
         }
 
         let orig_alpha = alpha;
+        let mut beta = beta;
         let mut tt_move = None;
         if let Some(e) = self.tt.probe(hash) {
             tt_move = e.best;
+            // score_from_tt(): converte o score guardado (relativo ao
+            // no' onde foi escrito) para a escala deste no' -- ver nota
+            // grande junto de score_to_tt/score_from_tt.
+            let tt_score = score_from_tt(e.score, ply as i32);
             if e.depth >= depth {
                 match e.bound {
-                    Bound::Exact => return e.score,
+                    Bound::Exact => return tt_score,
                     Bound::Lower => {
-                        if e.score > alpha {
-                            alpha = e.score;
+                        if tt_score > alpha {
+                            alpha = tt_score;
                         }
                     }
+                    // 2026-07-20 (BUG REAL corrigido -- ver nota grande
+                    // acima do ScoreFromTT): faltava apertar "beta" aqui
+                    // -- o ramo "Upper" real de um alfa-beta com TT
+                    // sempre aperta o limite CONTRARIO ao que "Lower"
+                    // aperta (Lower sobe alpha, Upper desce beta), para
+                    // o corte combinado "alpha>=beta" logo a seguir
+                    // conseguir mesmo cortar quando aplicavel. O corpo
+                    // vazio anterior fazia este ramo nunca contribuir
+                    // para nenhum corte.
                     Bound::Upper => {
-                        if e.score < beta && e.score < alpha {
-                            // upper bound abaixo de alpha ja' corta
+                        if tt_score < beta {
+                            beta = tt_score;
                         }
                     }
                 }
                 if alpha >= beta {
-                    return e.score;
+                    return tt_score;
                 }
             }
         }
@@ -345,7 +395,9 @@ impl<'a> Searcher<'a> {
         } else {
             Bound::Exact
         };
-        self.tt.store(hash, depth, best_score, bound, best_move);
+        // score_to_tt(): guarda relativo a ESTE no' (nao a raiz) -- ver
+        // nota grande junto de score_to_tt/score_from_tt.
+        self.tt.store(hash, depth, score_to_tt(best_score, ply as i32), bound, best_move);
 
         best_score
     }

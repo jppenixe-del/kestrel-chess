@@ -255,8 +255,27 @@ fn positional_terms(board: &Board) -> i32 {
 /// Polgar" -- pressao sobre o rei inimigo, mobilidade pesada, iniciativa
 /// via peoes passados e torres ativas). Devolve da perspetiva de quem
 /// tem a jogar (convencao negamax).
+///
+/// 2026-07-20 (teste A/B -- investigacao da queda de resultados, ver
+/// NOTAS_PROXIMA_SESSAO.md "proximos passos" #1): a variavel de ambiente
+/// KESTREL_EVAL_MODE=material desliga positional_terms_signed por
+/// completo, isolando se os termos "Polgar" ajudam ou atrapalham face a
+/// so' material+PST. Por omissao (variavel ausente ou qualquer outro
+/// valor) o comportamento fica EXATAMENTE como antes -- nada muda para o
+/// motor "normal" que a arena ja usa. Ler o env UMA vez (OnceLock),
+/// nao a cada chamada de evaluate() (custaria NPS real).
+static EVAL_MODE_MATERIAL_ONLY: OnceLock<bool> = OnceLock::new();
+fn eval_mode_material_only() -> bool {
+    *EVAL_MODE_MATERIAL_ONLY.get_or_init(|| {
+        std::env::var("KESTREL_EVAL_MODE").map(|v| v == "material").unwrap_or(false)
+    })
+}
 pub fn evaluate(board: &Board) -> i32 {
-    material_pst(board) + positional_terms_signed(board)
+    if eval_mode_material_only() {
+        material_pst(board)
+    } else {
+        material_pst(board) + positional_terms_signed(board)
+    }
 }
 
 /// So' material + PST, sem os termos posicionais caros (mobilidade/
