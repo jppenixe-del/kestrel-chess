@@ -164,16 +164,6 @@ const EG_VALUE: [i32; 6] = [94, 281, 297, 512, 936, 0];
 const PHASE_INC: [i32; 6] = [0, 1, 1, 2, 4, 0];
 const MAX_PHASE: i32 = 24;
 
-fn game_phase(board: &Board) -> i32 {
-    let mut phase = 0;
-    for c in [Color::White, Color::Black] {
-        for pt in ALL_PIECES {
-            phase += count(board.pieces[c.idx()][pt.idx()]) as i32 * PHASE_INC[pt.idx()];
-        }
-    }
-    phase.min(MAX_PHASE)
-}
-
 fn mirror_idx(color: Color, s: Square) -> usize {
     if color == Color::White {
         s as usize
@@ -206,6 +196,21 @@ fn pst_eg(kind: PieceType, color: Color, s: Square) -> i32 {
         PieceType::Queen => EG_QUEEN[idx],
         PieceType::King => EG_KING[idx],
     }
+}
+
+/// Contribuicao (mg, eg, incremento de fase) de UMA peca numa casa, do
+/// ponto de vista das BRANCAS (ja' com o sinal aplicado: positivo para
+/// brancas, negativo para pretas) -- usado por board.rs para manter
+/// `mg_score`/`eg_score`/`phase` actualizados incrementalmente em
+/// add_piece()/remove_piece(), em vez de recalcular material_pst() do
+/// zero em cada no' da busca (era o maior custo por no' que faltava
+/// tornar incremental, ver "Incrementally updated evaluation" na lista
+/// do Sirius).
+pub fn piece_contribution(kind: PieceType, color: Color, s: Square) -> (i32, i32, i32) {
+    let sign = if color == Color::White { 1 } else { -1 };
+    let mg = sign * (MG_VALUE[kind.idx()] + pst_mg(kind, color, s));
+    let eg = sign * (EG_VALUE[kind.idx()] + pst_eg(kind, color, s));
+    (mg, eg, PHASE_INC[kind.idx()])
 }
 
 /// Zona do rei: a propria casa + as 8 vizinhas (igual ao king_attacks).
@@ -505,23 +510,15 @@ pub fn evaluate_fast(board: &Board) -> i32 {
     material_pst(board)
 }
 
+/// Le' os acumuladores incrementais mantidos por add_piece()/remove_piece()
+/// (ver board.rs) em vez de percorrer todas as pecas -- era a soma mais
+/// cara paga em TODOS os nos (evaluate_fast() e' chamada em RFP/razoring/
+/// futility/IID, e evaluate() chama-a tambem via este material_pst()).
+/// A soma completa (loop por todas as pecas) so' acontece uma vez, na
+/// construcao do board (ver Board::recompute_eval_accumulators).
 fn material_pst(board: &Board) -> i32 {
-    let mut mg = 0i32;
-    let mut eg = 0i32;
-    for c in [Color::White, Color::Black] {
-        let sign = if c == Color::White { 1 } else { -1 };
-        for pt in ALL_PIECES {
-            let mut bbp = board.pieces[c.idx()][pt.idx()];
-            while bbp != 0 {
-                let s = bbp.trailing_zeros() as Square;
-                bbp &= bbp - 1;
-                mg += sign * (MG_VALUE[pt.idx()] + pst_mg(pt, c, s));
-                eg += sign * (EG_VALUE[pt.idx()] + pst_eg(pt, c, s));
-            }
-        }
-    }
-    let phase = game_phase(board);
-    let score = (mg * phase + eg * (MAX_PHASE - phase)) / MAX_PHASE;
+    let phase = board.phase.min(MAX_PHASE);
+    let score = (board.mg_score * phase + board.eg_score * (MAX_PHASE - phase)) / MAX_PHASE;
     if board.side == Color::White {
         score
     } else {

@@ -4,6 +4,7 @@ mod bitboard;
 mod board;
 mod book;
 mod eval;
+mod magic;
 mod movegen;
 mod moves;
 mod perft;
@@ -41,6 +42,17 @@ fn main() {
         let dt = t0.elapsed();
         println!("perft({}) = {}  ({:.2}s, {:.0} nps)", depth, n, dt.as_secs_f64(), n as f64 / dt.as_secs_f64().max(1e-9));
         return;
+    }
+    if args.len() >= 2 && args[1] == "verify_incremental" {
+        let depth: u32 = args.get(2).map(|s| s.parse().unwrap()).unwrap_or(5);
+        let fen = if args.len() > 3 { args[3..].join(" ") } else { "startpos".to_string() };
+        let atk = Attacks::new();
+        let mut board = if fen == "startpos" { Board::startpos() } else { Board::from_fen(&fen) };
+        let t0 = Instant::now();
+        let (nodes, mismatches) = perft::verify_incremental_eval(&mut board, depth, &atk);
+        let dt = t0.elapsed();
+        println!("verify_incremental({}) = {} nos, {} discrepancias ({:.2}s)", depth, nodes, mismatches, dt.as_secs_f64());
+        std::process::exit(if mismatches == 0 { 0 } else { 1 });
     }
     if args.len() >= 4 && args[1] == "buildbook" {
         build_book(&args[2], &args[3]);
