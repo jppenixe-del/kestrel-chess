@@ -18,6 +18,19 @@ pub struct Board {
     pub ep_square: Square,
     pub halfmove: u32,
     pub fullmove: u32,
+    // Acumuladores incrementais de avaliacao (material+PST, perspetiva das
+    // BRANCAS, mg/eg separados -- ver eval::piece_contribution()) --
+    // mantidos por add_piece()/remove_piece() em vez de recalculados do
+    // zero a cada chamada a evaluate(). `phase` conta so' pecas maiores
+    // (ver eval::PHASE_INC), nao inclui peoes.
+    pub mg_score: i32,
+    pub eg_score: i32,
+    pub phase: i32,
+    // Mailbox O(1) -- piece_at() fazia uma varredura ate' 12 bitboards
+    // (2 cores x 6 tipos) a cada chamada; era uma fatia real do tempo
+    // total dentro de make_move/unmake_move (ver perf), alem de ser
+    // usado em SEE. Mantido em sincronia por add_piece()/remove_piece().
+    pub mailbox: [Option<(PieceType, Color)>; 64],
 }
 
 #[derive(Copy, Clone)]
@@ -26,6 +39,12 @@ pub struct Undo {
     pub castling: u8,
     pub ep_square: Square,
     pub halfmove: u32,
+    // Snapshot inteiro (nao deltas) -- restaurar em unmake_move() e'
+    // sempre correcto por construcao, sem precisar de reverter cada
+    // captura/promocao/roque individualmente.
+    pub mg_score: i32,
+    pub eg_score: i32,
+    pub phase: i32,
 }
 
 /// Undo minimo para um null move (passar a vez): so' muda side + ep_square.
@@ -42,6 +61,7 @@ impl Board {
     pub fn from_fen(fen: &str) -> Self {
         let parts: Vec<&str> = fen.split_whitespace().collect();
         let mut pieces = [[0u64; 6]; 2];
+        let mut mailbox: [Option<(PieceType, Color)>; 64] = [None; 64];
         let mut rank = 7i32;
         let mut file = 0i32;
         for ch in parts[0].chars() {
@@ -66,6 +86,7 @@ impl Board {
                     };
                     let s = sq(file as u8, rank as u8);
                     pieces[color.idx()][kind.idx()] |= bb(s);
+                    mailbox[s as usize] = Some((kind, color));
                     file += 1;
                 }
             }
@@ -102,8 +123,13 @@ impl Board {
             ep_square,
             halfmove,
             fullmove,
+            mg_score: 0,
+            eg_score: 0,
+            phase: 0,
+            mailbox,
         };
         b.recompute_occ();
+        b.recompute_eval_accumulators();
         b
     }
 
@@ -118,20 +144,33 @@ impl Board {
         self.occ_all = self.occ_color[0] | self.occ_color[1];
     }
 
-    #[inline]
-    pub fn piece_at(&self, s: Square) -> Option<(PieceType, Color)> {
-        let m = bb(s);
+    /// Recalcula mg_score/eg_score/phase do ZERO, percorrendo todas as
+    /// pecas -- so' usado uma vez na construcao (from_fen); depois disso
+    /// add_piece()/remove_piece() mantem os campos correctos
+    /// incrementalmente.
+    pub fn recompute_eval_accumulators(&mut self) {
+        self.mg_score = 0;
+        self.eg_score = 0;
+        self.phase = 0;
         for c in [Color::White, Color::Black] {
-            if self.occ_color[c.idx()] & m == 0 {
-                continue;
-            }
             for pt in ALL_PIECES {
-                if self.pieces[c.idx()][pt.idx()] & m != 0 {
-                    return Some((pt, c));
+                let mut bbp = self.pieces[c.idx()][pt.idx()];
+                while bbp != 0 {
+                    let s = bbp.trailing_zeros() as Square;
+                    bbp &= bbp - 1;
+                    let (mg, eg, ph) = crate::eval::piece_contribution(pt, c, s);
+                    self.mg_score += mg;
+                    self.eg_score += eg;
+                    self.phase += ph;
                 }
             }
         }
-        None
+    }
+
+    #[inline]
+    #[inline(always)]
+    pub fn piece_at(&self, s: Square) -> Option<(PieceType, Color)> {
+        self.mailbox[s as usize]
     }
 
     pub fn king_sq(&self, color: Color) -> Square {
@@ -173,11 +212,21 @@ impl Board {
         self.pieces[c.idx()][pt.idx()] &= !bb(s);
         self.occ_color[c.idx()] &= !bb(s);
         self.occ_all &= !bb(s);
+        self.mailbox[s as usize] = None;
+        let (mg, eg, ph) = crate::eval::piece_contribution(pt, c, s);
+        self.mg_score -= mg;
+        self.eg_score -= eg;
+        self.phase -= ph;
     }
     fn add_piece(&mut self, pt: PieceType, c: Color, s: Square) {
         self.pieces[c.idx()][pt.idx()] |= bb(s);
         self.occ_color[c.idx()] |= bb(s);
         self.occ_all |= bb(s);
+        self.mailbox[s as usize] = Some((pt, c));
+        let (mg, eg, ph) = crate::eval::piece_contribution(pt, c, s);
+        self.mg_score += mg;
+        self.eg_score += eg;
+        self.phase += ph;
     }
 
     /// Aplica um lance PSEUDO-LEGAL (a legalidade -- nao ficar em xeque --
@@ -198,6 +247,9 @@ impl Board {
             castling: self.castling,
             ep_square: self.ep_square,
             halfmove: self.halfmove,
+            mg_score: self.mg_score,
+            eg_score: self.eg_score,
+            phase: self.phase,
         };
 
         // remove captured piece (normal or en passant)
@@ -326,6 +378,12 @@ impl Board {
         if us == Color::Black {
             self.fullmove -= 1;
         }
+        // Restauro explicito (nao so' confiar nos remove/add_piece acima
+        // se cancelarem exactamente): garante correccao mesmo que algum
+        // caso futuro deixe de espelhar make_move perfeitamente.
+        self.mg_score = undo.mg_score;
+        self.eg_score = undo.eg_score;
+        self.phase = undo.phase;
     }
 
     pub fn to_fen(&self) -> String {

@@ -74,39 +74,26 @@ impl Attacks {
     }
 }
 
-/// Sliding attacks via ray-cast + blocker scan (simple, correct; not the
-/// fastest approach but avoids magic-bitboard bugs for the first version).
+/// Sliding attacks via real magic bitboards (see magic.rs) -- was a naive
+/// ray-cast + blocker scan until profiling showed it at ~17% of total
+/// search time. Magic numbers are found by self-verifying random search
+/// at startup (see magic.rs), not hardcoded/transcribed from anywhere.
+static MAGICS: std::sync::OnceLock<crate::magic::Magics> = std::sync::OnceLock::new();
+fn magics() -> &'static crate::magic::Magics {
+    MAGICS.get_or_init(crate::magic::Magics::new)
+}
+
 #[inline]
 pub fn bishop_attacks(s: Square, occ: Bitboard) -> Bitboard {
-    ray_attacks(s, occ, &[(1, 1), (1, -1), (-1, 1), (-1, -1)])
+    magics().bishop_attacks(s, occ)
 }
 
 #[inline]
 pub fn rook_attacks(s: Square, occ: Bitboard) -> Bitboard {
-    ray_attacks(s, occ, &[(1, 0), (-1, 0), (0, 1), (0, -1)])
+    magics().rook_attacks(s, occ)
 }
 
 #[inline]
 pub fn queen_attacks(s: Square, occ: Bitboard) -> Bitboard {
     bishop_attacks(s, occ) | rook_attacks(s, occ)
-}
-
-fn ray_attacks(s: Square, occ: Bitboard, dirs: &[(i32, i32)]) -> Bitboard {
-    let f0 = file_of(s) as i32;
-    let r0 = rank_of(s) as i32;
-    let mut out = 0u64;
-    for &(df, dr) in dirs {
-        let mut f = f0 + df;
-        let mut r = r0 + dr;
-        while (0..8).contains(&f) && (0..8).contains(&r) {
-            let t = sq(f as u8, r as u8);
-            out |= bb(t);
-            if occ & bb(t) != 0 {
-                break;
-            }
-            f += df;
-            r += dr;
-        }
-    }
-    out
 }
