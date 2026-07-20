@@ -165,6 +165,7 @@ impl Engine {
         let mut movestogo: Option<i64> = None;
         let mut infinite = false;
         let mut nodes: Option<u64> = None;
+        let mut multipv: usize = 1;
         let mut i = 0;
         while i < tokens.len() {
             match tokens[i] {
@@ -176,6 +177,7 @@ impl Engine {
                 "movetime" => { movetime = tokens.get(i + 1).and_then(|s| s.parse().ok()); i += 2; }
                 "depth" => { depth = tokens.get(i + 1).and_then(|s| s.parse().ok()); i += 2; }
                 "nodes" => { nodes = tokens.get(i + 1).and_then(|s| s.parse().ok()); i += 2; }
+                "multipv" => { multipv = tokens.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(1).max(1); i += 2; }
                 "infinite" => { infinite = true; i += 1; }
                 _ => { i += 1; }
             }
@@ -204,33 +206,58 @@ impl Engine {
             history: self.history.clone(),
             killers: [[None; 2]; crate::search::MAX_PLY],
             history_scores: [[[0; 64]; 64]; 2],
+            countermoves: [[None; 64]; 6],
+            ply_last_move: [None; crate::search::MAX_PLY],
             root_best: None,
+            excluded_root_moves: Vec::new(),
             style_book: self.style_book.as_ref(),
         };
 
         let t0 = Instant::now();
-        let (best, score, depth_reached, nodes_searched) = searcher.iterative_deepening(&mut self.board);
-        self.last_score = Some(score);
-        let dt = t0.elapsed();
-        let nps = if dt.as_secs_f64() > 0.0 { (nodes_searched as f64 / dt.as_secs_f64()) as u64 } else { 0 };
+        let mut top_move: Option<crate::moves::Move> = None;
+        let mut nodes_total: u64 = 0;
+        for pv_index in 1..=multipv {
+            let (best, score, depth_reached, nodes_searched) = searcher.iterative_deepening(&mut self.board);
+            nodes_total += nodes_searched;
+            if pv_index == 1 {
+                self.last_score = Some(score);
+                top_move = best;
+            }
+            let dt = t0.elapsed();
+            let nps = if dt.as_secs_f64() > 0.0 { (nodes_total as f64 / dt.as_secs_f64()) as u64 } else { 0 };
+            let score_str = if score.abs() >= MATE_SCORE - 1000 {
+                let mate_in = ((MATE_SCORE - score.abs() + 1) / 2).max(1);
+                format!("mate {}", if score > 0 { mate_in } else { -mate_in })
+            } else {
+                format!("cp {}", score)
+            };
+            match best {
+                Some(mv) => {
+                    let _ = writeln!(
+                        out,
+                        "info depth {} multipv {} score {} nodes {} nps {} time {} pv {}",
+                        depth_reached, pv_index, score_str, nodes_total, nps, dt.as_millis(), mv.to_uci()
+                    );
+                    // MultiPV via exclusion: this line's move is dropped
+                    // from the root move list before the next call, so
+                    // the search finds the next-best line instead of
+                    // repeating the same one -- see excluded_root_moves.
+                    searcher.excluded_root_moves.push(mv);
+                }
+                None => break, // fewer legal root moves than requested lines
+            }
+            if multipv > 1 {
+                searcher.stop = false;
+            }
+        }
+        let _ = out.flush();
 
-        let score_str = if score.abs() >= MATE_SCORE - 1000 {
-            let mate_in = ((MATE_SCORE - score.abs() + 1) / 2).max(1);
-            format!("mate {}", if score > 0 { mate_in } else { -mate_in })
-        } else {
-            format!("cp {}", score)
-        };
-        let _ = writeln!(
-            out,
-            "info depth {} score {} nodes {} nps {} time {}",
-            depth_reached, score_str, nodes_searched, nps, dt.as_millis()
-        );
         // Rede de seguranca absoluta: mesmo que a busca nao tenha
         // conseguido terminar profundidade nenhuma (relogio esgotado
         // mesmo em cima do 1o lance, caso extremo), NUNCA devolver lance
         // nulo se houver lances legais -- joga o primeiro legal em vez de
         // "0000" (que a arena/arbitro trata como derrota imediata).
-        let final_move = best.or_else(|| {
+        let final_move = top_move.or_else(|| {
             crate::movegen::generate_legal(&self.board, &self.atk).into_iter().next()
         });
         match final_move {
