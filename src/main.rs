@@ -1,3 +1,4 @@
+mod advisor;
 mod attacks;
 mod bitboard;
 mod board;
