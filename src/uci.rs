@@ -370,6 +370,7 @@ impl Engine {
                         killers: [[None; 2]; crate::search::MAX_PLY],
                         history_scores: [[[0; 64]; 64]; 2],
                         countermoves: [[None; 64]; 6],
+                        cont_hist: vec![0i32; crate::search::CONT_HIST_SIZE].into_boxed_slice(),
                         ply_last_move: [None; crate::search::MAX_PLY],
                         root_best: None,
                         excluded_root_moves: excluded.to_vec(),
