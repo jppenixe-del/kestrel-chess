@@ -48,13 +48,25 @@ pub struct Searcher<'a> {
     /// Countermove heuristic: indexed by [piece type][to square] of the
     /// move that led INTO this node (the opponent's last move) -> a quiet
     /// move that previously caused a beta cutoff in reply to that exact
-    /// context. Gives a move-ordering bonus below killers, above plain
-    /// history, when the current candidate matches the recorded reply.
+    /// context. Kept for the picker's tier scoring; overshadowed by the
+    /// finer-grained `cont_hist` below (which gives a numeric weight per
+    /// (prev_piece,prev_to)->(curr_piece,curr_to) pair, at 1 AND 2 plies
+    /// back, exactly like the multi-lag continuation history in Sirius).
     pub countermoves: [[Option<Move>; 64]; 6],
+    /// Continuation history: dense i32 table indexed by (prev_piece,
+    /// prev_to, curr_piece, curr_to) -- gives quiet move ordering a
+    /// numeric bonus/malus based on how the SAME curr_move performed in
+    /// the past following the SAME prev_move (piece type + to-square).
+    /// Used at both 1-ply back (opponent's last move) and 2-ply back
+    /// (our own last move) -- multi-lag, like Sirius's `contHistEntry`
+    /// at plies -1, -2, -4 (we skip -4 for now, added if needed).
+    /// Heap-allocated (~576KB, 6*64*6*64 * 4 bytes) since it doesn't fit
+    /// on the stack. Zeroed once per `go` (Searcher is rebuilt each go).
+    pub cont_hist: Box<[i32]>,
     /// For each ply, the (piece type, to-square) of the move that was
     /// played to reach that ply (i.e. the opponent's last move as seen
     /// from this node) -- set by the parent right before recursing, read
-    /// by order_moves() to look up `countermoves`.
+    /// by the picker to look up `cont_hist`.
     pub ply_last_move: [Option<(PieceType, crate::types::Square)>; MAX_PLY],
     pub root_best: Option<Move>,
     /// MultiPV via the "exclusion" method: root moves listed here are
@@ -73,6 +85,19 @@ pub struct Searcher<'a> {
 /// avaliacao normal) -- MATE_SCORE menos a profundidade maxima possivel,
 /// para nao confundir avaliacoes normais muito altas com mates reais.
 const MATE_THRESHOLD: i32 = MATE_SCORE - MAX_PLY as i32;
+
+/// Tamanho da tabela cont_hist -- 6 tipos de peca * 64 casas destino
+/// para o prev-move, vezes o mesmo para o curr-move. Ver campo
+/// `cont_hist` do Searcher.
+pub const CONT_HIST_SIZE: usize = 6 * 64 * 6 * 64;
+const CONT_HIST_MAX: i32 = 16000;
+
+#[inline(always)]
+fn cont_hist_idx(prev_pt: PieceType, prev_to: crate::types::Square, curr_pt: PieceType, curr_to: crate::types::Square) -> usize {
+    let prev = prev_pt.idx() * 64 + prev_to as usize;
+    let curr = curr_pt.idx() * 64 + curr_to as usize;
+    prev * (6 * 64) + curr
+}
 
 /// 2026-07-20 (BUG REAL encontrado por auditoria -- investigacao da
 /// queda de resultados, ver NOTAS_PROXIMA_SESSAO.md): a TT guardava e
@@ -328,6 +353,17 @@ impl<'a> Searcher<'a> {
     fn update_history(&mut self, side: usize, mv: &Move, delta: i32) {
         let v = &mut self.history_scores[side][mv.from as usize][mv.to as usize];
         *v = (*v + delta).clamp(-HISTORY_MAX, HISTORY_MAX);
+    }
+
+    /// Actualiza cont_hist para o par (prev_move, curr_move) -- +bonus
+    /// se `curr_move` acabou de cortar beta em resposta a `prev_move`,
+    /// -bonus para os quiets tentados antes que nao cortaram.
+    /// `curr_pt` e a peca que fez `curr_mv` (piece_at(mv.from) no board
+    /// ANTES do make_move). Ver campo cont_hist no Searcher.
+    fn update_cont_hist(&mut self, prev_pt: PieceType, prev_to: crate::types::Square, curr_pt: PieceType, curr_to: crate::types::Square, delta: i32) {
+        let idx = cont_hist_idx(prev_pt, prev_to, curr_pt, curr_to);
+        let v = &mut self.cont_hist[idx];
+        *v = (*v + delta).clamp(-CONT_HIST_MAX, CONT_HIST_MAX);
     }
 
     fn order_moves(&self, board: &Board, mut moves: Vec<Move>, tt_move: Option<Move>, ply: usize, hash: Option<u64>) -> Vec<Move> {
@@ -792,13 +828,37 @@ impl<'a> Searcher<'a> {
                     for qm in &quiets_tried[..n] {
                         self.update_history(side, qm, -bonus);
                     }
-                    // Countermove heuristic: record this quiet move as
-                    // the reply to whatever context led into this node
-                    // (the opponent's last move, tracked via
-                    // ply_last_move) -- read back in order_moves() the
-                    // next time that exact context appears.
+                    // Countermove heuristic (binario) mantido para
+                    // compatibilidade; cont_hist e' o sinal principal.
                     if let Some((ctx_pt, ctx_to)) = self.ply_last_move[ply] {
                         self.countermoves[ctx_pt.idx()][ctx_to as usize] = Some(mv);
+                    }
+                    // Continuation history: actualiza (prev_move -> mv)
+                    // com +bonus para mv que cortou, -bonus para os
+                    // quiets tentados antes. Feito a 1-ply e 2-ply back
+                    // (multi-lag, ver `cont_hist`). Precisamos da peca
+                    // que fez mv -- board ja' fez unmake, portanto o
+                    // piece_at do mailbox devolve o estado ANTES do mv,
+                    // que e' exactamente o que queremos.
+                    if let Some((curr_pt, _)) = board.piece_at(mv.from) {
+                        let prev1 = if ply >= 1 { self.ply_last_move.get(ply).and_then(|x| *x) } else { None };
+                        let prev2 = if ply >= 2 { self.ply_last_move.get(ply - 1).and_then(|x| *x) } else { None };
+                        if let Some((p1_pt, p1_to)) = prev1 {
+                            self.update_cont_hist(p1_pt, p1_to, curr_pt, mv.to, bonus);
+                        }
+                        if let Some((p2_pt, p2_to)) = prev2 {
+                            self.update_cont_hist(p2_pt, p2_to, curr_pt, mv.to, bonus);
+                        }
+                        for qm in &quiets_tried[..n] {
+                            if let Some((q_pt, _)) = board.piece_at(qm.from) {
+                                if let Some((p1_pt, p1_to)) = prev1 {
+                                    self.update_cont_hist(p1_pt, p1_to, q_pt, qm.to, -bonus);
+                                }
+                                if let Some((p2_pt, p2_to)) = prev2 {
+                                    self.update_cont_hist(p2_pt, p2_to, q_pt, qm.to, -bonus);
+                                }
+                            }
+                        }
                     }
                 }
                 break;
@@ -1055,11 +1115,19 @@ impl MovePicker {
                         Some(b) => b.lookup(hash),
                         None => Vec::new(),
                     };
+                    // Countermove ainda usado como fallback binario (bonus
+                    // fixo se bater) para preservar continuidade das
+                    // iteracoes anteriores; cont_hist adiciona o sinal
+                    // numerico multi-lag por cima (ver Sirius:
+                    // history.cpp `getQuietStats` a somar contHist a -1,
+                    // -2, e -4 plies -- portamos -1 e -2 por agora).
                     let countermove = searcher
                         .ply_last_move
                         .get(ply)
                         .and_then(|x| *x)
                         .and_then(|(pt, to)| searcher.countermoves[pt.idx()][to as usize]);
+                    let prev1 = if ply >= 1 { searcher.ply_last_move.get(ply).and_then(|x| *x) } else { None };
+                    let prev2 = if ply >= 2 { searcher.ply_last_move.get(ply - 1).and_then(|x| *x) } else { None };
                     for i in 0..self.quiet.len() {
                         let m = self.quiet[i].0;
                         if m.from == m.to {
@@ -1071,13 +1139,23 @@ impl MovePicker {
                             self.quiet[i].1 = i32::MIN;
                             continue;
                         }
-                        // Mesma formula do order_moves antigo (para nao
-                        // regredir a ordenacao entre iteracoes):
-                        // history + countermove bonus + livro.
                         let h = searcher.history_scores[side][m.from as usize][m.to as usize];
                         let cm_bonus = if Some(m) == countermove { 2000 } else { 0 };
                         let book = searcher.book_bonus(&book_entries, &m);
-                        self.quiet[i].1 = h + cm_bonus + book;
+                        // Continuation history: precisa da peca que faz o
+                        // lance actual, obtida do mailbox O(1) do board
+                        // -- ~2ns por lookup, e so' aqui, fora do hot path
+                        // de make_move.
+                        let mut ch = 0i32;
+                        if let Some((curr_pt, _)) = board.piece_at(m.from) {
+                            if let Some((p1_pt, p1_to)) = prev1 {
+                                ch += searcher.cont_hist[cont_hist_idx(p1_pt, p1_to, curr_pt, m.to)];
+                            }
+                            if let Some((p2_pt, p2_to)) = prev2 {
+                                ch += searcher.cont_hist[cont_hist_idx(p2_pt, p2_to, curr_pt, m.to)];
+                            }
+                        }
+                        self.quiet[i].1 = h + cm_bonus + book + ch;
                     }
                     self.stage = PickerStage::Quiet;
                 }
