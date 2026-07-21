@@ -42,6 +42,18 @@ impl Zobrist {
         Zobrist { piece_sq, side, castling, ep_file }
     }
 
+    /// Recomputed from scratch each call (once per search node). This
+    /// is deliberately NOT maintained incrementally, despite that being
+    /// the textbook approach: tried it (2026-07-21, incremental hash in
+    /// add_piece/remove_piece/make_move, verified bit-exact over 124M
+    /// perft nodes) and it was a NET LOSS here -- perft(6) went ~4.8s ->
+    /// ~5.9s. Reason specific to this engine: generate_legal() does a
+    /// make/unmake per candidate move for legality (~35 per node), so
+    /// make/unmake are called far more often than this hash() is; paying
+    /// a few XORs in every make/unmake to save one recompute per node is
+    /// negative when the make:hash call ratio is ~35:1. Measured and
+    /// reverted, documented here so it isn't re-attempted as an "obvious
+    /// speedup" without also changing how legality checking works.
     pub fn hash(&self, board: &Board) -> u64 {
         let mut h = 0u64;
         for c in [Color::White, Color::Black] {
