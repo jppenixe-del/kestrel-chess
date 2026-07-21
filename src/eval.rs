@@ -510,7 +510,12 @@ fn positional_terms(board: &Board) -> i32 {
                 attacked[c.idx()] |= attacks;
                 attacked_by_pt[c.idx()][pt.idx()] |= attacks;
 
-                let mobility = count(attacks & !own) as usize;
+                // Mobility area excludes squares attacked by enemy
+                // pawns (moving there just hangs the piece for a pawn,
+                // not real mobility) as well as own-occupied squares.
+                // Standard refinement (Stockfish "mobility area").
+                let enemy_pawn_attacks = attacked_by_pt[c.opp().idx()][PieceType::Pawn.idx()];
+                let mobility = count(attacks & !own & !enemy_pawn_attacks) as usize;
                 let mob_table = match pt {
                     PieceType::Knight => &MOBILITY_KNIGHT,
                     PieceType::Bishop => &MOBILITY_BISHOP,
