@@ -83,6 +83,16 @@ pub struct Searcher<'a> {
     /// Heap-allocated (~576KB, 6*64*6*64 * 4 bytes) since it doesn't fit
     /// on the stack. Zeroed once per `go` (Searcher is rebuilt each go).
     pub cont_hist: Box<[i32]>,
+    /// Correction history: keyed by a cheap pawn-structure hash, learns
+    /// how far off the raw static eval tends to be for THIS pawn
+    /// structure once real search has settled on a score. Standard
+    /// technique (Stockfish/Ethereal "correction history") -- static
+    /// eval is fast but systematically biased for certain structures
+    /// (e.g. closed positions, specific pawn chains); this nudges it
+    /// toward what search has actually been finding there. Only affects
+    /// pruning-margin decisions (RFP/futility/LMP/razoring), never the
+    /// real leaf/quiescence evaluation.
+    pub corr_hist: Box<[i32]>,
     /// For each ply, the (piece type, to-square) of the move that was
     /// played to reach that ply (i.e. the opponent's last move as seen
     /// from this node) -- set by the parent right before recursing, read
@@ -131,6 +141,25 @@ fn cont_hist_idx(prev_pt: PieceType, prev_to: crate::types::Square, curr_pt: Pie
     let prev = prev_pt.idx() * 64 + prev_to as usize;
     let curr = curr_pt.idx() * 64 + curr_to as usize;
     prev * (6 * 64) + curr
+}
+
+/// Correction history table size (per color) and clamp. 16384 slots is
+/// plenty for a hash-modulo table at this scale; collisions just blend
+/// two structures' corrections together, self-correcting over time.
+pub const CORR_HIST_SIZE: usize = 16384;
+const CORR_HIST_MAX: i32 = 1200; // clamp on the stored correction itself
+const CORR_HIST_GRAIN: i32 = 256; // internal fixed-point scale (like Stockfish)
+
+/// Cheap, non-incremental pawn-structure hash -- just the two pawn
+/// bitboards mixed together. Not the real Zobrist key (which would
+/// need incremental maintenance in make/unmake_move); recomputed on
+/// demand, which is fine since it's only touched once or twice per
+/// node, not in the hot per-move loop.
+#[inline]
+fn pawn_structure_hash(board: &Board) -> u64 {
+    let wp = board.pieces[Color::White.idx()][PieceType::Pawn.idx()];
+    let bp = board.pieces[Color::Black.idx()][PieceType::Pawn.idx()];
+    wp.wrapping_mul(0x9E3779B97F4A7C15) ^ bp.wrapping_mul(0xC2B2AE3D27D4EB4F)
 }
 
 /// 2026-07-20 (BUG REAL encontrado por auditoria -- investigacao da
@@ -400,6 +429,38 @@ impl<'a> Searcher<'a> {
         *v = (*v + delta).clamp(-CONT_HIST_MAX, CONT_HIST_MAX);
     }
 
+    #[inline]
+    fn corr_hist_idx(&self, board: &Board) -> usize {
+        let h = pawn_structure_hash(board);
+        board.side.idx() * CORR_HIST_SIZE + (h as usize % CORR_HIST_SIZE)
+    }
+
+    /// Static eval adjusted by the learned correction for this pawn
+    /// structure (see `corr_hist`). Used only where the raw static eval
+    /// feeds a PRUNING margin decision, never for the real leaf value.
+    fn corrected_static_eval(&self, board: &Board, raw: i32) -> i32 {
+        let idx = self.corr_hist_idx(board);
+        raw + self.corr_hist[idx] / CORR_HIST_GRAIN
+    }
+
+    /// Called once a node's real search has settled on `best_score`
+    /// (not a stopped/aborted search, not a mate score, not near the
+    /// static-eval-unreliable zone): nudge the correction toward the
+    /// gap between what the fast static eval guessed and what real
+    /// search found. Small learning-rate style update so a single
+    /// unusual position doesn't dominate the table.
+    fn update_corr_hist(&mut self, board: &Board, static_eval: i32, best_score: i32, depth: i32) {
+        if best_score.abs() >= MATE_THRESHOLD {
+            return;
+        }
+        let idx = self.corr_hist_idx(board);
+        let diff = (best_score - static_eval) * CORR_HIST_GRAIN;
+        let weight = (depth + 1).min(16);
+        let v = &mut self.corr_hist[idx];
+        *v += (diff - *v) * weight / 256;
+        *v = (*v).clamp(-CORR_HIST_MAX * CORR_HIST_GRAIN, CORR_HIST_MAX * CORR_HIST_GRAIN);
+    }
+
     fn order_moves(&self, board: &Board, mut moves: Vec<Move>, tt_move: Option<Move>, ply: usize, hash: Option<u64>) -> Vec<Move> {
         let killers = self.killers[ply];
         let side = board.side.idx();
@@ -640,9 +701,16 @@ impl<'a> Searcher<'a> {
         // where it is meaningless); cached in `static_evals[ply]` so
         // the `improving` heuristic below can compare against 2 plies
         // back. Slight cost but pays off multiple times per node.
-        let static_eval = if in_check { 0 } else { crate::eval::evaluate_fast(board) };
+        let raw_static_eval = if in_check { 0 } else { crate::eval::evaluate_fast(board) };
+        // Corrected version (see corr_hist) used for pruning-margin
+        // decisions below; the raw value is what improving/static_evals
+        // track, since correction is a slow-moving average and mixing
+        // it into the improving comparison would blur a signal that's
+        // meant to be about THIS node's fast eval trend, not the
+        // learned bias.
+        let static_eval = if in_check { 0 } else { self.corrected_static_eval(board, raw_static_eval) };
         if ply < MAX_PLY {
-            self.static_evals[ply] = static_eval;
+            self.static_evals[ply] = raw_static_eval;
         }
         // `improving`: at a same-side ply, are we better than 2 plies
         // ago (last time we moved)? If so, position is trending our
@@ -650,7 +718,7 @@ impl<'a> Searcher<'a> {
         // be more careful. Standard heuristic in every strong engine.
         let improving = !in_check
             && ply >= 2
-            && static_eval > self.static_evals[ply - 2];
+            && raw_static_eval > self.static_evals[ply - 2];
 
         // Reverse futility pruning -- scaled by `improving` so we prune
         // more when we're winning (position better than 2 plies ago).
@@ -1045,6 +1113,13 @@ impl<'a> Searcher<'a> {
         // janela restrita e excluded_move.
         if excluded.is_none() {
             self.tt.store(hash, depth, score_to_tt(best_score, ply as i32), bound, best_move);
+            // Correction history update: only on a genuine Exact result
+            // (fail-high/fail-low bounds are one-sided, not a real
+            // estimate of the true value) and never in check (tactics
+            // dominate there, not the slow eval-bias signal we want).
+            if !self.stop && !in_check && bound == Bound::Exact {
+                self.update_corr_hist(board, raw_static_eval, best_score, depth);
+            }
         }
 
         best_score
