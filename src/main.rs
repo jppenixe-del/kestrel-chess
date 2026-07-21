@@ -66,6 +66,11 @@ fn main() {
         check_weights_roundtrip();
         return;
     }
+    if args.len() >= 4 && args[1] == "tune" {
+        let epochs: u32 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(20);
+        tune_weights(&args[2], &args[3], epochs);
+        return;
+    }
     let mut engine = uci::Engine::new();
     engine.run();
 }
@@ -106,6 +111,113 @@ fn check_weights_roundtrip() {
         println!("fen ok={} eval()={} evaluate_with_weights(default)={}: {}", a == b, a, b, fen);
     }
     let _ = atk;
+}
+
+/// Real Texel Tuning: coordinate descent on `Weights::to_vec()`'s flat
+/// parameter vector, minimizing squared error between the sigmoid of
+/// each position's static eval and the REAL game result it came from
+/// (1.0/0.5/0.0 from White's perspective). Classic method (the
+/// original Texel tuner and most small engines' tuners work exactly
+/// this way -- no autodiff needed): for each parameter, try +step and
+/// -step, keep whichever reduces total error over the whole dataset,
+/// else leave it unchanged. Dataset format: one line per position,
+/// "<FEN>\t<white_score>".
+fn tune_weights(dataset_path: &str, out_path: &str, epochs: u32) {
+    let text = std::fs::read_to_string(dataset_path).expect("nao consegui ler o dataset");
+    let mut boards: Vec<Board> = Vec::new();
+    let mut results: Vec<f64> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.split('\t');
+        let fen = parts.next().unwrap();
+        let res: f64 = parts.next().unwrap().parse().unwrap();
+        boards.push(Board::from_fen(fen));
+        results.push(res);
+    }
+    println!("dataset: {} positions", boards.len());
+
+    // sigmoid(eval) = 1 / (1 + 10^(-k*eval/400)) -- eval from White's POV.
+    fn sigmoid(eval_cp: f64, k: f64) -> f64 {
+        1.0 / (1.0 + 10f64.powf(-k * eval_cp / 400.0))
+    }
+    fn white_eval(board: &Board, w: &eval::Weights) -> f64 {
+        let e = eval::evaluate_with_weights(board, w);
+        if board.side == types::Color::White { e as f64 } else { -e as f64 }
+    }
+    fn total_error(boards: &[Board], results: &[f64], w: &eval::Weights, k: f64) -> f64 {
+        let mut sum = 0.0;
+        for (b, r) in boards.iter().zip(results.iter()) {
+            let pred = sigmoid(white_eval(b, w), k);
+            let d = r - pred;
+            sum += d * d;
+        }
+        sum / boards.len() as f64
+    }
+
+    let base = eval::default_weights().clone();
+
+    // Find the best sigmoid scale K for the CURRENT (untuned) weights
+    // first -- a coarse 1D scan, fixed for the rest of the run (this is
+    // what the original Texel tuner does: K only rescales how harshly
+    // error is measured, tuning it jointly with every other parameter
+    // every step is unnecessary).
+    let mut best_k = 1.0;
+    let mut best_k_err = f64::MAX;
+    let mut k = 0.2;
+    while k <= 3.0 {
+        let e = total_error(&boards, &results, &base, k);
+        if e < best_k_err {
+            best_k_err = e;
+            best_k = k;
+        }
+        k += 0.1;
+    }
+    println!("best K = {:.2}  (error at default weights = {:.6})", best_k, best_k_err);
+
+    let mut v = base.to_vec();
+    let mut current = base.from_vec(&v);
+    let mut current_err = total_error(&boards, &results, &current, best_k);
+    println!("starting error: {:.6}", current_err);
+
+    for epoch in 0..epochs {
+        let mut improved = 0;
+        for i in 0..v.len() {
+            let orig = v[i];
+            v[i] = orig + 1;
+            let cand = current.from_vec(&v);
+            let err_up = total_error(&boards, &results, &cand, best_k);
+            if err_up < current_err {
+                current_err = err_up;
+                current = cand;
+                improved += 1;
+                continue;
+            }
+            v[i] = orig - 1;
+            let cand = current.from_vec(&v);
+            let err_down = total_error(&boards, &results, &cand, best_k);
+            if err_down < current_err {
+                current_err = err_down;
+                current = cand;
+                improved += 1;
+                continue;
+            }
+            v[i] = orig;
+        }
+        println!("epoch {}: error={:.6}  params improved={}", epoch, current_err, improved);
+        if improved == 0 {
+            println!("converged (no parameter improved this epoch)");
+            break;
+        }
+    }
+
+    let out_vec = current.to_vec();
+    let serialized: Vec<String> = out_vec.iter().map(|x| x.to_string()).collect();
+    std::fs::write(out_path, serialized.join(",")).expect("nao consegui escrever o output");
+    println!("wrote tuned weights ({} scalars) to {}", out_vec.len(), out_path);
+    println!("final error: {:.6}  (started at {:.6}, default-K error {:.6})", current_err, current_err, best_k_err);
 }
 
 /// Debug helper: does `book_path` have an entry for `fen`? Prints the
