@@ -569,8 +569,30 @@ impl Default for Weights {
 }
 
 static DEFAULT_WEIGHTS: OnceLock<Weights> = OnceLock::new();
+/// A/B testing hook for a tuning run's output, same reversible pattern
+/// as `KESTREL_EVAL_MODE` above: with the env var unset (every
+/// deployment, including the live bot, unless someone deliberately
+/// sets it) this is byte-for-byte `Weights::default()`. Lets a
+/// candidate weight set from `kestrel tune` be exercised by the real
+/// position suite / a real game before ever touching the compiled-in
+/// consts -- nothing is "deployed" by running the tuner, only by a
+/// deliberate later commit copying values back into the consts.
 pub fn default_weights() -> &'static Weights {
-    DEFAULT_WEIGHTS.get_or_init(Weights::default)
+    DEFAULT_WEIGHTS.get_or_init(|| {
+        if let Ok(path) = std::env::var("KESTREL_TUNED_WEIGHTS") {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                let parsed: Vec<i32> = text.trim().split(',').filter_map(|s| s.parse().ok()).collect();
+                let base = Weights::default();
+                if parsed.len() == base.to_vec().len() {
+                    eprintln!("KESTREL_TUNED_WEIGHTS: loaded {} scalars from {}", parsed.len(), path);
+                    return base.from_vec(&parsed);
+                } else {
+                    eprintln!("KESTREL_TUNED_WEIGHTS: length mismatch ({} vs expected {}), ignoring", parsed.len(), base.to_vec().len());
+                }
+            }
+        }
+        Weights::default()
+    })
 }
 
 impl Weights {
