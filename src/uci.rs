@@ -248,26 +248,25 @@ impl Engine {
             // time cutoff for that case.
             None
         } else {
-            let (soft, hard_cap) = compute_time_budget(my_time, my_inc, opp_time, self.board.fullmove, movestogo, self.last_score);
+            let (soft, _hard_cap) = compute_time_budget(my_time, my_inc, opp_time, self.board.fullmove, movestogo, self.last_score);
             soft_budget_ms = Some(soft);
-            // The search's real deadline uses `hard_cap`, not the flat
-            // `soft` estimate (was computed and thrown away before --
-            // "let (soft, _hard) = ..."). `soft` is the right baseline
-            // for a typical move, but a position where the PV keeps
-            // changing between iterations deserves more than the flat
-            // per-move share -- exactly what a human does with clock to
-            // spare: move fast on the obvious ones, think longer on the
-            // hard ones, without flagging. `hard_cap` already collapses
-            // back down to `soft` in compute_time_budget's low-clock
-            // tiers (<20s/<4s/<1.2s), so this only grants extra thinking
-            // time when the clock is comfortable, never when short.
-            // `soft_deadline` (the stability early-exit checkpoint, see
-            // iterative_deepening() in search.rs) stays anchored to the
-            // smaller `soft`, not `hard_cap` -- an EASY position (root
-            // move stabilizes fast) still hands the clock back quickly
-            // instead of soaking up the wider ceiling for nothing.
-            let search_ms = if advisor_enabled { (hard_cap - ADVISOR_RESERVE_MS).max(1) } else { hard_cap };
-            soft_deadline = Some(Instant::now() + Duration::from_millis((soft / 2).max(1) as u64));
+            // REVERTED (2026-07-21, same day): using `hard_cap` as the
+            // real deadline looked safe in isolated single-threaded
+            // tests, but the live bot runs Threads=4 (see
+            // lichess_bridge.py), and Lazy SMP has genuine run-to-run
+            // variance in when a thread's root move stabilizes. Repro
+            // on the exact position from a real lost game (5 runs, same
+            // FEN, same clock, Threads=4): 1.0s, 6.8s, 2.5s, 1.5s,
+            // 10.6s. That matches a real pattern seen across 3 games in
+            // a 4-game series played right after this shipped: 10-16s
+            // burned on an ordinary move around move 4-8, then panic
+            // mode for the rest of the game. `hard_cap` is thread-count-
+            // sensitive noise, not a genuine difficulty signal -- back
+            // to the flat `soft` baseline until this can be built on a
+            // real complexity signal instead of per-thread stability
+            // timing.
+            let search_ms = if advisor_enabled { (soft - ADVISOR_RESERVE_MS).max(1) } else { soft };
+            soft_deadline = Some(Instant::now() + Duration::from_millis((search_ms / 2).max(1) as u64));
             Some(Instant::now() + Duration::from_millis(search_ms.max(1) as u64))
         };
 
