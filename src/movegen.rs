@@ -132,15 +132,25 @@ fn gen_from_attacks(out: &mut Vec<Move>, from: Square, targets: Bitboard, board:
     }
 }
 
-pub fn generate_legal(board: &Board, atk: &Attacks) -> Vec<Move> {
+/// Legality check via make/unmake on the SAME board (found in review,
+/// 2026-07-21) instead of a full `Board::clone()` + `make_move()` per
+/// pseudo-legal candidate -- every other legality check in the search
+/// (negamax/quiescence's own move loops) already uses make/unmake on
+/// one board; this was the one remaining spot still paying a full
+/// struct clone (mailbox, accumulators, castling/ep state, everything)
+/// per candidate move, at every single node. Requires `&mut Board`
+/// instead of `&Board` -- every call site already holds a `&mut Board`
+/// or an owned `Board`, so this is a mechanical signature change.
+pub fn generate_legal(board: &mut Board, atk: &Attacks) -> Vec<Move> {
     let mut pseudo = Vec::with_capacity(64);
     generate_pseudo_legal(board, atk, &mut pseudo);
     let mut legal = Vec::with_capacity(pseudo.len());
     for mv in pseudo {
-        let mut b2 = board.clone();
-        let us = b2.side;
-        b2.make_move(&mv);
-        if !b2.in_check(us, atk) {
+        let us = board.side;
+        let undo = board.make_move(&mv);
+        let illegal = board.in_check(us, atk);
+        board.unmake_move(&mv, &undo);
+        if !illegal {
             legal.push(mv);
         }
     }
