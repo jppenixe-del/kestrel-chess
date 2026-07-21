@@ -148,14 +148,21 @@ const EG_KING: [i32; 64] = [
      -74,  -35,  -18,  -18,  -11,   15,    4,  -17,
 ];
 
-/// Material base -- pontos de partida sensatos, para afinar via Texel
-/// Tuning proprio a seguir. Peao=100 (valor classico "1 pawn = 100cp")
-/// que da margem clara em posicoes de +1 peao, coisa que a busca em
-/// bullet precisa para preferir uma captura de peao a um lance
-/// posicional aproximadamente equivalente. Distintos de
-/// `PieceType::value()`, que continua a servir SEE/MVV-LVA.
-const MG_VALUE: [i32; 6] = [100, 340, 360, 520, 1000, 0];
-const EG_VALUE: [i32; 6] = [110, 300, 310, 540, 950, 0];
+/// Material tapered. Raciocinio:
+///  - Peao 100 mg / 115 eg: valor classico "1 pawn = 100cp" no mg;
+///    no eg o peao vale mais (proximidade da promocao, menos pecas
+///    para o parar).
+///  - Cavalo 320 mg / 285 eg: cavalo perde valor sem outras pecas por
+///    perto para saltar (a mobilidade eficaz baixa no eg).
+///  - Bispo 335 mg / 335 eg: bispo mantem valor no eg (diagonais
+///    abertas com menos pecas).
+///  - Torre 500 mg / 550 eg: torre ganha no eg (colunas abertas, 7a
+///    fileira).
+///  - Dama 950 mg / 960 eg: dama mantem-se (ambas fases).
+///  - Rei 0: nao conta na soma material.
+/// Distintos de PieceType::value() (usado por SEE/MVV-LVA sem fase).
+const MG_VALUE: [i32; 6] = [100, 320, 335, 500, 950, 0];
+const EG_VALUE: [i32; 6] = [115, 285, 335, 550, 960, 0];
 
 /// Incremento de fase por peca -- 4 cavalos+4 bispos+4 torres+2 damas =
 /// 4*1+4*1+4*2+2*4 = 24 = fase maxima (abertura). Fase 0 = so' reis e
@@ -227,101 +234,197 @@ fn king_zone(king_sq: Square) -> Bitboard {
 // abaixo sao meus -- monotonos e razoaveis, mas nao afinados. Isso e'
 // o proximo passo (Texel Tuning no server).
 
-const BISHOP_PAIR: (i32, i32) = (25, 55);
-const LONG_DIAG_BISHOP: (i32, i32) = (10, 10);
-const MINOR_BEHIND_PAWN: (i32, i32) = (5, 5);
-const KNIGHT_OUTPOST: (i32, i32) = (20, 15);
-const ROOK_OPEN: [(i32, i32); 2] = [(25, 5), (15, 0)]; // [0]=aberta, [1]=semi-aberta
-const TEMPO: (i32, i32) = (20, 15);
+// === Structural bonuses (raciocinio explicito) ===
+// BISHOP_PAIR: dois bispos cobrem todas as cores; vantagem cresce no
+// eg (diagonais abertas com menos pecas). Valor classico 30-50.
+const BISHOP_PAIR: (i32, i32) = (30, 55);
+// Bispo na longa diagonal central (a1-h8 ou h1-a8) que ataca >=2 casas
+// do centro (d4/e4/d5/e5) -- peca activa, small bonus.
+const LONG_DIAG_BISHOP: (i32, i32) = (10, 12);
+// Cavalo/bispo com peao proprio directamente a frente -- abrigo,
+// pequeno bonus por seguranca.
+const MINOR_BEHIND_PAWN: (i32, i32) = (5, 6);
+// Cavalo em outpost (casa avancada, defendida por peao, sem peao
+// inimigo nas colunas adjacentes que possa capturar) -- peca dominante.
+const KNIGHT_OUTPOST: (i32, i32) = (25, 20);
+// Torre em coluna aberta / semi-aberta. Aberta = mais mg (linhas de
+// ataque), eg mantem-se. Semi-open = metade.
+const ROOK_OPEN: [(i32, i32); 2] = [(30, 12), (18, 8)];
+// Tempo -- lado que joga tem pequena vantagem estrutural (iniciativa).
+// Valor classico 15-25.
+const TEMPO: (i32, i32) = (22, 15);
 
-// Mobility por peca -- crescente com o numero de casas seguras
-// atacadas. Base intuitiva: sem lances = muito mau; muitos lances = ok.
-// Valores propios, monotonos. Sirius/SF afinam versoes muito mais
-// nuancadas via Texel; deixamos o afinamento para depois.
+// === Mobility ===
+// Ideia geral: 0 lances legais = peca presa, penalidade forte. Curva
+// concava crescente ate' plateau (mobilidade extra alem de "activa" da'
+// diminishing returns). Piece-specific: dama tem 27 slots mas o valor
+// da mobilidade e' menor em cada slot (dama ja' e' potente sem precisar
+// de mobility). Cavalo tem so' 8 slots mas cada casa vale mais (cavalo
+// preso em canto vale muito pouco). eg = ligeiramente mais baixo que
+// mg em geral (mobility conta menos com menos pecas para interagir).
 const MOBILITY_KNIGHT: [(i32, i32); 28] = {
     let mut t = [(0i32, 0i32); 28];
-    let base = [-30, -15, -5, 0, 5, 10, 15, 20, 25];
-    let mut i = 0; while i < 9 { t[i] = (base[i], base[i] - 5); i += 1; }
+    // 0..=8 lances
+    let mg = [-40, -15, -5, 5, 12, 18, 25, 30, 35];
+    let eg = [-32, -14, -5, 3, 9, 14, 18, 22, 25];
+    let mut i = 0; while i < 9 { t[i] = (mg[i], eg[i]); i += 1; }
     t
 };
 const MOBILITY_BISHOP: [(i32, i32); 28] = {
     let mut t = [(0i32, 0i32); 28];
-    let base = [-30, -15, -5, 0, 4, 8, 12, 15, 18, 20, 22, 24, 25, 26];
-    let mut i = 0; while i < 14 { t[i] = (base[i], base[i] - 5); i += 1; }
+    // 0..=13 lances
+    let mg = [-40, -20, -8, 0, 7, 13, 18, 22, 25, 28, 30, 32, 34, 36];
+    let eg = [-30, -18, -8, -2, 5, 10, 14, 18, 20, 22, 24, 25, 26, 27];
+    let mut i = 0; while i < 14 { t[i] = (mg[i], eg[i]); i += 1; }
     t
 };
 const MOBILITY_ROOK: [(i32, i32); 28] = {
     let mut t = [(0i32, 0i32); 28];
-    let base = [-40, -20, -10, -5, 0, 3, 6, 9, 12, 14, 16, 18, 20, 22, 24];
-    let mut i = 0; while i < 15 { t[i] = (base[i], base[i]); i += 1; }
+    // 0..=14 lances -- torre ganha mais no eg (colunas abertas)
+    let mg = [-45, -25, -12, -4, 2, 7, 12, 16, 20, 23, 25, 27, 28, 28, 28];
+    let eg = [-35, -22, -12, -4, 3, 8, 13, 18, 23, 28, 30, 32, 33, 34, 34];
+    let mut i = 0; while i < 15 { t[i] = (mg[i], eg[i]); i += 1; }
     t
 };
 const MOBILITY_QUEEN: [(i32, i32); 28] = {
     let mut t = [(0i32, 0i32); 28];
-    let base = [-30, -20, -10, -5, 0, 2, 4, 6, 8, 10, 12, 13, 14, 15, 16, 17, 18, 19, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20];
-    let mut i = 0; while i < 28 { t[i] = (base[i], base[i]); i += 1; }
+    // 0..=27 lances. Cada slot vale menos (dama ja' e' potente).
+    // Plateau depois de ~20 lances.
+    let mg = [-30, -25, -15, -8, -3, 2, 6, 10, 13, 16, 18, 20, 22, 23, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24];
+    let eg = [-25, -20, -15, -8, -3, 2, 5, 8, 11, 14, 16, 18, 20, 21, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22];
+    let mut i = 0; while i < 28 { t[i] = (mg[i], eg[i]); i += 1; }
     t
 };
 
-// Peso de atacantes ao king ring por tipo -- damas mais que torres
-// mais que menores, padrao classico.
-const KING_ATTACKER_WEIGHT: [(i32, i32); 4] = [(15, 0), (15, 0), (30, 0), (60, 0)];
+// === King safety ===
+// Peso por peca a atacar a zona do rei inimigo. Dama pesa MUITO (peca
+// suprema no ataque), torre pesa ~2x menor, menores pesam menos.
+// eg = negativo pequeno -- ataques ao rei importam pouco quando ja
+// nao ha muitas pecas para atacar. Baseado no padrao classico
+// "attack units" do Stockfish clássico.
+const KING_ATTACKER_WEIGHT: [(i32, i32); 4] = [
+    (20, -3),   // Cavalo
+    (18, -3),   // Bispo
+    (35, -5),   // Torre
+    (65, -5),   // Dama
+];
+// Extra por casa da king zone atacada, alem do bonus por atacante.
 const KING_ATTACKS: (i32, i32) = (5, 0);
 
-// Ameacas -- estrutura standard (indexed por tipo da peca inimiga
-// atacada e por "defendida pelo inimigo?"). Valores crescentes com o
-// valor da peca atacada: atacar dama > torre > menor > peao. Atacar
-// peca defendida vale menos.
-// Ordem: [Pawn, Knight, Bishop, Rook, Queen, King].
+// === Threats ===
+// Estrutura standard (indexed por tipo da peca atacada e por
+// "defendida pelo inimigo?"). Raciocinio para os valores:
 //
-// THREAT_BY_PAWN e' indexed por defended para capturar o caso que faz
-// diferenca em jogo real: peao inimigo pendurado (atacado por peao
-// nosso E sem defensor) e' ganho de material efectivo -- vale muito.
-// Se estiver defendido e' recaptura ~equal, vale pouco. Este era o
-// "bug do recapturar" observado em jogo (N7671Omx): motor jogava Nc6
-// deixando peao em d6 pendurado, valuation = 0 (ambos casos eram
-// "atacar peao inimigo") em vez de refletir o material a ganhar.
+// UNDEFENDED = ganho de material em quase todos os casos. O bonus
+// aproxima o valor da peca ganha, com desconto por: possivel fuga
+// do alvo, tempo consumido, contra-ameaca. Tipico ~50-70% do valor
+// nominal.
+//
+// DEFENDED = recaptura, quase sempre equal ou pequeno ganho. Peao
+// defendido a peao defendido vale zero (recaptura pura); dama
+// defendida atacada por menor vale eg mais no eg (troca de dama por
+// menor + peao passado por baixo pressao).
+//
+// Ordem interna: [Pawn, Knight, Bishop, Rook, Queen, King].
+
+// THREAT_BY_PAWN: um peao vale 100mg; ganhar 1 peao com um peao vale
+// ~70mg (peao inicial pode ser recapturado se defendido depois; se
+// pendurado tira ~1 peao inteiro).
 const THREAT_BY_PAWN: [[(i32, i32); 6]; 2] = [
-    // [0] = alvo NAO defendido -> bonus grande (ganho material)
-    [(70, 60), (85, 60), (85, 60), (95, 55), (85, 40), (0, 0)],
-    // [1] = alvo defendido -> recaptura tipica, sinal moderado
+    // undefended (peao inimigo pendurado) - ganho quase full material
+    [(70, 60), (85, 55), (85, 55), (95, 55), (85, 40), (0, 0)],
+    // defended - trocamos peao por peao (equal); vs peca maior, ainda
+    // ganho porque a peca tem de sair. Especialmente eg.
     [(0, 5), (25, 15), (25, 15), (30, 20), (25, 10), (0, 0)],
 ];
-// [defended=0 nao-defendido / 1 defendido][target_piece]
+
+// THREAT_BY_KNIGHT: cavalo pode forkar 2 pecas (bonus grande vs torre/
+// dama undefended). Cavalo x cavalo = 0 (troca), cavalo x bispo pequena
+// pressao. Rook fork por cavalo e' patente 200+cp mas so' considera
+// aqui uma ameaca simples.
 const THREAT_BY_KNIGHT: [[(i32, i32); 6]; 2] = [
-    [(5, 15), (0, 0), (30, 20), (60, 25), (40, 20), (0, 0)],   // nao defendido
-    [(0, 5), (0, 0), (15, 15), (30, 20), (30, 30), (0, 0)],    // defendido
+    // undefended
+    [(5, 20), (0, 0), (30, 25), (65, 25), (50, 25), (0, 0)],
+    // defended
+    [(0, 5), (0, 0), (15, 15), (35, 20), (35, 25), (0, 0)],
 ];
+
+// THREAT_BY_BISHOP: bispo x torre e' padrao "attack on rank" tipico.
+// Bispo x bispo = 0 (troca), bispo x dama vale mais eg (dama nao pode
+// facilmente sair da diagonal).
 const THREAT_BY_BISHOP: [[(i32, i32); 6]; 2] = [
-    [(5, 15), (25, 25), (0, 0), (50, 25), (40, 40), (0, 0)],
-    [(0, 5), (10, 15), (0, 0), (30, 25), (40, 50), (0, 0)],
+    // undefended
+    [(5, 20), (30, 25), (0, 0), (60, 25), (45, 45), (0, 0)],
+    // defended
+    [(0, 5), (12, 15), (0, 0), (35, 25), (40, 50), (0, 0)],
 ];
+
+// THREAT_BY_ROOK: torre x cavalo/bispo = pressao clara (torre vale
+// mais). Torre x torre = troca equal. Torre x dama = grande bonus.
 const THREAT_BY_ROOK: [[(i32, i32); 6]; 2] = [
-    [(0, 15), (25, 30), (25, 30), (0, 0), (50, 20), (0, 0)],
-    [(-5, 5), (5, 10), (10, 5), (0, 0), (40, 60), (0, 0)],
+    // undefended
+    [(0, 20), (30, 30), (30, 30), (0, 0), (55, 25), (0, 0)],
+    // defended
+    [(-5, 5), (5, 12), (10, 8), (0, 0), (40, 55), (0, 0)],
 ];
+
+// THREAT_BY_QUEEN: dama e' o topo, atacar peca inimiga menor com dama
+// e' pressao mas nao tanto (dama nao quer trocar por peca menor).
+// Bonus modesto. Se defendida, e' quase mau para nos (dama presa).
 const THREAT_BY_QUEEN: [[(i32, i32); 6]; 2] = [
-    [(5, 15), (15, 20), (15, 25), (10, 10), (0, 0), (0, 0)],
+    // undefended
+    [(5, 15), (18, 20), (18, 22), (12, 10), (0, 0), (0, 0)],
+    // defended
     [(0, 5), (0, 5), (-5, 15), (-5, 5), (0, 0), (0, 0)],
 ];
-const THREAT_BY_KING: [(i32, i32); 6] = [(30, 15), (30, 25), (60, 20), (50, 5), (0, 0), (0, 0)];
-// "hit queen": peca nossa a 1 movimento de atacar a dama inimiga.
+
+// THREAT_BY_KING: rei so' ataca coisas se nao defendidas (senao morre).
+// Padrao end-game (rei activo).
+const THREAT_BY_KING: [(i32, i32); 6] = [(30, 20), (35, 30), (65, 25), (55, 10), (0, 0), (0, 0)];
+
+// Hit-queen: peca menor a UM movimento de atacar a dama inimiga (a
+// partir de casa segura). Valores baixos (a ameaca ainda nao aconteceu).
 const KNIGHT_HIT_QUEEN: (i32, i32) = (8, 5);
-const BISHOP_HIT_QUEEN: (i32, i32) = (12, 12);
-const ROOK_HIT_QUEEN: (i32, i32) = (12, 5);
-// Push threat: avanco de peao para casa segura que criaria nova ameaca
-// a peca inimiga nao-peao. Padrao HCE, usado em muitos motores.
-const PUSH_THREAT: (i32, i32) = (10, 12);
-// Casas restritas ao adversario (nos temos 2+ ataques, eles nao).
+const BISHOP_HIT_QUEEN: (i32, i32) = (14, 12);
+const ROOK_HIT_QUEEN: (i32, i32) = (14, 5);
+// Peao a UM push de atacar peca inimiga nao-peao (a partir de casa
+// safe). Padrao "pawn storm creates threat".
+const PUSH_THREAT: (i32, i32) = (12, 15);
+// Casas restritas ao adversario (nos double-attackamos, eles nao
+// double-defendem, mas eles ainda atacam). Reflecte "controlo do
+// espaco". Valor pequeno.
 const RESTRICTED_SQUARES: (i32, i32) = (2, 3);
 
-// Peoes -- tabelas indexadas por rank relativo (0..7; 0 e 7 nunca
-// aplicam porque peoes nunca la estao).
-const PAWN_PHALANX: [(i32, i32); 8] = [(0,0),(5,0),(10,5),(15,10),(30,25),(60,80),(100,150),(0,0)];
-const DEFENDED_PAWN: [(i32, i32); 8] = [(0,0),(0,0),(12,10),(10,12),(18,25),(35,55),(70,110),(0,0)];
-const ISOLATED_PAWN: (i32, i32) = (-8, -8);
-const DOUBLED_PAWN: (i32, i32) = (-8, -20);
-const PASSED_PAWN: [(i32, i32); 8] = [(0,0),(0,0),(0,0),(-20,-15),(-5,25),(30,100),(80,180),(0,0)];
+// === Pawn structure ===
+// Todas as tabelas indexadas por RANK RELATIVO (rank 0 = nossa 1a
+// fileira; rank 7 = 8a fileira / promocao). Slots 0/7 sao 0 porque
+// peoes nao existem la.
+//
+// PAWN_PHALANX: peao adjacente na mesma fileira -- estrutura forte,
+// especialmente perto de promocao (peoes avancados juntos suportam
+// promocao). Cresce quase quadraticamente com rank.
+const PAWN_PHALANX: [(i32, i32); 8] = [
+    (0, 0), (5, 0), (10, 5), (18, 12), (35, 30), (65, 100), (110, 175), (0, 0),
+];
+// DEFENDED_PAWN: peao suportado por outro peao proprio -- estabilidade.
+// Menos importante que phalanx (que promove junto), mas relevante.
+const DEFENDED_PAWN: [(i32, i32); 8] = [
+    (0, 0), (0, 0), (12, 10), (10, 12), (18, 22), (35, 55), (70, 110), (0, 0),
+];
+// ISOLATED_PAWN: sem peoes adjacentes -- fraqueza estrutural (nao pode
+// ser defendido por peao). Pior no eg (fica exposto sem pecas para
+// tapar).
+const ISOLATED_PAWN: (i32, i32) = (-10, -12);
+// DOUBLED_PAWN: por peao excedente na mesma coluna. Mg moderado (bloqueia
+// avanco proprio); eg severo (torre atras nao chega a promover).
+const DOUBLED_PAWN: (i32, i32) = (-10, -25);
+// PASSED_PAWN: nenhum peao inimigo no caminho para a promocao.
+// Cresce fortemente com rank (mais perto da promocao). Baixo mg (mais
+// pecas no meio da tabuleiro), alto eg (perto do fim, peao passado
+// muitas vezes ganha).
+const PASSED_PAWN: [(i32, i32); 8] = [
+    (0, 0), (0, 0), (0, 0), (-10, 5), (5, 40), (35, 110), (100, 200), (0, 0),
+];
 
 /// Avalia mobilidade, pressao sobre o rei inimigo, par de bispos, torres
 /// em colunas abertas/semi-abertas e estrutura de peoes usando os pesos
