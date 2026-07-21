@@ -141,12 +141,66 @@ fn gen_from_attacks(out: &mut Vec<Move>, from: Square, targets: Bitboard, board:
 /// per candidate move, at every single node. Requires `&mut Board`
 /// instead of `&Board` -- every call site already holds a `&mut Board`
 /// or an owned `Board`, so this is a mechanical signature change.
+/// Bitboard of our pieces that are absolutely pinned to our king by an
+/// enemy slider (found in review, 2026-07-21). A non-pinned, non-king
+/// move that isn't en passant can never expose our own king, so its
+/// legality needs no make/unmake test -- that's the fast path in
+/// generate_legal below. Computed once per position: for each enemy
+/// slider that would hit our king on an otherwise-empty board (a
+/// "sniper"), if exactly one piece sits between it and the king, that
+/// piece is pinned.
+fn compute_pinned(board: &Board, atk: &Attacks, us: Color, king_sq: Square) -> Bitboard {
+    let them = us.opp();
+    let occ = board.occ_all;
+    let enemy_rq = board.pieces[them.idx()][PieceType::Rook.idx()]
+        | board.pieces[them.idx()][PieceType::Queen.idx()];
+    let enemy_bq = board.pieces[them.idx()][PieceType::Bishop.idx()]
+        | board.pieces[them.idx()][PieceType::Queen.idx()];
+    // Snipers: sliders aligned with the king as if the board were empty.
+    let snipers = (rook_attacks(king_sq, 0) & enemy_rq) | (bishop_attacks(king_sq, 0) & enemy_bq);
+    let mut pinned = 0u64;
+    let mut s = snipers;
+    while s != 0 {
+        let sniper_sq = s.trailing_zeros() as Square;
+        s &= s - 1;
+        let between = atk.between[king_sq as usize][sniper_sq as usize];
+        let blockers = between & occ;
+        // Exactly one piece between king and sniper, and it's ours ->
+        // pinned. (If that one piece is theirs it's not our pin; if two+
+        // pieces, no pin.)
+        if blockers.count_ones() == 1 && (blockers & board.occ_color[us.idx()]) != 0 {
+            pinned |= blockers;
+        }
+    }
+    pinned
+}
+
 pub fn generate_legal(board: &mut Board, atk: &Attacks) -> Vec<Move> {
     let mut pseudo = Vec::with_capacity(64);
     generate_pseudo_legal(board, atk, &mut pseudo);
+    let us = board.side;
+    let king_sq = board.king_sq(us);
+    let in_check = board.in_check(us, atk);
+    let pinned = compute_pinned(board, atk, us, king_sq);
     let mut legal = Vec::with_capacity(pseudo.len());
     for mv in pseudo {
-        let us = board.side;
+        // Fast path: when not in check, a move by a non-pinned piece
+        // that is neither a king move nor en passant cannot leave our
+        // own king in check -- accept it without a make/unmake test.
+        // Everything else (in check, pinned piece, king move, en
+        // passant) falls back to the exact make/unmake check, which is
+        // known-correct and validated by perft. Pinned pieces are NOT
+        // simply rejected -- a pinned piece can still move along the
+        // pin ray (or capture the pinner), so those go through the
+        // fallback too rather than being wrongly dropped.
+        let needs_check = in_check
+            || mv.from == king_sq
+            || mv.flag == MoveFlag::EnPassant
+            || (bb(mv.from) & pinned) != 0;
+        if !needs_check {
+            legal.push(mv);
+            continue;
+        }
         let undo = board.make_move(&mv);
         let illegal = board.in_check(us, atk);
         board.unmake_move(&mv, &undo);
