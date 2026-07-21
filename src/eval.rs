@@ -479,6 +479,100 @@ const PASSED_PAWN: [(i32, i32); 8] = [
     (0, 0), (0, 0), (0, 0), (-10, 5), (5, 40), (35, 110), (100, 200), (0, 0),
 ];
 
+/// Runtime-adjustable copy of every constant `positional_terms()` uses
+/// (mobility/king-safety/threats/pawn-structure -- NOT material/PST,
+/// those stay compile-time consts read via the incremental board
+/// accumulators in board.rs, a performance-critical path this struct
+/// deliberately doesn't touch). `Default` just copies the existing
+/// consts field-by-field -- never retyped by hand -- so building this
+/// struct cannot introduce a transcription error: `default_weights()`
+/// is byte-for-byte what `positional_terms()` already computed before
+/// this struct existed. This is the prerequisite for real Texel Tuning
+/// (see src/tuning.rs): the tuner builds its own `Weights`, nudges
+/// fields, and calls `positional_terms(board, &candidate)` to score
+/// datasets -- the live search keeps using `default_weights()`
+/// unchanged until a tuning run's result is deliberately copied back
+/// into the consts above.
+#[derive(Clone)]
+pub struct Weights {
+    pub bishop_pair: (i32, i32),
+    pub long_diag_bishop: (i32, i32),
+    pub minor_behind_pawn: (i32, i32),
+    pub knight_outpost: (i32, i32),
+    pub rook_open: [(i32, i32); 2],
+    pub tempo: (i32, i32),
+    pub mobility_knight: [(i32, i32); 28],
+    pub mobility_bishop: [(i32, i32); 28],
+    pub mobility_rook: [(i32, i32); 28],
+    pub mobility_queen: [(i32, i32); 28],
+    pub king_attacker_weight: [(i32, i32); 4],
+    pub king_attacks: (i32, i32),
+    pub king_danger_table: [i32; 128],
+    pub pawn_shelter: [(i32, i32); 4],
+    pub shelter_open: (i32, i32),
+    pub pawn_storm: [(i32, i32); 4],
+    pub threat_by_pawn: [[(i32, i32); 6]; 2],
+    pub threat_by_knight: [[(i32, i32); 6]; 2],
+    pub threat_by_bishop: [[(i32, i32); 6]; 2],
+    pub threat_by_rook: [[(i32, i32); 6]; 2],
+    pub threat_by_queen: [[(i32, i32); 6]; 2],
+    pub threat_by_king: [(i32, i32); 6],
+    pub knight_hit_queen: (i32, i32),
+    pub bishop_hit_queen: (i32, i32),
+    pub rook_hit_queen: (i32, i32),
+    pub push_threat: (i32, i32),
+    pub restricted_squares: (i32, i32),
+    pub pawn_phalanx: [(i32, i32); 8],
+    pub defended_pawn: [(i32, i32); 8],
+    pub isolated_pawn: (i32, i32),
+    pub doubled_pawn: (i32, i32),
+    pub passed_pawn: [(i32, i32); 8],
+}
+
+impl Default for Weights {
+    fn default() -> Self {
+        Weights {
+            bishop_pair: BISHOP_PAIR,
+            long_diag_bishop: LONG_DIAG_BISHOP,
+            minor_behind_pawn: MINOR_BEHIND_PAWN,
+            knight_outpost: KNIGHT_OUTPOST,
+            rook_open: ROOK_OPEN,
+            tempo: TEMPO,
+            mobility_knight: MOBILITY_KNIGHT,
+            mobility_bishop: MOBILITY_BISHOP,
+            mobility_rook: MOBILITY_ROOK,
+            mobility_queen: MOBILITY_QUEEN,
+            king_attacker_weight: KING_ATTACKER_WEIGHT,
+            king_attacks: KING_ATTACKS,
+            king_danger_table: KING_DANGER_TABLE,
+            pawn_shelter: PAWN_SHELTER,
+            shelter_open: SHELTER_OPEN,
+            pawn_storm: PAWN_STORM,
+            threat_by_pawn: THREAT_BY_PAWN,
+            threat_by_knight: THREAT_BY_KNIGHT,
+            threat_by_bishop: THREAT_BY_BISHOP,
+            threat_by_rook: THREAT_BY_ROOK,
+            threat_by_queen: THREAT_BY_QUEEN,
+            threat_by_king: THREAT_BY_KING,
+            knight_hit_queen: KNIGHT_HIT_QUEEN,
+            bishop_hit_queen: BISHOP_HIT_QUEEN,
+            rook_hit_queen: ROOK_HIT_QUEEN,
+            push_threat: PUSH_THREAT,
+            restricted_squares: RESTRICTED_SQUARES,
+            pawn_phalanx: PAWN_PHALANX,
+            defended_pawn: DEFENDED_PAWN,
+            isolated_pawn: ISOLATED_PAWN,
+            doubled_pawn: DOUBLED_PAWN,
+            passed_pawn: PASSED_PAWN,
+        }
+    }
+}
+
+static DEFAULT_WEIGHTS: OnceLock<Weights> = OnceLock::new();
+pub fn default_weights() -> &'static Weights {
+    DEFAULT_WEIGHTS.get_or_init(Weights::default)
+}
+
 /// Avalia mobilidade, pressao sobre o rei inimigo, par de bispos, torres
 /// em colunas abertas/semi-abertas e estrutura de peoes usando os pesos
 /// tunados do Sirius v9.0 (ver constantes acima) -- consistente com as
@@ -499,7 +593,7 @@ fn pawn_attacks_by(board: &Board, by: Color) -> Bitboard {
     }
 }
 
-fn positional_terms(board: &Board) -> i32 {
+pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
     let a = atk();
     let occ = board.occ_all;
     let mut mg = 0i32;
@@ -542,8 +636,8 @@ fn positional_terms(board: &Board) -> i32 {
         let mut king_attack_units = (0i32, 0i32);
 
         if count(board.pieces[c.idx()][PieceType::Bishop.idx()]) >= 2 {
-            mg += sign * BISHOP_PAIR.0;
-            eg += sign * BISHOP_PAIR.1;
+            mg += sign * w.bishop_pair.0;
+            eg += sign * w.bishop_pair.1;
         }
 
         for pt in [PieceType::Knight, PieceType::Bishop, PieceType::Rook, PieceType::Queen] {
@@ -570,11 +664,11 @@ fn positional_terms(board: &Board) -> i32 {
                 let enemy_pawn_attacks = attacked_by_pt[c.opp().idx()][PieceType::Pawn.idx()];
                 let mobility = count(attacks & !own & !enemy_pawn_attacks) as usize;
                 let mob_table = match pt {
-                    PieceType::Knight => &MOBILITY_KNIGHT,
-                    PieceType::Bishop => &MOBILITY_BISHOP,
-                    PieceType::Rook => &MOBILITY_ROOK,
-                    PieceType::Queen => &MOBILITY_QUEEN,
-                    _ => &MOBILITY_KNIGHT,
+                    PieceType::Knight => &w.mobility_knight,
+                    PieceType::Bishop => &w.mobility_bishop,
+                    PieceType::Rook => &w.mobility_rook,
+                    PieceType::Queen => &w.mobility_queen,
+                    _ => &w.mobility_knight,
                 };
                 let m = mob_table[mobility.min(27)];
                 mg += sign * m.0;
@@ -590,9 +684,9 @@ fn positional_terms(board: &Board) -> i32 {
                         PieceType::Queen => 3,
                         _ => 0,
                     };
-                    let w = KING_ATTACKER_WEIGHT[widx];
-                    king_attack_units.0 += w.0 + hits * KING_ATTACKS.0;
-                    king_attack_units.1 += w.1 + hits * KING_ATTACKS.1;
+                    let aw = w.king_attacker_weight[widx];
+                    king_attack_units.0 += aw.0 + hits * w.king_attacks.0;
+                    king_attack_units.1 += aw.1 + hits * w.king_attacks.1;
                 }
 
                 if pt == PieceType::Rook {
@@ -601,8 +695,8 @@ fn positional_terms(board: &Board) -> i32 {
                     let enemy_pawns_on_file = board.pieces[c.opp().idx()][PieceType::Pawn.idx()] & file_mask;
                     if own_pawns_on_file == 0 {
                         let idx = if enemy_pawns_on_file == 0 { 0 } else { 1 };
-                        mg += sign * ROOK_OPEN[idx].0;
-                        eg += sign * ROOK_OPEN[idx].1;
+                        mg += sign * w.rook_open[idx].0;
+                        eg += sign * w.rook_open[idx].1;
                     }
                 }
 
@@ -613,8 +707,8 @@ fn positional_terms(board: &Board) -> i32 {
                     if (0..8).contains(&front_r)
                         && board.pieces[c.idx()][PieceType::Pawn.idx()] & bb(sq(f as u8, front_r as u8)) != 0
                     {
-                        mg += sign * MINOR_BEHIND_PAWN.0;
-                        eg += sign * MINOR_BEHIND_PAWN.1;
+                        mg += sign * w.minor_behind_pawn.0;
+                        eg += sign * w.minor_behind_pawn.1;
                     }
 
                     if pt == PieceType::Knight {
@@ -628,8 +722,8 @@ fn positional_terms(board: &Board) -> i32 {
                                 }
                             }
                             if defended && !ever_attackable {
-                                mg += sign * KNIGHT_OUTPOST.0;
-                                eg += sign * KNIGHT_OUTPOST.1;
+                                mg += sign * w.knight_outpost.0;
+                                eg += sign * w.knight_outpost.1;
                             }
                         }
                     }
@@ -638,8 +732,8 @@ fn positional_terms(board: &Board) -> i32 {
                 if pt == PieceType::Bishop {
                     let center: Bitboard = bb(sq(3, 3)) | bb(sq(4, 3)) | bb(sq(3, 4)) | bb(sq(4, 4));
                     if count(attacks & center) >= 2 {
-                        mg += sign * LONG_DIAG_BISHOP.0;
-                        eg += sign * LONG_DIAG_BISHOP.1;
+                        mg += sign * w.long_diag_bishop.0;
+                        eg += sign * w.long_diag_bishop.1;
                     }
                 }
             }
@@ -647,7 +741,7 @@ fn positional_terms(board: &Board) -> i32 {
 
         if king_attackers >= 2 {
             let danger_idx = king_attack_units.0.clamp(0, 127) as usize;
-            mg += sign * KING_DANGER_TABLE[danger_idx];
+            mg += sign * w.king_danger_table[danger_idx];
             eg += sign * king_attack_units.1;
         }
 
@@ -676,19 +770,19 @@ fn positional_terms(board: &Board) -> i32 {
             let enemy_pawns = board.pieces[c.opp().idx()][PieceType::Pawn.idx()] & file_mask;
             match shield_pawn_offset(own_pawns, kr, white) {
                 None => {
-                    mg += sign * SHELTER_OPEN.0;
-                    eg += sign * SHELTER_OPEN.1;
+                    mg += sign * w.shelter_open.0;
+                    eg += sign * w.shelter_open.1;
                 }
                 Some(off) => {
                     let idx = (off - 1).clamp(0, 3) as usize;
-                    mg += sign * PAWN_SHELTER[idx].0;
-                    eg += sign * PAWN_SHELTER[idx].1;
+                    mg += sign * w.pawn_shelter[idx].0;
+                    eg += sign * w.pawn_shelter[idx].1;
                 }
             }
             if let Some(off) = shield_pawn_offset(enemy_pawns, kr, white) {
                 let idx = (off - 1).clamp(0, 3) as usize;
-                mg += sign * PAWN_STORM[idx].0;
-                eg += sign * PAWN_STORM[idx].1;
+                mg += sign * w.pawn_storm[idx].0;
+                eg += sign * w.pawn_storm[idx].1;
             }
         }
     }
@@ -720,17 +814,17 @@ fn positional_terms(board: &Board) -> i32 {
             t &= t - 1;
             let defended = (defended_bb & bb(s)) != 0;
             if let Some((pt, _)) = board.piece_at(s) {
-                let entry = THREAT_BY_PAWN[defended as usize][pt.idx()];
+                let entry = w.threat_by_pawn[defended as usize][pt.idx()];
                 mg += sign * entry.0;
                 eg += sign * entry.1;
             }
         }
         // Threats por cavalo/bispo/torre/dama.
         for (pt_us, table) in [
-            (PieceType::Knight, &THREAT_BY_KNIGHT),
-            (PieceType::Bishop, &THREAT_BY_BISHOP),
-            (PieceType::Rook, &THREAT_BY_ROOK),
-            (PieceType::Queen, &THREAT_BY_QUEEN),
+            (PieceType::Knight, &w.threat_by_knight),
+            (PieceType::Bishop, &w.threat_by_bishop),
+            (PieceType::Rook, &w.threat_by_rook),
+            (PieceType::Queen, &w.threat_by_queen),
         ] {
             let mut t = attacked_by_pt[us][pt_us.idx()] & their_pieces;
             // Dama nao conta ameacas ao rei (o mate cobre isso).
@@ -754,8 +848,8 @@ fn positional_terms(board: &Board) -> i32 {
             let s = t.trailing_zeros() as Square;
             t &= t - 1;
             if let Some((pt, _)) = board.piece_at(s) {
-                mg += sign * THREAT_BY_KING[pt.idx()].0;
-                eg += sign * THREAT_BY_KING[pt.idx()].1;
+                mg += sign * w.threat_by_king[pt.idx()].0;
+                eg += sign * w.threat_by_king[pt.idx()].1;
             }
         }
 
@@ -764,8 +858,8 @@ fn positional_terms(board: &Board) -> i32 {
         // attackedBy2[us] & ~attackedBy2[them] & attacked[them].
         let restricted = attacked_by_2[us] & !attacked_by_2[them] & attacked[them];
         let n_restr = count(restricted) as i32;
-        mg += sign * RESTRICTED_SQUARES.0 * n_restr;
-        eg += sign * RESTRICTED_SQUARES.1 * n_restr;
+        mg += sign * w.restricted_squares.0 * n_restr;
+        eg += sign * w.restricted_squares.1 * n_restr;
 
         // Push threats: um peao nosso pode avancar 1 casa (ou 2 se
         // ainda esta' na fileira inicial) para uma casa "segura" e
@@ -799,8 +893,8 @@ fn positional_terms(board: &Board) -> i32 {
         };
         let non_pawn_enemies = their_pieces & !board.pieces[them][PieceType::Pawn.idx()];
         let n_push_threats = count(push_attacks_on_enemy & non_pawn_enemies) as i32;
-        mg += sign * PUSH_THREAT.0 * n_push_threats;
-        eg += sign * PUSH_THREAT.1 * n_push_threats;
+        mg += sign * w.push_threat.0 * n_push_threats;
+        eg += sign * w.push_threat.1 * n_push_threats;
 
         // Hit-queen: peca menor/torre nossa esta' a UMA-JOGADA de
         // atacar a dama inimiga a partir de casa segura.
@@ -813,15 +907,15 @@ fn positional_terms(board: &Board) -> i32 {
             // Sirius: knight hits nao precisa de attackedBy2[us], mas
             // bishop/rook precisam (targets &= attackedBy2[us]).
             let n_knight_hit = count(targets_base & knight_hits & attacked_by_pt[us][PieceType::Knight.idx()]) as i32;
-            mg += sign * KNIGHT_HIT_QUEEN.0 * n_knight_hit;
-            eg += sign * KNIGHT_HIT_QUEEN.1 * n_knight_hit;
+            mg += sign * w.knight_hit_queen.0 * n_knight_hit;
+            eg += sign * w.knight_hit_queen.1 * n_knight_hit;
             let targets_double = targets_base & attacked_by_2[us];
             let n_bishop_hit = count(targets_double & bishop_hits & attacked_by_pt[us][PieceType::Bishop.idx()]) as i32;
-            mg += sign * BISHOP_HIT_QUEEN.0 * n_bishop_hit;
-            eg += sign * BISHOP_HIT_QUEEN.1 * n_bishop_hit;
+            mg += sign * w.bishop_hit_queen.0 * n_bishop_hit;
+            eg += sign * w.bishop_hit_queen.1 * n_bishop_hit;
             let n_rook_hit = count(targets_double & rook_hits & attacked_by_pt[us][PieceType::Rook.idx()]) as i32;
-            mg += sign * ROOK_HIT_QUEEN.0 * n_rook_hit;
-            eg += sign * ROOK_HIT_QUEEN.1 * n_rook_hit;
+            mg += sign * w.rook_hit_queen.0 * n_rook_hit;
+            eg += sign * w.rook_hit_queen.1 * n_rook_hit;
         }
     }
 
@@ -853,8 +947,8 @@ fn positional_terms(board: &Board) -> i32 {
                 if enemy_pawns & m != 0 { blocked = true; break; }
             }
             if !blocked {
-                mg += sign * PASSED_PAWN[rel_rank].0;
-                eg += sign * PASSED_PAWN[rel_rank].1;
+                mg += sign * w.passed_pawn[rel_rank].0;
+                eg += sign * w.passed_pawn[rel_rank].1;
             }
 
             // Peao isolado.
@@ -864,23 +958,23 @@ fn positional_terms(board: &Board) -> i32 {
                 if own_pawns & (FILE_A << adj) != 0 { has_neighbor = true; break; }
             }
             if !has_neighbor {
-                mg += sign * ISOLATED_PAWN.0;
-                eg += sign * ISOLATED_PAWN.1;
+                mg += sign * w.isolated_pawn.0;
+                eg += sign * w.isolated_pawn.1;
             }
 
             // Peao defendido por outro peao proprio (usa mesmo truque
             // reversed pawn-attack table do SEE em search.rs).
             if a.pawn[c.opp().idx()][s as usize] & own_pawns != 0 {
-                mg += sign * DEFENDED_PAWN[rel_rank].0;
-                eg += sign * DEFENDED_PAWN[rel_rank].1;
+                mg += sign * w.defended_pawn[rel_rank].0;
+                eg += sign * w.defended_pawn[rel_rank].1;
             }
 
             // Falange (outro peao proprio na mesma fileira, coluna
             // adjacente).
             for adj in [f - 1, f + 1] {
                 if (0..8).contains(&adj) && own_pawns & bb(sq(adj as u8, r as u8)) != 0 {
-                    mg += sign * PAWN_PHALANX[rel_rank].0;
-                    eg += sign * PAWN_PHALANX[rel_rank].1;
+                    mg += sign * w.pawn_phalanx[rel_rank].0;
+                    eg += sign * w.pawn_phalanx[rel_rank].1;
                     break;
                 }
             }
@@ -890,18 +984,18 @@ fn positional_terms(board: &Board) -> i32 {
         for file in 0..8 {
             let n = count(own_pawns & (FILE_A << file)) as i32;
             if n > 1 {
-                mg += sign * DOUBLED_PAWN.0 * (n - 1);
-                eg += sign * DOUBLED_PAWN.1 * (n - 1);
+                mg += sign * w.doubled_pawn.0 * (n - 1);
+                eg += sign * w.doubled_pawn.1 * (n - 1);
             }
         }
     }
 
     // Tempo -- bonus para quem tem a jogar. Aplicado como (mg,eg) do
-    // ponto de vista das brancas: se e' a vez das brancas, +TEMPO; se
-    // e' a vez das pretas, -TEMPO. Sirius aplica assim mesmo.
+    // ponto de vista das brancas: se e' a vez das brancas, +w.tempo; se
+    // e' a vez das pretas, -w.tempo. Sirius aplica assim mesmo.
     let tempo_sign = if board.side == Color::White { 1 } else { -1 };
-    mg += tempo_sign * TEMPO.0;
-    eg += tempo_sign * TEMPO.1;
+    mg += tempo_sign * w.tempo.0;
+    eg += tempo_sign * w.tempo.1;
 
     // Interpolacao final pela fase actual do board (mesma logica de
     // material_pst; fase mantida incrementalmente em add_piece/
@@ -966,7 +1060,7 @@ fn material_pst(board: &Board) -> i32 {
 }
 
 fn positional_terms_signed(board: &Board) -> i32 {
-    let p = positional_terms(board);
+    let p = positional_terms(board, default_weights());
     if board.side == Color::White {
         p
     } else {
