@@ -161,8 +161,8 @@ const EG_KING: [i32; 64] = [
 ///  - Dama 950 mg / 960 eg: dama mantem-se (ambas fases).
 ///  - Rei 0: nao conta na soma material.
 /// Distintos de PieceType::value() (usado por SEE/MVV-LVA sem fase).
-const MG_VALUE: [i32; 6] = [100, 320, 335, 500, 950, 0];
-const EG_VALUE: [i32; 6] = [115, 285, 335, 550, 960, 0];
+const MG_VALUE: [i32; 6] = [125, 340, 355, 520, 990, 0];
+const EG_VALUE: [i32; 6] = [140, 300, 350, 570, 990, 0];
 
 /// Incremento de fase por peca -- 4 cavalos+4 bispos+4 torres+2 damas =
 /// 4*1+4*1+4*2+2*4 = 24 = fase maxima (abertura). Fase 0 = so' reis e

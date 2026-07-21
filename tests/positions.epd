@@ -75,3 +75,28 @@ r1bq1rk1/pppp1ppp/2n2n2/2b1p3/2B1P3/2NP1N2/PPP2PPP/R1BQ1RK1 w - - 0 6 bm c1g5 f3
 
 # --- Zugzwang / opposition ---
 8/8/8/3k4/8/3K4/8/8 w - - 0 1 bm d3c3 d3e3; id "opposition-lateral";
+
+# =========================================================
+# Mate-in-1 positions -- verified via python-chess. Unambiguous
+# solutions. Tactical calibrator with zero label debate.
+# =========================================================
+
+# KQ vs K: queen next to enemy king -- Qg7#
+7k/8/6QK/8/8/8/8/8 w - - 0 1 bm g6g7; id "m1-kqk-corner";
+
+# Back-rank mate: rook to 8th rank, escape blocked by own pawns
+6k1/5ppp/8/8/8/8/8/3R2K1 w - - 0 1 bm d1d8; id "m1-back-rank";
+
+# Two queens: g6+g5 dominate; Qg7#
+7k/8/6QK/6Q1/8/8/8/8 w - - 0 1 bm g6g7 g5g8; id "m1-two-queen";
+
+# --- Hanging pieces (unambiguous captures) ---
+# White knight on d5 undefended; black takes with rook
+r3r1k1/pp3ppp/8/3N4/8/8/PP3PPP/3R1RK1 b - - 0 1 bm e8d5 a8d5; id "hanging-knight-take";
+
+# --- Simple recaptures (should always be found) ---
+# White captured on e5 with pawn (dxe5); black must recapture with pawn
+rnbqkbnr/ppp2ppp/3p4/4P3/8/8/PPP1PPPP/RNBQKBNR b KQkq - 0 3 bm d6e5; id "recapture-simple-pawn";
+
+# White captured on d5 with knight (Nxd5); black should recapture (knight, pawn or queen)
+rnbqkb1r/ppp1pppp/8/3N4/8/8/PPP1PPPP/R1BQKBNR b KQkq - 0 4 bm g8f6 e7e6 c7c6 d8d5; id "recapture-simple-knight";
