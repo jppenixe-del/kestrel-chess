@@ -396,11 +396,12 @@ impl Engine {
     /// interval of every other, without needing a shared atomic flag.
     ///
     /// Result selection ("best thread"): the thread that reached the
-    /// greatest depth wins (ties broken by score, then by thread index) --
-    /// the standard simplified heuristic (a full implementation would also
-    /// weigh vote consistency across threads; not worth the complexity
-    /// here). Returns the winning thread's own `Searcher` so the caller
-    /// can still call `extract_pv()` against the TT it populated.
+    /// greatest depth wins (ties broken by score, then by thread index),
+    /// with a consensus safeguard against that thread being a lone
+    /// outlier the other threads disagree with (see the comment at the
+    /// vote-counting block below). Returns the winning thread's own
+    /// `Searcher` so the caller can still call `extract_pv()` against the
+    /// TT it populated.
     fn search_mt(
         &self,
         board: &Board,
@@ -447,6 +448,44 @@ impl Engine {
                     || (results[i].2 == results[best_idx].2 && results[i].1 > results[best_idx].1);
                 if better {
                     best_idx = i;
+                }
+            }
+            // Consensus safeguard (2026-07-21): "deepest thread wins" is a
+            // lone-outlier risk -- traced a real bullet loss to exactly
+            // this: one thread's search settled on a move (hanging a
+            // rook) that no other thread agreed with, won the tie-break
+            // by reaching one ply deeper, and got played. 20 repeated
+            // trials of that exact position/clock never reproduced it
+            // again (17/20 gave the objectively good move, 3/20 a
+            // different-but-sound trade), confirming it was thread-
+            // selection variance, not a deterministic eval/search bug.
+            // If the naive winner's move is a lone outlier that most
+            // OTHER threads disagree with, prefer whichever move the
+            // plurality of threads actually settled on instead (using
+            // the deepest thread among those that agree with it) --
+            // costs nothing when threads agree (the common case), only
+            // overrides the rare case where the deepest thread is
+            // alone against the rest.
+            if results.len() > 2 {
+                let vote_count = |mv: Option<crate::moves::Move>| results.iter().filter(|r| r.0 == mv).count();
+                let winner_move = results[best_idx].0;
+                let winner_votes = vote_count(winner_move);
+                let mut plurality_move = winner_move;
+                let mut plurality_votes = winner_votes;
+                for r in &results {
+                    let v = vote_count(r.0);
+                    if v > plurality_votes {
+                        plurality_votes = v;
+                        plurality_move = r.0;
+                    }
+                }
+                if plurality_votes > winner_votes && plurality_move != winner_move {
+                    if let Some(alt_idx) = (0..results.len())
+                        .filter(|&i| results[i].0 == plurality_move)
+                        .max_by_key(|&i| (results[i].2, results[i].1))
+                    {
+                        best_idx = alt_idx;
+                    }
                 }
             }
             let nodes_total: u64 = results.iter().map(|r| r.3).sum();
