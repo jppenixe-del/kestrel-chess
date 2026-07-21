@@ -720,6 +720,55 @@ impl<'a> Searcher<'a> {
                 return if in_check { -MATE_SCORE + ply as i32 } else { 0 };
             }
         }
+
+        // ProbCut: at reasonable depth, a capture that already beats a
+        // margin ABOVE the real beta in a cheap verification search is
+        // very likely to also beat the real beta with a full search --
+        // cut immediately instead of paying for it. Standard technique
+        // (Stockfish/many engines). Guards: not in check, not root (ply
+        // > 0, keeps root_best always defined), not during a singular
+        // re-search (keeps TT semantics simple), far from mate scores
+        // (never risk masking a real mate).
+        if depth >= 5
+            && ply > 0
+            && !in_check
+            && excluded.is_none()
+            && beta.abs() < MATE_SCORE - MAX_PLY as i32
+        {
+            let prob_beta = beta + 150;
+            if prob_beta < MATE_SCORE - MAX_PLY as i32 {
+                for mv in &moves {
+                    if !mv.is_capture() && mv.promotion.is_none() {
+                        continue;
+                    }
+                    // SEE pre-filter: skip captures whose max plausible
+                    // gain can't reach prob_beta from here anyway.
+                    if static_eval + self.see(board, mv) < prob_beta {
+                        continue;
+                    }
+                    let undo = board.make_move(mv);
+                    if ply + 1 < MAX_PLY {
+                        if let Some((moved_pt, _)) = board.piece_at(mv.to) {
+                            self.ply_last_move[ply + 1] = Some((moved_pt, mv.to));
+                        }
+                    }
+                    // Cheap verification at depth 1, then a real (but
+                    // reduced) search only if the quick probe holds up.
+                    let mut score = -self.negamax(board, 1, -prob_beta, -prob_beta + 1, ply + 1);
+                    if score >= prob_beta && !self.stop {
+                        score = -self.negamax(board, depth - 4, -prob_beta, -prob_beta + 1, ply + 1);
+                    }
+                    board.unmake_move(mv, &undo);
+                    if self.stop {
+                        return 0;
+                    }
+                    if score >= prob_beta {
+                        return score;
+                    }
+                }
+            }
+        }
+
         // Singular extensions -- port directo do padrao Sirius
         // (search.cpp): se o tt_move parece dominante (a TT diz "este
         // e' bom o suficiente" com bound Lower ou Exact e depth similar
