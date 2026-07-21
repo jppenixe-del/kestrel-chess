@@ -9,170 +9,151 @@ fn atk() -> &'static Attacks {
     ATTACKS.get_or_init(Attacks::new)
 }
 
-// Tapered piece-square tables e valores de material portados
-// literalmente do Sirius v9.0 (`src/eval/eval_constants.h`, mcthouacbb) --
-// motor #1 em HCE puro na sua tier, tabelas afinadas por Texel Tuning.
-// Duas conversoes de layout, sem alterar valores:
-//   1. Sirius armazena rank8-first (row 0 = 8a fileira); Kestrel usa
-//      rank1-first (row 0 = 1a fileira). O script
-//      `port_sirius_psqt.py` (scratchpad) inverte a ordem das linhas.
-//   2. Sirius usa king-buckets: a PSQT do Rei so' preenche files a-d;
-//      files e-h vem de um espelho horizontal quando o rei esta' no
-//      king-side. Kestrel nao tem esse mecanismo -- o port "materializa"
-//      esse espelho, os 4 files da direita sao copias espelhadas dos
-//      da esquerda. Resultado equivalente ao par
-//      (bucket-0-tabela + espelho horizontal) do Sirius.
-//
-// Nota importante (2026-07-20): num A/B self-play de 30 jogos, o motor
-// com estas tabelas + o `positional_terms` (que continua com pesos
-// calibrados a olho, nao afinados em conjunto com estas escalas) marcou
-// 26.7% -- interpretei mal esse sinal e cheguei a reverter. Correcao
-// registada em memoria (ver feedback_kestrel_nao_reverter_por_self_play_pequeno):
-// 30 jogos self-play nao tem resolucao para detectar Elo real; o codigo
-// e' correcto (portagem literal validada), o teste era fraco. A afinacao
-// dos pesos do positional_terms para a escala nova (Texel Tuning proprio)
-// e um passo separado, futuro.
+// Tapered piece-square tables (perspetiva das brancas, a1=indice 0 ..
+// h8=indice 63 -- peca preta usa espelho vertical). PSQT public
+// "PeSTO" (chessprogramming wiki), ponto de partida educacional
+// clássico -- valores para afinar via Texel Tuning proprio a seguir,
+// nao um estado final. Convertidas de rank8-first (formato da pagina)
+// para rank1-first (convencao deste codigo).
 #[rustfmt::skip]
 const MG_PAWN: [i32; 64] = [
-        0,     0,     0,     0,     0,     0,     0,     0,
-       -2,    24,    23,     5,    -1,    -4,    -9,   -16,
-      -10,    11,     2,     6,    -3,    -8,   -18,   -20,
-       -4,    -9,    16,    16,    13,     3,   -16,   -13,
-        6,     1,     9,    10,     4,     1,    -5,    -6,
-        9,    -8,     3,     8,    -1,    -1,   -14,     1,
-       63,     6,    21,    31,    56,    39,    28,    76,
-        0,     0,     0,     0,     0,     0,     0,     0,
+       0,    0,    0,    0,    0,    0,    0,    0,
+     -35,   -1,  -20,  -23,  -15,   24,   38,  -22,
+     -26,   -4,   -4,  -10,    3,    3,   33,  -12,
+     -27,   -2,   -5,   12,   17,    6,   10,  -25,
+     -14,   13,    6,   21,   23,   12,   17,  -23,
+      -6,    7,   26,   31,   65,   56,   25,  -20,
+      98,  134,   61,   95,   68,  126,   34,  -11,
+       0,    0,    0,    0,    0,    0,    0,    0,
 ];
 #[rustfmt::skip]
 const EG_PAWN: [i32; 64] = [
-        0,     0,     0,     0,     0,     0,     0,     0,
-       -7,     6,    67,     6,    -3,    -2,    10,    -4,
-       -7,     5,     3,    -3,    -3,    -4,    10,    -8,
-       -4,    14,   -27,   -18,   -20,   -14,    11,    -5,
-       11,    19,    -5,   -17,   -17,   -10,    12,    10,
-       12,    25,    -1,   -11,   -18,    -7,    19,    11,
-       90,   103,   108,    91,    69,    68,   103,    90,
-        0,     0,     0,     0,     0,     0,     0,     0,
+       0,    0,    0,    0,    0,    0,    0,    0,
+      13,    8,    8,   10,   13,    0,    2,   -7,
+       4,    7,   -6,    1,    0,   -5,   -1,   -8,
+      13,    9,   -3,   -7,   -7,   -8,    3,   -1,
+      32,   24,   13,    5,   -2,    4,   17,   17,
+      94,  100,   85,   67,   56,   53,   82,   84,
+     178,  173,  158,  134,  147,  132,  165,  187,
+       0,    0,    0,    0,    0,    0,    0,    0,
 ];
 #[rustfmt::skip]
 const MG_KNIGHT: [i32; 64] = [
-      -26,    -9,     0,     6,    -1,   -10,   -14,   -29,
-       11,     3,     8,    12,     5,     3,    -5,   -14,
-        5,    18,    16,    14,    12,     0,     5,    -6,
-       21,    28,    25,    18,    18,    19,    18,     9,
-       30,    29,    34,    28,    33,    20,    20,    13,
-       15,     8,    30,    25,    20,    23,     9,    11,
-        0,   -13,    19,    37,    24,    22,   -18,    -6,
-      -54,   -84,  -111,    -6,   -20,   -58,  -100,   -85,
+    -105,  -21,  -58,  -33,  -17,  -28,  -19,  -23,
+     -29,  -53,  -12,   -3,   -1,   18,  -14,  -19,
+     -23,   -9,   12,   10,   19,   17,   25,  -16,
+     -13,    4,   16,   13,   28,   19,   21,   -8,
+      -9,   17,   19,   53,   37,   69,   18,   22,
+     -47,   60,   37,   65,   84,  129,   73,   44,
+     -73,  -41,   72,   36,   23,   62,    7,  -17,
+    -167,  -89,  -34,  -49,   61,  -97,  -15, -107,
 ];
 #[rustfmt::skip]
 const EG_KNIGHT: [i32; 64] = [
-      -17,   -19,   -15,    -8,    -3,   -16,   -21,   -35,
-       -8,     1,   -13,    -1,    -1,   -12,    -4,   -19,
-       -5,    -1,    -1,    15,    10,    -2,    -6,    -7,
-        7,     6,    15,    29,    21,    15,     2,     4,
-        7,    11,    15,    24,    21,    15,     4,     6,
-       -5,    12,    11,    14,    14,     7,     9,   -11,
-       -2,    24,    10,    10,    18,    -6,    15,    -9,
-     -122,    13,    43,    13,    14,     6,     8,   -68,
+     -29,  -51,  -23,  -15,  -22,  -18,  -50,  -64,
+     -42,  -20,  -10,   -5,   -2,  -20,  -23,  -44,
+     -23,   -3,   -1,   15,   10,   -3,  -20,  -22,
+     -18,   -6,   16,   25,   16,   17,    4,  -18,
+     -17,    3,   22,   22,   22,   11,    8,  -18,
+     -24,  -20,   10,    9,   -1,   -9,  -19,  -41,
+     -25,   -8,  -25,   -2,   -9,  -25,  -24,  -52,
+     -58,  -38,  -13,  -28,  -31,  -27,  -63,  -99,
 ];
 #[rustfmt::skip]
 const MG_BISHOP: [i32; 64] = [
-       10,    -7,   -10,    11,     6,    -3,     6,     5,
-       23,    28,    26,    11,     2,    13,     9,    18,
-       21,    23,    13,    14,    13,     7,    28,    14,
-       19,     6,    10,    20,    20,    13,     9,    12,
-        6,    12,    13,    16,    25,    16,    11,     6,
-       21,     7,    19,    23,    18,    10,    15,     6,
-      -13,   -37,   -10,   -28,   -18,   -12,   -12,    -8,
-      -25,   -52,   -85,   -67,   -78,   -66,   -47,   -28,
+     -33,   -3,  -14,  -21,  -13,  -12,  -39,  -21,
+       4,   15,   16,    0,    7,   21,   33,    1,
+       0,   15,   15,   15,   14,   27,   18,   10,
+      -6,   13,   13,   26,   34,   12,   10,    4,
+      -4,    5,   19,   50,   37,   37,    7,   -2,
+     -16,   37,   43,   40,   35,   50,   37,   -2,
+     -26,   16,  -18,  -13,   30,   59,   18,  -47,
+     -29,    4,  -82,  -37,  -25,  -42,    7,   -8,
 ];
 #[rustfmt::skip]
 const EG_BISHOP: [i32; 64] = [
-      -30,     1,    -8,   -14,   -11,    -6,    -9,   -19,
-      -14,   -30,   -13,    -5,    -5,   -16,   -26,    -8,
-       -9,    -5,    -7,    12,     5,    -9,    -7,   -11,
-      -10,     6,    16,    15,    19,    10,     5,    -9,
-       -3,    15,    19,    28,    23,    15,    10,    -7,
-      -10,    12,     7,    11,    13,     0,     4,    -3,
-       -5,     5,     9,    14,    17,    11,   -10,    -1,
-      -37,    20,    23,    23,    31,    20,    16,   -15,
+     -23,   -9,  -23,   -5,   -9,  -16,   -5,  -17,
+     -14,  -18,   -7,   -1,    4,   -9,  -15,  -27,
+     -12,   -3,    8,   10,   13,    3,   -7,  -15,
+      -6,    3,   13,   19,    7,   10,   -3,   -9,
+      -3,    9,   12,    9,   14,   10,    3,    2,
+       2,   -8,    0,   -1,   -2,    6,    0,    4,
+      -8,   -4,    7,  -12,   -3,  -13,   -4,  -14,
+     -14,  -21,  -11,   -8,   -7,   -9,  -17,  -24,
 ];
 #[rustfmt::skip]
 const MG_ROOK: [i32; 64] = [
-      -14,   -18,     7,    13,     7,    -1,     0,    -1,
-      -50,    -6,     1,    -2,    -1,    -7,   -12,   -19,
-      -16,     6,    -8,    -1,    -1,   -13,    -4,   -18,
-      -23,   -10,   -12,   -10,   -12,   -16,   -15,   -13,
-      -16,    -6,    -3,    -9,    -2,     0,    -2,    -5,
-      -16,    10,    14,    16,    14,     8,     7,    -2,
-       25,    12,    18,    16,    22,    14,    13,    20,
-       16,    33,    28,    14,    25,    15,    18,    22,
+     -19,  -13,    1,   17,   16,    7,  -37,  -26,
+     -44,  -16,  -20,   -9,   -1,   11,   -6,  -71,
+     -45,  -25,  -16,  -17,    3,    0,   -5,  -33,
+     -36,  -26,  -12,   -1,    9,   -7,    6,  -23,
+     -24,  -11,    7,   26,   24,   35,   -8,  -20,
+      -5,   19,   26,   36,   17,   45,   61,   16,
+      27,   32,   58,   62,   80,   67,   26,   44,
+      32,   42,   32,   51,   63,    9,   31,   43,
 ];
 #[rustfmt::skip]
 const EG_ROOK: [i32; 64] = [
-      -35,   -19,   -23,   -29,   -28,   -20,   -24,   -22,
-      -27,   -34,   -22,   -21,   -23,   -17,   -22,   -22,
-      -25,   -26,    -8,   -16,   -17,    -7,   -15,   -14,
-       -3,     4,     9,     7,     4,    10,    11,     2,
-        9,    13,    12,     9,     6,     9,    14,    11,
-       16,    12,    10,     7,     7,    14,    17,    20,
-       10,    22,    19,    21,    24,    23,    21,    19,
-       16,    12,    14,    25,    15,    20,    22,    20,
+      -9,    2,    3,   -1,   -5,  -13,    4,  -20,
+      -6,   -6,    0,    2,   -9,   -9,  -11,   -3,
+      -4,    0,   -5,   -1,   -7,  -12,   -8,  -16,
+       3,    5,    8,    4,   -5,   -6,   -8,  -11,
+       4,    3,   13,    1,    2,    1,   -1,    2,
+       7,    7,    7,    5,    4,   -3,   -5,   -3,
+      11,   13,   13,   11,   -3,    3,    8,    3,
+      13,   10,   18,   15,   12,   12,    8,    5,
 ];
 #[rustfmt::skip]
 const MG_QUEEN: [i32; 64] = [
-      -16,   -23,   -15,    -7,    -3,   -10,   -12,   -20,
-       -1,     6,     0,    -4,    -7,     5,     0,     1,
-       -4,    -1,    -9,   -18,   -11,    -5,     7,     2,
-      -15,   -11,   -15,   -20,   -22,    -9,    -2,    -5,
-       -6,   -15,   -13,   -26,   -22,     5,     0,     4,
-        7,    11,    -4,   -19,    -5,    14,    27,    19,
-       34,    32,    10,   -16,    11,    15,    19,    12,
-       15,    49,    30,    20,    27,    36,    21,   -11,
+      -1,  -18,   -9,   10,  -15,  -25,  -31,  -50,
+     -35,   -8,   11,    2,    8,   15,   -3,    1,
+     -14,    2,  -11,   -2,   -5,    2,   14,    5,
+      -9,  -26,   -9,  -10,   -2,   -4,    3,   -3,
+     -27,  -27,  -16,  -16,   -1,   17,   -2,    1,
+     -13,  -17,    7,    8,   29,   56,   47,   57,
+     -24,  -39,   -5,    1,  -16,   57,   28,   54,
+     -28,    0,   29,   12,   59,   44,   43,   45,
 ];
 #[rustfmt::skip]
 const EG_QUEEN: [i32; 64] = [
-      -34,   -69,   -53,   -44,   -36,   -32,   -31,    -6,
-      -63,   -82,   -47,   -21,   -13,   -32,   -28,   -20,
-      -19,   -18,     1,    15,    14,     5,    -7,    -7,
-       21,    18,    19,    32,    43,    23,    11,     5,
-       12,    24,    23,    43,    40,     9,    19,    -4,
-        8,    11,    28,    41,    39,     0,   -24,   -12,
-       -7,    -6,    26,    43,    27,     3,    -9,    -1,
-       28,     3,    28,    36,    24,    10,    13,    33,
+     -33,  -28,  -22,  -43,   -5,  -32,  -20,  -41,
+     -22,  -23,  -30,  -16,  -16,  -23,  -36,  -32,
+     -16,  -27,   15,    6,    9,   17,   10,    5,
+     -18,   28,   19,   47,   31,   34,   39,   23,
+       3,   22,   24,   45,   57,   40,   57,   36,
+     -20,    6,    9,   49,   47,   35,   19,    9,
+     -17,   20,   32,   41,   58,   25,   30,    0,
+      -9,   22,   22,   27,   27,   19,   10,   20,
 ];
 #[rustfmt::skip]
 const MG_KING: [i32; 64] = [
-       66,    65,    28,    24,    24,    28,    65,    66,
-       66,    53,    23,    -1,    -1,    23,    53,    66,
-        9,     2,   -30,   -51,   -51,   -30,     2,     9,
-      -55,   -53,   -77,  -103,  -103,   -77,   -53,   -55,
-      -24,   -54,   -68,  -131,  -131,   -68,   -54,   -24,
-       39,   -19,   -70,  -150,  -150,   -70,   -19,    39,
-       37,   -26,   -78,  -101,  -101,   -78,   -26,    37,
-       64,     3,   -47,   -67,   -67,   -47,     3,    64,
+     -15,   36,   12,  -54,    8,  -28,   24,   14,
+       1,    7,   -8,  -64,  -43,  -16,    9,    8,
+     -14,  -14,  -22,  -46,  -44,  -30,  -15,  -27,
+     -49,   -1,  -27,  -39,  -46,  -44,  -33,  -51,
+     -17,  -20,  -12,  -27,  -30,  -25,  -14,  -36,
+      -9,   24,    2,  -16,  -20,    6,   22,  -22,
+      29,   -1,  -20,   -7,   -8,   -4,  -38,  -29,
+     -65,   23,   16,  -15,  -56,  -34,    2,   13,
 ];
 #[rustfmt::skip]
 const EG_KING: [i32; 64] = [
-      -39,    -4,   -65,  -125,  -125,   -65,    -4,   -39,
-       -7,    19,   -41,   -83,   -83,   -41,    19,    -7,
-       20,    47,    -8,   -48,   -48,    -8,    47,    20,
-       44,    79,    15,   -25,   -25,    15,    79,    44,
-       55,   108,    34,    -6,    -6,    34,   108,    55,
-       56,   129,    60,    14,    14,    60,   129,    56,
-       16,   126,    81,    59,    59,    81,   126,    16,
-     -154,    88,    40,    21,    21,    40,    88,  -154,
+     -53,  -34,  -21,  -11,  -28,  -14,  -24,  -43,
+     -27,  -11,    4,   13,   14,    4,   -5,  -17,
+     -19,   -3,   11,   21,   23,   16,    7,   -9,
+     -18,   -4,   21,   24,   27,   23,    9,  -11,
+      -8,   22,   24,   27,   26,   33,   26,    3,
+      10,   17,   23,   15,   20,   45,   44,   13,
+     -12,   17,   14,   17,   17,   38,   23,   11,
+     -74,  -35,  -18,  -18,  -11,   15,    4,  -17,
 ];
 
-/// Valores de material por fase -- Sirius v9.0 literais (afinados por
-/// Texel Tuning). Note-se a diferenca em relacao aos classicos: peao
-/// vale muito pouco no mg (65cp) mas muito no eg (138), o cavalo/bispo
-/// eg (450/475) valem mais que a torre mg (411), e a dama tem eg de
-/// 1957. Distintos de `PieceType::value()`, que continua a servir
-/// SEE/MVV-LVA (troca material simples, sem fase).
-const MG_VALUE: [i32; 6] = [65, 305, 320, 411, 844, 0];
-const EG_VALUE: [i32; 6] = [138, 450, 475, 816, 1957, 0];
+/// Material base -- pontos de partida clássicos usados em quase todos
+/// os motores educacionais (PeSTO / CPW / MADAM); serao afinados via
+/// Texel Tuning proprio a seguir. Distintos de `PieceType::value()`,
+/// que continua a servir SEE/MVV-LVA (troca material simples, sem fase).
+const MG_VALUE: [i32; 6] = [82, 337, 365, 477, 1025, 0];
+const EG_VALUE: [i32; 6] = [94, 281, 297, 512, 936, 0];
 
 /// Incremento de fase por peca -- 4 cavalos+4 bispos+4 torres+2 damas =
 /// 4*1+4*1+4*2+2*4 = 24 = fase maxima (abertura). Fase 0 = so' reis e
@@ -234,104 +215,98 @@ fn king_zone(king_sq: Square) -> Bitboard {
     atk().king[king_sq as usize] | bb(king_sq)
 }
 
-// Constantes tunadas do Sirius v9.0 (eval_constants.h) -- afinadas EM
-// CONJUNTO com o MATERIAL e as PSQT acima por Texel Tuning. Portar as
-// tabelas sem estas constantes deixa duas escalas em conflito (as
-// tabelas na escala Sirius, os pesos "posicionais" a olho na escala
-// PeSTO). Layout ScorePair = (mg, eg); interpolados pela fase do jogo
-// em positional_terms(). Nomes na convencao do proprio Sirius --
-// facilita cross-check contra o ficheiro fonte quando houver
-// actualizacoes.
-const BISHOP_PAIR: (i32, i32) = (22, 65);
-const LONG_DIAG_BISHOP: (i32, i32) = (12, 12);
-const MINOR_BEHIND_PAWN: (i32, i32) = (2, 9);
-const KNIGHT_OUTPOST: (i32, i32) = (18, 18);
-const ROOK_OPEN: [(i32, i32); 2] = [(29, 2), (19, -1)]; // [0]=aberta, [1]=semi-aberta
-const TEMPO: (i32, i32) = (28, 20);
+// Pesos de eval -- valores proprios sensatos como ponto de partida,
+// para afinar via Texel Tuning proprio (ver src/tuning/ quando existir).
+// Formato ScorePair (mg, eg), interpolados em positional_terms() pela
+// fase actual. Estrutura (mobility por peca e count, threats indexadas
+// por defended, king safety com attackers+attack_count, etc.) e' a
+// padrao de qualquer motor HCE forte -- Stockfish, Ethereal, Berserk,
+// Sirius, todos usam essencialmente a mesma organizacao. Os valores
+// abaixo sao meus -- monotonos e razoaveis, mas nao afinados. Isso e'
+// o proximo passo (Texel Tuning no server).
 
-// MOBILITY[piece][count] -- Sirius: Knight 0..=8, Bishop 0..=13, Rook
-// 0..=14, Queen 0..=27. Usamos 4 tabelas com o comprimento maximo
-// possivel (a Dama). Portagem literal.
-const MOBILITY_KNIGHT: [(i32, i32); 28] = [
-    (-20,-101),(-34,-46),(-19,-9),(-8,8),(2,18),(8,28),(17,33),(24,36),(34,27),
-    (0,0),(0,0),(0,0),(0,0),(0,0),(0,0),(0,0),(0,0),(0,0),(0,0),(0,0),(0,0),(0,0),(0,0),(0,0),(0,0),(0,0),(0,0),(0,0),
-];
-const MOBILITY_BISHOP: [(i32, i32); 28] = [
-    (-25,-111),(-41,-59),(-21,-27),(-10,-6),(-4,5),(0,15),(2,22),(5,26),(5,28),(9,29),(7,30),(13,23),(18,23),(48,-8),
-    (0,0),(0,0),(0,0),(0,0),(0,0),(0,0),(0,0),(0,0),(0,0),(0,0),(0,0),(0,0),(0,0),(0,0),
-];
-const MOBILITY_ROOK: [(i32, i32); 28] = [
-    (-58,-89),(-48,-66),(-16,-40),(-8,-23),(0,-12),(4,-2),(4,9),(6,14),(7,17),(9,23),(12,29),(13,35),(14,39),(17,41),(44,21),
-    (0,0),(0,0),(0,0),(0,0),(0,0),(0,0),(0,0),(0,0),(0,0),(0,0),(0,0),(0,0),(0,0),
-];
-const MOBILITY_QUEEN: [(i32, i32); 28] = [
-    (-29,-65),(-48,-72),(-59,-67),(-36,-132),(-24,-94),(-11,-55),(-3,-39),(1,-20),(1,-2),(2,11),(5,18),(5,28),(7,33),(7,41),
-    (9,45),(10,44),(9,49),(10,49),(12,49),(14,44),(17,41),(22,28),(21,28),(31,12),(20,23),(25,0),(21,-27),(-23,4),
-];
+const BISHOP_PAIR: (i32, i32) = (25, 55);
+const LONG_DIAG_BISHOP: (i32, i32) = (10, 10);
+const MINOR_BEHIND_PAWN: (i32, i32) = (5, 5);
+const KNIGHT_OUTPOST: (i32, i32) = (20, 15);
+const ROOK_OPEN: [(i32, i32); 2] = [(25, 5), (15, 0)]; // [0]=aberta, [1]=semi-aberta
+const TEMPO: (i32, i32) = (20, 15);
 
-// KING_ATTACKER_WEIGHT[Knight, Bishop, Rook, Queen]
-const KING_ATTACKER_WEIGHT: [(i32, i32); 4] = [(54, -2), (22, -2), (22, -7), (4, -9)];
-const KING_ATTACKS: (i32, i32) = (7, 0);
+// Mobility por peca -- crescente com o numero de casas seguras
+// atacadas. Base intuitiva: sem lances = muito mau; muitos lances = ok.
+// Valores propios, monotonos. Sirius/SF afinam versoes muito mais
+// nuancadas via Texel; deixamos o afinamento para depois.
+const MOBILITY_KNIGHT: [(i32, i32); 28] = {
+    let mut t = [(0i32, 0i32); 28];
+    let base = [-30, -15, -5, 0, 5, 10, 15, 20, 25];
+    let mut i = 0; while i < 9 { t[i] = (base[i], base[i] - 5); i += 1; }
+    t
+};
+const MOBILITY_BISHOP: [(i32, i32); 28] = {
+    let mut t = [(0i32, 0i32); 28];
+    let base = [-30, -15, -5, 0, 4, 8, 12, 15, 18, 20, 22, 24, 25, 26];
+    let mut i = 0; while i < 14 { t[i] = (base[i], base[i] - 5); i += 1; }
+    t
+};
+const MOBILITY_ROOK: [(i32, i32); 28] = {
+    let mut t = [(0i32, 0i32); 28];
+    let base = [-40, -20, -10, -5, 0, 3, 6, 9, 12, 14, 16, 18, 20, 22, 24];
+    let mut i = 0; while i < 15 { t[i] = (base[i], base[i]); i += 1; }
+    t
+};
+const MOBILITY_QUEEN: [(i32, i32); 28] = {
+    let mut t = [(0i32, 0i32); 28];
+    let base = [-30, -20, -10, -5, 0, 2, 4, 6, 8, 10, 12, 13, 14, 15, 16, 17, 18, 19, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20];
+    let mut i = 0; while i < 28 { t[i] = (base[i], base[i]); i += 1; }
+    t
+};
 
-// Ameacas -- Sirius: quando uma peca nossa ataca uma peca inimiga, soma
-// bonus indexado pelo tipo da peca atacada; para as pecas maiores, ha
-// tabela separada para "defendida pelo inimigo" vs nao. Isto e' o que
-// resolve o caso classico "peao inimigo ameaca o meu peao/peca em k
-// lances a frente" que a busca a profundidade baixa nao ve directamente.
+// Peso de atacantes ao king ring por tipo -- damas mais que torres
+// mais que menores, padrao classico.
+const KING_ATTACKER_WEIGHT: [(i32, i32); 4] = [(15, 0), (15, 0), (30, 0), (60, 0)];
+const KING_ATTACKS: (i32, i32) = (5, 0);
+
+// Ameacas -- estrutura standard (indexed por tipo da peca inimiga
+// atacada e por "defendida pelo inimigo?" para pecas maiores). Valores
+// crescentes com o valor da peca atacada: atacar dama > torre > menor
+// > peao. Atacar peca defendida vale menos ou nada.
 // Ordem: [Pawn, Knight, Bishop, Rook, Queen, King].
-const THREAT_BY_PAWN: [(i32, i32); 6] = [(-7,-19),(73,41),(65,72),(72,50),(56,24),(0,0)];
+const THREAT_BY_PAWN: [(i32, i32); 6] = [(0, 0), (50, 30), (50, 30), (60, 40), (50, 20), (0, 0)];
 // [defended=0 nao-defendido / 1 defendido][target_piece]
 const THREAT_BY_KNIGHT: [[(i32, i32); 6]; 2] = [
-    [(5,37),(12,85),(50,33),(86,13),(41,8),(0,0)],
-    [(-8,11),(9,79),(38,29),(71,45),(50,46),(0,0)],
+    [(5, 15), (0, 0), (30, 20), (60, 25), (40, 20), (0, 0)],   // nao defendido
+    [(0, 5), (0, 0), (15, 15), (30, 20), (30, 30), (0, 0)],    // defendido
 ];
 const THREAT_BY_BISHOP: [[(i32, i32); 6]; 2] = [
-    [(3,34),(36,44),(12,102),(58,35),(61,53),(0,0)],
-    [(-5,4),(20,21),(4,76),(56,60),(63,74),(0,0)],
+    [(5, 15), (25, 25), (0, 0), (50, 25), (40, 40), (0, 0)],
+    [(0, 5), (10, 15), (0, 0), (30, 25), (40, 50), (0, 0)],
 ];
 const THREAT_BY_ROOK: [[(i32, i32); 6]; 2] = [
-    [(-3,50),(35,52),(45,49),(-12,50),(67,-10),(0,0)],
-    [(-10,10),(8,15),(19,4),(1,22),(54,85),(0,0)],
+    [(0, 15), (25, 30), (25, 30), (0, 0), (50, 20), (0, 0)],
+    [(-5, 5), (5, 10), (10, 5), (0, 0), (40, 60), (0, 0)],
 ];
 const THREAT_BY_QUEEN: [[(i32, i32); 6]; 2] = [
-    [(8,21),(25,30),(18,65),(16,12),(-2,-17),(0,0)],
-    [(-5,16),(2,8),(-9,37),(-7,7),(-19,1),(0,0)],
+    [(5, 15), (15, 20), (15, 25), (10, 10), (0, 0), (0, 0)],
+    [(0, 5), (0, 5), (-5, 15), (-5, 5), (0, 0), (0, 0)],
 ];
-const THREAT_BY_KING: [(i32, i32); 6] = [(39,18),(33,38),(99,33),(83,8),(0,0),(0,0)];
-// Peca menor a atacar a dama inimiga (nao contado nos threat-by-X porque
-// esses ja' cobrem a captura directa; estes sao para o padrao de
-// "cavalo/bispo/torre em jogada seguinte deposita ameaca na dama").
-const KNIGHT_HIT_QUEEN: (i32, i32) = (7, 2);
-const BISHOP_HIT_QUEEN: (i32, i32) = (16, 15);
-const ROOK_HIT_QUEEN: (i32, i32) = (18, 0);
-// Bonus quando um push de peao (avanco de 1 casa) CRIARIA uma nova
-// ameaca a peca inimiga. Simulado por check-single-square-forward.
-const PUSH_THREAT: (i32, i32) = (13, 17);
-// Casas atacadas por nos e nao defendidas pelo inimigo -- pequeno bonus
-// por casa restrita ao adversario.
+const THREAT_BY_KING: [(i32, i32); 6] = [(30, 15), (30, 25), (60, 20), (50, 5), (0, 0), (0, 0)];
+// "hit queen": peca nossa a 1 movimento de atacar a dama inimiga.
+const KNIGHT_HIT_QUEEN: (i32, i32) = (8, 5);
+const BISHOP_HIT_QUEEN: (i32, i32) = (12, 12);
+const ROOK_HIT_QUEEN: (i32, i32) = (12, 5);
+// Push threat: avanco de peao para casa segura que criaria nova ameaca
+// a peca inimiga nao-peao. Padrao HCE, usado em muitos motores.
+const PUSH_THREAT: (i32, i32) = (10, 12);
+// Casas restritas ao adversario (nos temos 2+ ataques, eles nao).
 const RESTRICTED_SQUARES: (i32, i32) = (2, 3);
 
-// Peoes -- todas as tabelas indexadas por rank (0=1a, 7=8a; entrada 0 e
-// 7 sao 0 porque peoes nao existem la, mantidos para simplicidade de
-// index).
-const PAWN_PHALANX: [(i32, i32); 8] = [
-    (0,0),(4,-5),(11,0),(18,10),(40,34),(70,135),(104,178),(0,0)
-];
-const DEFENDED_PAWN: [(i32, i32); 8] = [
-    (0,0),(0,0),(16,7),(10,10),(18,24),(38,57),(71,119),(0,0)
-];
-// ISOLATED_PAWN[4] no Sirius e indexed por count acumulado de peoes
-// isolados; simplificamos para "peso por peao isolado individualmente"
-// usando o slot 0 (single isolated pawn).
-const ISOLATED_PAWN: (i32, i32) = (-6, 6);
-// DOUBLED_PAWN[4] no Sirius indexed por file (a/h=0, b/g=1, c/f=2,
-// d/e=3). Usamos a media por simplicidade.
-const DOUBLED_PAWN: (i32, i32) = (-3, -32);
-// PASSED_PAWN[defended][blocked][rank]; simplificamos usando o slot
-// mais comum (undefended, unblocked) e indexed by rank.
-const PASSED_PAWN: [(i32, i32); 8] = [
-    (0,0),(0,0),(0,0),(-31,-30),(-11,26),(22,140),(115,229),(0,0)
-];
+// Peoes -- tabelas indexadas por rank relativo (0..7; 0 e 7 nunca
+// aplicam porque peoes nunca la estao).
+const PAWN_PHALANX: [(i32, i32); 8] = [(0,0),(5,0),(10,5),(15,10),(30,25),(60,80),(100,150),(0,0)];
+const DEFENDED_PAWN: [(i32, i32); 8] = [(0,0),(0,0),(12,10),(10,12),(18,25),(35,55),(70,110),(0,0)];
+const ISOLATED_PAWN: (i32, i32) = (-8, -8);
+const DOUBLED_PAWN: (i32, i32) = (-8, -20);
+const PASSED_PAWN: [(i32, i32); 8] = [(0,0),(0,0),(0,0),(-20,-15),(-5,25),(30,100),(80,180),(0,0)];
 
 /// Avalia mobilidade, pressao sobre o rei inimigo, par de bispos, torres
 /// em colunas abertas/semi-abertas e estrutura de peoes usando os pesos
