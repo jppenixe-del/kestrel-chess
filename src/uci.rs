@@ -214,7 +214,17 @@ impl Engine {
         let mut soft_deadline: Option<Instant> = None;
         let deadline: Option<Instant> = if let Some(mt) = movetime {
             Some(Instant::now() + Duration::from_millis(mt.max(1) as u64))
-        } else if infinite || (my_time == 0 && movetime.is_none() && depth.is_none()) {
+        } else if infinite || my_time == 0 {
+            // No wtime/btime given (and no movetime, handled above): this
+            // is a fixed-depth or "go infinite" analysis request, not a
+            // live clock. Must NOT fall through to compute_time_budget(0,
+            // ...), which was handing "go depth N" a near-zero budget and
+            // cutting the search off many plies short of N (found while
+            // investigating an apparent root-move flip-flop that turned
+            // out to be this: "go depth 18" was actually stopping at
+            // depth 6). depth.is_some() still caps iterative_deepening's
+            // loop via max_depth below -- this only removes the artificial
+            // time cutoff for that case.
             None
         } else {
             let (soft, _hard) = compute_time_budget(my_time, my_inc, self.board.fullmove, movestogo, self.last_score);
