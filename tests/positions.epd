@@ -1,0 +1,77 @@
+# Kestrel test suite -- position + expected best move (bm) + id.
+# Format: FEN | " bm " expected_move [expected_move2 ...] "; id \"name\";"
+# Used by tests/run_positions.py to measure tactical + strategic accuracy.
+# Sources: classic tactics (many WAC-style), plus positions from real
+# Kestrel bot games where the engine picked the wrong move.
+
+# --- Basic tactics (mate in 1-3, forks, pins, hanging pieces) ---
+r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4 bm b1c3; id "italian-nc3-development";
+r3k2r/ppp2ppp/2np1n2/2b1p1B1/2B1P1b1/2NP1N2/PPP2PPP/R3K2R w KQkq - 0 1 bm h2h3; id "quiet-defend";
+
+# Mate in 2 -- Fool's mate pattern reversed
+rnb1kbnr/pppp1ppp/8/4p3/6Pq/5P2/PPPPP2P/RNBQKBNR w KQkq - 1 3 bm b1c3 d1e2 g1e2; id "fools-mate-defend";
+
+# --- Basic mate patterns (KQ vs K) ---
+8/8/8/4k3/8/8/1K6/6Q1 w - - 0 1 bm g1g5 g1g4 b2c3; id "kqk-mate-in-11-any-reasonable";
+
+# --- Fork patterns ---
+r1bqkb1r/pppp1ppp/2n5/1B2p3/3nP3/5N2/PPPP1PPP/RNBQK2R w KQkq - 0 4 bm f3d4; id "recapture-knight-e4";
+
+# --- Recapture defense (from real bot bug, game N7671Omx) ---
+# After 1.d4 d6 2.e4 e5 3.dxe5 -- black must recapture with dxe5 or lose pawn
+rnbqkbnr/ppp2ppp/3p4/4P3/4P3/8/PPP2PPP/RNBQKBNR b KQkq - 0 3 bm d6e5; id "recapture-d6xe5-critical";
+
+# Similar Balogh setup: after 1.d4 d6 2.e4 e5 3.dxe5 dxe5 material equal
+rnbqkbnr/ppp2ppp/8/4p3/4P3/8/PPP2PPP/RNBQKBNR w KQkq - 0 4 bm d1d8; id "queen-trade-after-recap";
+
+# Hanging piece: white to move, black knight on e5 is undefended and attacked
+r1bqkb1r/pppp1ppp/2n5/4n3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 0 5 bm f3e5; id "capture-hanging-knight";
+
+# --- Pins ---
+r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 3 3 bm a7a6 g8f6 d7d6; id "ruy-lopez-pin";
+
+# --- Simple tactics from beginner games ---
+# Skewer: rook + queen on same diagonal, attack with bishop
+r6k/pp3ppp/2n5/8/3B4/8/PPP2PPP/2KR4 w - - 0 1 bm d4a7; id "skewer-idea";
+
+# --- Endgame technique ---
+# King and pawn vs king: white must win with rook pawn
+7k/8/8/8/8/8/6PP/6K1 w - - 0 1 bm g1f2 g1g2 h2h4 g2g4; id "kpk-basic";
+
+# Rook endgame: Lucena position white to move -- classic winning method
+K7/1P6/8/8/8/6r1/8/2k5 w - - 0 1 bm a8b8 b7b8n; id "lucena-promote";
+
+# --- Opening principles ---
+# After 1.e4 -- develop knight or pawn, not queen out
+rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1 bm c7c5 e7e5 e7e6 c7c6 d7d5 g8f6; id "1.e4-reasonable-reply";
+
+# --- Positional / strategic ---
+# Isolani position: white should trade queens or restrain d-pawn
+r2q1rk1/pp3ppp/2n1bn2/8/3p4/3B1N2/PPP2PPP/R2QK2R w KQ - 0 12 bm b1c3 e1g1 d1d4; id "isolani-strategy";
+
+# Pawn structure: doubled pawns, keep flexibility
+r1bqkbnr/pp1p1ppp/2n5/2p1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 0 4 bm d2d3 e1g1 b1c3 f3g5; id "italian-develop";
+
+# --- Tactical shots (WAC-style) ---
+# WAC.001 (adapted): 2rr3k/pp3pp1/1nnqbN1p/3pN3/2pP4/2P3Q1/PPB4P/R4RK1 w - - bm Qg6; id "wac-001";
+2rr3k/pp3pp1/1nnqbN1p/3pN3/2pP4/2P3Q1/PPB4P/R4RK1 w - - 0 1 bm g3g6; id "wac-1-qg6";
+
+# WAC.002: 8/7p/5k2/5p2/p1p2P2/Pr1pPK2/1P1R3P/8 b - - bm Rxb2; id "wac-002";
+8/7p/5k2/5p2/p1p2P2/Pr1pPK2/1P1R3P/8 b - - 0 1 bm b3b2; id "wac-2-rxb2";
+
+# WAC.003: 5rk1/1ppb3p/p1pb4/6q1/3P1p1r/2P1R2P/PP1BQ1P1/5RKN b - - bm Rxh3+; id "wac-003";
+5rk1/1ppb3p/p1pb4/6q1/3P1p1r/2P1R2P/PP1BQ1P1/5RKN b - - 0 1 bm h4h3; id "wac-3-rxh3";
+
+# WAC.014: r2rb1k1/pp1q1p1p/2n1p1p1/2bp4/5P2/PQ1B1B1P/PPP1N1P1/R3K2R w KQ - bm Bxh7+; id "wac-014";
+r2rb1k1/pp1q1p1p/2n1p1p1/2bp4/5P2/PQ1B1B1P/PPP1N1P1/R3K2R w KQ - 0 1 bm f3h7; id "wac-14-bxh7";
+
+# --- King safety scenarios ---
+# Castled king, attack with queen + knight
+r1bq1rk1/pppp1ppp/2n2n2/2b1p3/2B1P3/2NP1N2/PPP2PPP/R1BQ1RK1 w - - 0 6 bm c1g5 f3g5; id "kingside-pressure";
+
+# --- Passed pawn endgames ---
+# White passed pawn on d6 should push
+8/8/3P4/5k2/8/8/6K1/8 w - - 0 1 bm d6d7; id "passed-pawn-push";
+
+# --- Zugzwang / opposition ---
+8/8/8/3k4/8/3K4/8/8 w - - 0 1 bm d3c3 d3e3; id "opposition-lateral";
