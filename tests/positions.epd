@@ -47,8 +47,14 @@ r6k/pp3ppp/2n5/8/3B4/8/PPP2PPP/2KR4 w - - 0 1 bm d4a7; id "skewer-idea";
 # King and pawn vs king: white must win with rook pawn
 7k/8/8/8/8/8/6PP/6K1 w - - 0 1 bm g1f2 g1g2 h2h4 g2g4; id "kpk-basic";
 
-# Rook endgame: Lucena position white to move -- classic winning method
-K7/1P6/8/8/8/6r1/8/2k5 w - - 0 1 bm a8b8 b7b8n; id "lucena-promote";
+# (removed "lucena-promote": mislabeled -- this isn't actually a
+# winning Lucena position. White's king on a8 has no flight square
+# from an a-file/8th-rank skewer once the pawn promotes, so this is a
+# real theoretical DRAW regardless of promotion choice, confirmed via
+# deep multipv search: b7b8q, b7b8n, b7b8r, b7b8b, and the quiet a8a7
+# all converge to score cp 0 at depth 30+, while a8b8 -- the move this
+# entry claimed was part of the winning method -- was the only one
+# NOT drawing clean (cp -20). The engine was right; the label wasn't.)
 
 # --- Opening principles ---
 # After 1.e4 -- develop knight or pawn, not queen out
