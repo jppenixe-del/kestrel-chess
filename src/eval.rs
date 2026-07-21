@@ -1181,13 +1181,21 @@ pub fn evaluate_fast(board: &Board) -> i32 {
 /// A soma completa (loop por todas as pecas) so' acontece uma vez, na
 /// construcao do board (ver Board::recompute_eval_accumulators).
 fn material_pst(board: &Board) -> i32 {
-    let phase = board.phase.min(MAX_PHASE);
-    let score = (board.mg_score * phase + board.eg_score * (MAX_PHASE - phase)) / MAX_PHASE;
     if board.side == Color::White {
-        score
+        material_pst_white(board)
     } else {
-        -score
+        -material_pst_white(board)
     }
+}
+
+/// Same as `material_pst()` but always from White's perspective
+/// (no side-to-move flip) -- what the fast linear-feature tuner
+/// (src/main.rs `tune_fast`) needs, since it builds its per-position
+/// bias directly in White's POV to match `positional_terms()`'s own
+/// convention, rather than negamax's STM-relative one.
+pub fn material_pst_white(board: &Board) -> i32 {
+    let phase = board.phase.min(MAX_PHASE);
+    (board.mg_score * phase + board.eg_score * (MAX_PHASE - phase)) / MAX_PHASE
 }
 
 fn positional_terms_signed(board: &Board) -> i32 {

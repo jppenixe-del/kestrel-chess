@@ -173,7 +173,11 @@ impl Engine {
     }
 
     fn find_move(&self, uci: &str) -> Option<crate::moves::Move> {
-        let legal = crate::movegen::generate_legal(&self.board, &self.atk);
+        // Not a hot path (one-off UCI move-string lookup, not called
+        // per search node) -- a local clone here is fine; the
+        // generate_legal() fix is about the search's own move loops.
+        let mut b = self.board.clone();
+        let legal = crate::movegen::generate_legal(&mut b, &self.atk);
         legal.into_iter().find(|m| m.to_uci() == uci)
     }
 
@@ -367,7 +371,7 @@ impl Engine {
         // nulo se houver lances legais -- joga o primeiro legal em vez de
         // "0000" (que a arena/arbitro trata como derrota imediata).
         let final_move = top_move.or_else(|| {
-            crate::movegen::generate_legal(&self.board, &self.atk).into_iter().next()
+            crate::movegen::generate_legal(&mut self.board, &self.atk).into_iter().next()
         });
         match final_move {
             Some(mv) => {

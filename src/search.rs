@@ -225,7 +225,7 @@ impl<'a> Searcher<'a> {
                 Some(m) => m,
                 None => break,
             };
-            let legal = generate_legal(&b, self.atk);
+            let legal = generate_legal(&mut b, self.atk);
             if !legal.contains(&mv) {
                 break;
             }
@@ -632,6 +632,20 @@ impl<'a> Searcher<'a> {
         self.nodes += 1;
         if self.time_up() {
             return 0;
+        }
+        // Ply upper bound (found in review, 2026-07-21): check
+        // extensions don't decrease depth (`depth - 1 + 1` when
+        // in_check), so an unbroken chain of in-check plies never
+        // shrinks `depth` to <=0 on its own -- ply keeps climbing on
+        // every recursive call with nothing else to stop it. Extremely
+        // unlikely in a real game (needs ~126+ consecutive checks
+        // unbroken), but static_evals[ply-2] a few lines below is an
+        // unguarded array read once ply passes MAX_PLY, so this would
+        // panic (an instant loss mid-game) rather than fail safely.
+        // quiescence_from() already has the equivalent guard; negamax
+        // didn't.
+        if ply >= MAX_PLY - 1 {
+            return crate::eval::evaluate_fast(board);
         }
 
         let mut beta = beta;
