@@ -44,6 +44,16 @@ pub struct SearchLimits {
     pub deadline: Option<Instant>,
     pub max_depth: i32,
     pub max_nodes: Option<u64>,
+    /// Optional earlier checkpoint than `deadline` -- purely advisory,
+    /// never used inside a single search (time_up() only ever checks
+    /// `deadline`, keeping the well-tested hard-stop logic untouched).
+    /// iterative_deepening() uses it BETWEEN completed iterations: if
+    /// we're past this point AND the root move has been stable for a
+    /// few iterations in a row, stop early and give the clock back --
+    /// no point spending the full soft budget re-confirming an obvious
+    /// move. If the move keeps changing, we ignore this and keep going
+    /// up to the real (hard) deadline as before.
+    pub soft_deadline: Option<Instant>,
 }
 
 pub struct Searcher<'a> {
@@ -1185,6 +1195,7 @@ impl<'a> Searcher<'a> {
         let mut best_score = 0;
         let mut last_depth = 0;
         let mut prev_score = 0;
+        let mut stable_count = 0;
         self.killers = [[None; 2]; MAX_PLY];
         for depth in 1..=self.limits.max_depth {
             let score = self.search_root(board, depth, prev_score);
@@ -1202,6 +1213,11 @@ impl<'a> Searcher<'a> {
             // uci.rs::cmd_go) em vez do lance vencedor que a busca ja'
             // tinha encontrado e guardado em root_best.
             if let Some(rb) = self.root_best {
+                if Some(rb) == best_move {
+                    stable_count += 1;
+                } else {
+                    stable_count = 0;
+                }
                 best_move = Some(rb);
                 best_score = score;
                 last_depth = depth;
@@ -1209,6 +1225,21 @@ impl<'a> Searcher<'a> {
             }
             if self.stop {
                 break;
+            }
+            // Best-move-stability early stop: past the soft checkpoint
+            // AND the root move hasn't changed in the last 3 completed
+            // iterations -- confident enough to hand the clock back
+            // instead of spending the full allotted time re-confirming
+            // an obvious move. Never overrides the hard deadline (that
+            // stop is still enforced inside time_up() as always); this
+            // only ever stops EARLIER than the hard limit, and only
+            // between fully-completed iterations, never mid-search.
+            if depth >= 6 && stable_count >= 3 {
+                if let Some(soft) = self.limits.soft_deadline {
+                    if Instant::now() >= soft {
+                        break;
+                    }
+                }
             }
         }
         (best_move, best_score, last_depth, self.nodes)

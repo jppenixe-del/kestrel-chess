@@ -205,6 +205,13 @@ impl Engine {
         const ADVISOR_RESERVE_MS: i64 = 1500;
         let advisor_enabled = crate::advisor::Advisor::from_env().is_some();
         let mut soft_budget_ms: Option<i64> = None;
+        // `soft_deadline`: an EARLIER, purely-advisory checkpoint used
+        // only by iterative_deepening()'s best-move-stability early
+        // exit (see search.rs) -- always <= `deadline`, so worst case
+        // (move never stabilizes) search behaves exactly as before,
+        // identical hard cutoff. Only set in the real-clock branch,
+        // half of that branch's own search budget.
+        let mut soft_deadline: Option<Instant> = None;
         let deadline: Option<Instant> = if let Some(mt) = movetime {
             Some(Instant::now() + Duration::from_millis(mt.max(1) as u64))
         } else if infinite || (my_time == 0 && movetime.is_none() && depth.is_none()) {
@@ -213,11 +220,12 @@ impl Engine {
             let (soft, _hard) = compute_time_budget(my_time, my_inc, self.board.fullmove, movestogo, self.last_score);
             soft_budget_ms = Some(soft);
             let search_ms = if advisor_enabled { (soft - ADVISOR_RESERVE_MS).max(1) } else { soft };
+            soft_deadline = Some(Instant::now() + Duration::from_millis((search_ms / 2).max(1) as u64));
             Some(Instant::now() + Duration::from_millis(search_ms.max(1) as u64))
         };
 
         let max_depth = depth.unwrap_or(64);
-        let limits = SearchLimits { deadline, max_depth, max_nodes: nodes };
+        let limits = SearchLimits { deadline, max_depth, max_nodes: nodes, soft_deadline };
         let board_now = self.board.clone();
         let history_now = self.history.clone();
         let mut excluded_root_moves: Vec<crate::moves::Move> = Vec::new();
