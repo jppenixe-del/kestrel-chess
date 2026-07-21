@@ -311,6 +311,32 @@ const KING_ATTACKER_WEIGHT: [(i32, i32); 4] = [
 // Extra por casa da king zone atacada, alem do bonus por atacante.
 const KING_ATTACKS: (i32, i32) = (5, 0);
 
+// King danger units (mg channel of the accumulation above) go through
+// this saturating, roughly-quadratic lookup before being added to the
+// score, instead of straight in. Classical engines all do this
+// (Stockfish's pre-NNUE king safety and derivatives): several
+// attackers combining is much more than additively dangerous, because
+// they can cover each other's escape squares/overload defenders in a
+// way a lone piece can't. A flat linear sum lets a single lurking
+// queen (65 units) already outweigh real pawn-shelter damage
+// regardless of backup. Table is self-derived (identity below the
+// ~100-unit mark that one or two ordinary attackers land in -- keeps
+// today's already-validated single/double-attacker behaviour
+// unchanged -- then grows superlinearly once several attackers
+// combine past that, capped so it can never swamp material). Not
+// copied from any specific engine's tuned safety table.
+const KING_DANGER_TABLE: [i32; 128] = {
+    let mut t = [0i32; 128];
+    let mut i = 0;
+    while i < 128 {
+        let d = i as i32;
+        let v = if d <= 100 { d } else { 100 + (d - 100) * (d - 100) / 40 };
+        t[i] = if v > 500 { 500 } else { v };
+        i += 1;
+    }
+    t
+};
+
 // Pawn shelter/storm: indexado por "offset" (distancia em ranks entre o
 // rei e o peao relevante, offset=1 e' o peao imediatamente a frente).
 // Shelter (peao proprio): offset 1 intacto = zero custo; cada rank extra
@@ -620,7 +646,8 @@ fn positional_terms(board: &Board) -> i32 {
         }
 
         if king_attackers >= 2 {
-            mg += sign * king_attack_units.0;
+            let danger_idx = king_attack_units.0.clamp(0, 127) as usize;
+            mg += sign * KING_DANGER_TABLE[danger_idx];
             eg += sign * king_attack_units.1;
         }
 
