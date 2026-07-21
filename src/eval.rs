@@ -311,6 +311,33 @@ const KING_ATTACKER_WEIGHT: [(i32, i32); 4] = [
 // Extra por casa da king zone atacada, alem do bonus por atacante.
 const KING_ATTACKS: (i32, i32) = (5, 0);
 
+// Pawn shelter/storm: indexado por "offset" (distancia em ranks entre o
+// rei e o peao relevante, offset=1 e' o peao imediatamente a frente).
+// Shelter (peao proprio): offset 1 intacto = zero custo; cada rank extra
+// de avanco e' abrigo perdido sem ganho nenhum em troca. Storm (peao
+// inimigo): o inverso -- quanto mais perto do rei, mais perigoso.
+const PAWN_SHELTER: [(i32, i32); 4] = [(0, 0), (-10, -2), (-24, -4), (-34, -6)];
+const SHELTER_OPEN: (i32, i32) = (-30, -6);
+const PAWN_STORM: [(i32, i32); 4] = [(-38, -8), (-22, -5), (-10, -2), (0, 0)];
+
+/// Rank offset (sempre positivo, "para a frente" do rei) do peao mais
+/// perto do rei nesta bitboard (ja filtrada a uma unica coluna). `None`
+/// se nao houver nenhum peao dessa cor "a frente" do rei nessa coluna.
+fn shield_pawn_offset(pawns_on_file: Bitboard, king_rank: i32, white: bool) -> Option<i32> {
+    let mut bbp = pawns_on_file;
+    let mut best: Option<i32> = None;
+    while bbp != 0 {
+        let s = bbp.trailing_zeros() as Square;
+        bbp &= bbp - 1;
+        let r = rank_of(s) as i32;
+        let off = if white { r - king_rank } else { king_rank - r };
+        if off > 0 {
+            best = Some(best.map_or(off, |b| b.min(off)));
+        }
+    }
+    best
+}
+
 // === Threats ===
 // Estrutura standard (indexed por tipo da peca atacada e por
 // "defendida pelo inimigo?"). Raciocinio para os valores:
@@ -595,6 +622,47 @@ fn positional_terms(board: &Board) -> i32 {
         if king_attackers >= 2 {
             mg += sign * king_attack_units.0;
             eg += sign * king_attack_units.1;
+        }
+
+        // === Pawn shelter / storm around own king ===
+        // Missing piece found after a real bullet loss (2026-07-21,
+        // GLUlNq1Q): White played g4/g5 in front of its own castled
+        // king with no concrete follow-up, and lost material to ...Bxh3
+        // a few moves later. At bullet depth the search never calculated
+        // that far -- what should have stopped the push is the STATIC
+        // eval already pricing in "my own king shield just moved 2
+        // squares forward", the same way a human's intuition flags a
+        // self-weakening pawn storm before calculating anything concrete.
+        // This is a universal HCE component (Stockfish's ShelterStrength/
+        // UnblockedStorm, Ethereal/Berserk equivalents all encode some
+        // version of it); values below are mine, reasoned from scratch:
+        // an intact shield pawn one square ahead of the king costs
+        // nothing, each extra square it advances trades king safety for
+        // nothing in return, and an enemy pawn closing in on the king's
+        // file is progressively more dangerous the closer it gets.
+        let kf = file_of(board.king_sq(c)) as i32;
+        let kr = rank_of(board.king_sq(c)) as i32;
+        let white = c == Color::White;
+        for f in (kf - 1).max(0)..=(kf + 1).min(7) {
+            let file_mask = FILE_A << f;
+            let own_pawns = board.pieces[c.idx()][PieceType::Pawn.idx()] & file_mask;
+            let enemy_pawns = board.pieces[c.opp().idx()][PieceType::Pawn.idx()] & file_mask;
+            match shield_pawn_offset(own_pawns, kr, white) {
+                None => {
+                    mg += sign * SHELTER_OPEN.0;
+                    eg += sign * SHELTER_OPEN.1;
+                }
+                Some(off) => {
+                    let idx = (off - 1).clamp(0, 3) as usize;
+                    mg += sign * PAWN_SHELTER[idx].0;
+                    eg += sign * PAWN_SHELTER[idx].1;
+                }
+            }
+            if let Some(off) = shield_pawn_offset(enemy_pawns, kr, white) {
+                let idx = (off - 1).clamp(0, 3) as usize;
+                mg += sign * PAWN_STORM[idx].0;
+                eg += sign * PAWN_STORM[idx].1;
+            }
         }
     }
 
