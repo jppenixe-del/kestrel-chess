@@ -148,12 +148,14 @@ const EG_KING: [i32; 64] = [
      -74,  -35,  -18,  -18,  -11,   15,    4,  -17,
 ];
 
-/// Material base -- pontos de partida clássicos usados em quase todos
-/// os motores educacionais (PeSTO / CPW / MADAM); serao afinados via
-/// Texel Tuning proprio a seguir. Distintos de `PieceType::value()`,
-/// que continua a servir SEE/MVV-LVA (troca material simples, sem fase).
-const MG_VALUE: [i32; 6] = [82, 337, 365, 477, 1025, 0];
-const EG_VALUE: [i32; 6] = [94, 281, 297, 512, 936, 0];
+/// Material base -- pontos de partida sensatos, para afinar via Texel
+/// Tuning proprio a seguir. Peao=100 (valor classico "1 pawn = 100cp")
+/// que da margem clara em posicoes de +1 peao, coisa que a busca em
+/// bullet precisa para preferir uma captura de peao a um lance
+/// posicional aproximadamente equivalente. Distintos de
+/// `PieceType::value()`, que continua a servir SEE/MVV-LVA.
+const MG_VALUE: [i32; 6] = [100, 340, 360, 520, 1000, 0];
+const EG_VALUE: [i32; 6] = [110, 300, 310, 540, 950, 0];
 
 /// Incremento de fase por peca -- 4 cavalos+4 bispos+4 torres+2 damas =
 /// 4*1+4*1+4*2+2*4 = 24 = fase maxima (abertura). Fase 0 = so' reis e
@@ -267,11 +269,24 @@ const KING_ATTACKER_WEIGHT: [(i32, i32); 4] = [(15, 0), (15, 0), (30, 0), (60, 0
 const KING_ATTACKS: (i32, i32) = (5, 0);
 
 // Ameacas -- estrutura standard (indexed por tipo da peca inimiga
-// atacada e por "defendida pelo inimigo?" para pecas maiores). Valores
-// crescentes com o valor da peca atacada: atacar dama > torre > menor
-// > peao. Atacar peca defendida vale menos ou nada.
+// atacada e por "defendida pelo inimigo?"). Valores crescentes com o
+// valor da peca atacada: atacar dama > torre > menor > peao. Atacar
+// peca defendida vale menos.
 // Ordem: [Pawn, Knight, Bishop, Rook, Queen, King].
-const THREAT_BY_PAWN: [(i32, i32); 6] = [(0, 0), (50, 30), (50, 30), (60, 40), (50, 20), (0, 0)];
+//
+// THREAT_BY_PAWN e' indexed por defended para capturar o caso que faz
+// diferenca em jogo real: peao inimigo pendurado (atacado por peao
+// nosso E sem defensor) e' ganho de material efectivo -- vale muito.
+// Se estiver defendido e' recaptura ~equal, vale pouco. Este era o
+// "bug do recapturar" observado em jogo (N7671Omx): motor jogava Nc6
+// deixando peao em d6 pendurado, valuation = 0 (ambos casos eram
+// "atacar peao inimigo") em vez de refletir o material a ganhar.
+const THREAT_BY_PAWN: [[(i32, i32); 6]; 2] = [
+    // [0] = alvo NAO defendido -> bonus grande (ganho material)
+    [(70, 60), (85, 60), (85, 60), (95, 55), (85, 40), (0, 0)],
+    // [1] = alvo defendido -> recaptura tipica, sinal moderado
+    [(0, 5), (25, 15), (25, 15), (30, 20), (25, 10), (0, 0)],
+];
 // [defended=0 nao-defendido / 1 defendido][target_piece]
 const THREAT_BY_KNIGHT: [[(i32, i32); 6]; 2] = [
     [(5, 15), (0, 0), (30, 20), (60, 25), (40, 20), (0, 0)],   // nao defendido
@@ -495,14 +510,16 @@ fn positional_terms(board: &Board) -> i32 {
             | attacked_by_pt[them][PieceType::Pawn.idx()]
             | (attacked[them] & !attacked_by_2[us]);
 
-        // Threats por peao.
+        // Threats por peao -- agora indexed por defended tambem.
         let mut t = attacked_by_pt[us][PieceType::Pawn.idx()] & their_pieces;
         while t != 0 {
             let s = t.trailing_zeros() as Square;
             t &= t - 1;
+            let defended = (defended_bb & bb(s)) != 0;
             if let Some((pt, _)) = board.piece_at(s) {
-                mg += sign * THREAT_BY_PAWN[pt.idx()].0;
-                eg += sign * THREAT_BY_PAWN[pt.idx()].1;
+                let entry = THREAT_BY_PAWN[defended as usize][pt.idx()];
+                mg += sign * entry.0;
+                eg += sign * entry.1;
             }
         }
         // Threats por cavalo/bispo/torre/dama.
