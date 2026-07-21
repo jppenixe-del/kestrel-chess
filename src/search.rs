@@ -486,7 +486,16 @@ impl<'a> Searcher<'a> {
             .get(ply)
             .and_then(|x| *x)
             .and_then(|(pt, to)| self.countermoves[pt.idx()][to as usize]);
-        moves.sort_by_key(|m| {
+        // sort_by_cached_key (found in review, 2026-07-21), not
+        // sort_by_key: the key closure calls self.see() for every
+        // capture, a full exchange simulation -- sort_by_key doesn't
+        // guarantee calling the key function exactly once per element,
+        // so that SEE could be recomputed more than once per move
+        // during the sort. This runs in quiescence, visited far more
+        // often than main-search nodes (every horizon leaf resolves
+        // through it). Pure perf fix, same ordering/behavior either
+        // way -- caching a key is never observable, only its cost is.
+        moves.sort_by_cached_key(|m| {
             if Some(*m) == tt_move {
                 -1_000_000
             } else if m.is_capture() {
