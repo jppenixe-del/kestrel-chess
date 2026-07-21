@@ -20,6 +20,7 @@ const MOVE_OVERHEAD_MS: i64 = 60;
 fn compute_time_budget(
     my_time: i64,
     my_inc: i64,
+    opp_time: i64,
     fullmove: u32,
     movestogo: Option<i64>,
     last_score: Option<i32>,
@@ -48,6 +49,25 @@ fn compute_time_budget(
     let soft_max = (safe_time / 2).max(10);
     let mut soft = base.clamp(10, soft_max);
     let mut hard_cap = (safe_time * 3 / 10).max(soft); // nunca mais de ~30% do relogio numa jogada
+
+    // Nivel 1.5: "olhar para o adversario" antes de decidir quanto gastar
+    // -- pedido directo depois de reparar que o motor por vezes joga
+    // depressa demais em posicoes dificeis mesmo com relogio de sobra.
+    // So' ajusta o TECTO extra (hard_cap), nunca o `soft` baseline nem os
+    // niveis de panico abaixo -- a seguranca do proprio relogio nunca
+    // depende do relogio alheio. Confortavelmente a frente (>=1.5x o
+    // deles): podemos dar-nos ao luxo de pensar mais fundo numa posicao
+    // dificil, o adversario provavelmente vai precisar de mais tempo do
+    // que nos em breve. Confortavelmente atras (eles >=1.5x o nosso):
+    // aperta -- preservar o proprio relogio pesa mais quando ja estamos
+    // em desvantagem nele.
+    if opp_time > 0 {
+        if my_time >= opp_time * 3 / 2 {
+            hard_cap = hard_cap * 6 / 5;
+        } else if opp_time >= my_time * 3 / 2 {
+            hard_cap = hard_cap * 4 / 5;
+        }
+    }
 
     let clearly_winning = last_score.map(|s| s >= 400).unwrap_or(false);
     let clearly_losing = last_score.map(|s| s <= -400).unwrap_or(false);
@@ -187,6 +207,7 @@ impl Engine {
 
         let side_white = self.board.side == crate::types::Color::White;
         let (my_time, my_inc) = if side_white { (wtime, winc) } else { (btime, binc) };
+        let opp_time = if side_white { btime } else { wtime };
 
         // `soft_budget_ms` tracks the real per-move time budget derived
         // from wtime/btime specifically (None for movetime/infinite/depth
@@ -227,10 +248,26 @@ impl Engine {
             // time cutoff for that case.
             None
         } else {
-            let (soft, _hard) = compute_time_budget(my_time, my_inc, self.board.fullmove, movestogo, self.last_score);
+            let (soft, hard_cap) = compute_time_budget(my_time, my_inc, opp_time, self.board.fullmove, movestogo, self.last_score);
             soft_budget_ms = Some(soft);
-            let search_ms = if advisor_enabled { (soft - ADVISOR_RESERVE_MS).max(1) } else { soft };
-            soft_deadline = Some(Instant::now() + Duration::from_millis((search_ms / 2).max(1) as u64));
+            // The search's real deadline uses `hard_cap`, not the flat
+            // `soft` estimate (was computed and thrown away before --
+            // "let (soft, _hard) = ..."). `soft` is the right baseline
+            // for a typical move, but a position where the PV keeps
+            // changing between iterations deserves more than the flat
+            // per-move share -- exactly what a human does with clock to
+            // spare: move fast on the obvious ones, think longer on the
+            // hard ones, without flagging. `hard_cap` already collapses
+            // back down to `soft` in compute_time_budget's low-clock
+            // tiers (<20s/<4s/<1.2s), so this only grants extra thinking
+            // time when the clock is comfortable, never when short.
+            // `soft_deadline` (the stability early-exit checkpoint, see
+            // iterative_deepening() in search.rs) stays anchored to the
+            // smaller `soft`, not `hard_cap` -- an EASY position (root
+            // move stabilizes fast) still hands the clock back quickly
+            // instead of soaking up the wider ceiling for nothing.
+            let search_ms = if advisor_enabled { (hard_cap - ADVISOR_RESERVE_MS).max(1) } else { hard_cap };
+            soft_deadline = Some(Instant::now() + Duration::from_millis((soft / 2).max(1) as u64));
             Some(Instant::now() + Duration::from_millis(search_ms.max(1) as u64))
         };
 
