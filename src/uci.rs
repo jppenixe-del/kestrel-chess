@@ -371,6 +371,7 @@ impl Engine {
                         history_scores: [[[0; 64]; 64]; 2],
                         countermoves: [[None; 64]; 6],
                         cont_hist: vec![0i32; crate::search::CONT_HIST_SIZE].into_boxed_slice(),
+                        corr_hist: vec![0i32; crate::search::CORR_HIST_SIZE * 2].into_boxed_slice(),
                         ply_last_move: [None; crate::search::MAX_PLY],
                         static_evals: [0i32; crate::search::MAX_PLY],
                         root_best: None,
