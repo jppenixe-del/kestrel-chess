@@ -58,8 +58,33 @@ fn main() {
         build_book(&args[2], &args[3]);
         return;
     }
+    if args.len() >= 4 && args[1] == "lookupbook" {
+        lookup_book(&args[2], &args[3..].join(" "));
+        return;
+    }
     let mut engine = uci::Engine::new();
     engine.run();
+}
+
+/// Debug helper: does `book_path` have an entry for `fen`? Prints the
+/// move(s)/counts found or "no entry" -- used to check coverage
+/// questions ("was this exact opening position in the source games?")
+/// without writing a one-off script each time.
+fn lookup_book(book_path: &str, fen: &str) {
+    let zob = Zobrist::new();
+    let board = Board::from_fen(fen);
+    let hash = zob.hash(&board);
+    let bk = book::Book::load(book_path).expect("nao consegui carregar o livro");
+    let entries = bk.lookup(hash);
+    if entries.is_empty() {
+        println!("no entry for this position");
+        return;
+    }
+    for (m16, cnt) in entries {
+        let (from, to, promo) = book::decode_move16(m16);
+        println!("{}{}{} count={}", crate::types::sq_name(from), crate::types::sq_name(to),
+            promo.map(|p| format!("={:?}", p)).unwrap_or_default(), cnt);
+    }
 }
 
 /// Le' um ficheiro de jogos (um por linha, lances UCI separados por
