@@ -372,6 +372,7 @@ impl Engine {
                         countermoves: [[None; 64]; 6],
                         cont_hist: vec![0i32; crate::search::CONT_HIST_SIZE].into_boxed_slice(),
                         ply_last_move: [None; crate::search::MAX_PLY],
+                        static_evals: [0i32; crate::search::MAX_PLY],
                         root_best: None,
                         excluded_move: None,
                         excluded_root_moves: excluded.to_vec(),

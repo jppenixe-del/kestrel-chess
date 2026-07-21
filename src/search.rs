@@ -68,6 +68,12 @@ pub struct Searcher<'a> {
     /// from this node) -- set by the parent right before recursing, read
     /// by the picker to look up `cont_hist`.
     pub ply_last_move: [Option<(PieceType, crate::types::Square)>; MAX_PLY],
+    /// Static eval saved at each ply -- used by the `improving`
+    /// heuristic: at a node, compare the current side's static eval
+    /// against the one from 2 plies back (same side to move). If it
+    /// went up, we're "improving" -- position getting better, so we
+    /// spend less time (tighter futility, more aggressive pruning).
+    pub static_evals: [i32; MAX_PLY],
     pub root_best: Option<Move>,
     /// Singular extensions: quando estamos a verificar se o tt_move e'
     /// "singular" (nenhum outro lance bate uma janela restrita), fazemos
@@ -610,20 +616,30 @@ impl<'a> Searcher<'a> {
 
         let in_check = board.in_check(board.side, self.atk);
 
-        // Reverse futility pruning (static null move): se a avaliacao
-        // estatica rapida ja' esta' tao acima de beta que nem uma
-        // margem generosa por profundidade a apanha, a posicao e' boa
-        // demais para precisar de busca real -- corta. So' em nos nao-
-        // raiz, fora de xeque, profundidade baixa (a margem cresce
-        // linear com a profundidade, torna-se pouco fiavel depressa) e
-        // longe de scores de mate (nao mascarar mates reais).
+        // Static eval computed once at each node (except while in check,
+        // where it is meaningless); cached in `static_evals[ply]` so
+        // the `improving` heuristic below can compare against 2 plies
+        // back. Slight cost but pays off multiple times per node.
+        let static_eval = if in_check { 0 } else { crate::eval::evaluate_fast(board) };
+        if ply < MAX_PLY {
+            self.static_evals[ply] = static_eval;
+        }
+        // `improving`: at a same-side ply, are we better than 2 plies
+        // ago (last time we moved)? If so, position is trending our
+        // way -- afford tighter pruning; if not, we're stagnant/worse,
+        // be more careful. Standard heuristic in every strong engine.
+        let improving = !in_check
+            && ply >= 2
+            && static_eval > self.static_evals[ply - 2];
+
+        // Reverse futility pruning -- scaled by `improving` so we prune
+        // more when we're winning (position better than 2 plies ago).
         if !in_check
             && ply > 0
             && depth <= 6
             && beta.abs() < MATE_SCORE - MAX_PLY as i32
         {
-            let margin = 90 * depth;
-            let static_eval = crate::eval::evaluate_fast(board);
+            let margin = if improving { 65 * depth } else { 95 * depth };
             if static_eval - margin >= beta {
                 return static_eval - margin;
             }
@@ -668,7 +684,6 @@ impl<'a> Searcher<'a> {
         // o fail-low, para nunca perder uma tactica real.
         if !in_check && ply > 0 && depth <= 3 {
             let margin = 150 + 100 * (depth - 1);
-            let static_eval = crate::eval::evaluate_fast(board);
             if static_eval + margin <= alpha {
                 let full_stand_pat = evaluate(board);
                 let q = self.quiescence_from(board, alpha, beta, ply, full_stand_pat);
@@ -678,21 +693,16 @@ impl<'a> Searcher<'a> {
             }
         }
 
-        // Internal Iterative Deepening: sem lance da TT para ordenar por
-        // (tipico em nos que nunca foram visitados a esta profundidade),
-        // uma pesquisa reduzida barata da' um lance de ordenacao muito
-        // melhor do que a ordem crua do gerador -- mais cortes beta mais
-        // cedo no loop principal abaixo. So' compensa a profundidades
-        // razoaveis (a reducao tem de deixar sobrar pesquisa real) e nunca
-        // em xeque (ja' e' extendido, o proprio xeque restringe as opcoes).
+        // Internal Iterative Reduction (IIR): if there is no TT move at
+        // a node that would otherwise search deep, drop the depth by 1
+        // instead of running a full nested IID search (which costs a
+        // sub-tree). The idea: without a TT hint the move ordering is
+        // weaker, so an extra ply won't help much anyway -- better to
+        // spend the time on the fully-ordered later iterations. Cheap
+        // to implement, well-tested pattern.
+        let mut depth = depth;
         if tt_move.is_none() && depth >= 4 && !in_check {
-            self.negamax(board, depth - 2, alpha, beta, ply);
-            if self.stop {
-                return 0;
-            }
-            if let Some(e) = self.tt.probe(hash) {
-                tt_move = e.best;
-            }
+            depth -= 1;
         }
 
         let mut moves = generate_legal(board, self.atk);
@@ -771,12 +781,33 @@ impl<'a> Searcher<'a> {
         self.history.push(hash);
         let mut i: usize = 0;
         while let Some(mv) = picker.next_move(self, board, ply.min(MAX_PLY - 1), hash) {
-            // Futility pruning: a profundidade baixa, lances tranquilos
-            // que nem com uma margem generosa da avaliacao estatica
-            // conseguem bater alfa raramente valem a pena explorar --
-            // salta-os sem pesquisar. Nunca no 1o lance (pode ser o
-            // melhor), nunca em xeque/captura/promocao, nunca perto de
-            // scores de mate (a avaliacao estatica nao e' fiavel ai).
+            // Late Move Pruning (LMP): at low depth, after already
+            // trying enough quiet moves, skip the rest entirely
+            // (unlike LMR which only reduces depth). Threshold grows
+            // quadratically with depth; tighter when not improving.
+            // Never in check, never on capture/promotion, never near
+            // mate scores.
+            if !in_check
+                && depth <= 5
+                && !mv.is_capture()
+                && mv.promotion.is_none()
+                && alpha.abs() < MATE_SCORE - MAX_PLY as i32
+            {
+                let lmp_threshold = if improving {
+                    3 + depth * depth
+                } else {
+                    2 + depth * depth / 2
+                };
+                if (quiets_tried.len() as i32) >= lmp_threshold {
+                    i += 1;
+                    continue;
+                }
+            }
+
+            // Futility pruning: quiet moves at low depth that cannot
+            // beat alpha even with a generous margin over static eval
+            // are usually not worth searching. Improving-aware: tighter
+            // margin when position is trending well (afford more prune).
             if i > 0
                 && !in_check
                 && depth <= 6
@@ -784,8 +815,8 @@ impl<'a> Searcher<'a> {
                 && mv.promotion.is_none()
                 && alpha.abs() < MATE_SCORE - MAX_PLY as i32
             {
-                let margin = 100 * depth;
-                let fe = *futility_eval.get_or_insert_with(|| crate::eval::evaluate_fast(board));
+                let margin = if improving { 75 * depth } else { 105 * depth };
+                let fe = *futility_eval.get_or_insert(static_eval);
                 if fe + margin <= alpha {
                     i += 1;
                     continue;
