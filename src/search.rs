@@ -578,6 +578,28 @@ impl<'a> Searcher<'a> {
             // caso, is_capture()==false, so' entram aqui por causa do
             // OR acima -- SEE nao se aplica, `is_capture()` protege isso).
             moves.retain(|m| !m.is_capture() || self.see(board, m) >= 0);
+            // Delta pruning: a capture that CANNOT reach alpha even in
+            // the best case (winning the captured piece outright, a
+            // looser bound than the full SEE exchange) isn't worth
+            // trying at all -- cheaper pre-filter than SEE, applied
+            // after it since SEE already thinned the list. Skipped
+            // near mate scores (a fixed material margin isn't
+            // meaningful there) and for promotions (potential gain is
+            // much larger than a simple capture value suggests).
+            if alpha.abs() < MATE_SCORE - MAX_PLY as i32 {
+                const DELTA_MARGIN: i32 = 200;
+                moves.retain(|m| {
+                    if m.promotion.is_some() {
+                        return true;
+                    }
+                    let captured_value = if m.flag == MoveFlag::EnPassant {
+                        PieceType::Pawn.value()
+                    } else {
+                        board.piece_at(m.to).map(|(pt, _)| pt.value()).unwrap_or(0)
+                    };
+                    stand_pat + captured_value + DELTA_MARGIN >= alpha
+                });
+            }
         }
         let moves = self.order_moves(board, moves, None, ply.min(MAX_PLY - 1), None);
 
