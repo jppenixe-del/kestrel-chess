@@ -8,7 +8,27 @@ use crate::moves::{Move, MoveFlag};
 use crate::tt::{Bound, TranspositionTable};
 use crate::types::{file_of, rank_of, sq, Color, PieceType};
 use crate::zobrist::Zobrist;
+use std::sync::OnceLock;
 use std::time::Instant;
+
+/// LMR reduction table indexed by [depth][move_index], both clamped to
+/// 63. Logarithmic formula (standard shape used by essentially every
+/// modern alpha-beta engine): reduction grows with ln(depth)*ln(count),
+/// smooth instead of the old fixed tiers (+1/+2/+3 at hard thresholds).
+/// Computed once at first use, cheap (64*64 entries).
+static LMR_TABLE: OnceLock<[[i32; 64]; 64]> = OnceLock::new();
+fn lmr_table() -> &'static [[i32; 64]; 64] {
+    LMR_TABLE.get_or_init(|| {
+        let mut t = [[0i32; 64]; 64];
+        for d in 1..64 {
+            for m in 1..64 {
+                let r = 0.5 + (d as f64).ln() * (m as f64).ln() / 2.1;
+                t[d][m] = r as i32;
+            }
+        }
+        t
+    })
+}
 
 pub const MATE_SCORE: i32 = 30000;
 pub const MAX_PLY: usize = 128;
@@ -889,31 +909,27 @@ impl<'a> Searcher<'a> {
             let score = if i == 0 {
                 -self.negamax(board, depth - 1 + extend, -beta, -alpha, ply + 1)
             } else {
-                // LMR: lances tardios na ordenacao (>= 4) tendem a ser maus;
-                // pesquisa-os com profundidade reduzida primeiro. Nao reduzir
-                // capturas, promocoes, lances que dao xeque, nem quando
-                // estamos a escapar de xeque (extend == 1).
+                // LMR: late quiet moves are usually not the best -- search
+                // them at a reduced depth first, verify with full depth
+                // only if promising. Logarithmic reduction (standard
+                // shape) instead of hard tiers: smooth growth with depth
+                // and move index. Never reduce captures/promotions/
+                // checks/while escaping check. History-adjusted: a move
+                // with strongly positive history gets less reduction
+                // (it's usually been good here before), strongly
+                // negative gets more.
                 let gives_check = board.in_check(board.side, self.atk);
-                let r = if i >= 4
-                    && depth >= 3
+                let r = if i >= 2
+                    && depth >= 2
                     && extend == 0
                     && !mv.is_capture()
                     && mv.promotion.is_none()
                     && !gives_check
                 {
-                    // Adaptive: lances mais tardios e nos mais profundos
-                    // toleram uma reducao maior -- a probabilidade deste
-                    // lance ser o melhor cai com a posicao na ordenacao,
-                    // e a arvore restante e' grande o suficiente para a
-                    // reducao extra ainda deixar profundidade real.
-                    let mut r = 1;
-                    if depth >= 6 {
-                        r += 1;
-                    }
-                    if i >= 10 {
-                        r += 1;
-                    }
-                    r.min(depth - 1)
+                    let base = lmr_table()[(depth as usize).min(63)][(i + 1).min(63)];
+                    let h = self.history_scores[board.side.idx()][mv.from as usize][mv.to as usize];
+                    let hist_adj = -(h / 4000); // +/-1 per ~4000 history points
+                    (base + hist_adj).clamp(0, depth - 1)
                 } else {
                     0
                 };
