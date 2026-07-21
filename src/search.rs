@@ -538,34 +538,59 @@ impl<'a> Searcher<'a> {
         if self.time_up() {
             return stand_pat;
         }
-        if stand_pat >= beta {
-            return beta;
-        }
-        if stand_pat > alpha {
-            alpha = stand_pat;
+        // "Standing pat" (declining to search further, taking the
+        // static eval as-is) is only a legal option when NOT in check
+        // -- a side in check has no "do nothing" move, it MUST respond.
+        // Applying the stand-pat cutoff/floor while in check would
+        // silently accept an illegal null move and could miss forced
+        // mates or misjudge a check sequence entirely. When in check,
+        // every legal reply must be searched (not just captures), same
+        // as the main search's check-evasion handling.
+        let in_check = board.in_check(board.side, self.atk);
+        if !in_check {
+            if stand_pat >= beta {
+                return beta;
+            }
+            if stand_pat > alpha {
+                alpha = stand_pat;
+            }
         }
         if ply >= MAX_PLY - 1 {
             return stand_pat;
         }
 
         let mut moves = generate_legal(board, self.atk);
-        moves.retain(|m| m.is_capture() || m.promotion == Some(PieceType::Queen));
-        // Poda por SEE: uma captura que perde material na troca completa
-        // (SEE negativo) quase nunca vale a pena dentro da quiescence --
-        // e' exactamente o tipo de "captura mal calculada" que antes
-        // era sempre pesquisada (MVV-LVA nao filtra nada, so' ordena).
-        // Promocoes de dama ficam sempre (mv.to nao e' captura nesse
-        // caso, is_capture()==false, so' entram aqui por causa do
-        // OR acima -- SEE nao se aplica, `is_capture()` protege isso).
-        moves.retain(|m| !m.is_capture() || self.see(board, m) >= 0);
+        if in_check {
+            if moves.is_empty() {
+                return -MATE_SCORE + ply as i32;
+            }
+            // No capture-only filter here: any legal evasion may be the
+            // only way out (blocking, king move, or capturing the
+            // checker). SEE pruning also doesn't apply -- a losing
+            // capture can still be the only legal escape from check.
+        } else {
+            moves.retain(|m| m.is_capture() || m.promotion == Some(PieceType::Queen));
+            // Poda por SEE: uma captura que perde material na troca completa
+            // (SEE negativo) quase nunca vale a pena dentro da quiescence --
+            // e' exactamente o tipo de "captura mal calculada" que antes
+            // era sempre pesquisada (MVV-LVA nao filtra nada, so' ordena).
+            // Promocoes de dama ficam sempre (mv.to nao e' captura nesse
+            // caso, is_capture()==false, so' entram aqui por causa do
+            // OR acima -- SEE nao se aplica, `is_capture()` protege isso).
+            moves.retain(|m| !m.is_capture() || self.see(board, m) >= 0);
+        }
         let moves = self.order_moves(board, moves, None, ply.min(MAX_PLY - 1), None);
 
+        let mut best = if in_check { -MATE_SCORE - 1 } else { alpha };
         for mv in moves {
             let undo = board.make_move(&mv);
             let score = -self.quiescence(board, -beta, -alpha, ply + 1);
             board.unmake_move(&mv, &undo);
             if self.stop {
-                return alpha;
+                return if in_check { best.max(alpha) } else { alpha };
+            }
+            if score > best {
+                best = score;
             }
             if score >= beta {
                 return beta;
@@ -574,7 +599,11 @@ impl<'a> Searcher<'a> {
                 alpha = score;
             }
         }
-        alpha
+        if in_check {
+            best
+        } else {
+            alpha
+        }
     }
 
     fn negamax(&mut self, board: &mut Board, depth: i32, mut alpha: i32, beta: i32, ply: usize) -> i32 {
