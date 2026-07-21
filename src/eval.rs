@@ -573,6 +573,115 @@ pub fn default_weights() -> &'static Weights {
     DEFAULT_WEIGHTS.get_or_init(Weights::default)
 }
 
+impl Weights {
+    /// Flattens every tunable scalar into one Vec<i32>, fixed order,
+    /// matching `apply_vec()` exactly -- lets the tuner (src/tuning.rs)
+    /// treat this as one flat parameter vector for coordinate descent
+    /// instead of hand-writing a perturbation loop per field.
+    /// `king_danger_table` is deliberately excluded: it's a derived
+    /// smooth curve (see its own comment above), not something to let
+    /// 128 independent coordinate-descent steps chew on with a small
+    /// dataset -- tune the pieces that feed it instead.
+    pub fn to_vec(&self) -> Vec<i32> {
+        let mut v = Vec::with_capacity(512);
+        macro_rules! pair { ($p:expr) => { v.push($p.0); v.push($p.1); } }
+        macro_rules! pairs { ($arr:expr) => { for p in $arr.iter() { pair!(p); } } }
+        pair!(self.bishop_pair);
+        pair!(self.long_diag_bishop);
+        pair!(self.minor_behind_pawn);
+        pair!(self.knight_outpost);
+        pairs!(self.rook_open);
+        pair!(self.tempo);
+        pairs!(self.mobility_knight);
+        pairs!(self.mobility_bishop);
+        pairs!(self.mobility_rook);
+        pairs!(self.mobility_queen);
+        pairs!(self.king_attacker_weight);
+        pair!(self.king_attacks);
+        pairs!(self.pawn_shelter);
+        pair!(self.shelter_open);
+        pairs!(self.pawn_storm);
+        for row in self.threat_by_pawn.iter() { pairs!(row); }
+        for row in self.threat_by_knight.iter() { pairs!(row); }
+        for row in self.threat_by_bishop.iter() { pairs!(row); }
+        for row in self.threat_by_rook.iter() { pairs!(row); }
+        for row in self.threat_by_queen.iter() { pairs!(row); }
+        pairs!(self.threat_by_king);
+        pair!(self.knight_hit_queen);
+        pair!(self.bishop_hit_queen);
+        pair!(self.rook_hit_queen);
+        pair!(self.push_threat);
+        pair!(self.restricted_squares);
+        pairs!(self.pawn_phalanx);
+        pairs!(self.defended_pawn);
+        pair!(self.isolated_pawn);
+        pair!(self.doubled_pawn);
+        pairs!(self.passed_pawn);
+        v
+    }
+
+    /// Inverse of `to_vec()` -- rebuilds a full `Weights` from a flat
+    /// vector in the exact same field order. `king_danger_table` is
+    /// copied from `self` unchanged (see `to_vec` doc).
+    pub fn from_vec(&self, v: &[i32]) -> Weights {
+        let mut i = 0;
+        macro_rules! next { () => { { let x = v[i]; i += 1; x } } }
+        macro_rules! pair { () => { (next!(), next!()) } }
+        macro_rules! pairs { ($n:expr) => { { let mut a = [(0i32,0i32); $n]; for j in 0..$n { a[j] = pair!(); } a } } }
+        let bishop_pair = pair!();
+        let long_diag_bishop = pair!();
+        let minor_behind_pawn = pair!();
+        let knight_outpost = pair!();
+        let rook_open = pairs!(2);
+        let tempo = pair!();
+        let mobility_knight = pairs!(28);
+        let mobility_bishop = pairs!(28);
+        let mobility_rook = pairs!(28);
+        let mobility_queen = pairs!(28);
+        let king_attacker_weight = pairs!(4);
+        let king_attacks = pair!();
+        let pawn_shelter = pairs!(4);
+        let shelter_open = pair!();
+        let pawn_storm = pairs!(4);
+        let threat_by_pawn = [pairs!(6), pairs!(6)];
+        let threat_by_knight = [pairs!(6), pairs!(6)];
+        let threat_by_bishop = [pairs!(6), pairs!(6)];
+        let threat_by_rook = [pairs!(6), pairs!(6)];
+        let threat_by_queen = [pairs!(6), pairs!(6)];
+        let threat_by_king = pairs!(6);
+        let knight_hit_queen = pair!();
+        let bishop_hit_queen = pair!();
+        let rook_hit_queen = pair!();
+        let push_threat = pair!();
+        let restricted_squares = pair!();
+        let pawn_phalanx = pairs!(8);
+        let defended_pawn = pairs!(8);
+        let isolated_pawn = pair!();
+        let doubled_pawn = pair!();
+        let passed_pawn = pairs!(8);
+        assert_eq!(i, v.len(), "from_vec: length mismatch with to_vec's field order");
+        Weights {
+            bishop_pair, long_diag_bishop, minor_behind_pawn, knight_outpost, rook_open, tempo,
+            mobility_knight, mobility_bishop, mobility_rook, mobility_queen,
+            king_attacker_weight, king_attacks, king_danger_table: self.king_danger_table,
+            pawn_shelter, shelter_open, pawn_storm,
+            threat_by_pawn, threat_by_knight, threat_by_bishop, threat_by_rook, threat_by_queen, threat_by_king,
+            knight_hit_queen, bishop_hit_queen, rook_hit_queen, push_threat, restricted_squares,
+            pawn_phalanx, defended_pawn, isolated_pawn, doubled_pawn, passed_pawn,
+        }
+    }
+}
+
+/// Full evaluate(), but with a caller-supplied `Weights` instead of
+/// `default_weights()` -- what the tuner calls to score a position
+/// under a candidate parameter vector. Mirrors `evaluate()`'s material
+/// + positional composition exactly.
+pub fn evaluate_with_weights(board: &Board, w: &Weights) -> i32 {
+    let p = positional_terms(board, w);
+    let p_signed = if board.side == Color::White { p } else { -p };
+    material_pst(board) + p_signed
+}
+
 /// Avalia mobilidade, pressao sobre o rei inimigo, par de bispos, torres
 /// em colunas abertas/semi-abertas e estrutura de peoes usando os pesos
 /// tunados do Sirius v9.0 (ver constantes acima) -- consistente com as

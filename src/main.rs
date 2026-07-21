@@ -62,8 +62,50 @@ fn main() {
         lookup_book(&args[2], &args[3..].join(" "));
         return;
     }
+    if args.len() >= 2 && args[1] == "checkweights" {
+        check_weights_roundtrip();
+        return;
+    }
     let mut engine = uci::Engine::new();
     engine.run();
+}
+
+/// Debug helper: to_vec()/from_vec() must be exact inverses of each
+/// other (same field order both ways) -- checked once here instead of
+/// trusting it by inspection, since a mismatch would silently corrupt
+/// every tuning run without ever panicking on a length assert.
+fn check_weights_roundtrip() {
+    let original = eval::default_weights().clone();
+    let v = original.to_vec();
+    println!("flat vector length: {}", v.len());
+    let rebuilt = original.from_vec(&v);
+    let v2 = rebuilt.to_vec();
+    if v == v2 {
+        println!("OK: to_vec/from_vec round-trip matches ({} scalars)", v.len());
+    } else {
+        println!("MISMATCH: round-trip does not match!");
+        for (idx, (a, b)) in v.iter().zip(v2.iter()).enumerate() {
+            if a != b {
+                println!("  index {}: {} != {}", idx, a, b);
+            }
+        }
+    }
+    // Also confirm evaluate_with_weights(default) == evaluate() exactly
+    // on a handful of real positions (checks the struct itself, not
+    // just the vector round-trip).
+    let atk = Attacks::new();
+    let fens = [
+        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+        "r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4",
+        "8/1p3Q1p/p3r3/2pk4/8/5K1P/Pb3PP1/7R b - - 0 30",
+    ];
+    for fen in fens {
+        let board = Board::from_fen(fen);
+        let a = eval::evaluate(&board);
+        let b = eval::evaluate_with_weights(&board, &original);
+        println!("fen ok={} eval()={} evaluate_with_weights(default)={}: {}", a == b, a, b, fen);
+    }
+    let _ = atk;
 }
 
 /// Debug helper: does `book_path` have an entry for `fen`? Prints the
