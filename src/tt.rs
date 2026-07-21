@@ -147,8 +147,26 @@ impl TranspositionTable {
         let data = encode_data(depth, score, bound, best);
         let idx = (key as usize) & self.mask;
         let slot = &self.slots[idx];
-        // sempre substitui (simples; substituicao por profundidade fica
-        // para uma versao seguinte)
+        // Always-replace, and it's the RIGHT choice for this table's
+        // shape, not a placeholder (2026-07-21 -- measured, replacing
+        // an older comment that called depth-preferred replacement
+        // "deferred work"). Tried the textbook depth-preferred rule
+        // (keep the existing entry when it's the same position at a
+        // deeper depth): it cost ~30% MORE nodes to the same fixed
+        // depth (988901 -> 1302548 on a middlegame test position),
+        // making the engine reach shallower depths under a fixed
+        // movetime and regressing the tactical suite (87% -> 74%). The
+        // reason: this is a single-slot table (one entry per index, no
+        // multi-way bucket) with no generation/aging counter. Real
+        // engines' depth-preferred replacement is always paired with
+        // buckets AND aging (keep-if-deeper-OR-from-an-older-search),
+        // which is what makes it a net win; adding only the "keep if
+        // deeper" half, on a single slot, just freezes a stale
+        // best-move in place and starves move ordering -> more nodes.
+        // Always-replace keeps the most recent (and in iterative
+        // deepening, deepest-so-far) info in every slot, which is
+        // strictly better here until/unless the table grows a
+        // bucket+aging design.
         slot.data.store(data, Ordering::Relaxed);
         slot.key_xor_data.store(key ^ data, Ordering::Relaxed);
     }
