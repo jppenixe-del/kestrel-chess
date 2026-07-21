@@ -959,6 +959,26 @@ impl<'a> Searcher<'a> {
                     continue;
                 }
             }
+
+            // History pruning: late quiet moves at low depth whose
+            // history score is strongly negative have consistently
+            // failed to cause a cutoff in similar contexts before --
+            // skip them outright instead of even a reduced search.
+            // Separate signal from LMP (which is pure move-count) and
+            // from LMR (which still searches, just shallower).
+            if i >= 3
+                && !in_check
+                && depth <= 4
+                && !mv.is_capture()
+                && mv.promotion.is_none()
+                && alpha.abs() < MATE_SCORE - MAX_PLY as i32
+            {
+                let h = self.history_scores[board.side.idx()][mv.from as usize][mv.to as usize];
+                if h < -2500 * depth {
+                    i += 1;
+                    continue;
+                }
+            }
             let undo = board.make_move(&mv);
             if ply + 1 < MAX_PLY {
                 if let Some((moved_pt, _)) = board.piece_at(mv.to) {
