@@ -273,6 +273,44 @@ const MOBILITY_QUEEN: [(i32, i32); 28] = [
 const KING_ATTACKER_WEIGHT: [(i32, i32); 4] = [(54, -2), (22, -2), (22, -7), (4, -9)];
 const KING_ATTACKS: (i32, i32) = (7, 0);
 
+// Ameacas -- Sirius: quando uma peca nossa ataca uma peca inimiga, soma
+// bonus indexado pelo tipo da peca atacada; para as pecas maiores, ha
+// tabela separada para "defendida pelo inimigo" vs nao. Isto e' o que
+// resolve o caso classico "peao inimigo ameaca o meu peao/peca em k
+// lances a frente" que a busca a profundidade baixa nao ve directamente.
+// Ordem: [Pawn, Knight, Bishop, Rook, Queen, King].
+const THREAT_BY_PAWN: [(i32, i32); 6] = [(-7,-19),(73,41),(65,72),(72,50),(56,24),(0,0)];
+// [defended=0 nao-defendido / 1 defendido][target_piece]
+const THREAT_BY_KNIGHT: [[(i32, i32); 6]; 2] = [
+    [(5,37),(12,85),(50,33),(86,13),(41,8),(0,0)],
+    [(-8,11),(9,79),(38,29),(71,45),(50,46),(0,0)],
+];
+const THREAT_BY_BISHOP: [[(i32, i32); 6]; 2] = [
+    [(3,34),(36,44),(12,102),(58,35),(61,53),(0,0)],
+    [(-5,4),(20,21),(4,76),(56,60),(63,74),(0,0)],
+];
+const THREAT_BY_ROOK: [[(i32, i32); 6]; 2] = [
+    [(-3,50),(35,52),(45,49),(-12,50),(67,-10),(0,0)],
+    [(-10,10),(8,15),(19,4),(1,22),(54,85),(0,0)],
+];
+const THREAT_BY_QUEEN: [[(i32, i32); 6]; 2] = [
+    [(8,21),(25,30),(18,65),(16,12),(-2,-17),(0,0)],
+    [(-5,16),(2,8),(-9,37),(-7,7),(-19,1),(0,0)],
+];
+const THREAT_BY_KING: [(i32, i32); 6] = [(39,18),(33,38),(99,33),(83,8),(0,0),(0,0)];
+// Peca menor a atacar a dama inimiga (nao contado nos threat-by-X porque
+// esses ja' cobrem a captura directa; estes sao para o padrao de
+// "cavalo/bispo/torre em jogada seguinte deposita ameaca na dama").
+const KNIGHT_HIT_QUEEN: (i32, i32) = (7, 2);
+const BISHOP_HIT_QUEEN: (i32, i32) = (16, 15);
+const ROOK_HIT_QUEEN: (i32, i32) = (18, 0);
+// Bonus quando um push de peao (avanco de 1 casa) CRIARIA uma nova
+// ameaca a peca inimiga. Simulado por check-single-square-forward.
+const PUSH_THREAT: (i32, i32) = (13, 17);
+// Casas atacadas por nos e nao defendidas pelo inimigo -- pequeno bonus
+// por casa restrita ao adversario.
+const RESTRICTED_SQUARES: (i32, i32) = (2, 3);
+
 // Peoes -- todas as tabelas indexadas por rank (0=1a, 7=8a; entrada 0 e
 // 7 sao 0 porque peoes nao existem la, mantidos para simplicidade de
 // index).
@@ -302,11 +340,50 @@ const PASSED_PAWN: [(i32, i32); 8] = [
 /// fase do jogo (mesma logica de material_pst). Devolve da perspetiva
 /// das BRANCAS (score_white - score_black), interpolado; o chamador
 /// (evaluate) converte para a convencao negamax.
+/// Bitboard de todas as casas atacadas por peoes de `by`. Combinacao
+/// classica: shifts diagonais dos peoes ao invez de um loop.
+fn pawn_attacks_by(board: &Board, by: Color) -> Bitboard {
+    let pawns = board.pieces[by.idx()][PieceType::Pawn.idx()];
+    if by == Color::White {
+        // brancas atacam para NW e NE (rank+1, file-1 / file+1)
+        (pawns & !FILE_A) << 7 | (pawns & !FILE_H) << 9
+    } else {
+        // pretas atacam para SW e SE
+        (pawns & !FILE_A) >> 9 | (pawns & !FILE_H) >> 7
+    }
+}
+
 fn positional_terms(board: &Board) -> i32 {
     let a = atk();
     let occ = board.occ_all;
     let mut mg = 0i32;
     let mut eg = 0i32;
+
+    // === EvalData estilo Sirius (`eval.cpp` EvalData/initEvalData) ===
+    // Bitboards acumulados por cor para: casas atacadas por cada tipo
+    // de peca (attacked_by_pt), casas atacadas total (attacked), casas
+    // atacadas por 2 ou mais pecas (attacked_by_2). Precisamos destes
+    // agregados para calcular ameacas correctamente: "peca inimiga
+    // defendida" = casa atacada 2x por eles OU atacada 1x por peao
+    // deles OU atacada por qualquer peca deles e nao atacada 2x por nos.
+    let mut attacked_by_pt: [[Bitboard; 6]; 2] = [[0; 6]; 2];
+    let mut attacked: [Bitboard; 2] = [0; 2];
+    let mut attacked_by_2: [Bitboard; 2] = [0; 2];
+
+    // Peoes: ataques diagonais em massa via shifts.
+    for c in [Color::White, Color::Black] {
+        let pa = pawn_attacks_by(board, c);
+        attacked_by_2[c.idx()] |= attacked[c.idx()] & pa;
+        attacked[c.idx()] |= pa;
+        attacked_by_pt[c.idx()][PieceType::Pawn.idx()] |= pa;
+
+        // Rei.
+        let ks = board.king_sq(c);
+        let ka = a.king[ks as usize];
+        attacked_by_2[c.idx()] |= attacked[c.idx()] & ka;
+        attacked[c.idx()] |= ka;
+        attacked_by_pt[c.idx()][PieceType::King.idx()] |= ka;
+    }
 
     let white_king_zone = king_zone(board.king_sq(Color::White));
     let black_king_zone = king_zone(board.king_sq(Color::Black));
@@ -335,6 +412,11 @@ fn positional_terms(board: &Board) -> i32 {
                     PieceType::Queen => queen_attacks(s, occ),
                     _ => 0,
                 };
+                // Registar em EvalData para a fase de threats abaixo.
+                attacked_by_2[c.idx()] |= attacked[c.idx()] & attacks;
+                attacked[c.idx()] |= attacks;
+                attacked_by_pt[c.idx()][pt.idx()] |= attacks;
+
                 let mobility = count(attacks & !own) as usize;
                 let mob_table = match pt {
                     PieceType::Knight => &MOBILITY_KNIGHT,
@@ -347,8 +429,6 @@ fn positional_terms(board: &Board) -> i32 {
                 mg += sign * m.0;
                 eg += sign * m.1;
 
-                // Ataques a zona do rei -- pesados por tipo de peca +
-                // conta de ataques (KING_ATTACKS por casa atacada).
                 let hits = count(attacks & enemy_king_zone) as i32;
                 if hits > 0 {
                     king_attackers += 1;
@@ -364,7 +444,6 @@ fn positional_terms(board: &Board) -> i32 {
                     king_attack_units.1 += w.1 + hits * KING_ATTACKS.1;
                 }
 
-                // Torre em coluna aberta / semi-aberta.
                 if pt == PieceType::Rook {
                     let file_mask = FILE_A << file_of(s);
                     let own_pawns_on_file = board.pieces[c.idx()][PieceType::Pawn.idx()] & file_mask;
@@ -376,7 +455,6 @@ fn positional_terms(board: &Board) -> i32 {
                     }
                 }
 
-                // Menor "atras" de um peao proprio.
                 if pt == PieceType::Knight || pt == PieceType::Bishop {
                     let f = file_of(s) as i32;
                     let r = rank_of(s) as i32;
@@ -388,8 +466,6 @@ fn positional_terms(board: &Board) -> i32 {
                         eg += sign * MINOR_BEHIND_PAWN.1;
                     }
 
-                    // Knight outpost (o Sirius nao tem outpost para
-                    // bispo separado, so' para cavalo).
                     if pt == PieceType::Knight {
                         let own_side_rank = if c == Color::White { r } else { 7 - r };
                         if (3..=5).contains(&own_side_rank) {
@@ -408,7 +484,6 @@ fn positional_terms(board: &Board) -> i32 {
                     }
                 }
 
-                // Bispo na longa diagonal central.
                 if pt == PieceType::Bishop {
                     let center: Bitboard = bb(sq(3, 3)) | bb(sq(4, 3)) | bb(sq(3, 4)) | bb(sq(4, 4));
                     if count(attacks & center) >= 2 {
@@ -419,12 +494,145 @@ fn positional_terms(board: &Board) -> i32 {
             }
         }
 
-        // Bonus de ataque ao rei: acumulado, escalado por numero de
-        // atacantes distintos (peso principal ja' aplicado por peca).
         if king_attackers >= 2 {
             mg += sign * king_attack_units.0;
             eg += sign * king_attack_units.1;
         }
+    }
+
+    // === Ameacas (Sirius `evaluateThreats`) ===
+    // Aplica por cor: bonus para cada peca inimiga que a nossa peca de
+    // tipo X ATACA, indexada pelo tipo alvo e por "defended".
+    // defended = attackedBy2[them] | attackedBy[them][PAWN] |
+    //            (attacked[them] & ~attackedBy2[us])
+    // (formula literal do Sirius; a intuicao: peca inimiga esta
+    // "defendida" se qq peca ou peao deles defende, EXCEPTO quando nos
+    // temos MAIS atacantes que eles defensores.)
+    for c in [Color::White, Color::Black] {
+        let sign = if c == Color::White { 1 } else { -1 };
+        let us = c.idx();
+        let them = c.opp().idx();
+        let their_pieces = board.occ_color[them];
+        let their_queen = board.pieces[them][PieceType::Queen.idx()];
+        let their_king = board.pieces[them][PieceType::King.idx()];
+
+        let defended_bb: Bitboard = attacked_by_2[them]
+            | attacked_by_pt[them][PieceType::Pawn.idx()]
+            | (attacked[them] & !attacked_by_2[us]);
+
+        // Threats por peao.
+        let mut t = attacked_by_pt[us][PieceType::Pawn.idx()] & their_pieces;
+        while t != 0 {
+            let s = t.trailing_zeros() as Square;
+            t &= t - 1;
+            if let Some((pt, _)) = board.piece_at(s) {
+                mg += sign * THREAT_BY_PAWN[pt.idx()].0;
+                eg += sign * THREAT_BY_PAWN[pt.idx()].1;
+            }
+        }
+        // Threats por cavalo/bispo/torre/dama.
+        for (pt_us, table) in [
+            (PieceType::Knight, &THREAT_BY_KNIGHT),
+            (PieceType::Bishop, &THREAT_BY_BISHOP),
+            (PieceType::Rook, &THREAT_BY_ROOK),
+            (PieceType::Queen, &THREAT_BY_QUEEN),
+        ] {
+            let mut t = attacked_by_pt[us][pt_us.idx()] & their_pieces;
+            // Dama nao conta ameacas ao rei (o mate cobre isso).
+            if pt_us == PieceType::Queen {
+                t &= !their_king;
+            }
+            while t != 0 {
+                let s = t.trailing_zeros() as Square;
+                t &= t - 1;
+                let defended = (defended_bb & bb(s)) != 0;
+                if let Some((tgt, _)) = board.piece_at(s) {
+                    let entry = table[defended as usize][tgt.idx()];
+                    mg += sign * entry.0;
+                    eg += sign * entry.1;
+                }
+            }
+        }
+        // Threats por rei -- so' contra pecas nao-defendidas.
+        let mut t = attacked_by_pt[us][PieceType::King.idx()] & their_pieces & !defended_bb;
+        while t != 0 {
+            let s = t.trailing_zeros() as Square;
+            t &= t - 1;
+            if let Some((pt, _)) = board.piece_at(s) {
+                mg += sign * THREAT_BY_KING[pt.idx()].0;
+                eg += sign * THREAT_BY_KING[pt.idx()].1;
+            }
+        }
+
+        // Restricted squares: casas onde nos temos 2+ atacantes, eles
+        // nao tem 2+, mas eles atacam pelo menos 1 vez. Sirius:
+        // attackedBy2[us] & ~attackedBy2[them] & attacked[them].
+        let restricted = attacked_by_2[us] & !attacked_by_2[them] & attacked[them];
+        let n_restr = count(restricted) as i32;
+        mg += sign * RESTRICTED_SQUARES.0 * n_restr;
+        eg += sign * RESTRICTED_SQUARES.1 * n_restr;
+
+        // Push threats: um peao nosso pode avancar 1 casa (ou 2 se
+        // ainda esta' na fileira inicial) para uma casa "segura" e
+        // ATACAR uma peca nao-peao inimiga a partir dai. `safe` =
+        // casas nao defendidas OU casas onde nos temos mais atacantes.
+        let empty = !occ;
+        let own_pawns = board.pieces[us][PieceType::Pawn.idx()];
+        let one_push = if c == Color::White {
+            (own_pawns << 8) & empty
+        } else {
+            (own_pawns >> 8) & empty
+        };
+        // Second push (para peoes na fileira inicial, o "empurrao
+        // duplo"): sobre o subconjunto do one_push que caiu na 3a
+        // fileira relativa.
+        let rank3_bb: Bitboard = if c == Color::White { RANK_3 } else { RANK_6 };
+        let two_push = if c == Color::White {
+            ((one_push & rank3_bb) << 8) & empty
+        } else {
+            ((one_push & rank3_bb) >> 8) & empty
+        };
+        let pushes = one_push | two_push;
+        let safe = !defended_bb
+            | (attacked[us] & !attacked_by_pt[them][PieceType::Pawn.idx()] & !attacked_by_2[them]);
+        let safe_pushes = pushes & safe;
+        // Casas atacadas por peoes-nossos-simulados-nas-safe_pushes:
+        let push_attacks_on_enemy = if c == Color::White {
+            ((safe_pushes & !FILE_A) << 7) | ((safe_pushes & !FILE_H) << 9)
+        } else {
+            ((safe_pushes & !FILE_A) >> 9) | ((safe_pushes & !FILE_H) >> 7)
+        };
+        let non_pawn_enemies = their_pieces & !board.pieces[them][PieceType::Pawn.idx()];
+        let n_push_threats = count(push_attacks_on_enemy & non_pawn_enemies) as i32;
+        mg += sign * PUSH_THREAT.0 * n_push_threats;
+        eg += sign * PUSH_THREAT.1 * n_push_threats;
+
+        // Hit-queen: peca menor/torre nossa esta' a UMA-JOGADA de
+        // atacar a dama inimiga a partir de casa segura.
+        if count(their_queen) == 1 {
+            let qs = their_queen.trailing_zeros() as Square;
+            let targets_base = safe & !own_pawns;
+            let knight_hits = a.knight[qs as usize];
+            let bishop_hits = bishop_attacks(qs, occ);
+            let rook_hits = rook_attacks(qs, occ);
+            // Sirius: knight hits nao precisa de attackedBy2[us], mas
+            // bishop/rook precisam (targets &= attackedBy2[us]).
+            let n_knight_hit = count(targets_base & knight_hits & attacked_by_pt[us][PieceType::Knight.idx()]) as i32;
+            mg += sign * KNIGHT_HIT_QUEEN.0 * n_knight_hit;
+            eg += sign * KNIGHT_HIT_QUEEN.1 * n_knight_hit;
+            let targets_double = targets_base & attacked_by_2[us];
+            let n_bishop_hit = count(targets_double & bishop_hits & attacked_by_pt[us][PieceType::Bishop.idx()]) as i32;
+            mg += sign * BISHOP_HIT_QUEEN.0 * n_bishop_hit;
+            eg += sign * BISHOP_HIT_QUEEN.1 * n_bishop_hit;
+            let n_rook_hit = count(targets_double & rook_hits & attacked_by_pt[us][PieceType::Rook.idx()]) as i32;
+            mg += sign * ROOK_HIT_QUEEN.0 * n_rook_hit;
+            eg += sign * ROOK_HIT_QUEEN.1 * n_rook_hit;
+        }
+    }
+
+    // === Estrutura de peoes (mantem-se por cor, dentro de novo loop) ===
+    for c in [Color::White, Color::Black] {
+        let sign = if c == Color::White { 1 } else { -1 };
 
         // Estrutura de peoes.
         let own_pawns = board.pieces[c.idx()][PieceType::Pawn.idx()];
