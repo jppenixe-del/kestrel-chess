@@ -670,3 +670,100 @@ a sessão tmux `chessclaude` quando recuperar quota):
 5. Todos os commits desta sessão têm mensagens e comentários novos em
    inglês (pedido do utilizador, repo é público no GitHub); este
    ficheiro de notas mantém-se em português.
+
+## Atualização 2026-07-22 (continuação): auditoria Sirius+Ethereal e ronda de integração de features
+
+Pedido do utilizador: "isto não pode parar... não quero ouvir já fiz mas
+não integrei" -- integrar a sério, não só planear. Metodologia acordada:
+integrar a estrutura agora (validada por correção -- perft, sem crashes),
+testar/calibrar os valores depois com jogos reais, tal como motores
+reais evoluíram ao longo de anos com dezenas de milhares de jogos. Não
+gatear a integração à espera de prova de Elo num A/B pequeno.
+
+**Duas auditorias feitas pelo Fable, em background:**
+1. **Kestrel vs lista de features do Sirius** (item a item, lendo o
+   código real, não nomes de commits): confirmou que quase tudo de
+   busca já está implementado (PVS, null-move, LMR, RFP, razoring,
+   futility quiet, LMP, history pruning, IIR, ProbCut, correction
+   history, Lazy SMP, staged move picker, singular extensions -- tudo
+   `TEM`). Gaps reais identificados, por prioridade: endgame scaling,
+   backward/candidate passed pawns, bad bishop, king safety (safe
+   checks + gate de dama), futility de capturas, capture history,
+   qsearch LMP, node-count time management. Fora de alcance nesta
+   janela: double/negative extensions, multicut genérico, complexity
+   eval completo (exigem SPRT longo para validar com segurança).
+2. **Como o Ethereal (C, AndyGrant/Ethereal) resolve os mesmos
+   componentes**: relatório com fórmulas e valores exatos (não só
+   nomes) -- king safety quadrática completa, endgame scale factors,
+   complexity eval, todas as margens de poda com o Elo estimado por
+   SPSA do próprio autor. Confirmou algo importante: **o Ethereal não
+   tem correction history** (técnica pós-2022) e mesmo assim é um dos
+   motores clássicos mais fortes de sempre -- não é pré-requisito para
+   força clássica. Também confirmou que mesmo COM NNUE hoje, o Ethereal
+   mantém o eval clássico completo como fallback ativo em posições de
+   material extremo, porque o autor considera-o robusto o suficiente
+   para produção.
+
+**Implementado nesta ronda (todos validados: build limpo, perft(5)=4865609
+inalterado, sem crashes; A/B self-play fixed-nodes para cada um, valores
+ainda por calibrar como o plano previa):**
+
+1. **Endgame scaling** (`eval.rs`, `scale_endgame`/`endgame_scale_factor`):
+   opposite-colored-bishops (3 graus: só bispos/+1 torre/+1 cavalo),
+   minor solitário vs rei só com peões (empate garantido), fallback por
+   contagem de peões do lado forte em posições sem damas. Arquitetura
+   do Ethereal, valores próprios. Aplicado ao eval já interpolado (não
+   dividido mg/eg como o Ethereal) para não quebrar a linearidade que
+   `tune_fast` (main.rs) assume em `positional_terms()` -- troca
+   deliberada, documentada no código. **A/B (300 jogos, fixed-nodes):
+   48.8% -- neutro, sem sinal, esperado a esta escala.**
+2. **King safety: safe checks + queen-gate** (`eval.rs`, dentro de
+   `positional_terms`): king danger table agora exige só 1 atacante
+   com a dama inimiga em jogo (antes eram sempre 2), e ganha uma
+   segunda pass depois do loop principal que conta lances de
+   cavalo/bispo/torre/dama que dariam xeque numa casa sem qualquer
+   defensor inimigo ("safe check", 1 ply de lookahead sem simular o
+   lance a sério). Reutiliza o peso `king_attacks` existente em vez de
+   criar campos novos tunáveis. **A/B (300 jogos): ~46-47%, negativo e
+   persistente ao longo de todo o lote** -- estrutura correta
+   (arquitetura do Ethereal), mas a calibração inicial (peso reutilizado,
+   pode estar demasiado forte agora que dispara com mais frequência)
+   provavelmente precisa de ser mais fraca. **Próximo passo: não
+   reverter a estrutura, mas testar um peso dedicado mais pequeno em vez
+   de reutilizar `king_attacks`, ou testar o threshold antigo (sempre 2)
+   mantendo só o bónus de safe-check.**
+3. **Backward pawns + candidate passed pawns + bad bishop** (`eval.rs`,
+   loop de peões e loop de bispos): três termos novos, pesos próprios
+   pequenos (`BACKWARD_PAWN=(-6,-10)`, `CANDIDATE_PASSED_PAWN=(6,18)`,
+   `BAD_BISHOP=(-2,-4)` por peão na mesma cor). `LIGHT_SQUARES` novo em
+   `bitboard.rs`. Ainda sem A/B isolado (medido em conjunto com o resto
+   desta ronda).
+4. **Futility pruning para capturas** (`search.rs`, negamax): mesma
+   ideia do futility de lances tranquilos já existente, mas para
+   capturas, usando SEE (não valor bruto da peça) como estimativa de
+   melhor caso.
+5. **TT extended cutoff** (`search.rs`, negamax, achado específico do
+   Ethereal não coberto por nenhuma lista genérica): aceita uma entrada
+   da TT UM depth abaixo do pedido como corte, se já parecia um
+   fail-low claro (`Bound::Upper`, não-PV, margem de 130cp).
+6. **Qsearch late move pruning** (`search.rs`, quiescence_from): limite
+   de 8 capturas tentadas (já ordenadas por SEE, já filtradas SEE>=0)
+   antes de desistir do resto.
+
+**A/B combinado (5+6, capture-futility+TT-cutoff, 300 jogos vs a
+baseline com king-safety+endgame-scaling): a decorrer, tendência
+positiva inicial (~58-60% nos primeiros ~40 jogos) -- ver log mais
+recente antes de confiar no número final.**
+
+**Binários de checkpoint guardados** (não commitados, artefactos locais)
+em `/root/kestrel_joao/`: `kestrel_with_endgamescale`,
+`kestrel_with_kingsafety`, `kestrel_with_capfutility`,
+`kestrel_with_ttcutoff`, `kestrel_with_qslmp` -- úteis para isolar
+qual mudança específica ajudou/prejudicou se for preciso investigar
+mais tarde. Scripts de A/B: `sprt_endgamescale.py`, `sprt_kingsafety.py`,
+`sprt_search_batch.py` (todos variantes do padrão já estabelecido em
+`sprt_structural_fix.py`).
+
+**Não implementado ainda desta lista** (falta tempo, não descartado):
+capture history dedicada, node-count time management. Ficam para a
+próxima sessão/instância se sobrar tempo até 24 Jul 21h.

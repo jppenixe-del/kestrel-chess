@@ -47,6 +47,16 @@ fn lmr_table() -> &'static [[i32; 64]; 64] {
 
 pub const MATE_SCORE: i32 = 30000;
 pub const MAX_PLY: usize = 128;
+/// Safety margin for the extended TT cutoff (see negamax's TT probe):
+/// how far under alpha a depth-1-short entry's score has to sit before
+/// it's trusted as "this would fail low anyway" without a confirming
+/// re-search at full depth.
+const TT_EXTENDED_CUTOFF_MARGIN: i32 = 130;
+/// Quiescence late move pruning: how many SEE-ordered captures to try
+/// (not in check) before giving up on the rest. Captures beyond this
+/// are both SEE>=0 (already filtered) and low in the ordering, so
+/// they're rarely the one that changes the outcome.
+const QS_LMP_LIMIT: usize = 8;
 
 /// Limite de saturacao da history heuristic (bonus/malus acumulados por
 /// [cor][from][to]) -- evita que um par from/to muito bem sucedido
@@ -707,7 +717,19 @@ impl<'a> Searcher<'a> {
         let moves = self.order_moves(board, moves, None, ply.min(MAX_PLY - 1), None);
 
         let mut best = if in_check { -MATE_SCORE - 1 } else { alpha };
+        let mut tried = 0;
         for mv in moves {
+            // Quiescence late move pruning: captures are already ordered
+            // best-SEE-first and filtered to SEE>=0 above, so anything
+            // past the first handful is very unlikely to be the one that
+            // matters -- cap it, same spirit as LMP in the main search.
+            // Never while in check (every legal reply must be tried
+            // there, not just captures) and never near mate scores
+            // (a fixed count isn't meaningful when the game is decided).
+            if !in_check && tried >= QS_LMP_LIMIT && alpha.abs() < MATE_SCORE - MAX_PLY as i32 {
+                break;
+            }
+            tried += 1;
             let undo = board.make_move(&mv);
             let score = -self.quiescence(board, -beta, -alpha, ply + 1);
             board.unmake_move(&mv, &undo);
@@ -785,6 +807,10 @@ impl<'a> Searcher<'a> {
 
         let orig_alpha = alpha;
         let mut tt_move = None;
+        // Standard PVS convention: a null/scout window (beta == alpha+1)
+        // means this is not a PV node. Used below for the extended TT
+        // cutoff.
+        let is_pv = beta - alpha > 1;
         let mut tt_entry_captured: Option<crate::tt::TtEntry> = None;
         if excluded.is_none() { if let Some(e) = self.tt.probe(hash) {
             tt_entry_captured = Some(e);
@@ -859,6 +885,22 @@ impl<'a> Searcher<'a> {
                     }
                     return tt_score;
                 }
+            } else if !is_pv
+                && e.depth == depth - 1
+                && e.bound == Bound::Upper
+                && tt_score + TT_EXTENDED_CUTOFF_MARGIN <= alpha
+            {
+                // Extended TT cutoff: a same-position entry exactly ONE
+                // depth short of what's needed still short-circuits the
+                // search if it already looked like a clear fail-low --
+                // the entry says "this position tops out at tt_score or
+                // below" one ply shallower, and tt_score is already well
+                // under alpha even with a safety margin. A full re-search
+                // at the requested depth would almost certainly just
+                // confirm the same fail-low, so accept it now instead of
+                // paying for the confirmation. Never at PV nodes (those
+                // need the real answer, not a probable one).
+                return alpha;
             }
         }}
 
@@ -1133,6 +1175,31 @@ impl<'a> Searcher<'a> {
                 let margin = if improving { 75 * depth } else { 105 * depth };
                 let fe = *futility_eval.get_or_insert(static_eval);
                 if fe + margin <= alpha {
+                    i += 1;
+                    continue;
+                }
+            }
+
+            // Noisy (capture) futility pruning: same idea as the quiet
+            // version above, but for captures -- uses SEE (the real net
+            // material swing of the full exchange, not just the target
+            // piece's face value) as the realistic best case instead of
+            // a flat piece-value guess. If even that can't reach alpha
+            // with the margin, this capture isn't worth searching either.
+            // Wider margin than the quiet case: a capture at least wins
+            // back some material even when it's not tactically decisive,
+            // so it needs more slack before being confidently dismissed.
+            if i > 0
+                && !in_check
+                && depth <= 6
+                && mv.is_capture()
+                && mv.promotion.is_none()
+                && alpha.abs() < MATE_SCORE - MAX_PLY as i32
+            {
+                let margin = if improving { 90 * depth } else { 130 * depth };
+                let fe = *futility_eval.get_or_insert(static_eval);
+                let see_val = self.see(board, &mv);
+                if fe + see_val + margin <= alpha {
                     i += 1;
                     continue;
                 }
