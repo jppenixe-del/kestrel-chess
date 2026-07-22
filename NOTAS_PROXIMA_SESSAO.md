@@ -894,3 +894,23 @@ direção (ainda que fraca) é positiva.
 
 Ficheiros novos: `ethereal_search_profile.txt`,
 `build_ethereal_search_profile.py`, `sprt_ethereal_search.py`/`.log`.
+
+## Atualização 2026-07-22 (continuação): NPS + resultado real vs Stockfish skill10
+
+**NPS** (binário final desta sessão, `go movetime 5000` a partir do
+startpos): single-thread **~896k nps** (depth 19); 4 threads (Lazy SMP)
+**~3.75M nps agregado** (depth 18 -- menos 1 profundidade que
+single-thread no mesmo tempo, esperado por overhead de agregação entre
+threads).
+
+**10 jogos vs `stockfish_skill10` (60+1, via arena)**: **7V-2D-1E =
+75%**. Primeiro teste real (não self-play) desde os fixes/features
+desta sessão toda -- sinal absoluto de progresso real, não só relativo
+entre versões próprias. Um dos jogos foi longo e disputado (68+ lances,
+Stockfish em apuros de tempo perto do fim). Não há registo do resultado
+equivalente ANTES desta sessão para comparação directa (as notas de
+20-21 Jul só têm resultados vs Stockfish "cheio", que dava sempre 0V --
+esta é a primeira vez que a escada de skill graduado é usada depois de
+uma ronda grande de mudanças). Se sobrar tempo, valeria a pena um lote
+maior (20-30 jogos) neste mesmo degrau antes de subir para skill15,
+para ter uma leitura mais estável do nível absoluto atual.
