@@ -914,3 +914,65 @@ esta é a primeira vez que a escada de skill graduado é usada depois de
 uma ronda grande de mudanças). Se sobrar tempo, valeria a pena um lote
 maior (20-30 jogos) neste mesmo degrau antes de subir para skill15,
 para ter uma leitura mais estável do nível absoluto atual.
+
+**Lote maior a 20 jogos (mesmo binário, skill10)**: 9V-6D-5E = **57.5%**
+-- mais moderado que os 75% do lote de 10, mas ainda claramente
+positivo. Confirma o degrau; próximo passo natural é subir a skill15.
+
+## Atualização 2026-07-22 (continuação): itens "fora de alcance" implementados a sério, e a lição de não reverter
+
+Pedido explícito do utilizador: continuar mesmo os itens que o Fable
+tinha marcado como "fora de alcance nesta janela" -- não deixar nada
+por integrar só porque é mais arriscado. Implementados, todos com
+formulas/valores portados directamente do Ethereal (Fable já tinha o
+código-fonte lido):
+
+1. **TTPV** (commit `2a888e8`): bit novo na entrada da TT (posição
+   anteriormente não usada, sem mudar o layout de 64 bits) marca se a
+   entrada foi escrita por uma pesquisa de janela completa (PV). Usado
+   para reduzir 1 ply menos no LMR quando a posição já tinha esse
+   estatuto antes.
+2. **Double/negative extensions** (commit `a90a9a9`): porte directo do
+   `search.c` do Ethereal -- singular por margem extra (16) e' +2 em
+   vez de +1, com contador `dextensions` por linha (limite 6, valor do
+   Ethereal); negative extension quando o tt_move já bate beta na
+   depth actual sem disparar multicut, encolhe a depth em vez de
+   estender.
+3. **Complexity eval** (commit `1c48b4c`): fórmula exacta do Ethereal
+   (pawns*8 + ambos-os-flancos*82 + final-de-peões*76 - 157), aplicada
+   com o mesmo clamp que preserva sinal (nunca inverte quem está
+   melhor). 4 novos campos no `Weights`.
+4. **Multicut genérico**: **decidido não implementar como algo à
+   parte**. O próprio relatório do Fable sobre o Ethereal confirma que
+   a implementação REAL dele também é só a versão fundida dentro da
+   verificação singular (reutiliza o mesmo move picker, não tem loop
+   próprio) -- ou seja, o que o Kestrel já tinha desde a sessão
+   anterior já é equivalente à prática de um motor de referência forte.
+   Construir uma versão "mais genérica" seria pior, não melhor -- nem o
+   Ethereal faz isso.
+
+**A/Bs (300 jogos cada, fixed-nodes) -- resultados honestos:**
+- TTPV: **46.5%** (139.5/300), negativo e consistente ao longo do lote.
+- Extensões duplas/negativas: **46.2%** (138.5/300), negativo e
+  consistente.
+- Complexity eval: ~48-49%, praticamente neutro.
+
+**Decisão: NENHUM destes foi revertido**, apesar dos números negativos
+de TTPV/extensões. Motivo: existe já um precedente exacto no histórico
+do projecto (ver comentário junto às singular extensions em
+`search.rs` -- "revertido por A/B de 30 jogos, decisão errada,
+restaurado depois") e o utilizador reforçou-o explicitamente esta
+sessão: "atenção às reversões... se foi pedido tem de estar feito."
+Um A/B de 300 jogos tem erro-padrão ~2.9% -- um resultado a 46-47% está
+perto de 1 desvio-padrão do neutro, não é evidência forte de regressão
+real para uma técnica JÁ PROVADA por um motor de referência forte
+(Ethereal). Reverter tecnologia comprovada com base em ruído
+estatístico deste tamanho é exactamente o erro documentado.
+**Guardado como memória permanente**:
+`feedback_kestrel_nao_reverter_por_self_play_pequeno` (ver
+`/root/.claude/projects/-root-kestrel-joao/memory/`).
+
+**Se sobrar tempo**: um SPRT muito mais longo (milhares de jogos) seria
+o próximo passo correcto para confirmar/refutar TTPV e as extensões
+com poder estatístico real -- não um novo A/B de 300 jogos, que já se
+sabe não ter resolução suficiente.
