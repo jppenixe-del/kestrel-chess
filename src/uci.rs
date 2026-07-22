@@ -438,6 +438,7 @@ impl Engine {
                         excluded_root_moves: excluded.to_vec(),
                         style_book: self.style_book.as_ref(),
                         root_move_nodes: Vec::new(),
+                        capture_history: [[[0; 6]; 6]; 2],
                     };
                     scope.spawn(move || {
                         let mut searcher = searcher;
