@@ -16,13 +16,28 @@ use std::time::Instant;
 /// modern alpha-beta engine): reduction grows with ln(depth)*ln(count),
 /// smooth instead of the old fixed tiers (+1/+2/+3 at hard thresholds).
 /// Computed once at first use, cheap (64*64 entries).
+///
+/// The divisor (2.1) is A/B-testable via `KESTREL_LMR_DIVISOR`, same
+/// reversible opt-in pattern as `KESTREL_EVAL_MODE`/`KESTREL_TUNED_WEIGHTS`:
+/// unset (every real deployment) reproduces the compiled-in default
+/// bit-for-bit. Smaller divisor -> larger reduction -> more aggressive
+/// pruning. A previous A/B attempt at tuning this used ad-hoc scratch
+/// binaries whose provenance couldn't be reconstructed reliably -- this
+/// env var replaces that with a reproducible single-binary comparison.
 static LMR_TABLE: OnceLock<[[i32; 64]; 64]> = OnceLock::new();
 fn lmr_table() -> &'static [[i32; 64]; 64] {
     LMR_TABLE.get_or_init(|| {
+        let divisor = std::env::var("KESTREL_LMR_DIVISOR")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(2.1);
+        if divisor != 2.1 {
+            eprintln!("KESTREL_LMR_DIVISOR: using {} (default 2.1)", divisor);
+        }
         let mut t = [[0i32; 64]; 64];
         for d in 1..64 {
             for m in 1..64 {
-                let r = 0.5 + (d as f64).ln() * (m as f64).ln() / 2.1;
+                let r = 0.5 + (d as f64).ln() * (m as f64).ln() / divisor;
                 t[d][m] = r as i32;
             }
         }
