@@ -779,5 +779,72 @@ mais tarde. Scripts de A/B: `sprt_endgamescale.py`, `sprt_kingsafety.py`,
 `sprt_structural_fix.py`).
 
 **Não implementado ainda desta lista** (falta tempo, não descartado):
-capture history dedicada, node-count time management. Ficam para a
-próxima sessão/instância se sobrar tempo até 24 Jul 21h.
+capture history dedicada. Ficam para a próxima sessão/instância se
+sobrar tempo até 24 Jul 21h.
+
+## Atualização 2026-07-22 (continuação): recalibração, node-count time management, infraestrutura "profiles"
+
+**King safety recalibrado (commit `a1cf79a`)**: o bónus de safe-check
+reutilizava o peso `king_attacks` (5,0) directamente -- separado num
+campo próprio `SAFE_CHECK=(2,1)` mais fraco. A/B refeito: **48.7%
+(146V-140D-28E/300)**, muito mais perto de neutro que os 46.8%
+originais -- confirma que a magnitude era mesmo o problema principal,
+não a estrutura (queen-gate mantido).
+
+**Node-count time management adicionado** (mesmo commit): o early-stop
+por estabilidade do melhor lance agora só dispara se >=70% dos nós
+totais do `go` estiverem concentrados no lance escolhido -- evita parar
+cedo só porque o lance não mudou, se a busca ainda gasta esforço
+comparável em alternativas.
+
+**Infraestrutura "profiles" (pedido explícito do utilizador -- pesos
+programáveis, não só constantes fixas), commit `2ad0bf1`:**
+- `SearchParams` novo em `search.rs`: TODAS as margens de poda
+  (RFP, razoring, futility quiet/captura, delta pruning do qsearch,
+  limite de LMP no qsearch, margem do TT extended cutoff, multiplicador
+  de history pruning) que antes eram `const`/literais espalhados,
+  agora num struct único, carregável via `KESTREL_SEARCH_PARAMS=<path>`
+  (mesmo padrão reversível do `KESTREL_TUNED_WEIGHTS`). Validado:
+  default (env var não definida) reproduz busca fixed-node
+  byte-a-byte idêntica; um perfil diferente muda mesmo o PV.
+- Fatores de scale do endgame (OCB, fallback sem damas) movidos de
+  valores hardcoded para dentro do `Weights` (5 novos campos escalares)
+  -- eram a única parte do eval ainda não programável.
+- **Ainda sem tuner automático para o `SearchParams`** -- estas margens
+  interagem com contagem de nós de forma não-linear, o método Texel
+  (posições estáticas) não se aplica; tuning a sério precisaria de SPSA
+  sobre jogos reais (a mesma infraestrutura de self-play A/B já usada
+  esta sessão serve de base, só falta o laço de otimização).
+
+**Teste "perfil Sirius" feito (pedido do utilizador)**: construído
+`sirius_profile.txt` (script `build_sirius_profile.py`) -- pega no
+vector de pesos DEFAULT do Kestrel e substitui os 184/473 campos que o
+port histórico de 2026-07-20 (commit `a11d7bd`, valores reais de
+`Sirius/src/eval/eval_constants.h`) cobria (bishop pair, mobilidade
+completa, king attacker weights, pawn structure), deixando tudo o resto
+(threats, shelter/storm, os termos adicionados hoje) nos valores
+próprios do Kestrel. **Resultado do A/B (300 jogos, mesma estrutura de
+código): Kestrel próprio 53.2% vs perfil Sirius 46.8%** -- os pesos
+próprios do Kestrel, afinados à mão ao longo de várias sessões,
+vencem os valores reais tunados do Sirius dentro da MESMA arquitetura
+de busca. Achado genuíno: pesos de eval são tunados EM CONJUNTO com a
+busca que os usa -- os do Sirius foram calibrados para a busca dele
+(margens/podas diferentes), não transferem de graça para a busca do
+Kestrel. Consistente com a nota já existente do port histórico ("não
+testado via self-play, sinal viria de jogos externos/Peachfruit") --
+agora testado, e o resultado favorece manter os valores próprios.
+
+**Perfil equivalente do Ethereal para `SearchParams`: não construído.**
+As fórmulas do Ethereal diferem em FORMA (não só em magnitude) das do
+Kestrel -- RFP usa uma margem única com `depth-1` quando "improving"
+em vez de duas margens separadas tipo Kestrel; razoring usa margem
+FIXA 3488 em vez de linear em profundidade (`150+100*depth`). Copiar
+os números do Ethereal para dentro das fórmulas do Kestrel sem
+adaptar a própria fórmula não seria um teste justo -- ficaria a
+comparar formas de curva diferentes, não só calibração. Se for para
+fazer isto a sério, precisa de portar a FÓRMULA também, não só os
+números -- fica para decisão futura, não descartado só adiado.
+
+Ficheiros novos (não commitados, artefactos locais):
+`sirius_profile.txt`, `build_sirius_profile.py`,
+`sprt_sirius_profile.py`/`.log`, `sprt_safecheck_v2.py`/`.log`.
