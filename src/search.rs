@@ -239,6 +239,18 @@ pub struct Searcher<'a> {
     /// (prev_piece,prev_to)->(curr_piece,curr_to) pair, at 1 AND 2 plies
     /// back, exactly like the multi-lag continuation history in Sirius).
     pub countermoves: [[Option<Move>; 64]; 6],
+    /// Capture history: indexed by [side][moving piece][captured piece]
+    /// -- a coarser, dedicated signal complementing SEE in noisy move
+    /// ordering. SEE gives the true material outcome of an exchange but
+    /// says nothing about which of several SEE-EQUAL captures tends to
+    /// actually work out (e.g. two captures that both win a pawn cleanly
+    /// -- history says which capture pattern has paid off more at this
+    /// kind of node before). Deliberately used ONLY as a tie-break when
+    /// SEE values are exactly equal (see MovePicker::pick_best_noisy) --
+    /// never mixed into the SEE score itself, which would shift the
+    /// good/bad-noisy partition boundary that many other pruning
+    /// decisions rely on being pure SEE.
+    pub capture_history: [[[i32; 6]; 6]; 2],
     /// Continuation history: dense i32 table indexed by (prev_piece,
     /// prev_to, curr_piece, curr_to) -- gives quiet move ordering a
     /// numeric bonus/malus based on how the SAME curr_move performed in
@@ -588,6 +600,15 @@ impl<'a> Searcher<'a> {
     /// qualidade real do lance do que um corte raso).
     fn update_history(&mut self, side: usize, mv: &Move, delta: i32) {
         let v = &mut self.history_scores[side][mv.from as usize][mv.to as usize];
+        *v = (*v + delta).clamp(-HISTORY_MAX, HISTORY_MAX);
+    }
+
+    /// Same bonus/malus shape as update_history, for captures -- keyed
+    /// by (moving piece, captured piece) instead of (from, to), since
+    /// what matters for "does this TYPE of capture tend to work out" is
+    /// which pieces are involved, not the exact squares.
+    fn update_capture_history(&mut self, side: usize, moving: PieceType, captured: PieceType, delta: i32) {
+        let v = &mut self.capture_history[side][moving.idx()][captured.idx()];
         *v = (*v + delta).clamp(-HISTORY_MAX, HISTORY_MAX);
     }
 
@@ -1274,6 +1295,7 @@ impl<'a> Searcher<'a> {
         // aplicar malus de history heuristic se um lance POSTERIOR causar
         // o corte beta (ver update_history/history_scores).
         let mut quiets_tried: Vec<Move> = Vec::new();
+        let mut captures_tried: Vec<(Move, PieceType, PieceType)> = Vec::new();
         let mut futility_eval: Option<i32> = None;
         self.history.push(hash);
         let mut i: usize = 0;
@@ -1423,6 +1445,17 @@ impl<'a> Searcher<'a> {
             board.unmake_move(&mv, &undo);
             if !mv.is_capture() {
                 quiets_tried.push(mv);
+            } else if let Some((moving_pt, _)) = board.piece_at(mv.from) {
+                // Post-unmake board has the captured piece restored at
+                // mv.to (except en passant, where it's a pawn beside
+                // mv.to, not on it -- handled by the flag check instead
+                // of relying on board state for that one case).
+                let captured_pt = if mv.flag == MoveFlag::EnPassant {
+                    PieceType::Pawn
+                } else {
+                    board.piece_at(mv.to).map(|(pt, _)| pt).unwrap_or(PieceType::Pawn)
+                };
+                captures_tried.push((mv, moving_pt, captured_pt));
             }
             if ply == 0 {
                 let delta = self.nodes.saturating_sub(root_nodes_before);
@@ -1508,6 +1541,21 @@ impl<'a> Searcher<'a> {
                                 }
                             }
                         }
+                    }
+                } else if mv.is_capture() {
+                    // Capture history: same bonus/malus shape as the
+                    // quiet-move history above, keyed by (moving,
+                    // captured) piece type instead of (from, to).
+                    // Complements SEE in ordering (see MovePicker) --
+                    // never touches SEE itself.
+                    let bonus = (depth * depth).min(HISTORY_MAX);
+                    let side = board.side.idx();
+                    let n = captures_tried.len().saturating_sub(1);
+                    if let Some(&(_, moving_pt, captured_pt)) = captures_tried.last() {
+                        self.update_capture_history(side, moving_pt, captured_pt, bonus);
+                    }
+                    for &(_, moving_pt, captured_pt) in &captures_tried[..n] {
+                        self.update_capture_history(side, moving_pt, captured_pt, -bonus);
                     }
                 }
                 break;
@@ -1692,7 +1740,7 @@ pub struct MovePicker {
     /// so' quando entramos em `ScoreNoisy`. Cada entrada guarda o lance
     /// e o SEE score correspondente; SEE>=0 vao primeiro (GoodNoisy),
     /// SEE<0 vao no fim (BadNoisy).
-    noisy: Vec<(Move, i32)>,
+    noisy: Vec<(Move, i32, i32)>,
     noisy_idx: usize,
     /// Marca onde acabam os good noisy (SEE>=0) e comecam os bad noisy
     /// (SEE<0). Definido quando `ScoreNoisy` termina.
@@ -1712,11 +1760,11 @@ impl MovePicker {
         // Separa capturas/promocoes de quietos numa unica passagem.
         // MoveFlag::EnPassant e captura; promocoes contam sempre como
         // noisy (mesmo sem captura -- a promocao propria e "material").
-        let mut noisy: Vec<(Move, i32)> = Vec::with_capacity(moves.len() / 4);
+        let mut noisy: Vec<(Move, i32, i32)> = Vec::with_capacity(moves.len() / 4);
         let mut quiet: Vec<(Move, i32)> = Vec::with_capacity(moves.len());
         for m in moves {
             if m.is_capture() || m.promotion.is_some() {
-                noisy.push((m, 0));
+                noisy.push((m, 0, 0));
             } else {
                 quiet.push((m, 0));
             }
@@ -1791,6 +1839,23 @@ impl MovePicker {
                             continue;
                         }
                         self.noisy[i].1 = searcher.see(board, &m);
+                        // Capture history: tie-break only (see field doc
+                        // on Searcher::capture_history) -- non-capture
+                        // promotions have no "captured piece", left at 0.
+                        self.noisy[i].2 = if m.is_capture() {
+                            let moving_pt = board.piece_at(m.from).map(|(pt, _)| pt);
+                            let captured_pt = if m.flag == MoveFlag::EnPassant {
+                                Some(PieceType::Pawn)
+                            } else {
+                                board.piece_at(m.to).map(|(pt, _)| pt)
+                            };
+                            match (moving_pt, captured_pt) {
+                                (Some(mp), Some(cp)) => searcher.capture_history[board.side.idx()][mp.idx()][cp.idx()],
+                                _ => 0,
+                            }
+                        } else {
+                            0
+                        };
                     }
                     // Nao ordenamos o vector agora -- selection-sort
                     // in-place em `GoodNoisy` e `BadNoisy` extrai o
@@ -1904,7 +1969,7 @@ impl MovePicker {
     /// emitir -- ambos podem ser lixo (TT colisao ou killer stale que
     /// ja nao aplica a esta posicao).
     fn contains_move(&self, m: Move) -> bool {
-        self.noisy.iter().any(|(x, _)| *x == m) || self.quiet.iter().any(|(x, _)| *x == m)
+        self.noisy.iter().any(|(x, _, _)| *x == m) || self.quiet.iter().any(|(x, _)| *x == m)
     }
     fn quiet_contains(&self, m: Move) -> bool {
         self.quiet.iter().any(|(x, _)| *x == m)
@@ -1934,16 +1999,22 @@ impl MovePicker {
     /// devolve SEE<0). Se nao ha mais na fase actual, devolve None.
     fn pick_best_noisy(&mut self, good_only: bool) -> Option<Move> {
         while self.noisy_idx < self.noisy.len() {
+            // Primary key SEE, tie-broken by capture history ONLY when
+            // SEE is exactly equal -- the good/bad-noisy boundary check
+            // below still looks purely at SEE, completely unaffected by
+            // the tie-break (many other pruning decisions assume that
+            // boundary is pure SEE, see search_params()-driven captures
+            // futility/SEE pruning).
             let mut best_i = self.noisy_idx;
-            let mut best_score = self.noisy[best_i].1;
             for i in (self.noisy_idx + 1)..self.noisy.len() {
-                if self.noisy[i].1 > best_score {
-                    best_score = self.noisy[i].1;
+                let (_, s, h) = self.noisy[i];
+                let (_, bs, bh) = self.noisy[best_i];
+                if s > bs || (s == bs && h > bh) {
                     best_i = i;
                 }
             }
             self.noisy.swap(self.noisy_idx, best_i);
-            let (m, score) = self.noisy[self.noisy_idx];
+            let (m, score, _) = self.noisy[self.noisy_idx];
             // score == i32::MIN significa "e' o TT-move, salta"
             if score == i32::MIN {
                 self.noisy_idx += 1;
