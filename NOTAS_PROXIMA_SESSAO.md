@@ -474,6 +474,51 @@ vale a pena afinar LMR por cima de uma busca possivelmente patológica.
    para mudar defaults -- SPRT-ou-nada, "inconclusivo -> sem mudança"
    é um desfecho válido e a norma esperada, não falha.
 
+## Atualização 2026-07-22 (continuação): diagnóstico qualitativo feito, pivot para dataset de tuning
+
+**Passo 2 do plano (diagnóstico "dama sem plano") -- resultado:**
+- vs `stockfish_skill5` (60+1, binário atual): **5V-0D-1E em 6 jogos**
+  (nunca perdeu). Leitura dos 5 PGNs decisivos: padrão antigo
+  AUSENTE -- todos os lances de dama ligados a ameaças/capturas
+  concretas, sem recuos estranhos, sem trocas más da nossa parte.
+- Utilizador pediu para subir de escalão (skill5 "já é fácil") ->
+  lançado lote vs `stockfish_skill10`, **parado a meio a pedido do
+  utilizador** ("ainda é cedo para verificar a força contra SF") em
+  1V-2D-2E/5 jogos -- amostra pequena demais e interrompida de propósito,
+  não tirar conclusões daqui.
+- **Falso alarme investigado a fundo**: o utilizador apanhou uma
+  promoção a Cavalo em vez de Dama (`h8=N+`) num dos jogos vs skill10 e
+  achou suspeito. Investigação completa (reconstrução da posição exata,
+  comparação de profundidade por profundidade, e confirmação
+  **independente com Stockfish real**): **não é bug**. A posição tinha
+  uma armadilha tática real -- promover a Dama permite `...Rh3` seguido
+  de `Kg5` (forçado) e `Rxh8`, uma ESPETADA que ganha a dama de graça;
+  o Stockfish concorda byte a byte com a avaliação e a escolha do
+  kestrel de promover a Cavalo com xeque para fugir dessa linha.
+  Confirmado também que isto não é regressão do commit `ca8bfce`
+  (testado num worktree do commit anterior, mesmo resultado).
+  **Achado real, não o alarme original**: o Stockfish avalia a posição
+  ORIGINAL (antes de qualquer promoção) já em -450/-540 para as
+  Brancas -- ou seja, a vantagem material que as Brancas tinham bem
+  mais cedo no jogo (lances ~45-64, torre+peões conectados) foi mal
+  convertida antes de chegar aqui. **Pista para investigar depois**:
+  técnica de final de torre+peões, não a escolha de promoção.
+
+**Conclusão do passo 2**: luz verde mecanística para o LMR (passo 3),
+mas ainda não confirmado por SPRT quantitativo -- ver plano do Opus
+(quantificar o fix estrutural com SPRT binário-atual vs
+`kestrel_prekillersfix_bin` continua por fazer).
+
+**Pivot pedido pelo utilizador**: antes de avançar para
+tuning de pesos de eval (que já tem histórico de overfit -- ver
+commits `891cb81`/`6edebf9`, infraestrutura `kestrel selfplay`/
+`kestrel tune`/`kestrel tunefast` já existe, MÚLTIPLAS tentativas
+anteriores falharam mesmo com regularização L2 e validação held-out),
+o utilizador pediu para consultar um agente **Fable** especificamente
+sobre que tipo de jogo(s) usar para construir um dataset melhor --
+tarefa lançada em background, a aguardar relatório antes de gerar
+mais dados ou tunar. Não avançar tuning sem esse relatório.
+
 **Nota lateral (fora do escopo do Kestrel)**: o utilizador mencionou um
 segundo projeto ("littlerock/half2k", adversário de referência
 "PeachFruit" no Lichess) com prazo até sexta (24 Jul) para bater o Elo
