@@ -156,7 +156,27 @@ impl Engine {
                 i += 1;
             }
             let fen = tokens[start..i].join(" ");
-            self.board = Board::from_fen(&fen);
+            let parsed = Board::from_fen(&fen);
+            // Reject a FEN where the side NOT to move is already in
+            // check -- impossible in any position reachable by legal
+            // play (the mover would have had to leave their own king
+            // in check), but nothing in FEN parsing itself rejects it.
+            // Found by review (2026-07-22): feeding such a FEN in
+            // crashes deep in search/eval (`board.rs` king_sq() reads
+            // an empty king bitboard -- `trailing_zeros()` on an empty
+            // u64 returns 64, out of bounds for a 64-entry attack
+            // table) once the search reaches a position where that
+            // "already illegal" king similarly ends up captured. Not
+            // reachable through normal play (a real game/GUI never
+            // sends this), but `position fen <arbitrary>` is untrusted
+            // input from whatever's driving the UCI connection -- fail
+            // safe to startpos instead of crashing.
+            if parsed.in_check(parsed.side.opp(), &self.atk) {
+                eprintln!("position fen: rejected (side not to move is in check, illegal position) -- falling back to startpos");
+                self.board = Board::startpos();
+            } else {
+                self.board = parsed;
+            }
         }
         self.history.clear();
         self.history.push(self.zob.hash(&self.board));

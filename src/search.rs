@@ -987,6 +987,22 @@ impl<'a> Searcher<'a> {
         // means this is not a PV node. Used below for the extended TT
         // cutoff.
         let is_pv = beta - alpha > 1;
+        // Propagate the double-extension count from the PARENT ply
+        // unconditionally, every time this ply is visited -- not just
+        // when a double extension is actually granted (bug found by
+        // review 2026-07-22: `dextensions[ply]` was only ever WRITTEN
+        // inside the double-extension branch below, so on every other
+        // path through this ply -- normal/negative extension, multicut,
+        // depth<8, no tt_move -- the slot kept whatever a PREVIOUS,
+        // unrelated visit to this same ply left there during the DFS
+        // -- sibling/cousin branches, not this line's real ancestor.
+        // `ply` alone doesn't identify a line, only depth-in-tree, so
+        // without this unconditional propagation the counter is a
+        // shared watermark across unrelated branches instead of a
+        // per-line counter, defeating the whole point of the cap).
+        if ply > 0 {
+            self.dextensions[ply] = self.dextensions[ply - 1];
+        }
         let mut tt_entry_captured: Option<crate::tt::TtEntry> = None;
         if excluded.is_none() { if let Some(e) = self.tt.probe(hash) {
             tt_entry_captured = Some(e);

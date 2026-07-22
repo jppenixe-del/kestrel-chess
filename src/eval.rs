@@ -1501,12 +1501,18 @@ fn endgame_scale_factor(board: &Board, raw: i32, weights: &Weights) -> i32 {
         }
     }
 
-    // A single minor piece (knight or bishop), nothing else but pawns,
-    // for the side with more total material -- can't force a win
-    // against a lone king even with extra pawns, only a fortress/
-    // blockade at best. True draw scale.
-    let w_minors_only = n_wr == 0 && n_wq == 0 && (n_wn + n_wb) <= 1;
-    let b_minors_only = n_br == 0 && n_bq == 0 && (n_bn + n_bb) <= 1;
+    // True insufficient material: at most a lone minor (knight or
+    // bishop) and NO PAWNS AT ALL against a completely bare king --
+    // K+N vs K / K+B vs K, the only cases actually impossible to force
+    // a win in. Bug found by review (2026-07-22): the original version
+    // of this check never looked at the STRONG side's own pawn count
+    // (only the weak side's), so it fired for K+P vs K and similar
+    // trivially-won endgames -- `evaluate()` returned exactly 0 for a
+    // real K+P vs K position, confirmed by direct testing. A minor
+    // piece PLUS pawns is not a fortress in general (the pawn just
+    // queens); only the zero-pawn case is a genuine forced draw.
+    let w_minors_only = n_wr == 0 && n_wq == 0 && n_wp == 0 && (n_wn + n_wb) <= 1;
+    let b_minors_only = n_br == 0 && n_bq == 0 && n_bp == 0 && (n_bn + n_bb) <= 1;
     if w_minors_only && n_br == 0 && n_bq == 0 && n_bn == 0 && n_bb == 0 && n_bp == 0 {
         return 0;
     }
