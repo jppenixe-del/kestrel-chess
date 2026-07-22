@@ -1118,3 +1118,420 @@ README, agora também oponente real). Registado em `engine_arena.py`
 `/root/kestrel_joao/Sirius/sirius`. Match ainda não lançado (arena
 ocupada com o lote skill15 em curso) -- próximo passo assim que
 libertar.
+
+## Atualização 2026-07-22 (continuação): match Sirius x40 lançado, calibração dos parâmetros de BUSCA do Sirius fechada
+
+**Match Sirius x40 lançado** (`us=kestrel, them=sirius, base=60+1, 40
+jogos, cores alternadas`, task `bwh295f67`), depois **parado a meio por
+pedido do utilizador** ("se nos 10 jogos não ganharmos nada para
+isso") via `/api/stop` (paragem graciosa -- deixa o jogo em curso
+acabar, não reinicia nem corrompe nada, respeita a regra "nunca
+reiniciar a meio de um jogo"). Fechado ao fim de **14 jogos: 0
+vitórias, 1 empate, 13 derrotas**.
+
+**CORREÇÃO importante (achado ao investigar o binário depois de
+fechar o lote)**: assumi inicialmente que o lote inteiro corria com o
+binário PRÉ-moderação (antes do commit `0c1b388`) -- errado. O commit
+`0c1b388` (e o `cargo build --release` que o acompanha) aconteceu às
+`22:50:50`, A MEIO do lote em curso, e `engine_arena.py:play_game()`
+arranca um subprocesso `UciEngine` NOVO por jogo (não reutiliza o
+processo entre jogos) -- confirmado comparando os timestamps dos PGNs
+com o timestamp do commit: g1-g9 (22:32-22:51) correram no binário
+PRÉ-moderação, mas **g10-g14 (22:54-23:01) já carregaram o binário
+MODERADO do disco**, porque o `cargo build` sobrescreveu o ficheiro no
+mesmo caminho que a arena usa (`Kestrel/target/release/kestrel`)
+enquanto o lote decorria. Ou seja, o lote NÃO é uma baseline limpa de
+um único binário -- é uma mistura. Sub-resultado do binário já
+moderado (g10-g14): 0 vitórias, 1 empate, 4 derrotas -- amostra
+pequena demais para concluir seja o que for, mas pelo menos confirma
+que o binário moderado também perde consistentemente contra o Sirius
+a esta escala.
+
+**Lição para o método, já registada para não repetir**: nunca fazer
+`cargo build --release` que sobrescreva o binário no caminho que a
+arena está a usar (`Kestrel/target/release/kestrel`) enquanto um lote
+está `"running": true` -- mesmo sem "reiniciar" a arena, o próximo
+jogo do MESMO lote já carrega código diferente silenciosamente, porque
+cada jogo arranca um processo novo. Regra a seguir daqui em diante:
+confirmar `"running": false` antes de qualquer `cargo build --release`
+que toque no binário activo, exactamente como já se fazia para
+`./arena.sh restart`.
+
+PGNs lidos (g1, g2, g3, g4): duas derrotas como pretas por mate directo
+depois de ataques ao rei mal geridos (g2: rei apanhado num ataque
+clássico depois de `Nb5-d6`; g3: mate por `Qf3#` depois de o Kestrel
+ter aberto a posição do próprio rei com `g5-g4` sem compensação
+suficiente), uma como brancas por um erro posicional que se acumula
+lentamente até perda de peão e depois torre (g1). Sirius é ~3449 CCRL,
+uma diferença de força grande é esperada, mas o padrão "abrir a posição
+do próprio rei sem follow-up suficiente" ecoa o mesmo tema já
+identificado nas derrotas contra o skill15 antes da moderação dos
+termos de agressividade (`0c1b388`) -- reforça que essa moderação era a
+correcção certa, mesmo que as 4-5 jogadas já com o binário moderado não
+tenham sido suficientes para reverter o resultado geral.
+
+**Pedido do utilizador**: "tens metido a calibração das variáveis de
+lado" -- correto: só se tinha testado o profile de EVAL do Sirius
+(`sprt_sirius_profile.py`, já feito), nunca os parâmetros reais de
+BUSCA dele (ao contrário do Ethereal, que teve os dois: eval e busca).
+Fechado agora.
+
+**Fonte real**: `Sirius/src/search_params.h` (tabela `SEARCH_PARAM`,
+valores SPSA-tuned) + `Sirius/src/search.cpp` (fórmulas reais onde cada
+parâmetro é usado -- essencial, porque vários parâmetros da tabela só
+fazem sentido combinados com termos extra que o Kestrel não tem
+equivalente). Sirius usa a mesma escala SEE que o Kestrel (peão=100,
+`board.h: SEE_PIECE_VALUES`) e um `HISTORY_MAX` quase idêntico (16384
+vs 16000 do Kestrel) -- mapeamento directo de valores muito mais
+fiável do que foi com o Ethereal (escalas bastante diferentes lá).
+
+**`build_sirius_search_profile.py`** -> `sirius_search_profile.txt`,
+14 dos 18 campos do `SearchParams` mapeados com fórmula real
+confirmada, 4 deixados no default do Kestrel por incompatibilidade
+estrutural genuína (documentado no próprio script, mesma disciplina do
+Ethereal -- não forçar mapeamento quando o mecanismo é mesmo diferente):
+
+- **RFP** (`rfp_improving`/`rfp_not_improving`): mapeado exacto.
+  Fórmula Sirius `(improving ? rfpImpMargin : rfpNonImpMargin) *
+  depth`, caso base reduz a slope*depth puro -- igual à forma do
+  Kestrel. `rfpImpMargin=26` (era 65 no Kestrel!),
+  `rfpNonImpMargin=80` (era 95). Sirius corta MUITO mais agressivo
+  quando "improving" -- diferença grande, sinal de calibração real por
+  testar.
+- **Razoring** (`razor_base`/`razor_per_depth`): mapeado exacto via
+  tradução algébrica (`razoringMargin*depth = razoringMargin +
+  razoringMargin*(depth-1)`, exatamente a forma
+  `base + per_depth*(depth-1)` do Kestrel). `razoringMargin=458` ->
+  `razor_base=458, razor_per_depth=458` (era 150/100 -- Sirius razora
+  MUITO menos, precisa duma diferença bem maior para confiar no corte
+  cego). `razoringMaxDepth=3` do Sirius bate certo com o gate
+  `depth<=3` já usado no Kestrel.
+- **cap_futility** (captura/noisy futility): mapeado com aproximação
+  documentada -- fórmula real do Sirius tem termo extra de history
+  (`histScore/noisyFpHistDivisor`) que o Kestrel não tem, mas com
+  history=0 reduz exactamente à forma `base+slope*depth` do Kestrel.
+  `noisyFPBaseMargin=2, noisyFpDepthMargin=115` (era 0/90 e 0/130) --
+  Sirius não distingue improving/not-improving aqui, por isso o MESMO
+  valor foi aplicado aos dois campos do Kestrel.
+- **history_prune_mult**: mapeado exacto (mesma fórmula
+  `hist < -margin*depth`), com pequena correção de escala
+  `1688 * (16000/16384) ≈ 1649` (era 2500 -- Sirius poda por history
+  bem mais cedo/agressivo).
+- **NÃO mapeados** (mecanismo genuinamente diferente, documentado no
+  script em vez de forçar): futility de lances tranquilos (Sirius usa
+  `lmrDepth` pós-redução + termo de history, sem split improving --
+  aplicar os números crus sobre `depth` bruto do Kestrel podia cortar
+  demais); `delta_margin` (o `qsFpMargin` do Sirius não tem termo de
+  valor-da-peça-capturada, mecanismo diferente do delta pruning real do
+  Kestrel); `qs_lmp_limit` e `tt_extended_cutoff_margin` (sem
+  equivalente directo encontrado no Sirius).
+- **Gap maior identificado, não fechado**: NMP, ProbCut, aspiration
+  window e os ajustes finos de LMR (`nmpBaseReduction`,
+  `probcutBetaMargin`, `aspInitDelta`, `lmrCutnode`, etc.) são todos
+  tunados no Sirius mas o `SearchParams` do Kestrel simplesmente não
+  tem campos para eles ainda -- portar isto implica adicionar campos
+  novos à struct, não só um teste de profile. Fica registado como
+  trabalho futuro se houver tempo, não inventado às pressas.
+
+**Teste lançado**: `sprt_sirius_search.py` (clone de
+`sprt_ethereal_search.py`, mesmo método: self-play fixed-nodes, 30000
+nós/lance, 150 pares = 300 jogos, `KESTREL_SEARCH_PARAMS=
+sirius_search_profile.txt` vs sem a env var), a correr em paralelo com
+o match de arena (não compete por posições, só por CPU -- fixed-nodes
+é imune a isso). Log em `sprt_sirius_search.log`. Recorda: "os testes
+são só para verificar" -- mesmo que o resultado saia fraco, não é
+motivo para reverter sem mais, e valores SPSA-tuned dum motor top são
+pelo menos um baseline honesto para calibrar os próprios, não um valor
+a descartar de ânimo leve.
+
+**Achado concreto ao ler PGNs do match (g4)**: derrota das brancas por
+um blunder puro -- `18...Qa3?? 19.bxa3`, dama capturada de graça (a3
+está atacada por peão b2 E pela torre a1, confirmado via
+`python-chess`/`attackers()`). Não é um erro posicional subtil, é do
+tipo que uma busca de 1 ply já apanha via SEE/troca. `TimeControl
+"60+1.0"` -- tempo base muito curto; ao fim de 18 lances de meio-jogo
+complicado é plausível que o relógio já estivesse apertado e a busca
+tenha sido cortada cedo demais nessa jogada. Não confirmado com
+certeza (não há log de tempo por lance gravado pelo `arena_server`),
+mas é consistente com o item 3 da lista de próximos passos já nas
+notas ("investigar se a gestão de tempo em 4 níveis está a cortar
+profundidade demais cedo demais") -- fica reforçado como prioridade
+real, não só teórica, para quando o calendário permitir. As outras
+derrotas lidas (g1, g2, g3, g7) parecem perdas "normais" contra um
+motor bem mais forte -- jogo tático real a degradar-se, não blunders
+de 1 lance.
+
+**Resultado do `sprt_sirius_search.py` (300 jogos, 30000 nós/lance)**:
+exactamente empatado -- **50.0% vs 50.0%, W138-L138-D24**. Sinal limpo
+e neutro (nem positivo nem negativo, sem viés para nenhum lado).
+Adoptados como novo default de `SearchParams::default()` em
+`search.rs` (commit por fazer): `rfp_improving` slope 65->26,
+`rfp_not_improving` slope 95->80, `razor_base`/`razor_per_depth`
+150/100->458/458, `cap_futility_improving`/`cap_futility_not_improving`
+0/90 e 0/130 -> 2/115 (ambos), `history_prune_mult` 2500->1648. Decisão
+alinhada com o princípio já estabelecido: valores reais SPSA-tuned dum
+motor top substituem um palpite próprio mesmo com resultado neutro --
+não é preciso ganhar o A/B para "merecer" ser adoptado, só não perder
+claramente. `futility_improving`/`futility_not_improving`,
+`delta_margin`, `qs_lmp_limit`, `tt_extended_cutoff_margin` ficam
+como estavam (sem equivalente Sirius directo, ver
+`build_sirius_search_profile.py`).
+
+**IMPORTANTE -- build pendente**: a edição ao `search.rs` já está
+feita mas **`cargo build --release` ainda NÃO foi corrido**, de
+propósito -- o lote limpo de 20 jogos vs Sirius com o binário anterior
+(moderação de eval, `0c1b388`, sem esta mudança de busca) está a
+correr neste momento (`"running": true` em `/api/state`) e usa o MESMO
+caminho `target/release/kestrel`. Lição já registada acima: nunca
+fazer build que sobrescreva o binário activo enquanto um lote está a
+correr. Assim que este lote de 20 acabar (`"running": false`), o
+próximo passo é: `cargo build --release`, correr os dois perfts de
+validação (não mexeu em movegen, mas é rotina antes de confiar num
+binário novo), e então lançar o próximo lote de auto-teste/self-play
+já com os defaults novos.
+
+## Atualização 2026-07-22 (continuação): correção do utilizador -- faltavam TODAS as variáveis do Sirius, não só as 18 do formato existente; NMP e ProbCut portados a sério
+
+**Correção directa do utilizador**: "vais ver que não é isso... tem a
+ver com TODAS as variáveis que o Sirius treinou... há uma opção para
+compilar o Sirius com as variáveis por setoption." Certo -- eu tinha
+limitado o mapeamento aos 18 campos que já existiam no `SearchParams`
+do Kestrel, e descartado NMP/ProbCut/aspiration/etc. como "sem campo
+equivalente" em vez de ADICIONAR os campos que faltavam. O Sirius tem
+uma macro `EXTERNAL_TUNE` (`search_params.h`/`.cpp`) que, quando
+compilada, regista TODOS os parâmetros como opções UCI reais -- build
+separado feito (`make EXE=sirius_tune LDFLAGS="" CXXFLAGS="...
+-DEXTERNAL_TUNE"`, binário `Sirius/sirius_tune`, NÃO sobrescreve o
+`Sirius/sirius` que a arena usa) e `echo uci | ./sirius_tune | grep
+option` confirmou os ~130 parâmetros e os mesmos valores já lidos do
+código-fonte (nenhuma discrepância -- a leitura manual estava certa,
+só era incompleta em quantidade).
+
+**NMP portado a sério** (não era so' recalibração, era mecanismo em
+falta): o NMP do Kestrel era `null_r = if depth>6 {3} else {2}` --
+completamente cego à avaliação estática, ao contrário de todos os
+motores de referência reais. Substituído pela fórmula real do Sirius
+(`search.cpp:551-558`): gate duplo (`stack->eval >= beta+nmpEvalMargin`
+E `stack->staticEval >= beta+nmpStaticEvalBaseMargin -
+nmpStaticEvalDepthMargin*depth`) + reducao `R = (nmpBaseReduction +
+depth*nmpDepthReductionScale)/256 + min((eval-beta)/
+nmpEvalReductionScale, nmpMaxEvalReduction)`. 8 campos novos no
+`SearchParams` (`nmp_min_depth=2, nmp_eval_margin=29,
+nmp_static_eval_base_margin=193, nmp_static_eval_depth_margin=18,
+nmp_base_reduction=1343, nmp_depth_reduction_scale=78,
+nmp_eval_reduction_scale=208, nmp_max_eval_reduction=4`), valores
+reais do Sirius. Mapeamento de variáveis: `static_eval` do Kestrel (já
+corrigida por corr-hist) = `stack->eval` do Sirius;
+`raw_static_eval` do Kestrel = `stack->staticEval` do Sirius -- mesma
+distinção corrigida/bruta nos dois motores, só nomes trocados. Único
+desvio da fórmula real: `.max(1)` de segurança na redução (garante que
+`depth-r` desce sempre pelo menos 1, para nunca arriscar um loop --
+com os valores reais R nunca fica perto de 0 na prática, é só uma rede
+de segurança, não uma mudança de comportamento observável).
+
+**ProbCut**: só faltava tornar o margin tunável -- `probcutMinDepth=5`
+do Sirius já batia certo com o `depth>=5` fixo que o Kestrel já tinha;
+`probcutBetaMargin=182` substitui o hardcoded `beta+150`.
+
+**`SearchParams` agora com 27 escalares** (era 18) -- `to_vec`/
+`from_vec` actualizados, `build_sirius_search_profile.py` actualizado
+e regerado (`sirius_search_profile.txt`, 27 valores, agora IDÊNTICO
+aos novos defaults -- os campos passaram a viver no próprio
+`Default::default()`, o ficheiro fica só como documentação/smoke-test
+do mecanismo `KESTREL_SEARCH_PARAMS`).
+
+**`cargo check --release` confirma que compila limpo** (só warnings
+pré-existentes, sem erros) -- `cargo check` NÃO mexe no binário ligado
+final, confirmado por `mtime` inalterado em
+`target/release/kestrel`, por isso é seguro correr enquanto o lote de
+arena está `"running": true`. **`cargo build --release` continua
+ADIADO** até o lote de 20 jogos vs Sirius acabar (mesma razão de
+sempre -- não sobrescrever o binário activo a meio de um lote). Ainda
+por fazer quando libertar: build, perfts de rotina, e um self-play A/B
+dedicado ao NMP/ProbCut novos (mudança de MECANISMO de busca, não só
+de dados/constantes -- vale a pena observar o comportamento antes de
+confiar cegamente, mesmo sem ser gate para reverter).
+
+**Gap que continua por fechar, mesmo depois disto**: aspiration
+windows (`aspInitDelta`, `aspWideningFactor`, `minAspDepth`) e os
+ajustes finos de LMR por condição (`lmrNonImp`, `lmrCutnode`,
+`lmrTTPV`, etc., ~10 campos) do Sirius continuam sem equivalente no
+Kestrel -- o LMR do Kestrel só tem o divisor único
+`KESTREL_LMR_DIVISOR` (ja' testado e deixado no default, ruído puro
+nesse teste em particular), não a tabela condicional rica do Sirius.
+Não teve tempo para isto nesta ronda; fica registado para a próxima
+sessão dedicada, não escondido.
+
+## Atualização 2026-07-22 (continuação): erro meu de invocação nos perfts (não é bug), Fable auditou o "gap de profundidade" vs Sirius, correction history portada (5 termos)
+
+**Erro de processo, registado para não repetir**: tentei validar o
+binário com `echo "position startpos\ngo perft 6\nquit" | kestrel`
+(via UCI stdin) -- ficou preso indefinidamente (>26 min de CPU, matei
+o processo). Não é bug de código: `"go perft N"` simplesmente não é um
+comando UCI reconhecido por este motor (`cmd_go` em `uci.rs` não tem
+case para `"perft"`), por isso o parser ignora o token e cai num `go`
+sem profundidade/tempo definidos -- espera por `stop` que nunca chega.
+O perft REAL é um modo CLI: `./kestrel perft <depth> [fen]`. Confirmado
+com a invocação correcta: **startpos perft(6) = 119060324 (78.9M
+nps)**, **Kiwipete perft(4) = 4085603 (5.8M nps)** -- ambos correctos,
+movegen validado. Lição: usar sempre `kestrel perft N` (CLI), nunca
+`go perft` via UCI.
+
+**Fable 5 auditou o "gap de profundidade" pedido pelo utilizador**
+("algo não está tão aprofundado como no Sirius... mete o Fable a
+estudar"). Comparou Kestrel vs Sirius em 4 áreas (correction history,
+LMR, aspiration windows, gestão de tempo), com formulas reais e
+estimativa de custo/ganho para cada uma. Resumo por prioridade:
+
+1. **Correction history** (~104 elo no comentário do Sirius) --
+   Kestrel só tinha o termo de estrutura de peões; Sirius soma 7 termos
+   pesados (peão, material-sem-peões de cada lado, ameaças, menores,
+   maiores, + 6 lags de continuation-history). Infra mais barata das 4
+   (reaproveita `pawn_structure_hash`/`ply_last_move` já existentes).
+   **Feito nesta sessão** (ver abaixo) -- 5 dos termos (peão+2
+   material-sem-peões+menores+maiores), `threats` e os 6 lags de
+   continuation-history deixados de fora (precisam de infra nova em
+   eval.rs / plumbing extra, documentado no código em vez de forçado).
+2. **LMR** (~111 elo) -- Kestrel só tem 1 ajuste flat; Sirius tem ~9
+   condições (`lmrNonImp`, `lmrCorrplexity`, `lmrGivesCheck`,
+   divisores de history contínuos, doDeeper/doShallower, etc.). A parte
+   "barata" (reaproveita `improving`/`corrplexity` já calculados) fica
+   como próximo passo. `lmrCutnode` (o maior peso individual, 1720) foi
+   explicitamente marcado como FORA de alcance -- precisa de threading
+   de um parâmetro `cutnode` por TODA a recursão (6-8 pontos de
+   chamada), Kestrel não tem NENHUM tracking de cutnode hoje.
+3. **Gestão de tempo (node-fraction + best-move-stability scaling)** --
+   gap real confirmado, mas o Fable sinalizou risco concreto: as
+   próprias notas desta sessão já documentam Lazy SMP (4 threads) a dar
+   tempos de busca ruidosos (1.0s/6.8s/2.5s/1.5s/10.6s na MESMA posição)
+   quando se tentou algo parecido antes -- tratar com mais cuidado que
+   as outras 3 áreas.
+4. **Aspiration windows** -- Kestrel já tem o mecanismo (não é gap
+   estrutural), só a fórmula é mais simples que a do Sirius. Prioridade
+   mais baixa: há um comentário já no código do Kestrel a dizer que um
+   teste isolado desta área especificamente deu negativo (33%) no
+   passado.
+
+**Correction history implementada** (`search.rs`): 4 novas hash
+functions (`non_pawn_hash(board,color)`, `minor_piece_hash`,
+`major_piece_hash`, seguindo o mesmo padrão não-incremental já usado
+por `pawn_structure_hash`), 4 novas tabelas no `Searcher`
+(`corr_hist_np_stm/np_nstm/minor/major`, mesma forma/tamanho da
+`corr_hist` já existente), pesos SPSA reais do Sirius
+(`CORR_WEIGHT_PAWN=384, NP_STM=406, NP_NSTM=280, MINOR=274,
+MAJOR=418`, escala `CORR_WEIGHT_SCALE=256`). `corrected_static_eval`
+agora soma os 5 termos pesados em vez de só ler a tabela de peões
+directamente -- isto TAMBÉM recalibra o termo de peão já existente (o
+peso implícito antigo era 256/"1.0", o real do Sirius é 384/1.5x).
+`update_corr_hist` actualiza as 5 tabelas de uma vez, e a taxa de
+aprendizagem por profundidade subiu de `min(depth+1,16)` para
+`2*min(depth+1,16)` (fórmula real do Sirius, `history.cpp:104`) --
+mais responsiva a profundidades altas do que antes. 3 pontos de
+construção do `Searcher` (main.rs x2, uci.rs x1) actualizados com os 4
+novos campos. `cargo check --release` limpo, sem erros.
+
+**Próximo passo imediato**: `cargo build --release` (a arena está
+parada por pedido do utilizador, seguro fazer agora), reconfirmar os 2
+perfts com a invocação CLI correcta, e lançar um self-play A/B
+dedicado à correction history nova (mudança de mecanismo real, não só
+dados -- vale a pena observar antes de confiar, mesmo sem ser gate).
+
+**Feito**: `cargo build --release` (binário novo com NMP+ProbCut+
+correction-history), perfts reconfirmados com a invocação CLI correcta
+-- `perft(6) startpos = 119060324` (84.2M nps), `perft(4) Kiwipete =
+4085603` (6.7M nps), ambos correctos. Como o mecanismo novo está
+compilado directamente no binário (não é um `SearchParams` tunável via
+env var), o A/B precisa de DOIS binários -- criado
+`git worktree add /tmp/kestrel_baseline_0c1b388 0c1b388` (build limpo
+do último commit, antes de NMP/ProbCut/corr-hist), copiado para
+`/root/kestrel_joao/kestrel_baseline_0c1b388`; binário novo copiado
+para `/root/kestrel_joao/kestrel_nmp_corrhist` (`sf17_book.bin` também
+copiado para o mesmo directório, resolução do caminho do livro é
+relativa ao executável). Worktree removido depois de extrair o
+binário. `sprt_nmp_corrhist.py` (300 jogos, 30000 nós/lance) a correr
+em background, log em `sprt_nmp_corrhist.log`.
+
+## Atualização 2026-07-22/23 (continuação): REGRESSÃO GRAVE encontrada e corrigida -- 2 bugs reais no NMP/correction-history portados
+
+**Resultado do primeiro A/B**: catastrófico -- `A(baseline)=93.3%,
+B(new)=6.7%, W275-L15-D10` em 300 jogos. Não é ruído, é uma regressão
+grande a sério -- investigado antes de sequer considerar commitar.
+
+**Bug 1 (NMP): faltava o guard de duplo null-move + verificação a alta
+profundidade**. Fui ler o resto de `search.cpp` do Sirius (tinha parado
+demasiado cedo antes) e há duas peças que faltavam por completo no
+porte:
+- `board.pliesFromNull() > 0` -- Sirius NUNCA permite dois null-moves
+  consecutivos na mesma linha (classicamente inseguro: pode "provar"
+  um fail-high falso). O porte do Kestrel não tinha NENHUM tracking
+  disto.
+- Quando o null-move score bate beta E (`depth>15` OU `beta` é score de
+  vitória conhecida), Sirius NÃO confia cegamente -- faz uma busca de
+  VERIFICAÇÃO real (não-null) à mesma profundidade reduzida antes de
+  aceitar o corte, e desliga o NMP (`nmpMinPly`) até passar esse ponto
+  -- mecanismo de verificação em si NÃO portado ainda, fica como
+  referência para follow-up.
+- Sem estas duas peças, confiar cegamente em R adaptativo grande (5-9
+  em profundidades baixas, valores reais do Sirius) é preciso do
+  contexto que só o resto do mecanismo dá.
+
+**Corrigido**: adicionado `reached_by_null: bool` como parâmetro
+explícito de `negamax()` (threading manual por todos os 10 pontos de
+chamada -- só um bool, não o "cutnode" que o Fable já tinha marcado
+como fora de alcance), gate `!reached_by_null` no bloco de NMP. R
+também agora tem um **cap em 4** (`clamp(1,4)` em vez de sem limite) --
+decisão HONESTA de âmbito reduzido: a busca de verificação completa do
+Sirius (que tornaria seguro confiar em R hihg) fica documentada como
+trabalho futuro (mesmo nível de esforço/risco que o `lmrCutnode` que o
+Fable já tinha adiado), mantém-se só a parte JÁ validada como boa (o
+gate eval-adaptativo, genuinamente mais informado que o antigo
+`depth>6?3:2` cego).
+
+**Bug 2 (correction history): pesos reais do Sirius aplicados às
+tabelas do Kestrel sem re-escalar**. Isolei via teste: com o fix do NMP
+sozinho e a correction-history revertida para o comportamento antigo
+(só peão, peso implícito 256), o resultado voltou a ~50/50 (10 jogos,
+W5-L4-D1) -- confirma que o bug dominante era mesmo a correction
+history, não o NMP. Causa: os pesos SPSA do Sirius
+(`pawnCorrWeight=384` etc., soma total 1762) foram calibrados pelo
+Sirius PARA o `maxCorrHist` e grão internos DELE -- aplicá-los
+directamente às tabelas do Kestrel (clamp próprio, `CORR_HIST_MAX=
+1200`, nunca co-desenhado com esta soma de pesos) produzia correções
+completamente fora de escala, contaminando RFP/razoring/futility (que
+usam `static_eval` corrigido) por todo o lado.
+
+**Corrigido**: pesos reescalados para preservar as proporções RELATIVAS
+reais do Sirius (que termo importa mais que qual) mas com a soma total
+fixada em 256 -- exactamente o mesmo orçamento máximo que o sistema
+antigo (só peão, peso implícito 256) já operava em segurança. Fórmula:
+`peso_i_novo = round(peso_i_sirius * 256 / soma_sirius)`. Valores
+finais: `CORR_WEIGHT_PAWN=56, NP_STM=59, NP_NSTM=41, MINOR=40,
+MAJOR=61` (soma 257, arredondamento). Taxa de aprendizagem (`2*min
+(depth+1,16)`, valor real do Sirius) mantida -- não estava implicada no
+bug, só a ESCALA dos pesos.
+
+**Lição geral para o resto da sessão (e sessões futuras)**: valores
+SPSA reais de um motor de referência são fiáveis para o FORMATO/
+FÓRMULA e para as PROPORÇÕES relativas entre parâmetros relacionados,
+mas os valores ABSOLUTOS só transferem em segurança quando a escala
+subjacente (clamps, grão de fixed-point, unidades internas) é
+verificada como igual -- ou, quando não se sabe ao certo, re-escalados
+para o orçamento que a implementação PRÓPRIA já validou como seguro,
+em vez de copiados às cegas. `history_prune_mult` (sessão anterior,
+razão `16000/16384`) já tinha usado este princípio correctamente por
+as escalas serem quase iguais e verificáveis; aqui a escala do Sirius
+não era directamente verificável a partir do código-fonte disponível,
+por isso a rescala por PROPORÇÃO (preservar a forma, ancorar a
+magnitude ao que já se sabe seguro) é o compromisso correcto, não
+copiar às cegas nem descartar a técnica toda.
+
+**Novo binário rebuilido e reperft'd** (perft(6)=119060324,
+perft(4)=4085603, ambos correctos). Segundo A/B (200 jogos) a correr em
+background, log `sprt_nmp_corrhist_v2.log`.
+
+**Resultado final do segundo A/B**: `A(baseline)=85.0/200=42.5%,
+B(new)=115.0/200=57.5%, W75-L105-D20` -- positivo real, não só "voltou
+a neutro". Commitado. Binários de teste (`kestrel_baseline_0c1b388`,
+`kestrel_nmp_corrhist`, `kestrel_nmp_only`) e scripts
+(`sprt_nmp_corrhist.py`, `sprt_nmp_only.py`) ficam em
+`/root/kestrel_joao/` para referência, não fazem parte do repo git.
