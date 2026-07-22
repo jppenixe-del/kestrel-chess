@@ -554,6 +554,85 @@ impl<'a> Searcher<'a> {
         self.quiescence_from(board, alpha, beta, ply, stand_pat)
     }
 
+    /// Same search as quiescence(), but also returns the board reached
+    /// at the leaf of the best line found -- for tuning dataset prep
+    /// (resolve a training position to a tactically quiet successor
+    /// before scoring it with the candidate eval weights, instead of
+    /// scoring a position mid-exchange). Not used by real gameplay
+    /// search (negamax calls quiescence()/quiescence_from(), unchanged)
+    /// -- purely additive, zero behavior change for the live engine.
+    pub fn quiescence_leaf(&mut self, board: &mut Board, alpha: i32, beta: i32, ply: usize) -> (i32, Board) {
+        let stand_pat = crate::eval::evaluate_fast(board);
+        self.quiescence_leaf_from(board, alpha, beta, ply, stand_pat)
+    }
+
+    fn quiescence_leaf_from(&mut self, board: &mut Board, mut alpha: i32, beta: i32, ply: usize, stand_pat: i32) -> (i32, Board) {
+        self.nodes += 1;
+        let leaf_here = board.clone();
+        if self.time_up() || ply >= MAX_PLY - 1 {
+            return (stand_pat, leaf_here);
+        }
+        let in_check = board.in_check(board.side, self.atk);
+        if !in_check {
+            if stand_pat >= beta {
+                return (beta, leaf_here);
+            }
+            if stand_pat > alpha {
+                alpha = stand_pat;
+            }
+        }
+        let mut moves = generate_legal(board, self.atk);
+        if in_check {
+            if moves.is_empty() {
+                return (-MATE_SCORE + ply as i32, leaf_here);
+            }
+        } else {
+            moves.retain(|m| m.is_capture() || m.promotion == Some(PieceType::Queen));
+            moves.retain(|m| !m.is_capture() || self.see(board, m) >= 0);
+            if alpha.abs() < MATE_SCORE - MAX_PLY as i32 {
+                const DELTA_MARGIN: i32 = 200;
+                moves.retain(|m| {
+                    if m.promotion.is_some() {
+                        return true;
+                    }
+                    let captured_value = if m.flag == MoveFlag::EnPassant {
+                        PieceType::Pawn.value()
+                    } else {
+                        board.piece_at(m.to).map(|(pt, _)| pt.value()).unwrap_or(0)
+                    };
+                    stand_pat + captured_value + DELTA_MARGIN >= alpha
+                });
+            }
+        }
+        let moves = self.order_moves(board, moves, None, ply.min(MAX_PLY - 1), None);
+
+        let mut best = if in_check { -MATE_SCORE - 1 } else { alpha };
+        let mut best_leaf = leaf_here;
+        for mv in moves {
+            let undo = board.make_move(&mv);
+            let (child_score, child_leaf) = self.quiescence_leaf(board, -beta, -alpha, ply + 1);
+            let score = -child_score;
+            board.unmake_move(&mv, &undo);
+            if self.stop {
+                return (if in_check { best.max(alpha) } else { alpha }, best_leaf);
+            }
+            let beats_beta = score >= beta;
+            if score > best {
+                best = score;
+                if beats_beta {
+                    return (beta, child_leaf);
+                }
+                best_leaf = child_leaf;
+            } else if beats_beta {
+                return (beta, child_leaf);
+            }
+            if score > alpha {
+                alpha = score;
+            }
+        }
+        if in_check { (best, best_leaf) } else { (alpha, best_leaf) }
+    }
+
     /// Nucleo da quiescence, recebendo o stand-pat ja' calculado (completo
     /// na 1a chamada vinda do negamax, rapido nas recursoes seguintes --
     /// ver negamax()).

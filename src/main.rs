@@ -76,6 +76,10 @@ fn main() {
         selfplay_datagen(num_games, out_path, node_limit, threads);
         return;
     }
+    if args.len() >= 4 && args[1] == "resolvequiet" {
+        resolve_quiet_dataset(&args[2], &args[3]);
+        return;
+    }
     if args.len() >= 4 && args[1] == "tunefast" {
         let iters: u32 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(2000);
         let lr: f64 = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(2.0);
@@ -677,6 +681,82 @@ fn tune_weights(dataset_path: &str, out_path: &str, epochs: u32, lambda: f64) {
     std::fs::write(out_path, serialized.join(",")).expect("nao consegui escrever o output");
     println!("wrote tuned weights ({} scalars) to {}", out_vec.len(), out_path);
     println!("final error: {:.6}  (started at {:.6}, default-K error {:.6})", current_err, current_err, best_k_err);
+}
+
+/// Resolve every position in a `kestrel tune`-format dataset (`<fen>\t
+/// <result>` per line) to its quiescence leaf before tuning touches it.
+/// Standard Texel practice is to label the QSEARCH-resolved position,
+/// not whatever the sampler happened to land on -- a position mid
+/// tactical exchange (about to lose/win material next move) has a
+/// static eval that doesn't match its true value, and no amount of
+/// tuning-loop regularization fixes a mislabeled example. This is a
+/// ONE-TIME pass over the dataset (cheap: one quiescence search per
+/// position), not per-parameter-trial -- running full quiescence at
+/// every coordinate-descent step (~920 trials/epoch x 20 epochs x
+/// dataset size) would be 1000x+ more expensive and wasn't tractable
+/// in the time available. This gets the main practical benefit
+/// (positions are guaranteed tactically settled) without that cost;
+/// `tune`/`tunefast` afterward are unchanged, still score with
+/// `evaluate_with_weights`, just on cleaner input.
+fn resolve_quiet_dataset(in_path: &str, out_path: &str) {
+    use crate::search::{Searcher, SearchLimits, CONT_HIST_SIZE, CORR_HIST_SIZE, MAX_PLY, MATE_SCORE};
+    let atk = Attacks::new();
+    let zob = zobrist::Zobrist::new();
+    let tt = tt::TranspositionTable::new(1);
+
+    let text = std::fs::read_to_string(in_path).expect("nao consegui ler o dataset");
+    let lines: Vec<&str> = text.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
+    println!("resolving {} positions to quiescence leaves...", lines.len());
+    let t0 = std::time::Instant::now();
+
+    let mut out = String::new();
+    let mut skipped = 0u32;
+    for (i, line) in lines.iter().enumerate() {
+        let mut parts = line.split('\t');
+        let fen = parts.next().unwrap();
+        let res = parts.next().unwrap();
+        let mut board = Board::from_fen(fen);
+
+        let mut searcher = Searcher {
+            atk: &atk,
+            zob: &zob,
+            tt: &tt,
+            nodes: 0,
+            limits: SearchLimits { deadline: None, max_depth: 64, max_nodes: None, soft_deadline: None },
+            stop: false,
+            history: Vec::new(),
+            killers: [[None; 2]; MAX_PLY],
+            history_scores: [[[0; 64]; 64]; 2],
+            countermoves: [[None; 64]; 6],
+            cont_hist: vec![0i32; CONT_HIST_SIZE].into_boxed_slice(),
+            corr_hist: vec![0i32; CORR_HIST_SIZE * 2].into_boxed_slice(),
+            ply_last_move: [None; MAX_PLY],
+            static_evals: [0i32; MAX_PLY],
+            root_best: None,
+            excluded_move: None,
+            excluded_root_moves: vec![],
+            style_book: None,
+        };
+        let (score, leaf) = searcher.quiescence_leaf(&mut board, -MATE_SCORE, MATE_SCORE, 0);
+        if score.abs() >= MATE_SCORE - MAX_PLY as i32 {
+            // Forced mate found inside quiescence -- drop it, same filter
+            // tune_weights's own dataset-reading loop would want (a
+            // position where the game is already tactically decided
+            // isn't useful signal for eval-weight tuning).
+            skipped += 1;
+            continue;
+        }
+        out.push_str(&leaf.to_fen());
+        out.push('\t');
+        out.push_str(res);
+        out.push('\n');
+        if (i + 1) % 5000 == 0 {
+            println!("  {}/{} ({:.0}s)", i + 1, lines.len(), t0.elapsed().as_secs_f64());
+        }
+    }
+    std::fs::write(out_path, &out).expect("nao consegui escrever o output");
+    println!("wrote {} quiet-resolved positions ({} skipped as forced mate) to {} in {:.0}s",
+        lines.len() as u32 - skipped, skipped, out_path, t0.elapsed().as_secs_f64());
 }
 
 /// Debug helper: does `book_path` have an entry for `fen`? Prints the
