@@ -1022,3 +1022,20 @@ panic -- útil para o futuro se aparecer outro crash: `RUST_BACKTRACE=1
 ./target/debug/kestrel` dá stack trace preciso, o binário release por
 vezes atribui a linha errada por causa de inlining (embora neste caso
 tenha calhado por acaso estar certo).
+
+## Atualização 2026-07-22 (continuação): degrau skill15 (binário pré-fixes)
+
+**20 jogos vs `stockfish_skill15` (60+1): 1V-15D-4E = 15%.** Contraste
+claro com skill10 (57.5%/75% conforme o lote) -- skill15 é um degrau
+real ainda não superado, a força actual fica algures entre os dois
+níveis. Corrido com o binário de ANTES dos 3 fixes da revisão do Fable
+(`59a7c62`/`a857622`) -- o fix do endgame scaling em particular pode
+ter impacto real em jogos que cheguem a finais de peões, vale a pena
+repetir este degrau com o binário corrigido antes de tirar conclusões
+finais sobre o nível absoluto. Arena já reiniciada com o binário
+corrigido (`469770e`), pronta para o próximo lote.
+
+**Próximo passo sugerido**: repetir skill15 (ou mesmo skill10 outra
+vez, para confirmar que os fixes não pioraram nada) com o binário
+actual antes de decidir se o degrau é mesmo skill15 ou se os fixes
+mudam a leitura.
