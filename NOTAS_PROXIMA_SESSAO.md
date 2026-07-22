@@ -519,6 +519,35 @@ sobre que tipo de jogo(s) usar para construir um dataset melhor --
 tarefa lançada em background, a aguardar relatório antes de gerar
 mais dados ou tunar. Não avançar tuning sem esse relatório.
 
+**Relatório do Fable (2026-07-22): não perseguir tuning agora.**
+Achado chave: já existia uma ronda inteira de tuning **não documentada**
+num scratchpad partilhado doutra sessão (mesma proveniência dos
+binários `kestrel_fast`/`kestrel_lmr` mencionados acima) -- self-play
+de 3000 jogos (100k+ posições, MAIS que os 20-50k que o Opus tinha
+sugerido), varrimento de lambda de regularização, um run bem-comportado
+(λ=0.001, convergência real). **Validação final A/B em jogo real: 49.6%
+vs 50.4% -- ruído puro, sem sinal em nenhum sentido.** Ou seja: volume e
+regularização já foram varridos com resultado nulo -- não é aí que
+está o problema.
+
+**Causa mais provável identificada (metodológica, confirmada no
+código)**: `tune_weights()`/`white_eval()` em `main.rs:572-575` rotula
+cada posição com o eval ESTÁTICO cru (`evaluate_with_weights`), nunca
+passando por `quiescence()` (`search.rs:552`) -- desvio real do método
+Texel canónico (que usa o score de quiescence search como preditor,
+confirmado por pesquisa: Ethereal/Texel original fazem isto). Corrigir
+isto é trabalho de código real (~1-2h + revalidação), não garantido a
+ajudar, e ainda por cima **contradiz o volume já testado em vão**.
+
+**Decisão**: não avançar mais tuning de eval nesta janela. Voltar à
+prioridade já estabelecida pelo Opus -- SPRT binário-atual vs
+`kestrel_prekillersfix_bin` para quantificar o fix estrutural, depois
+LMR. Ver relatório completo do Fable (texto integral não guardado em
+ficheiro -- se precisar de o reconsultar, os artefactos-fonte estão em
+`/tmp/claude-0/-root/29d54c55-88c4-4e30-af2c-56dc260673c1/scratchpad/`:
+`selfplay_big.epd`/`selfplay_quiet.epd`, `tune_reg*.log`/`tuned_reg*.txt`,
+`ab_match.py`/`ab_match.log`).
+
 **Nota lateral (fora do escopo do Kestrel)**: o utilizador mencionou um
 segundo projeto ("littlerock/half2k", adversário de referência
 "PeachFruit" no Lichess) com prazo até sexta (24 Jul) para bater o Elo
