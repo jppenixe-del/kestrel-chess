@@ -109,11 +109,25 @@ fn compute_time_budget(
 /// maquina) -- pedido depois de mover o motor para o servidor remoto:
 /// "/mnt/d/..." nao existe la'. Espera polgar_book.bin ao lado do binario.
 fn default_style_book_path() -> String {
+    // 2026-07-22: the Judit Polgar signature book was the user's
+    // original IDEA for the project's personality, not a fixed
+    // requirement -- explicitly set aside once real games against
+    // strong engines (Stockfish skill15) showed a pattern of
+    // speculative sacrifices without enough calculated backing (see
+    // NOTAS_PROXIMA_SESSAO.md, "não é compatível com o jogo entre
+    // motores"). Default book is now one built from real Stockfish
+    // 17.1 search at depth>=16 (`sf17_book.bin`, 199 lines/~3.5k
+    // positions, see build_sf_book_games.py) instead of human-game
+    // frequency. `KESTREL_BOOK_FILE` overrides the filename (same
+    // reversible env-var pattern as every other opt-in hook in this
+    // codebase) -- set it to `polgar_book.bin` to go back to the
+    // original book, which is kept on disk, not deleted.
+    let filename = std::env::var("KESTREL_BOOK_FILE").unwrap_or_else(|_| "sf17_book.bin".to_string());
     std::env::current_exe()
         .ok()
-        .and_then(|p| p.parent().map(|d| d.join("polgar_book.bin")))
+        .and_then(|p| p.parent().map(|d| d.join(&filename)))
         .and_then(|p| p.to_str().map(|s| s.to_string()))
-        .unwrap_or_else(|| "polgar_book.bin".to_string())
+        .unwrap_or(filename)
 }
 
 pub struct Engine {

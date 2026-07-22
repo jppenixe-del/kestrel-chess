@@ -1069,3 +1069,52 @@ adversário da mesma força não encontraria. Não decidido se vale a pena
 reequilibrar os termos de agressividade -- fica como pergunta em
 aberto para o utilizador, não uma correção automática (mudaria o
 carácter do bot que foi pedido deliberadamente).
+
+## Atualização 2026-07-22 (continuação): livro Polgar posto de lado, novo livro via Stockfish, Sirius instalado
+
+**Decisão do utilizador**: "mete o polgar de lado... não foi um pedido
+foi uma ideia... isso não é compatível com o jogo entre motores." O
+livro de assinatura da Judit Polgar (baseado em frequência de jogos
+humanos reais) deixa de ser o default -- substituído por um livro
+construído a partir de análise real do Stockfish.
+
+**Novo livro (`sf17_book.bin`)**: só há Stockfish **17.1** neste
+servidor, não 18 (pesquisei o sistema todo, não encontrado) -- usado
+17.1, diferença irrelevante para teoria de abertura a esta profundidade.
+Script `build_sf_book_games.py`: 199 linhas de 20 plies cada
+(satisfaz "16 plies no mínimo"), cada lance escolhido por
+`go depth 16` real do Stockfish, não frequência humana. Diversidade via
+alguns plies iniciais aleatórios por linha (Stockfish é determinístico
+para a mesma posição/profundidade -- sem isso todas as linhas
+colapsavam na mesma). `kestrel buildbook` -> 3469 posições únicas, 3664
+registos.
+
+**Limitação conhecida, documentada honestamente**: como a diversidade
+vem de 2-6 plies ALEATÓRIOS no início de cada linha (não escolhidos
+pelo Stockfish), a distribuição de lances na posição INICIAL fica um
+pouco diluída por ruído (contagens espalhadas por quase todos os
+primeiros lances possíveis, incluindo alguns fracos tipo `Nh3`/`a3`).
+A partir do 3º/4º lance em diante, as linhas já são análise real do
+Stockfish. Não corrigido por falta de tempo -- se for revisitado, a
+forma certa é usar MultiPV do Stockfish na raiz (ponderado para o
+melhor lance) em vez de aleatoriedade pura, só para dar diversidade sem
+perder qualidade logo na posição mais visitada do livro.
+
+**Troca implementada** (`uci.rs`, `default_style_book_path()`):
+`KESTREL_BOOK_FILE` (default agora `sf17_book.bin`, era hardcoded
+`polgar_book.bin`) -- mesmo padrão reversível de env var de sempre.
+`polgar_book.bin` fica no disco, não apagado -- `KESTREL_BOOK_FILE=
+polgar_book.bin` volta ao livro antigo se for preciso.
+
+**Sirius 9.0 instalado** (pedido explícito: "instala o Sirius e joga
+contra ele"). `git clone https://github.com/mcthouacbb/Sirius.git`,
+`make LDFLAGS=""` (o Makefile pede `-fuse-ld=lld`, o lld não está no
+PATH deste servidor por nome próprio -- só dentro do toolchain do
+Rust -- por isso build com o linker default em vez de instalar lld à
+parte). C++ puro, **sem NNUE** (~3449 CCRL 40/15, muito mais forte que
+o Kestrel actual -- é o motor de referência que já era citado no
+README, agora também oponente real). Registado em `engine_arena.py`
+(`OPPONENTS["sirius"]`, Threads=1, Hash=64). Binário em
+`/root/kestrel_joao/Sirius/sirius`. Match ainda não lançado (arena
+ocupada com o lote skill15 em curso) -- próximo passo assim que
+libertar.
