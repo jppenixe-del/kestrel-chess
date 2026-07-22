@@ -976,3 +976,49 @@ estatístico deste tamanho é exactamente o erro documentado.
 o próximo passo correcto para confirmar/refutar TTPV e as extensões
 com poder estatístico real -- não um novo A/B de 300 jogos, que já se
 sabe não ter resolução suficiente.
+
+## Atualização 2026-07-22 (continuação): revisão de código do Fable, 2 bugs reais + 1 crash corrigidos
+
+Pedido do utilizador: revisão de código independente aos 14 commits
+desta sessão. Achados reais (commits `59a7c62`, `a857622`):
+
+1. **CRÍTICO (`eval.rs`, `endgame_scale_factor`)**: o check de
+   "minor-só-vs-rei-nu = empate" nunca verificava os peões do lado
+   FORTE, só os do lado fraco -- disparava para K+P vs K e finais
+   trivialmente ganhos. Confirmado por teste directo: `evaluate()`
+   devolvia exactamente 0 numa posição real de K+P vs K. Corrigido:
+   agora exige zero peões também do lado forte (só K+N vs K / K+B vs K
+   reais, material insuficiente genuíno).
+2. **MODERADO (`search.rs`, `dextensions`)**: o contador de extensões
+   duplas só era ESCRITO no ramo que concede a extensão, nunca
+   propagado do pai em todos os outros caminhos pelo mesmo ply --
+   como o array é indexado só por `ply` (não por linha de pesquisa),
+   isto deixava o contador contaminado por ramos não relacionados.
+   Corrigido: propagação incondicional `dextensions[ply] =
+   dextensions[ply-1]` no topo de cada visita ao nó.
+3. **CRÍTICO -- CRASH real (`uci.rs`)**: um `position fen <...>` com o
+   lado que NÃO joga já em xeque (posição ilegal, impossível de
+   alcançar por jogo real, mas o parser de FEN não rejeita) podia
+   fazer crash na busca (`king_sq()` lê um bitboard de rei vazio,
+   `trailing_zeros()`=64, fora dos limites da tabela de 64 casas).
+   **Confirmado pré-existente** (mesmo crash num binário de 20 Jul,
+   muito antes desta sessão) -- não foi introduzido hoje, só nunca
+   tinha sido encontrado. Não alcançável por jogo normal, mas
+   `position fen` é entrada não confiável de quem quer que esteja do
+   outro lado da ligação UCI. Corrigido: validação no parse -- rejeita
+   e cai para startpos em vez de aceitar uma posição já ilegal.
+
+Achados menores também corrigidos: TTPV agora persiste através de
+escritas scout subsequentes (`OR` com o flag antigo, como
+Stockfish/Ethereal fazem -- antes era apagado quase de imediato pelo
+esquema always-replace); dois comentários incorrectos (complexity_eval
+não "encolhe para zero" como dizia, na verdade soma um bónus em
+posições normais; ordem OCB rook/knight trocada no comentário); guard
+`ply>0` defensivo no TT extended cutoff.
+
+**Ficheiro de teste usado para confirmar os bugs**: build de debug
+(`cargo build`, não `--release`) para atribuição exacta de linha no
+panic -- útil para o futuro se aparecer outro crash: `RUST_BACKTRACE=1
+./target/debug/kestrel` dá stack trace preciso, o binário release por
+vezes atribui a linha errada por causa de inlining (embora neste caso
+tenha calhado por acaso estar certo).
