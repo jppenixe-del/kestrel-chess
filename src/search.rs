@@ -47,16 +47,122 @@ fn lmr_table() -> &'static [[i32; 64]; 64] {
 
 pub const MATE_SCORE: i32 = 30000;
 pub const MAX_PLY: usize = 128;
-/// Safety margin for the extended TT cutoff (see negamax's TT probe):
-/// how far under alpha a depth-1-short entry's score has to sit before
-/// it's trusted as "this would fail low anyway" without a confirming
-/// re-search at full depth.
-const TT_EXTENDED_CUTOFF_MARGIN: i32 = 130;
-/// Quiescence late move pruning: how many SEE-ordered captures to try
-/// (not in check) before giving up on the rest. Captures beyond this
-/// are both SEE>=0 (already filtered) and low in the ordering, so
-/// they're rarely the one that changes the outcome.
-const QS_LMP_LIMIT: usize = 8;
+
+/// Every scalar pruning margin/threshold in the search, in one runtime-
+/// swappable place -- same reversible pattern as `Weights`/
+/// `KESTREL_TUNED_WEIGHTS` in eval.rs, but for the SEARCH side. Before
+/// this, these were scattered `const`s and inline literals (RFP margin,
+/// razoring, futility x2, qsearch delta pruning, qsearch LMP, TT
+/// extended cutoff, history pruning) with no way to swap them without
+/// editing and recompiling -- noticed while building an eval "profile"
+/// (Kestrel's own weights vs a ported Sirius/Ethereal set) that the
+/// search side had no equivalent, even though real engines tune THESE
+/// margins just as much (every one of Ethereal's has a measured Elo
+/// value from SPSA, see NOTAS_PROXIMA_SESSAO.md). `KESTREL_SEARCH_PARAMS=
+/// <path>` loads a `to_vec()`-shaped file the same way
+/// `KESTREL_TUNED_WEIGHTS` does; unset reproduces every default exactly.
+/// No coordinate-descent tuner for this yet (these interact with node
+/// counts nonlinearly -- Texel's static-position method doesn't apply,
+/// real tuning here needs SPSA over actual games, same self-play
+/// infrastructure this session already uses for A/B validation) -- this
+/// commit only makes the values swappable, doesn't add a tuner.
+#[derive(Clone, Copy)]
+pub struct SearchParams {
+    pub rfp_margin_improving: i32,
+    pub rfp_margin_not_improving: i32,
+    pub razor_base: i32,
+    pub razor_per_depth: i32,
+    pub futility_margin_improving: i32,
+    pub futility_margin_not_improving: i32,
+    pub cap_futility_margin_improving: i32,
+    pub cap_futility_margin_not_improving: i32,
+    /// Quiescence delta pruning margin (both the negamax entry point and
+    /// the tuning-dataset quiescence_leaf path use the same value).
+    pub delta_margin: i32,
+    pub qs_lmp_limit: i32,
+    pub tt_extended_cutoff_margin: i32,
+    /// History pruning threshold multiplier: a quiet move is skipped
+    /// outright (not even reduced-searched) when its history score is
+    /// below `-history_prune_mult * depth`.
+    pub history_prune_mult: i32,
+}
+
+impl Default for SearchParams {
+    fn default() -> Self {
+        SearchParams {
+            rfp_margin_improving: 65,
+            rfp_margin_not_improving: 95,
+            razor_base: 150,
+            razor_per_depth: 100,
+            futility_margin_improving: 75,
+            futility_margin_not_improving: 105,
+            cap_futility_margin_improving: 90,
+            cap_futility_margin_not_improving: 130,
+            delta_margin: 200,
+            qs_lmp_limit: 8,
+            tt_extended_cutoff_margin: 130,
+            history_prune_mult: 2500,
+        }
+    }
+}
+
+impl SearchParams {
+    pub fn to_vec(&self) -> Vec<i32> {
+        vec![
+            self.rfp_margin_improving,
+            self.rfp_margin_not_improving,
+            self.razor_base,
+            self.razor_per_depth,
+            self.futility_margin_improving,
+            self.futility_margin_not_improving,
+            self.cap_futility_margin_improving,
+            self.cap_futility_margin_not_improving,
+            self.delta_margin,
+            self.qs_lmp_limit,
+            self.tt_extended_cutoff_margin,
+            self.history_prune_mult,
+        ]
+    }
+    pub fn from_vec(v: &[i32]) -> Self {
+        SearchParams {
+            rfp_margin_improving: v[0],
+            rfp_margin_not_improving: v[1],
+            razor_base: v[2],
+            razor_per_depth: v[3],
+            futility_margin_improving: v[4],
+            futility_margin_not_improving: v[5],
+            cap_futility_margin_improving: v[6],
+            cap_futility_margin_not_improving: v[7],
+            delta_margin: v[8],
+            qs_lmp_limit: v[9],
+            tt_extended_cutoff_margin: v[10],
+            history_prune_mult: v[11],
+        }
+    }
+}
+
+static SEARCH_PARAMS: OnceLock<SearchParams> = OnceLock::new();
+pub fn search_params() -> &'static SearchParams {
+    SEARCH_PARAMS.get_or_init(|| {
+        if let Ok(path) = std::env::var("KESTREL_SEARCH_PARAMS") {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                let parsed: Vec<i32> = text.trim().split(',').filter_map(|s| s.parse().ok()).collect();
+                let default = SearchParams::default();
+                if parsed.len() == default.to_vec().len() {
+                    eprintln!("KESTREL_SEARCH_PARAMS: loaded {} scalars from {}", parsed.len(), path);
+                    return SearchParams::from_vec(&parsed);
+                } else {
+                    eprintln!(
+                        "KESTREL_SEARCH_PARAMS: length mismatch ({} vs expected {}), ignoring",
+                        parsed.len(),
+                        default.to_vec().len()
+                    );
+                }
+            }
+        }
+        SearchParams::default()
+    })
+}
 
 /// Limite de saturacao da history heuristic (bonus/malus acumulados por
 /// [cor][from][to]) -- evita que um par from/to muito bem sucedido
@@ -607,7 +713,7 @@ impl<'a> Searcher<'a> {
             moves.retain(|m| m.is_capture() || m.promotion == Some(PieceType::Queen));
             moves.retain(|m| !m.is_capture() || self.see(board, m) >= 0);
             if alpha.abs() < MATE_SCORE - MAX_PLY as i32 {
-                const DELTA_MARGIN: i32 = 200;
+                let delta_margin = search_params().delta_margin;
                 moves.retain(|m| {
                     if m.promotion.is_some() {
                         return true;
@@ -617,7 +723,7 @@ impl<'a> Searcher<'a> {
                     } else {
                         board.piece_at(m.to).map(|(pt, _)| pt.value()).unwrap_or(0)
                     };
-                    stand_pat + captured_value + DELTA_MARGIN >= alpha
+                    stand_pat + captured_value + delta_margin >= alpha
                 });
             }
         }
@@ -707,7 +813,7 @@ impl<'a> Searcher<'a> {
             // meaningful there) and for promotions (potential gain is
             // much larger than a simple capture value suggests).
             if alpha.abs() < MATE_SCORE - MAX_PLY as i32 {
-                const DELTA_MARGIN: i32 = 200;
+                let delta_margin = search_params().delta_margin;
                 moves.retain(|m| {
                     if m.promotion.is_some() {
                         return true;
@@ -717,7 +823,7 @@ impl<'a> Searcher<'a> {
                     } else {
                         board.piece_at(m.to).map(|(pt, _)| pt.value()).unwrap_or(0)
                     };
-                    stand_pat + captured_value + DELTA_MARGIN >= alpha
+                    stand_pat + captured_value + delta_margin >= alpha
                 });
             }
         }
@@ -733,7 +839,7 @@ impl<'a> Searcher<'a> {
             // Never while in check (every legal reply must be tried
             // there, not just captures) and never near mate scores
             // (a fixed count isn't meaningful when the game is decided).
-            if !in_check && tried >= QS_LMP_LIMIT && alpha.abs() < MATE_SCORE - MAX_PLY as i32 {
+            if !in_check && tried >= search_params().qs_lmp_limit as usize && alpha.abs() < MATE_SCORE - MAX_PLY as i32 {
                 break;
             }
             tried += 1;
@@ -895,7 +1001,7 @@ impl<'a> Searcher<'a> {
             } else if !is_pv
                 && e.depth == depth - 1
                 && e.bound == Bound::Upper
-                && tt_score + TT_EXTENDED_CUTOFF_MARGIN <= alpha
+                && tt_score + search_params().tt_extended_cutoff_margin <= alpha
             {
                 // Extended TT cutoff: a same-position entry exactly ONE
                 // depth short of what's needed still short-circuits the
@@ -954,7 +1060,8 @@ impl<'a> Searcher<'a> {
             && depth <= 6
             && beta.abs() < MATE_SCORE - MAX_PLY as i32
         {
-            let margin = if improving { 65 * depth } else { 95 * depth };
+            let sp = search_params();
+            let margin = if improving { sp.rfp_margin_improving * depth } else { sp.rfp_margin_not_improving * depth };
             if static_eval - margin >= beta {
                 return static_eval - margin;
             }
@@ -998,7 +1105,8 @@ impl<'a> Searcher<'a> {
         // (nao um corte cego) e so' se aceita o resultado se confirmar
         // o fail-low, para nunca perder uma tactica real.
         if !in_check && ply > 0 && depth <= 3 {
-            let margin = 150 + 100 * (depth - 1);
+            let sp = search_params();
+            let margin = sp.razor_base + sp.razor_per_depth * (depth - 1);
             if static_eval + margin <= alpha {
                 let full_stand_pat = evaluate(board);
                 let q = self.quiescence_from(board, alpha, beta, ply, full_stand_pat);
@@ -1179,7 +1287,8 @@ impl<'a> Searcher<'a> {
                 && mv.promotion.is_none()
                 && alpha.abs() < MATE_SCORE - MAX_PLY as i32
             {
-                let margin = if improving { 75 * depth } else { 105 * depth };
+                let sp = search_params();
+                let margin = if improving { sp.futility_margin_improving * depth } else { sp.futility_margin_not_improving * depth };
                 let fe = *futility_eval.get_or_insert(static_eval);
                 if fe + margin <= alpha {
                     i += 1;
@@ -1203,7 +1312,8 @@ impl<'a> Searcher<'a> {
                 && mv.promotion.is_none()
                 && alpha.abs() < MATE_SCORE - MAX_PLY as i32
             {
-                let margin = if improving { 90 * depth } else { 130 * depth };
+                let sp = search_params();
+                let margin = if improving { sp.cap_futility_margin_improving * depth } else { sp.cap_futility_margin_not_improving * depth };
                 let fe = *futility_eval.get_or_insert(static_eval);
                 let see_val = self.see(board, &mv);
                 if fe + see_val + margin <= alpha {
@@ -1226,7 +1336,7 @@ impl<'a> Searcher<'a> {
                 && alpha.abs() < MATE_SCORE - MAX_PLY as i32
             {
                 let h = self.history_scores[board.side.idx()][mv.from as usize][mv.to as usize];
-                if h < -2500 * depth {
+                if h < -search_params().history_prune_mult * depth {
                     i += 1;
                     continue;
                 }
