@@ -750,10 +750,24 @@ ainda por calibrar como o plano previa):**
    de 8 capturas tentadas (já ordenadas por SEE, já filtradas SEE>=0)
    antes de desistir do resto.
 
-**A/B combinado (5+6, capture-futility+TT-cutoff, 300 jogos vs a
-baseline com king-safety+endgame-scaling): a decorrer, tendência
-positiva inicial (~58-60% nos primeiros ~40 jogos) -- ver log mais
-recente antes de confiar no número final.**
+**A/B final (4+5+6 combinados: futility de capturas + TT extended
+cutoff + qsearch LMP, 300 jogos vs a baseline com king-safety+
+endgame-scaling): 52.3% (157V-135D-16E)** -- positivo, modesto (~+16
+Elo), consistente ao longo do lote (começou mais alto ~58%, estabilizou
+por volta de 52-53% com mais jogos). Dentro do que se espera para
+refinamentos de poda deste tamanho. Commitado (`48795d8`).
+
+**Resumo final dos A/Bs desta ronda:**
+| Mudança | Resultado (300 jogos, fixed-nodes) | Decisão |
+|---|---|---|
+| Endgame scaling | 48.8% | Neutro, integrado (estrutural, não tático) |
+| King safety (safe checks + queen-gate) | 46.8%, negativo persistente | Integrado, calibração é o próximo passo (não reverter estrutura) |
+| Backward/candidate pawns + bad bishop | não medido isolado | Integrado junto com king safety |
+| Capture futility + TT cutoff + qsearch LMP | 52.3%, positivo | Integrado |
+
+Commits desta ronda: `7b7e5dd` (eval: endgame scaling, king safety,
+pawn terms, bad bishop), `48795d8` (search: capture futility, TT
+cutoff, qsearch LMP).
 
 **Binários de checkpoint guardados** (não commitados, artefactos locais)
 em `/root/kestrel_joao/`: `kestrel_with_endgamescale`,
