@@ -302,11 +302,20 @@ const MOBILITY_QUEEN: [(i32, i32); 28] = {
 // eg = negativo pequeno -- ataques ao rei importam pouco quando ja
 // nao ha muitas pecas para atacar. Baseado no padrao classico
 // "attack units" do Stockfish clássico.
+// Moderado ~25% em 2026-07-22: dois lotes reais consecutivos contra
+// oponentes fortes e precisos (Stockfish skill15, Sirius 9.0) mostraram
+// um padrao recorrente de sacrificios/trocas especulativas do kestrel
+// sem compensacao suficiente, consistente com estes pesos a empurrar
+// para ataques ao rei que a busca pratica nao consegue validar em
+// profundidade suficiente. Pedido do utilizador: "isso nao e'
+// compativel com o jogo entre motores" -- moderado, nao eliminado (o
+// estilo agressivo continua a existir, so' menos extremo). Valores
+// antigos preservados em comentario para referencia/reversao.
 const KING_ATTACKER_WEIGHT: [(i32, i32); 4] = [
-    (20, -3),   // Cavalo
-    (18, -3),   // Bispo
-    (35, -5),   // Torre
-    (65, -5),   // Dama
+    (15, -2),   // Cavalo (era 20,-3)
+    (13, -2),   // Bispo (era 18,-3)
+    (26, -4),   // Torre (era 35,-5)
+    (48, -4),   // Dama (era 65,-5)
 ];
 // Extra por casa da king zone atacada, alem do bonus por atacante.
 const KING_ATTACKS: (i32, i32) = (5, 0);
@@ -449,9 +458,11 @@ const THREAT_BY_KING: [(i32, i32); 6] = [(30, 20), (35, 30), (65, 25), (55, 10),
 
 // Hit-queen: peca menor a UM movimento de atacar a dama inimiga (a
 // partir de casa segura). Valores baixos (a ameaca ainda nao aconteceu).
-const KNIGHT_HIT_QUEEN: (i32, i32) = (8, 5);
-const BISHOP_HIT_QUEEN: (i32, i32) = (14, 12);
-const ROOK_HIT_QUEEN: (i32, i32) = (14, 5);
+// Moderado ~25% em 2026-07-22, mesmo motivo do KING_ATTACKER_WEIGHT
+// acima (padrao de sacrificios especulativos vs oponentes fortes).
+const KNIGHT_HIT_QUEEN: (i32, i32) = (6, 4);   // era (8, 5)
+const BISHOP_HIT_QUEEN: (i32, i32) = (10, 9);  // era (14, 12)
+const ROOK_HIT_QUEEN: (i32, i32) = (10, 4);    // era (14, 5)
 // Peao a UM push de atacar peca inimiga nao-peao (a partir de casa
 // safe). Padrao "pawn storm creates threat".
 const PUSH_THREAT: (i32, i32) = (12, 15);
