@@ -305,6 +305,7 @@ fn play_one_selfplay_game(
             style_book: None,
             root_move_nodes: Vec::new(),
             capture_history: [[[0; 6]; 6]; 2],
+            dextensions: [0; MAX_PLY],
         };
         let (best, score, _depth, _nodes) = searcher.iterative_deepening(&mut board);
         let Some(mv) = best else {
@@ -741,6 +742,7 @@ fn resolve_quiet_dataset(in_path: &str, out_path: &str) {
             style_book: None,
             root_move_nodes: Vec::new(),
             capture_history: [[[0; 6]; 6]; 2],
+            dextensions: [0; MAX_PLY],
         };
         let (score, leaf) = searcher.quiescence_leaf(&mut board, -MATE_SCORE, MATE_SCORE, 0);
         if score.abs() >= MATE_SCORE - MAX_PLY as i32 {

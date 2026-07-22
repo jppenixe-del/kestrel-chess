@@ -439,6 +439,7 @@ impl Engine {
                         style_book: self.style_book.as_ref(),
                         root_move_nodes: Vec::new(),
                         capture_history: [[[0; 6]; 6]; 2],
+                        dextensions: [0; crate::search::MAX_PLY],
                     };
                     scope.spawn(move || {
                         let mut searcher = searcher;

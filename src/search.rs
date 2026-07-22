@@ -308,12 +308,29 @@ pub struct Searcher<'a> {
     /// Vec, not a HashMap: the root move list is at most a few dozen
     /// moves, so a linear scan per update is cheaper than hashing.
     pub root_move_nodes: Vec<(Move, u64)>,
+    /// Double-extension counter, propagated down a search LINE (indexed
+    /// by ply): how many times this exact line has already used a
+    /// double extension. Read from the PARENT ply before deciding to
+    /// grant another one, same guard Ethereal uses (`dextensions<=6`)
+    /// to stop a run of double extensions from exploding the tree --
+    /// each one costs an extra full ply, and they can chain if several
+    /// nodes in a row are singular by a wide margin.
+    pub dextensions: [i32; MAX_PLY],
 }
 
 /// Limiar a partir do qual um score e' considerado "de mate" (nao so'
 /// avaliacao normal) -- MATE_SCORE menos a profundidade maxima possivel,
 /// para nao confundir avaliacoes normais muito altas com mates reais.
 const MATE_THRESHOLD: i32 = MATE_SCORE - MAX_PLY as i32;
+/// How much MORE singular (below s_beta) a move has to be, on top of
+/// just passing the ordinary singular-extension check, before it earns
+/// a double (+2 ply) extension instead of the normal +1. Ethereal's
+/// value, ported directly (its search.c uses the same margin literally
+/// named for this check).
+const DOUBLE_EXT_MARGIN: i32 = 16;
+/// Cap on chained double extensions along one search line (read from
+/// the parent ply's count) -- Ethereal's value.
+const DOUBLE_EXT_MAX: i32 = 6;
 
 /// Tamanho da tabela cont_hist -- 6 tipos de peca * 64 casas destino
 /// para o prev-move, vezes o mesmo para o curr-move. Ver campo
@@ -1273,11 +1290,34 @@ impl<'a> Searcher<'a> {
                     if self.stop {
                         return 0;
                     }
-                    if s_score < s_beta {
+                    // Double extension (Ethereal): not just singular but
+                    // singular by a WIDE margin (DOUBLE_EXT_MARGIN extra)
+                    // -- extend 2 plies instead of 1. Capped via
+                    // `dextensions` (read from the PARENT ply) so a run
+                    // of double extensions along one line can't explode
+                    // the tree; falls back to a normal +1 singular
+                    // extension once the cap is hit.
+                    let parent_dext = self.dextensions[ply.saturating_sub(1)];
+                    if s_score < s_beta - DOUBLE_EXT_MARGIN && !is_pv && parent_dext <= DOUBLE_EXT_MAX {
+                        se_candidate = Some(tm);
+                        se_extension = 2;
+                        self.dextensions[ply] = parent_dext + 1;
+                    } else if s_score < s_beta {
                         se_candidate = Some(tm);
                         se_extension = 1;
                     } else if s_beta >= beta {
                         return s_beta;
+                    } else if tt_score >= beta {
+                        // Negative extension: the tt_move already looked
+                        // like it beats beta at the CURRENT depth (not
+                        // just the reduced verification depth) without
+                        // triggering the multicut condition above --
+                        // Ethereal's signal that a full-depth search here
+                        // would likely just re-confirm the same cutoff,
+                        // so shrink depth by 1 instead of granting an
+                        // extension.
+                        se_candidate = Some(tm);
+                        se_extension = -1;
                     }
                 }
             }
