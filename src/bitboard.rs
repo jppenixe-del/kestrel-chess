@@ -19,6 +19,9 @@ pub fn count(b: Bitboard) -> u32 {
     b.count_ones()
 }
 
+/// a1=index 0 is a dark square; (rank+file)%2==1 is the light-square
+/// parity used throughout the codebase (see eval.rs bishop-color checks).
+pub const LIGHT_SQUARES: Bitboard = 0x55AA55AA55AA55AA;
 pub const FILE_A: Bitboard = 0x0101010101010101;
 pub const FILE_H: Bitboard = 0x8080808080808080;
 pub const RANK_1: Bitboard = 0x00000000000000FF;

@@ -478,6 +478,23 @@ const DOUBLED_PAWN: (i32, i32) = (-10, -25);
 const PASSED_PAWN: [(i32, i32); 8] = [
     (0, 0), (0, 0), (0, 0), (-10, 5), (5, 40), (35, 110), (100, 200), (0, 0),
 ];
+// BACKWARD_PAWN: no pawn on an adjacent file can ever support it (none
+// sit level with or behind it) AND its advance square is controlled by
+// an enemy pawn -- stuck, can't safely push, can't be defended by a
+// pawn. Mild penalty (structural, not material): Ethereal/Sirius list
+// it but it's a smaller effect than isolation.
+const BACKWARD_PAWN: (i32, i32) = (-6, -10);
+// CANDIDATE_PASSED_PAWN: not passed yet (an enemy pawn still contests
+// its file or a neighboring file ahead), but the local pawn count says
+// it wins the race after likely trades -- own supporters on adjacent
+// files at-or-behind >= enemy blockers on adjacent files ahead. Real
+// but smaller than an actual passed pawn's bonus (see PASSED_PAWN).
+const CANDIDATE_PASSED_PAWN: (i32, i32) = (6, 18);
+// BAD_BISHOP: per own pawn sitting on the bishop's own square color --
+// each one is a square that piece can never influence and often has
+// to be defended twice. Small per-pawn penalty, worse in the endgame
+// (fewer other pieces to compensate for the bad bishop's blind squares).
+const BAD_BISHOP: (i32, i32) = (-2, -4);
 
 /// Runtime-adjustable copy of every constant `positional_terms()` uses
 /// (mobility/king-safety/threats/pawn-structure -- NOT material/PST,
@@ -527,6 +544,9 @@ pub struct Weights {
     pub isolated_pawn: (i32, i32),
     pub doubled_pawn: (i32, i32),
     pub passed_pawn: [(i32, i32); 8],
+    pub backward_pawn: (i32, i32),
+    pub candidate_passed_pawn: (i32, i32),
+    pub bad_bishop: (i32, i32),
 }
 
 impl Default for Weights {
@@ -564,6 +584,9 @@ impl Default for Weights {
             isolated_pawn: ISOLATED_PAWN,
             doubled_pawn: DOUBLED_PAWN,
             passed_pawn: PASSED_PAWN,
+            backward_pawn: BACKWARD_PAWN,
+            candidate_passed_pawn: CANDIDATE_PASSED_PAWN,
+            bad_bishop: BAD_BISHOP,
         }
     }
 }
@@ -639,6 +662,9 @@ impl Weights {
         pair!(self.isolated_pawn);
         pair!(self.doubled_pawn);
         pairs!(self.passed_pawn);
+        pair!(self.backward_pawn);
+        pair!(self.candidate_passed_pawn);
+        pair!(self.bad_bishop);
         v
     }
 
@@ -681,6 +707,9 @@ impl Weights {
         let isolated_pawn = pair!();
         let doubled_pawn = pair!();
         let passed_pawn = pairs!(8);
+        let backward_pawn = pair!();
+        let candidate_passed_pawn = pair!();
+        let bad_bishop = pair!();
         assert_eq!(i, v.len(), "from_vec: length mismatch with to_vec's field order");
         Weights {
             bishop_pair, long_diag_bishop, minor_behind_pawn, knight_outpost, rook_open, tempo,
@@ -690,6 +719,7 @@ impl Weights {
             threat_by_pawn, threat_by_knight, threat_by_bishop, threat_by_rook, threat_by_queen, threat_by_king,
             knight_hit_queen, bishop_hit_queen, rook_hit_queen, push_threat, restricted_squares,
             pawn_phalanx, defended_pawn, isolated_pawn, doubled_pawn, passed_pawn,
+            backward_pawn, candidate_passed_pawn, bad_bishop,
         }
     }
 }
@@ -759,12 +789,19 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
     let white_king_zone = king_zone(board.king_sq(Color::White));
     let black_king_zone = king_zone(board.king_sq(Color::Black));
 
+    // Indexed by the ATTACKING color (not the color whose king is in
+    // danger) -- king_attack_units[White] is how much White's pieces
+    // threaten Black's king, contributed with White's (+1) sign below,
+    // same convention the code already used locally before this was
+    // hoisted out of the loop.
+    let mut king_attackers = [0i32; 2];
+    let mut king_attack_units = [(0i32, 0i32); 2];
+
     for c in [Color::White, Color::Black] {
         let sign = if c == Color::White { 1 } else { -1 };
         let own = board.occ_color[c.idx()];
         let enemy_king_zone = if c == Color::White { black_king_zone } else { white_king_zone };
-        let mut king_attackers = 0i32;
-        let mut king_attack_units = (0i32, 0i32);
+        let ci = c.idx();
 
         if count(board.pieces[c.idx()][PieceType::Bishop.idx()]) >= 2 {
             mg += sign * w.bishop_pair.0;
@@ -807,7 +844,7 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
 
                 let hits = count(attacks & enemy_king_zone) as i32;
                 if hits > 0 {
-                    king_attackers += 1;
+                    king_attackers[ci] += 1;
                     let widx = match pt {
                         PieceType::Knight => 0,
                         PieceType::Bishop => 1,
@@ -816,8 +853,8 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
                         _ => 0,
                     };
                     let aw = w.king_attacker_weight[widx];
-                    king_attack_units.0 += aw.0 + hits * w.king_attacks.0;
-                    king_attack_units.1 += aw.1 + hits * w.king_attacks.1;
+                    king_attack_units[ci].0 += aw.0 + hits * w.king_attacks.0;
+                    king_attack_units[ci].1 += aw.1 + hits * w.king_attacks.1;
                 }
 
                 if pt == PieceType::Rook {
@@ -866,14 +903,18 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
                         mg += sign * w.long_diag_bishop.0;
                         eg += sign * w.long_diag_bishop.1;
                     }
+
+                    // Bispo mau: penalidade por cada peao proprio na
+                    // mesma cor de casa que o bispo -- casas que essa
+                    // peca nunca pode influenciar, muitas vezes tem de
+                    // ser defendidas por outra peca em vez dele.
+                    let bishop_light = (rank_of(s) + file_of(s)) % 2 == 1;
+                    let own_pawns_same_color = if bishop_light { LIGHT_SQUARES } else { !LIGHT_SQUARES };
+                    let n = count(board.pieces[c.idx()][PieceType::Pawn.idx()] & own_pawns_same_color) as i32;
+                    mg += sign * w.bad_bishop.0 * n;
+                    eg += sign * w.bad_bishop.1 * n;
                 }
             }
-        }
-
-        if king_attackers >= 2 {
-            let danger_idx = king_attack_units.0.clamp(0, 127) as usize;
-            mg += sign * w.king_danger_table[danger_idx];
-            eg += sign * king_attack_units.1;
         }
 
         // === Pawn shelter / storm around own king ===
@@ -915,6 +956,62 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
                 mg += sign * w.pawn_storm[idx].0;
                 eg += sign * w.pawn_storm[idx].1;
             }
+        }
+    }
+
+    // === Safe checks + queen-gated king danger (Ethereal's approach,
+    // architecture ported not values) ===
+    // Deferred to its own pass after both colors' attacked[]/
+    // attacked_by_pt[] are fully known -- a "safe" square (no enemy
+    // defender at all, conservative but simple) can only be judged once
+    // the DEFENDING side's full attack set exists, which isn't true yet
+    // mid-loop above when processing the attacking side first.
+    for c in [Color::White, Color::Black] {
+        let sign = if c == Color::White { 1 } else { -1 };
+        let us = c.idx();
+        let them = c.opp().idx();
+        let enemy_king_sq = board.king_sq(c.opp());
+        let own_occ = board.occ_color[us];
+        // Conservative "safe": zero enemy defenders on the square at
+        // all (not even the king). Undercounts some genuinely-safe
+        // checks where we'd have enough backup to win the exchange,
+        // but is cheap and never wrongly counts an unsafe one.
+        let safe = !attacked[them];
+
+        let knight_checks = a.knight[enemy_king_sq as usize];
+        let bishop_checks = bishop_attacks(enemy_king_sq, occ);
+        let rook_checks = rook_attacks(enemy_king_sq, occ);
+        let queen_checks = bishop_checks | rook_checks;
+
+        let n_knight = count(knight_checks & attacked_by_pt[us][PieceType::Knight.idx()] & !own_occ & safe) as i32;
+        let n_bishop = count(bishop_checks & attacked_by_pt[us][PieceType::Bishop.idx()] & !own_occ & safe) as i32;
+        let n_rook = count(rook_checks & attacked_by_pt[us][PieceType::Rook.idx()] & !own_occ & safe) as i32;
+        let n_queen = count(queen_checks & attacked_by_pt[us][PieceType::Queen.idx()] & !own_occ & safe) as i32;
+
+        // Reuses the existing per-hit `king_attacks` weight as the unit
+        // value for a free check (queen checks weighted double -- by
+        // far the most dangerous piece to let deliver one for free)
+        // instead of adding new tunable fields: keeps this additive to
+        // the Weights struct and to tune_fast's king-field sentinel
+        // detection in main.rs, which already special-cases every
+        // OTHER king-safety field as "nonlinear, not tuned here".
+        let safe_check_units = n_knight + n_bishop + n_rook + 2 * n_queen;
+        if safe_check_units > 0 {
+            king_attackers[us] += 1;
+            king_attack_units[us].0 += safe_check_units * w.king_attacks.0;
+            king_attack_units[us].1 += safe_check_units * w.king_attacks.1;
+        }
+
+        // Queen-gate: with the defending side's queen off the board, a
+        // single attacker rarely turns into a real mating attack --
+        // require at least 2. With her still on board, one already
+        // matters (Ethereal: `kingAttackersCount > 1 - popcount(queens)`).
+        let defender_has_queen = board.pieces[them][PieceType::Queen.idx()] != 0;
+        let threshold = if defender_has_queen { 1 } else { 2 };
+        if king_attackers[us] >= threshold {
+            let danger_idx = king_attack_units[us].0.clamp(0, 127) as usize;
+            mg += sign * w.king_danger_table[danger_idx];
+            eg += sign * king_attack_units[us].1;
         }
     }
 
@@ -1080,6 +1177,59 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
             if !blocked {
                 mg += sign * w.passed_pawn[rel_rank].0;
                 eg += sign * w.passed_pawn[rel_rank].1;
+            } else {
+                // Peao atrasado: nenhum peao proprio numa coluna adjacente
+                // ao mesmo nivel ou atras pode alguma vez apoiar o avanco
+                // deste peao, E a casa de avanco esta controlada por peao
+                // inimigo -- preso, nao avanca em seguranca nem e' defendido.
+                let front_r = if c == Color::White { r + 1 } else { r - 1 };
+                let mut supported_ever = false;
+                for adj in [f - 1, f + 1] {
+                    if !(0..8).contains(&adj) { continue; }
+                    let mut m: Bitboard = 0;
+                    if c == Color::White {
+                        for rr in 0..=r { m |= bb(sq(adj as u8, rr as u8)); }
+                    } else {
+                        for rr in r..8 { m |= bb(sq(adj as u8, rr as u8)); }
+                    }
+                    if own_pawns & m != 0 { supported_ever = true; break; }
+                }
+                if !supported_ever && (0..8).contains(&front_r) {
+                    let front_sq = sq(f as u8, front_r as u8);
+                    if a.pawn[c.idx()][front_sq as usize] & enemy_pawns != 0 {
+                        mg += sign * w.backward_pawn.0;
+                        eg += sign * w.backward_pawn.1;
+                    }
+                }
+
+                // Peao passado candidato: nenhum peao inimigo na MESMA
+                // coluna a frente (essa parte da corrida ja' esta' livre),
+                // e nas colunas adjacentes a frente o numero de bloqueadores
+                // inimigos nao excede o numero de apoiadores proprios ao
+                // mesmo nivel ou atras -- depois de uma troca razoavel,
+                // este peao fica realmente passado.
+                if enemy_pawns & (FILE_A << f) == 0 {
+                    let mut enemy_ahead = 0u32;
+                    let mut own_support = 0u32;
+                    for adj in [f - 1, f + 1] {
+                        if !(0..8).contains(&adj) { continue; }
+                        let mut ahead: Bitboard = 0;
+                        let mut behind: Bitboard = 0;
+                        if c == Color::White {
+                            for rr in (r + 1)..8 { ahead |= bb(sq(adj as u8, rr as u8)); }
+                            for rr in 0..=r { behind |= bb(sq(adj as u8, rr as u8)); }
+                        } else {
+                            for rr in 0..r { ahead |= bb(sq(adj as u8, rr as u8)); }
+                            for rr in r..8 { behind |= bb(sq(adj as u8, rr as u8)); }
+                        }
+                        enemy_ahead += count(enemy_pawns & ahead);
+                        own_support += count(own_pawns & behind);
+                    }
+                    if enemy_ahead >= 1 && enemy_ahead <= own_support {
+                        mg += sign * w.candidate_passed_pawn.0;
+                        eg += sign * w.candidate_passed_pawn.1;
+                    }
+                }
             }
 
             // Peao isolado.
@@ -1155,11 +1305,116 @@ fn eval_mode_material_only() -> bool {
     })
 }
 pub fn evaluate(board: &Board) -> i32 {
-    if eval_mode_material_only() {
+    let raw = if eval_mode_material_only() {
         material_pst(board)
     } else {
         material_pst(board) + positional_terms_signed(board)
+    };
+    scale_endgame(board, raw)
+}
+
+/// Endgame scale factor (Ethereal's approach, ported architecture not
+/// values -- own thresholds below): known drawish/hard-to-convert
+/// material patterns get their eval shrunk toward zero, in proportion
+/// to how "scaled down" that material pattern actually plays in
+/// practice. Applied to the WHOLE already-tapered eval rather than
+/// splitting mg/eg and rescaling only eg separately -- by the time any
+/// of these patterns fire, so little material is left that `phase` is
+/// already deep in the endgame anyway, so the approximation costs
+/// little accuracy for a lot less invasive a change (keeps
+/// `positional_terms()` exactly linear in its weights, which
+/// `tune_fast` in main.rs relies on -- see the comment there).
+/// Symmetric (doesn't care whose turn it is), so it's safe to apply
+/// after `material_pst`/`positional_terms_signed` have already flipped
+/// sign for side-to-move.
+const SCALE_NORMAL: i32 = 128;
+
+fn scale_endgame(board: &Board, raw: i32) -> i32 {
+    if raw == 0 {
+        return 0;
     }
+    let scale = endgame_scale_factor(board, raw);
+    if scale == SCALE_NORMAL {
+        return raw;
+    }
+    raw * scale / SCALE_NORMAL
+}
+
+fn endgame_scale_factor(board: &Board, raw: i32) -> i32 {
+    let w = Color::White.idx();
+    let b = Color::Black.idx();
+    let wp = board.pieces[w][PieceType::Pawn.idx()];
+    let bp = board.pieces[b][PieceType::Pawn.idx()];
+    let wn = board.pieces[w][PieceType::Knight.idx()];
+    let bn = board.pieces[b][PieceType::Knight.idx()];
+    let wb = board.pieces[w][PieceType::Bishop.idx()];
+    let bb_ = board.pieces[b][PieceType::Bishop.idx()];
+    let wr = board.pieces[w][PieceType::Rook.idx()];
+    let br = board.pieces[b][PieceType::Rook.idx()];
+    let wq = board.pieces[w][PieceType::Queen.idx()];
+    let bq = board.pieces[b][PieceType::Queen.idx()];
+
+    let n_wp = count(wp) as i32;
+    let n_bp = count(bp) as i32;
+    let n_wn = count(wn);
+    let n_bn = count(bn);
+    let n_wb = count(wb);
+    let n_bb = count(bb_);
+    let n_wr = count(wr);
+    let n_br = count(br);
+    let n_wq = count(wq);
+    let n_bq = count(bq);
+
+    // Opposite-colored bishops: exactly one bishop each, on different
+    // square colors. Classic drawing fortress even a pawn or two up.
+    // Scales down further, the fewer other pieces are left to help
+    // convert (bishops-only < one-knight-each < one-rook-each).
+    if n_wb == 1 && n_bb == 1 {
+        let wb_sq = wb.trailing_zeros();
+        let bb_sq = bb_.trailing_zeros();
+        let wb_light = (rank_of(wb_sq as Square) + file_of(wb_sq as Square)) % 2 == 1;
+        let bb_light = (rank_of(bb_sq as Square) + file_of(bb_sq as Square)) % 2 == 1;
+        if wb_light != bb_light {
+            if n_wn == 0 && n_bn == 0 && n_wr == 0 && n_br == 0 && n_wq == 0 && n_bq == 0 {
+                return 64;
+            }
+            if n_wr == 1 && n_br == 1 && n_wn == 0 && n_bn == 0 && n_wq == 0 && n_bq == 0 {
+                return 96;
+            }
+            if n_wn == 1 && n_bn == 1 && n_wr == 0 && n_br == 0 && n_wq == 0 && n_bq == 0 {
+                return 106;
+            }
+        }
+    }
+
+    // A single minor piece (knight or bishop), nothing else but pawns,
+    // for the side with more total material -- can't force a win
+    // against a lone king even with extra pawns, only a fortress/
+    // blockade at best. True draw scale.
+    let w_minors_only = n_wr == 0 && n_wq == 0 && (n_wn + n_wb) <= 1;
+    let b_minors_only = n_br == 0 && n_bq == 0 && (n_bn + n_bb) <= 1;
+    if w_minors_only && n_br == 0 && n_bq == 0 && n_bn == 0 && n_bb == 0 && n_bp == 0 {
+        return 0;
+    }
+    if b_minors_only && n_wr == 0 && n_wq == 0 && n_wn == 0 && n_wb == 0 && n_wp == 0 {
+        return 0;
+    }
+
+    // Fallback: scale down with how few pawns the stronger side has
+    // left -- fewer pawns left to shelter a passer/create a second
+    // weakness makes converting a material edge progressively harder.
+    // Gated to queenless positions only: this function scales the
+    // WHOLE already-tapered eval (not just the eg component the way
+    // Ethereal's mg/eg-split version does), so applying it unconditionally
+    // would also shrink ordinary middlegame evals whenever pawn counts
+    // differ -- wrong, since in the midgame this pattern says nothing
+    // about convertibility. No queens is a cheap, real proxy for "this
+    // is actually an endgame" that keeps the approximation safe.
+    if n_wq == 0 && n_bq == 0 {
+        let strong_pawns = if raw > 0 { n_wp } else { n_bp };
+        return (96 + 8 * strong_pawns).min(SCALE_NORMAL);
+    }
+    SCALE_NORMAL
 }
 
 /// So' material + PST, sem os termos posicionais caros (mobilidade/
