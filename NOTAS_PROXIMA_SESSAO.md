@@ -1585,3 +1585,68 @@ dentro do ruído normal de 300 jogos (nada como os 6.7% do bug real de
 antes) e são valores REAIS do Sirius, fielmente traduzidos (não
 inventados) -- mantido e commitado, mesmo princípio já aplicado a
 TTPV/extensions nesta sessão ("os testes são só para verificar").
+
+## Atualização 2026-07-23 (continuação): revisão do Fable ao diff da sessão -- 2 bugs reais MAIS encontrados no NMP
+
+Depois de commitar `9f93be9`/`c189efe`, pedi ao Fable uma revisão
+adversarial independente ao diff inteiro (dado o susto já teve com o
+corr-hist). Resultado: 2 bugs reais confirmados, ambos no NMP; as
+áreas mais próximas do bug anterior (separação das 5 tabelas de
+corr-hist, threading do `reached_by_null` pelos 10 pontos de chamada,
+`to_vec`/`from_vec`, os 3 pontos de construção do `Searcher`) vieram
+todas limpas.
+
+**Bug real #1 (grave)**: o `.clamp(1,4)` no R do NMP colapsava SEMPRE
+para 4 -- a fórmula real do Sirius com as constantes reais
+(`nmp_base_reduction=1343`) nunca produz menos que ~5 em profundidade
+>=`nmp_min_depth`(2), por isso o clamp inferior (1) nunca entra em
+jogo e o superior (4) capta sempre o mesmo valor. O mecanismo
+"eval-adaptativo" descrito nos comentários era código morto na
+prática -- ainda validado como melhoria real via self-play (57.5%),
+mas pela razão errada (R fixo=4, mais agressivo que o antigo
+`depth>6?3:2`, não pela adaptividade genuína). **Corrigido**:
+subtraído um offset de segurança (3) antes do clamp final
+(`(raw_r - 3).clamp(1, 6)`), restaura resposta real a
+profundidade/eval mantendo a mesma razão para o limite superior
+(busca de verificação do Sirius continua não portada).
+
+**Bug real #2**: o segundo gate do NMP usava `raw_static_eval`
+(comentário dizia ser o equivalente do `stack->staticEval` do Sirius)
+mas na verdade, no código-fonte real do Sirius, TANTO `stack->eval`
+COMO `stack->staticEval` guardam o valor CORRIGIDO -- `rawStaticEval`
+é só uma variável local do Sirius, nunca guardada no stack. O
+comentário estava trocado e o código seguia o erro. **Corrigido**:
+os dois gates agora usam `static_eval` (o corrigido).
+
+**Falso positivo do Fable, verificado e descartado**: sinalizou
+`history_prune_mult=1648` como possível erro de transcrição vs o
+`1688` real do Sirius -- não é, é o resultado deliberado e já
+documentado da correção de escala `1688*(16000/16384)` (HISTORY_MAX
+do Kestrel vs do Sirius), calculado e confirmado de novo
+(`round(1688*16000/16384)=1648`). Lição: verificar SEMPRE antes de
+aplicar uma sugestão de revisão às cegas, mesmo vinda de uma revisão
+cuidadosa.
+
+**Achado de confiança mais baixa, não fechado**: possível off-by-one
+no threshold de `min_moves` do LMR (índice `i` do Kestrel é
+"lances já jogados ANTES deste", enquanto o `movesPlayed` do Sirius já
+inclui o lance actual no ponto de comparação) -- direcção conservadora
+(reduz um pouco mais tarde que o Sirius pretendia), não é bug de
+solidez, deixado como está (já validado via A/B, resultado neutro-
+levemente-negativo mantido por política).
+
+**Validação do fix**: perfts reconfirmados. Lote de arena Sirius em
+curso foi parado cedo (só 4 jogos, binário desactualizado por este
+fix) -- não informativo, descartado. Novo A/B de 300 jogos
+(`sprt_nmpfix.py`) a correr, log `sprt_nmpfix.log`, binário anterior
+(`c189efe`) buildado num worktree separado para comparação limpa.
+
+**Resultado**: exactamente empatado -- `50.0%/50.0%, W139-L139-D22`
+vs o estado anterior (que já incluía o bug do R fixo). Ou seja, o R
+fixo "por acidente" tinha, por acaso, um desempenho equivalente à
+adaptividade real nesta amostra -- mas isto são correcções de
+CORRECÇÃO (variável errada, lógica morta apresentada como
+adaptativa), não só recalibração, por isso mantido e commitado
+independentemente do resultado neutro -- código a fazer o que os
+próprios comentários dizem que faz vale a pena mesmo sem ganho
+imediato mensurável.

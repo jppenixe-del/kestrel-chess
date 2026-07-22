@@ -791,11 +791,6 @@ impl<'a> Searcher<'a> {
         board.side.idx() * CORR_HIST_SIZE + (hash as usize % CORR_HIST_SIZE)
     }
 
-    #[inline]
-    fn corr_hist_idx(&self, board: &Board) -> usize {
-        self.corr_idx(board, pawn_structure_hash(board))
-    }
-
     /// Static eval adjusted by the learned correction (see `corr_hist`
     /// and friends). Used only where the raw static eval feeds a
     /// PRUNING margin decision, never for the real leaf value.
@@ -1359,10 +1354,12 @@ impl<'a> Searcher<'a> {
         // que ignorava completamente a avaliacao estatica -- mecanismo
         // genuinamente mais informado (quanto mais a posicao excede
         // beta, mais funda a reducao), nao so' constantes recalibradas.
-        // `static_eval` (ja' corrigida por corr-hist, como o
-        // `stack->eval` do Sirius) para o gate/reducao,
-        // `raw_static_eval` (como o `stack->staticEval` do Sirius) so'
-        // para o segundo gate dependente de profundidade.
+        // `static_eval` (ja' corrigida por corr-hist -- em Sirius,
+        // AMBOS `stack->eval` e `stack->staticEval` guardam o valor
+        // CORRIGIDO, `rawStaticEval` e' so' uma variavel local nunca
+        // guardada no stack; confirmado por revisao do Fable 2026-07-
+        // 23, o comentario anterior estava trocado e o segundo gate
+        // usava `raw_static_eval` por engano) usado nos DOIS gates.
         let sp_nmp = search_params();
         if depth >= sp_nmp.nmp_min_depth
             && !in_check
@@ -1372,24 +1369,27 @@ impl<'a> Searcher<'a> {
             && beta.abs() < MATE_SCORE - MAX_PLY as i32
             && self.has_non_pawn_material(board)
             && static_eval >= beta + sp_nmp.nmp_eval_margin
-            && raw_static_eval
+            && static_eval
                 >= beta + sp_nmp.nmp_static_eval_base_margin - sp_nmp.nmp_static_eval_depth_margin * depth
         {
-            // Cap on R: Sirius's real formula (unbounded here) relies
-            // on a verification re-search when the null-move probe
-            // passes at high depth/near-decisive beta (their
-            // `nmpMinPly`/`verifScore` mechanism) to stay sound at
-            // large R -- that re-search is NOT ported this session
-            // (real extra recursion-wide state, deferred like
-            // `lmrCutnode`). Without it, trusting R up to 7-9
-            // unconditionally caused the regression above. Capped at 4
-            // (old Kestrel max was 3) as an honest, documented
-            // narrowing: keep the genuinely-better eval-adaptive GATING
-            // condition, drop only the unsafe unverified tail of the
-            // reduction magnitude.
-            let r = ((sp_nmp.nmp_base_reduction + depth * sp_nmp.nmp_depth_reduction_scale) / 256
-                + ((static_eval - beta) / sp_nmp.nmp_eval_reduction_scale).min(sp_nmp.nmp_max_eval_reduction))
-                .clamp(1, 4);
+            // R: revisao do Fable (2026-07-23) encontrou que a formula
+            // real portada nunca produz menos que ~5 com as constantes
+            // reais do Sirius (nmp_base_reduction=1343 sozinho ja' da'
+            // (1343+78*depth)/256 >= 5 para qualquer depth>=
+            // nmp_min_depth), por isso o `.clamp(1,4)` anterior
+            // colapsava silenciosamente para um R=4 FIXO sempre -- o
+            // comentario "eval-adaptativo" descrevia codigo morto
+            // (ainda assim validado como melhoria real sobre o antigo
+            // `depth>6?3:2` fixo via self-play, mas pela razao errada).
+            // Corrigido subtraindo um offset de seguranca (3) antes do
+            // clamp final, restaurando resposta genuina a
+            // profundidade/eval, mantendo a mesma razao de antes para
+            // ainda precisar de um limite superior (a busca de
+            // verificacao do Sirius, que tornaria seguro confiar num R
+            // grande, continua nao portada -- ver comentario abaixo).
+            let raw_r = (sp_nmp.nmp_base_reduction + depth * sp_nmp.nmp_depth_reduction_scale) / 256
+                + ((static_eval - beta) / sp_nmp.nmp_eval_reduction_scale).min(sp_nmp.nmp_max_eval_reduction);
+            let r = (raw_r - 3).clamp(1, 6);
             let undo = board.make_null_move();
             let score = -self.negamax(board, depth - r, -beta, -beta + 1, ply + 1, true);
             board.unmake_null_move(&undo);
