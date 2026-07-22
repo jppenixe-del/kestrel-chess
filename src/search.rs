@@ -158,6 +158,13 @@ pub struct Searcher<'a> {
     // avaliacao real. None se o livro nao carregou (o motor continua a
     // funcionar normalmente sem ele).
     pub style_book: Option<&'a Book>,
+    /// Node-count time management (Ethereal): total nodes spent on each
+    /// ROOT move across the whole `go`, accumulated over every
+    /// iterative-deepening iteration (not cleared between depths --
+    /// only `iterative_deepening()` clears it, once per `go`). A small
+    /// Vec, not a HashMap: the root move list is at most a few dozen
+    /// moves, so a linear scan per update is cheaper than hashing.
+    pub root_move_nodes: Vec<(Move, u64)>,
 }
 
 /// Limiar a partir do qual um score e' considerado "de mate" (nao so'
@@ -1224,6 +1231,7 @@ impl<'a> Searcher<'a> {
                     continue;
                 }
             }
+            let root_nodes_before = if ply == 0 { self.nodes } else { 0 };
             let undo = board.make_move(&mv);
             if ply + 1 < MAX_PLY {
                 if let Some((moved_pt, _)) = board.piece_at(mv.to) {
@@ -1280,6 +1288,14 @@ impl<'a> Searcher<'a> {
             board.unmake_move(&mv, &undo);
             if !mv.is_capture() {
                 quiets_tried.push(mv);
+            }
+            if ply == 0 {
+                let delta = self.nodes.saturating_sub(root_nodes_before);
+                if let Some(entry) = self.root_move_nodes.iter_mut().find(|(m, _)| *m == mv) {
+                    entry.1 += delta;
+                } else {
+                    self.root_move_nodes.push((mv, delta));
+                }
             }
 
             // BUG corrigido (2026-07-20, achado num jogo real na Arena --
@@ -1432,6 +1448,7 @@ impl<'a> Searcher<'a> {
         let mut prev_score = 0;
         let mut stable_count = 0;
         self.killers = [[None; 2]; MAX_PLY];
+        self.root_move_nodes.clear();
         for depth in 1..=self.limits.max_depth {
             let score = self.search_root(board, depth, prev_score);
             // 2026-07-20 (BUG REAL corrigido -- irmao do bug ja' corrigido
@@ -1469,10 +1486,32 @@ impl<'a> Searcher<'a> {
             // stop is still enforced inside time_up() as always); this
             // only ever stops EARLIER than the hard limit, and only
             // between fully-completed iterations, never mid-search.
+            // Node-count time management (Ethereal): only trust the
+            // stability-based early stop once the search has actually
+            // CONCENTRATED its effort on the current best move, not
+            // just kept repeating the same choice while still spending
+            // comparable nodes on alternatives (root move counts can
+            // stay "stable" while the search is still genuinely
+            // uncertain -- e.g. it keeps re-confirming move A each
+            // iteration but is spending nearly as much time weighing
+            // move B every time too). Requires >=70% of this go's total
+            // nodes on the best move before an early stop is trusted;
+            // below that, keep going even if the move hasn't changed in
+            // 3 iterations. Complements best-move-stability, doesn't
+            // replace it -- both gates must pass.
             if depth >= 6 && stable_count >= 3 {
-                if let Some(soft) = self.limits.soft_deadline {
-                    if Instant::now() >= soft {
-                        break;
+                let concentrated = if let Some(bm) = best_move {
+                    let total = self.nodes.max(1);
+                    let on_best = self.root_move_nodes.iter().find(|(m, _)| *m == bm).map(|(_, n)| *n).unwrap_or(0);
+                    (on_best as f64 / total as f64) >= 0.70
+                } else {
+                    false
+                };
+                if concentrated {
+                    if let Some(soft) = self.limits.soft_deadline {
+                        if Instant::now() >= soft {
+                            break;
+                        }
                     }
                 }
             }

@@ -303,6 +303,7 @@ fn play_one_selfplay_game(
             excluded_move: None,
             excluded_root_moves: vec![],
             style_book: None,
+            root_move_nodes: Vec::new(),
         };
         let (best, score, _depth, _nodes) = searcher.iterative_deepening(&mut board);
         let Some(mv) = best else {
@@ -372,11 +373,11 @@ fn play_one_selfplay_game(
 /// Texel's per-parameter perturbation method (`tune_weights` above).
 ///
 /// Why this is valid here: `positional_terms()` is linear in every
-/// tunable field EXCEPT `king_attacker_weight`/`king_attacks`, which
-/// feed the deliberately nonlinear KING_DANGER_TABLE lookup (see its
-/// comment in eval.rs). Those 10 scalars are held fixed at their
-/// default values for this fast path -- not tuned here, kept for the
-/// slower coordinate-descent tuner if they're ever revisited. For
+/// tunable field EXCEPT `king_attacker_weight`/`king_attacks`/
+/// `safe_check`, which feed the deliberately nonlinear KING_DANGER_TABLE
+/// lookup (see its comment in eval.rs). Those 12 scalars are held fixed
+/// at their default values for this fast path -- not tuned here, kept
+/// for the slower coordinate-descent tuner if they're ever revisited. For
 /// every other field, `positional_terms(board, w) - positional_terms(board, w_with_field_zeroed)`
 /// scales exactly linearly with that field's value, which is what lets
 /// a single "unit contribution" per field be measured ONCE per
@@ -410,6 +411,7 @@ fn tune_fast(dataset_path: &str, out_path: &str, iters: u32, lr: f64) {
     let mut sentinel = default.from_vec(&vec![0i32; dim]);
     sentinel.king_attacker_weight = [(1, 1); 4];
     sentinel.king_attacks = (1, 1);
+    sentinel.safe_check = (1, 1);
     let sentinel_vec = sentinel.to_vec();
     let is_king_field: Vec<bool> = sentinel_vec.iter().map(|&x| x == 1).collect();
     let king_field_count = is_king_field.iter().filter(|&&b| b).count();
@@ -736,6 +738,7 @@ fn resolve_quiet_dataset(in_path: &str, out_path: &str) {
             excluded_move: None,
             excluded_root_moves: vec![],
             style_book: None,
+            root_move_nodes: Vec::new(),
         };
         let (score, leaf) = searcher.quiescence_leaf(&mut board, -MATE_SCORE, MATE_SCORE, 0);
         if score.abs() >= MATE_SCORE - MAX_PLY as i32 {

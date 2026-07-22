@@ -310,6 +310,18 @@ const KING_ATTACKER_WEIGHT: [(i32, i32); 4] = [
 ];
 // Extra por casa da king zone atacada, alem do bonus por atacante.
 const KING_ATTACKS: (i32, i32) = (5, 0);
+// SAFE_CHECK: unidade de perigo por peca que poderia dar um xeque numa
+// casa sem qualquer defensor inimigo (ver a segunda passagem em
+// positional_terms(), depois do loop principal). Valor deliberadamente
+// pequeno e SEPARADO de king_attacks -- a primeira versao reutilizava
+// king_attacks directamente e o A/B (2026-07-22, 300 jogos self-play)
+// deu 46.8%, negativo e persistente ao longo de todo o lote. Campo
+// proprio para poder ser recalibrado sem afectar o resto do king
+// safety, e para o proximo A/B isolar se o problema era mesmo a
+// magnitude (hipotese principal) ou o novo threshold de 1-atacante-
+// com-dama (ver endgame_scale_factor -- king_attackers[]/threshold
+// continuam iguais, so' o peso mudou aqui).
+const SAFE_CHECK: (i32, i32) = (2, 1);
 
 // King danger units (mg channel of the accumulation above) go through
 // this saturating, roughly-quadratic lookup before being added to the
@@ -524,6 +536,7 @@ pub struct Weights {
     pub mobility_queen: [(i32, i32); 28],
     pub king_attacker_weight: [(i32, i32); 4],
     pub king_attacks: (i32, i32),
+    pub safe_check: (i32, i32),
     pub king_danger_table: [i32; 128],
     pub pawn_shelter: [(i32, i32); 4],
     pub shelter_open: (i32, i32),
@@ -564,6 +577,7 @@ impl Default for Weights {
             mobility_queen: MOBILITY_QUEEN,
             king_attacker_weight: KING_ATTACKER_WEIGHT,
             king_attacks: KING_ATTACKS,
+            safe_check: SAFE_CHECK,
             king_danger_table: KING_DANGER_TABLE,
             pawn_shelter: PAWN_SHELTER,
             shelter_open: SHELTER_OPEN,
@@ -643,6 +657,7 @@ impl Weights {
         pairs!(self.mobility_queen);
         pairs!(self.king_attacker_weight);
         pair!(self.king_attacks);
+        pair!(self.safe_check);
         pairs!(self.pawn_shelter);
         pair!(self.shelter_open);
         pairs!(self.pawn_storm);
@@ -688,6 +703,7 @@ impl Weights {
         let mobility_queen = pairs!(28);
         let king_attacker_weight = pairs!(4);
         let king_attacks = pair!();
+        let safe_check = pair!();
         let pawn_shelter = pairs!(4);
         let shelter_open = pair!();
         let pawn_storm = pairs!(4);
@@ -714,7 +730,7 @@ impl Weights {
         Weights {
             bishop_pair, long_diag_bishop, minor_behind_pawn, knight_outpost, rook_open, tempo,
             mobility_knight, mobility_bishop, mobility_rook, mobility_queen,
-            king_attacker_weight, king_attacks, king_danger_table: self.king_danger_table,
+            king_attacker_weight, king_attacks, safe_check, king_danger_table: self.king_danger_table,
             pawn_shelter, shelter_open, pawn_storm,
             threat_by_pawn, threat_by_knight, threat_by_bishop, threat_by_rook, threat_by_queen, threat_by_king,
             knight_hit_queen, bishop_hit_queen, rook_hit_queen, push_threat, restricted_squares,
@@ -988,18 +1004,20 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
         let n_rook = count(rook_checks & attacked_by_pt[us][PieceType::Rook.idx()] & !own_occ & safe) as i32;
         let n_queen = count(queen_checks & attacked_by_pt[us][PieceType::Queen.idx()] & !own_occ & safe) as i32;
 
-        // Reuses the existing per-hit `king_attacks` weight as the unit
-        // value for a free check (queen checks weighted double -- by
-        // far the most dangerous piece to let deliver one for free)
-        // instead of adding new tunable fields: keeps this additive to
-        // the Weights struct and to tune_fast's king-field sentinel
-        // detection in main.rs, which already special-cases every
-        // OTHER king-safety field as "nonlinear, not tuned here".
+        // Dedicated `safe_check` weight (queen checks weighted double --
+        // by far the most dangerous piece to let deliver one for free).
+        // First version reused `king_attacks` directly; the 2026-07-22
+        // self-play A/B (300 games) came back 46.8%, negative and
+        // persistent through the whole run. Split into its own field,
+        // deliberately smaller (SAFE_CHECK=(2,1) vs king_attacks=(5,0)),
+        // so it can be recalibrated independently -- added to
+        // tune_fast's king-field sentinel in main.rs alongside every
+        // other nonlinear king-safety field.
         let safe_check_units = n_knight + n_bishop + n_rook + 2 * n_queen;
         if safe_check_units > 0 {
             king_attackers[us] += 1;
-            king_attack_units[us].0 += safe_check_units * w.king_attacks.0;
-            king_attack_units[us].1 += safe_check_units * w.king_attacks.1;
+            king_attack_units[us].0 += safe_check_units * w.safe_check.0;
+            king_attack_units[us].1 += safe_check_units * w.safe_check.1;
         }
 
         // Queen-gate: with the defending side's queen off the board, a
