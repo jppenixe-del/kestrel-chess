@@ -396,3 +396,89 @@ equilibrar (ver resultado mais recente em
 original -- `91ea1a7` (TT mate-ply + panic), `a008413` (killers
 persistentes), `95a1046` (history heuristic). Todos validados
 individualmente (perft + mate + NPS + A/B self-play antes de commitar).
+
+## Nota de processo (2026-07-22): idioma
+
+Pedido explícito do utilizador: **commits e comentários no código em
+inglês** (o repo é público no GitHub). Este ficheiro de notas
+(handoff entre sessões/instâncias) continua em português. Código
+existente com comentários em português não precisa de tradução
+retroativa só por causa disto -- é regra para trabalho novo daqui
+para a frente.
+
+## Atualização 2026-07-22 (sessão via servidor, enquanto a sessão tmux `chessclaude` está sem quota semanal até 24 Jul 21h Berlim)
+
+Contexto: a sessão `chessclaude` (tmux) tinha lançado um teste A/B de LMR
+(base-LMR divisor 2.1 vs uma variante "aggr-LMR") em self-play fixed-nodes
+(30000 nós/jogada, 150 jogos) e ficou sem quota semanal mesmo depois do
+resultado sair: **48.7% vs 51.3%** -- dentro do ruído estatístico, não
+teria sido conclusivo mesmo com quota. O binário "aggr-LMR" foi construído
+num scratchpad de sessão partilhada (`/tmp/.../scratchpad/kestrel_lmr`) e a
+sua proveniência exata (que valor de divisor, que patch) não ficou
+registada de forma reconstruível.
+
+**Consultado um agente Opus para validar o plano antes de avançar** (pedido
+explícito do utilizador: pedir validação ao Opus e trabalhar em cima
+disso). Dois furos metodológicos identificados:
+1. **Amostra subdimensionada para o efeito esperado**: um ajuste de
+   divisor de LMR vale tipicamente 5-15 Elo (score ~51-52%), não os ~35
+   Elo (55%) que o limiar informal do projeto assumia. Distinguir 10 Elo
+   com confiança (95%/80% power) precisa de ~10000 jogos decisivos, não
+   100-150. O teste anterior não teve azar -- foi *underpowered by
+   design*.
+2. **Fixed-nodes subestima um divisor mais agressivo**: o valor do LMR é
+   ir mais fundo no mesmo tempo/nós; com um teto de nós fixo, um divisor
+   agressivo perde justamente o benefício "profundidade de graça" que
+   teria em jogo real por tempo. Fixed-nodes serve para *ver a direção*
+   (exploração, baixa variância), não para a *decisão final* de mudar o
+   default -- isso precisa de confirmação em time-based (o
+   `engine_arena.py` já é time-based, via `go wtime/btime`).
+
+**Prioridade corrigida pelo Opus**: investigar primeiro se o padrão
+"dama sem plano" / recuos estranhos (secção "Atualização 2026-07-20",
+achado #4 da leitura qualitativa) ainda existe com o binário atual
+(todos os fixes de TT/killers/history/root_best já aplicados) -- esses
+PGNs antigos foram jogados ANTES desses fixes. Payoff potencial (>100
+Elo se for um problema estrutural de busca) é ordens de magnitude maior
+que afinar o divisor de LMR (~5-15 Elo), e é pré-requisito lógico: não
+vale a pena afinar LMR por cima de uma busca possivelmente patológica.
+
+**Feito nesta sessão:**
+- **`3a9d95e`**: adicionada env var `KESTREL_LMR_DIVISOR` (default 2.1,
+  mesmo padrão opt-in/fail-safe de `KESTREL_EVAL_MODE`/
+  `KESTREL_TUNED_WEIGHTS`) -- substitui a necessidade de binários
+  scratch ad-hoc por uma comparação reprodutível num único binário.
+  Validado: com a env var por omissão vs explicitamente `2.1`, busca
+  fixed-nodes dá nodes/depth/score/PV/bestmove **idênticos**
+  (só ruído de NPS); com `1.7` o comportamento muda visivelmente
+  (confirma que o hook funciona). Perft 5 confirma movegen intocado
+  (LMR não entra em geração de lances).
+
+**Plano de intervenção ordenado (Opus), até 24 Jul 21h:**
+1. ~~Infra `KESTREL_LMR_DIVISOR`~~ -- feito, commitado.
+2. **[em curso]** Diagnóstico qualitativo: correr ~10-15 jogos com o
+   binário atual (self-play e/ou vs `stockfish_skill5`), ler os PGNs à
+   procura do padrão "dama sem plano"/recuos/trocas más. Se
+   desapareceu -> passar ao LMR (passo 3). Se persiste -> isolar FEN,
+   inspecionar PV por profundidade via `go depth N`, é provavelmente
+   ordenação/redução a esconder o lance refutador -- torna-se a
+   intervenção da sessão.
+3. LMR só se o passo 2 der luz verde: exploração de direção
+   (fixed-nodes, 3 braços 1.7/2.1/2.5, ~150 jogos/par, SEM mudar
+   default) -> só se algum braço se destacar claramente, SPRT de 2
+   braços (2.1 vs candidato) em time-based via `engine_arena.py`,
+   fronteiras Elo[0,5] α=β=0.05, decide o próprio SPRT.
+4. Se sobrar tempo: livro pesado por resultado da partida (mudança de
+   formato do `.bin`, hoje só `count: u32`, ver `book.rs` RECSZ=14).
+5. **Regra transversal**: parar de tratar <400 jogos como evidência
+   para mudar defaults -- SPRT-ou-nada, "inconclusivo -> sem mudança"
+   é um desfecho válido e a norma esperada, não falha.
+
+**Nota lateral (fora do escopo do Kestrel)**: o utilizador mencionou um
+segundo projeto ("littlerock/half2k", adversário de referência
+"PeachFruit" no Lichess) com prazo até sexta (24 Jul) para bater o Elo
+dele sempre e jogar bem. Esse projeto corre na máquina `napoleon`
+(10.0.0.2, WireGuard) que está **desligada/sem handshake há >1 dia** --
+fora do alcance desta sessão até a máquina voltar a ligar. Não
+misturar com o trabalho do Kestrel (que corre neste servidor, 10.0.0.1,
+sem essa dependência).
