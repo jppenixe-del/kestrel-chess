@@ -66,16 +66,35 @@ pub const MAX_PLY: usize = 128;
 /// real tuning here needs SPSA over actual games, same self-play
 /// infrastructure this session already uses for A/B validation) -- this
 /// commit only makes the values swappable, doesn't add a tuner.
+/// Margin shape `base + slope*depth`, generalizing the old pure-
+/// multiplier form (`slope*depth`, base=0 -- what every Kestrel default
+/// already was, so this changes zero behavior by default) to also
+/// represent engines whose margins have a flat component (e.g.
+/// Ethereal's quiet futility `77 + lmrDepth*52`). Both shapes are one
+/// special case of this one, so profiles from either kind of engine can
+/// be expressed without lying about the source's real formula.
+#[derive(Clone, Copy)]
+pub struct DepthMargin {
+    pub base: i32,
+    pub slope: i32,
+}
+impl DepthMargin {
+    #[inline]
+    fn at(&self, depth: i32) -> i32 {
+        self.base + self.slope * depth
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct SearchParams {
-    pub rfp_margin_improving: i32,
-    pub rfp_margin_not_improving: i32,
+    pub rfp_improving: DepthMargin,
+    pub rfp_not_improving: DepthMargin,
     pub razor_base: i32,
     pub razor_per_depth: i32,
-    pub futility_margin_improving: i32,
-    pub futility_margin_not_improving: i32,
-    pub cap_futility_margin_improving: i32,
-    pub cap_futility_margin_not_improving: i32,
+    pub futility_improving: DepthMargin,
+    pub futility_not_improving: DepthMargin,
+    pub cap_futility_improving: DepthMargin,
+    pub cap_futility_not_improving: DepthMargin,
     /// Quiescence delta pruning margin (both the negamax entry point and
     /// the tuning-dataset quiescence_leaf path use the same value).
     pub delta_margin: i32,
@@ -90,14 +109,14 @@ pub struct SearchParams {
 impl Default for SearchParams {
     fn default() -> Self {
         SearchParams {
-            rfp_margin_improving: 65,
-            rfp_margin_not_improving: 95,
+            rfp_improving: DepthMargin { base: 0, slope: 65 },
+            rfp_not_improving: DepthMargin { base: 0, slope: 95 },
             razor_base: 150,
             razor_per_depth: 100,
-            futility_margin_improving: 75,
-            futility_margin_not_improving: 105,
-            cap_futility_margin_improving: 90,
-            cap_futility_margin_not_improving: 130,
+            futility_improving: DepthMargin { base: 0, slope: 75 },
+            futility_not_improving: DepthMargin { base: 0, slope: 105 },
+            cap_futility_improving: DepthMargin { base: 0, slope: 90 },
+            cap_futility_not_improving: DepthMargin { base: 0, slope: 130 },
             delta_margin: 200,
             qs_lmp_limit: 8,
             tt_extended_cutoff_margin: 130,
@@ -109,14 +128,20 @@ impl Default for SearchParams {
 impl SearchParams {
     pub fn to_vec(&self) -> Vec<i32> {
         vec![
-            self.rfp_margin_improving,
-            self.rfp_margin_not_improving,
+            self.rfp_improving.base,
+            self.rfp_improving.slope,
+            self.rfp_not_improving.base,
+            self.rfp_not_improving.slope,
             self.razor_base,
             self.razor_per_depth,
-            self.futility_margin_improving,
-            self.futility_margin_not_improving,
-            self.cap_futility_margin_improving,
-            self.cap_futility_margin_not_improving,
+            self.futility_improving.base,
+            self.futility_improving.slope,
+            self.futility_not_improving.base,
+            self.futility_not_improving.slope,
+            self.cap_futility_improving.base,
+            self.cap_futility_improving.slope,
+            self.cap_futility_not_improving.base,
+            self.cap_futility_not_improving.slope,
             self.delta_margin,
             self.qs_lmp_limit,
             self.tt_extended_cutoff_margin,
@@ -125,18 +150,18 @@ impl SearchParams {
     }
     pub fn from_vec(v: &[i32]) -> Self {
         SearchParams {
-            rfp_margin_improving: v[0],
-            rfp_margin_not_improving: v[1],
-            razor_base: v[2],
-            razor_per_depth: v[3],
-            futility_margin_improving: v[4],
-            futility_margin_not_improving: v[5],
-            cap_futility_margin_improving: v[6],
-            cap_futility_margin_not_improving: v[7],
-            delta_margin: v[8],
-            qs_lmp_limit: v[9],
-            tt_extended_cutoff_margin: v[10],
-            history_prune_mult: v[11],
+            rfp_improving: DepthMargin { base: v[0], slope: v[1] },
+            rfp_not_improving: DepthMargin { base: v[2], slope: v[3] },
+            razor_base: v[4],
+            razor_per_depth: v[5],
+            futility_improving: DepthMargin { base: v[6], slope: v[7] },
+            futility_not_improving: DepthMargin { base: v[8], slope: v[9] },
+            cap_futility_improving: DepthMargin { base: v[10], slope: v[11] },
+            cap_futility_not_improving: DepthMargin { base: v[12], slope: v[13] },
+            delta_margin: v[14],
+            qs_lmp_limit: v[15],
+            tt_extended_cutoff_margin: v[16],
+            history_prune_mult: v[17],
         }
     }
 }
@@ -1061,7 +1086,7 @@ impl<'a> Searcher<'a> {
             && beta.abs() < MATE_SCORE - MAX_PLY as i32
         {
             let sp = search_params();
-            let margin = if improving { sp.rfp_margin_improving * depth } else { sp.rfp_margin_not_improving * depth };
+            let margin = if improving { sp.rfp_improving.at(depth) } else { sp.rfp_not_improving.at(depth) };
             if static_eval - margin >= beta {
                 return static_eval - margin;
             }
@@ -1288,7 +1313,7 @@ impl<'a> Searcher<'a> {
                 && alpha.abs() < MATE_SCORE - MAX_PLY as i32
             {
                 let sp = search_params();
-                let margin = if improving { sp.futility_margin_improving * depth } else { sp.futility_margin_not_improving * depth };
+                let margin = if improving { sp.futility_improving.at(depth) } else { sp.futility_not_improving.at(depth) };
                 let fe = *futility_eval.get_or_insert(static_eval);
                 if fe + margin <= alpha {
                     i += 1;
@@ -1313,7 +1338,7 @@ impl<'a> Searcher<'a> {
                 && alpha.abs() < MATE_SCORE - MAX_PLY as i32
             {
                 let sp = search_params();
-                let margin = if improving { sp.cap_futility_margin_improving * depth } else { sp.cap_futility_margin_not_improving * depth };
+                let margin = if improving { sp.cap_futility_improving.at(depth) } else { sp.cap_futility_not_improving.at(depth) };
                 let fe = *futility_eval.get_or_insert(static_eval);
                 let see_val = self.see(board, &mv);
                 if fe + see_val + margin <= alpha {
