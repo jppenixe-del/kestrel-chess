@@ -16,6 +16,14 @@ pub struct TtEntry {
     pub score: i32,
     pub bound: Bound,
     pub best: Option<Move>,
+    /// TTPV: was this entry written by a search at a PV node (full
+    /// alpha-beta window), as opposed to a null/scout window? A later
+    /// probe that only reaches this position via a scout search still
+    /// knows it was "important" once -- used to reduce LESS via LMR at
+    /// that position (same idea Stockfish/Ethereal use TTPV for), since
+    /// a genuinely quiet position wouldn't have earned full-window
+    /// treatment before.
+    pub pv: bool,
 }
 
 /// Lock-free slot: `data` packs the whole entry into 64 bits (see
@@ -85,7 +93,7 @@ fn decode_move(bits: u64) -> Option<Move> {
     Some(Move { from, to, promotion: promo, flag })
 }
 
-fn encode_data(depth: i32, score: i32, bound: Bound, best: Option<Move>) -> u64 {
+fn encode_data(depth: i32, score: i32, bound: Bound, best: Option<Move>, pv: bool) -> u64 {
     let mv_bits = encode_move(best);
     let score16 = (score.clamp(i16::MIN as i32, i16::MAX as i32) as i16 as u16) as u64;
     let depth16 = (depth.clamp(i16::MIN as i32, i16::MAX as i32) as i16 as u16) as u64;
@@ -94,10 +102,11 @@ fn encode_data(depth: i32, score: i32, bound: Bound, best: Option<Move>) -> u64 
         Bound::Lower => 1,
         Bound::Upper => 2,
     };
-    mv_bits | (score16 << 18) | (depth16 << 34) | (bound_bits << 50)
+    let pv_bit: u64 = if pv { 1 } else { 0 };
+    mv_bits | (score16 << 18) | (depth16 << 34) | (bound_bits << 50) | (pv_bit << 52)
 }
 
-fn decode_data(data: u64) -> (i32, i32, Bound, Option<Move>) {
+fn decode_data(data: u64) -> (i32, i32, Bound, Option<Move>, bool) {
     let mv_bits = data & 0x3FFFF;
     let score = ((data >> 18) & 0xFFFF) as u16 as i16 as i32;
     let depth = ((data >> 34) & 0xFFFF) as u16 as i16 as i32;
@@ -106,7 +115,8 @@ fn decode_data(data: u64) -> (i32, i32, Bound, Option<Move>) {
         1 => Bound::Lower,
         _ => Bound::Upper,
     };
-    (depth, score, bound, decode_move(mv_bits))
+    let pv = (data >> 52) & 1 == 1;
+    (depth, score, bound, decode_move(mv_bits), pv)
 }
 
 impl TranspositionTable {
@@ -134,8 +144,8 @@ impl TranspositionTable {
         if key_xor ^ data != key {
             return None;
         }
-        let (depth, score, bound, best) = decode_data(data);
-        Some(TtEntry { key, depth, score, bound, best })
+        let (depth, score, bound, best, pv) = decode_data(data);
+        Some(TtEntry { key, depth, score, bound, best, pv })
     }
 
     /// Takes `&self`, not `&mut self` -- entries are updated via atomics,
@@ -143,8 +153,8 @@ impl TranspositionTable {
     /// shared table (the whole point of Lazy SMP: independent threads,
     /// one shared TT, no locks).
     #[inline]
-    pub fn store(&self, key: u64, depth: i32, score: i32, bound: Bound, best: Option<Move>) {
-        let data = encode_data(depth, score, bound, best);
+    pub fn store(&self, key: u64, depth: i32, score: i32, bound: Bound, best: Option<Move>, pv: bool) {
+        let data = encode_data(depth, score, bound, best, pv);
         let idx = (key as usize) & self.mask;
         let slot = &self.slots[idx];
         // Always-replace, and it's the RIGHT choice for this table's
