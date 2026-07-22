@@ -848,3 +848,49 @@ números -- fica para decisão futura, não descartado só adiado.
 Ficheiros novos (não commitados, artefactos locais):
 `sirius_profile.txt`, `build_sirius_profile.py`,
 `sprt_sirius_profile.py`/`.log`, `sprt_safecheck_v2.py`/`.log`.
+
+## Atualização 2026-07-22 (continuação): SearchParams generalizado + perfil de busca do Ethereal
+
+Pedido do utilizador: importar valores conhecidos para os campos do
+`SearchParams` recém-criado, tal como foi feito para o eval com o
+Sirius. Antes de conseguir fazer isso a sério para o Ethereal, foi
+preciso generalizar a forma das margens.
+
+**Generalização (commit `f6df9f6`)**: `DepthMargin{base, slope}`
+substitui o multiplicador puro `slope*depth` que todos os campos
+tinham. Kestrel's próprios defaults são exactamente `base=0` na forma
+nova -- zero mudança de comportamento por default (validado: busca
+fixed-node idêntica byte a byte). Isto importa porque a fórmula real do
+RFP do Ethereal (`65*MAX(0,depth-improving)`) e do futility
+(`77+lmrDepth*52`) TÊM componente base -- não eram representáveis na
+forma antiga sem mentir sobre a fórmula real do Ethereal.
+
+**Perfil do Ethereal construído (parcial, honesto sobre o que não
+mapeia)**: `ethereal_search_profile.txt`
+(`build_ethereal_search_profile.py`) -- só os campos onde a fórmula do
+Ethereal tem mesmo a forma base+inclinação foram substituídos (RFP,
+razoring -- margem fixa 3488 -- futility de lances tranquilos, margem
+do TT extended cutoff). **Não mapeado, deixado no default do Kestrel**:
+futility de capturas (o Ethereal usa poda por SEE com escala
+QUADRÁTICA em profundidade, mecanismo completamente diferente de uma
+margem de futility), delta pruning do qsearch, limite de LMP do
+qsearch, multiplicador de history pruning (Ethereal usa um limiar
+FIXO, não escalado por profundidade) -- nenhum destes tinha um
+equivalente Ethereal reportado com a MESMA forma, copiar às cegas
+teria sido enganoso.
+
+**A/B (300 jogos, fixed-nodes): perfil Ethereal 51.8% vs Kestrel
+próprio 48.2%** -- ligeira vantagem para o Ethereal, mas dentro do
+ruído estatístico (~+12 Elo, <1 desvio-padrão a 300 jogos). Ao
+contrário do teste do eval (onde os pesos próprios do Kestrel bateram
+os do Sirius claramente, 53.2%/46.8%), aqui o resultado é ambíguo --
+faz sentido: margens de busca (RFP, futility) são conceptualmente mais
+universais entre motores do que pesos de eval (que dependem de como
+interagem com os OUTROS termos do eval específico de cada motor).
+**Não mudado o default** -- segue a regra transversal já estabelecida
+(SPRT-ou-nada, <400 jogos não é evidência suficiente). Se sobrar tempo,
+vale a pena correr mais jogos neste perfil especificamente, já que a
+direção (ainda que fraca) é positiva.
+
+Ficheiros novos: `ethereal_search_profile.txt`,
+`build_ethereal_search_profile.py`, `sprt_ethereal_search.py`/`.log`.
