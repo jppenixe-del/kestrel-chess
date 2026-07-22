@@ -637,3 +637,36 @@ dele sempre e jogar bem. Esse projeto corre na máquina `napoleon`
 fora do alcance desta sessão até a máquina voltar a ligar. Não
 misturar com o trabalho do Kestrel (que corre neste servidor, 10.0.0.1,
 sem essa dependência).
+
+## Atualização 2026-07-22 (continuação): LMR fechado, resumo do estado
+
+**Exploração de direção do LMR concluída** (script
+`/root/kestrel_joao/lmr_direction_explore.py`, self-play fixed-nodes
+30000/lance, 3 confrontos de 300 jogos cada via `KESTREL_LMR_DIVISOR`):
+- 2.1 vs 1.7: 50.7% / 49.3%
+- 2.1 vs 2.5: 48.0% / 52.0%
+- 1.7 vs 2.5: 53.7% / 46.3%
+
+**Resultado circular** (viola transitividade -- se 2.5 bate 2.1 e 2.1
+empata com 1.7, esperar-se-ia 2.5 >= 1.7, mas é o oposto). Assinatura
+clássica de ruído puro em vez de direção real. **Conclusão: manter o
+divisor default 2.1, não gastar mais orçamento de SPRT aqui** -- regra
+transversal do plano do Opus aplicada tal como definida. Item #3 do
+plano fechado.
+
+**Resumo do estado no fim desta sessão** (para quem retomar, incluindo
+a sessão tmux `chessclaude` quando recuperar quota):
+1. Fix estrutural (TT/killers/history/root_best): confirmado
+   qualitativa E quantitativamente (SPRT 88.5%, ~+354 Elo). Fechado.
+2. LMR: parâmetro testado, sem sinal, default mantido. Fechado.
+3. Tuning de pesos de eval: infraestrutura significativamente
+   melhorada (`quiescence_leaf`/`resolvequiet`, commit `3e736c7`), uma
+   terceira tentativa com dataset mais profundo e limpo por quiescence
+   convergiu de verdade mas ainda regride a suite tática -- ver
+   detalhe acima. Não deployado. Em aberto: re-tunar margens de poda
+   em conjunto, ou aumentar a suite tática antes de mais uma ronda.
+4. Livro pesado por resultado da partida: ainda não começado (item #4
+   original do plano do Opus, baixa prioridade).
+5. Todos os commits desta sessão têm mensagens e comentários novos em
+   inglês (pedido do utilizador, repo é público no GitHub); este
+   ficheiro de notas mantém-se em português.
