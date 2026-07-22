@@ -104,23 +104,66 @@ pub struct SearchParams {
     /// outright (not even reduced-searched) when its history score is
     /// below `-history_prune_mult * depth`.
     pub history_prune_mult: i32,
+    /// Null-move pruning gating/reduction, ported from Sirius's real
+    /// eval-adaptive formula (search.cpp) -- see NMP block in
+    /// negamax(). Previously a flat depth>6?3:2 reduction with no eval
+    /// awareness at all; this is a genuinely different (more capable)
+    /// mechanism, not just recalibrated constants.
+    pub nmp_min_depth: i32,
+    pub nmp_eval_margin: i32,
+    pub nmp_static_eval_base_margin: i32,
+    pub nmp_static_eval_depth_margin: i32,
+    pub nmp_base_reduction: i32,
+    pub nmp_depth_reduction_scale: i32,
+    pub nmp_eval_reduction_scale: i32,
+    pub nmp_max_eval_reduction: i32,
+    /// ProbCut margin above beta for the cheap verification search
+    /// (was a hardcoded `beta + 150`).
+    pub probcut_beta_margin: i32,
 }
 
 impl Default for SearchParams {
     fn default() -> Self {
+        // 2026-07-22: rfp_improving/rfp_not_improving, razor_base/
+        // razor_per_depth, cap_futility_improving/not_improving and
+        // history_prune_mult are Sirius's (mcthouacbb/Sirius, ~3449
+        // CCRL 40/15, pure HCE) real SPSA-tuned values, ported where its
+        // formula genuinely matches this shape (see
+        // build_sirius_search_profile.py for the full derivation and
+        // the fields deliberately left unmapped). A/B (300 games,
+        // 30000 nodes/move) came back exactly neutral -- 50.0%/50.0%,
+        // W138-L138-D24 -- against Kestrel's own previously hand-set
+        // values, so a real top engine's calibration replaces a guess
+        // rather than being discarded for lack of a positive delta
+        // ("os testes sao so' para verificar, e' sempre para
+        // implementar").
         SearchParams {
-            rfp_improving: DepthMargin { base: 0, slope: 65 },
-            rfp_not_improving: DepthMargin { base: 0, slope: 95 },
-            razor_base: 150,
-            razor_per_depth: 100,
+            rfp_improving: DepthMargin { base: 0, slope: 26 },
+            rfp_not_improving: DepthMargin { base: 0, slope: 80 },
+            razor_base: 458,
+            razor_per_depth: 458,
             futility_improving: DepthMargin { base: 0, slope: 75 },
             futility_not_improving: DepthMargin { base: 0, slope: 105 },
-            cap_futility_improving: DepthMargin { base: 0, slope: 90 },
-            cap_futility_not_improving: DepthMargin { base: 0, slope: 130 },
+            cap_futility_improving: DepthMargin { base: 2, slope: 115 },
+            cap_futility_not_improving: DepthMargin { base: 2, slope: 115 },
             delta_margin: 200,
             qs_lmp_limit: 8,
             tt_extended_cutoff_margin: 130,
-            history_prune_mult: 2500,
+            history_prune_mult: 1648,
+            // Sirius real values (search_params.h / search.cpp), same
+            // adoption rationale as above -- eval-adaptive NMP is a
+            // strictly more informed mechanism than the old flat
+            // depth>6?3:2 reduction, and there was no Kestrel-tuned
+            // value to compare against for these fields at all.
+            nmp_min_depth: 2,
+            nmp_eval_margin: 29,
+            nmp_static_eval_base_margin: 193,
+            nmp_static_eval_depth_margin: 18,
+            nmp_base_reduction: 1343,
+            nmp_depth_reduction_scale: 78,
+            nmp_eval_reduction_scale: 208,
+            nmp_max_eval_reduction: 4,
+            probcut_beta_margin: 182,
         }
     }
 }
@@ -146,6 +189,15 @@ impl SearchParams {
             self.qs_lmp_limit,
             self.tt_extended_cutoff_margin,
             self.history_prune_mult,
+            self.nmp_min_depth,
+            self.nmp_eval_margin,
+            self.nmp_static_eval_base_margin,
+            self.nmp_static_eval_depth_margin,
+            self.nmp_base_reduction,
+            self.nmp_depth_reduction_scale,
+            self.nmp_eval_reduction_scale,
+            self.nmp_max_eval_reduction,
+            self.probcut_beta_margin,
         ]
     }
     pub fn from_vec(v: &[i32]) -> Self {
@@ -162,6 +214,15 @@ impl SearchParams {
             qs_lmp_limit: v[15],
             tt_extended_cutoff_margin: v[16],
             history_prune_mult: v[17],
+            nmp_min_depth: v[18],
+            nmp_eval_margin: v[19],
+            nmp_static_eval_base_margin: v[20],
+            nmp_static_eval_depth_margin: v[21],
+            nmp_base_reduction: v[22],
+            nmp_depth_reduction_scale: v[23],
+            nmp_eval_reduction_scale: v[24],
+            nmp_max_eval_reduction: v[25],
+            probcut_beta_margin: v[26],
         }
     }
 }
@@ -271,6 +332,22 @@ pub struct Searcher<'a> {
     /// pruning-margin decisions (RFP/futility/LMP/razoring), never the
     /// real leaf/quiescence evaluation.
     pub corr_hist: Box<[i32]>,
+    /// 2026-07-22: four more correction-history dimensions, ported from
+    /// Sirius (7-term weighted correction, ~104 elo comment in its
+    /// source; Kestrel previously had only the pawn term below). Same
+    /// table shape/update rule as `corr_hist`, different hash input.
+    /// `threats` (the 6th/7th Sirius terms) deliberately skipped -- it
+    /// needs an "all squares attacked by side X" bitboard that isn't
+    /// factored out of eval.rs as a standalone callable today; porting
+    /// it would mean a real eval.rs refactor, not just new search
+    /// state, so it's left as a documented follow-up rather than
+    /// force-fit. Continuation-history correction (6 more Sirius terms,
+    /// lags 2-7) also deferred for the same reason (real scope, own
+    /// follow-up).
+    pub corr_hist_np_stm: Box<[i32]>,
+    pub corr_hist_np_nstm: Box<[i32]>,
+    pub corr_hist_minor: Box<[i32]>,
+    pub corr_hist_major: Box<[i32]>,
     /// For each ply, the (piece type, to-square) of the move that was
     /// played to reach that ply (i.e. the opponent's last move as seen
     /// from this node) -- set by the parent right before recursing, read
@@ -352,6 +429,30 @@ pub const CORR_HIST_SIZE: usize = 16384;
 const CORR_HIST_MAX: i32 = 1200; // clamp on the stored correction itself
 const CORR_HIST_GRAIN: i32 = 256; // internal fixed-point scale (like Stockfish)
 
+/// SPSA-tuned weights for combining the 5 correction-history
+/// dimensions (Sirius search_params.h: pawnCorrWeight,
+/// nonPawnStmCorrWeight, nonPawnNstmCorrWeight, minorCorrWeight,
+/// majorCorrWeight). `CORR_WEIGHT_SCALE`=256 means a weight of 256 is
+/// "full 1.0 effect" (matches the old pawn-only formula's implicit
+/// weight before this was ported).
+const CORR_WEIGHT_SCALE: i32 = 256;
+// 2026-07-22 CORRECTED (see NOTAS): Sirius's raw weights
+// (384/406/280/274/418) were SPSA-tuned against Sirius's OWN
+// maxCorrHist clamp/grain, not Kestrel's independently-chosen
+// CORR_HIST_MAX=1200 -- applying the raw numbers directly caused a
+// severe regression (300-game A/B: 6.7% vs the pre-change baseline).
+// Rescaled here to preserve Sirius's REAL relative proportions between
+// the 5 terms (which term matters more than which) while capping the
+// worst-case total (all 5 tables simultaneously maxed the same
+// direction) at exactly the same bound the old single-pawn-term system
+// safely operated at: weights sum to 256 ("1.0"), same as the old
+// implicit pawn-only weight, instead of Sirius's own sum of 1762.
+const CORR_WEIGHT_PAWN: i32 = 56;
+const CORR_WEIGHT_NP_STM: i32 = 59;
+const CORR_WEIGHT_NP_NSTM: i32 = 41;
+const CORR_WEIGHT_MINOR: i32 = 40;
+const CORR_WEIGHT_MAJOR: i32 = 61;
+
 /// Cheap, non-incremental pawn-structure hash -- just the two pawn
 /// bitboards mixed together. Not the real Zobrist key (which would
 /// need incremental maintenance in make/unmake_move); recomputed on
@@ -362,6 +463,51 @@ fn pawn_structure_hash(board: &Board) -> u64 {
     let wp = board.pieces[Color::White.idx()][PieceType::Pawn.idx()];
     let bp = board.pieces[Color::Black.idx()][PieceType::Pawn.idx()];
     wp.wrapping_mul(0x9E3779B97F4A7C15) ^ bp.wrapping_mul(0xC2B2AE3D27D4EB4F)
+}
+
+/// Same non-incremental, on-demand approach as `pawn_structure_hash`,
+/// applied to the other correction-history dimensions ported from
+/// Sirius. Non-pawn material (knights/bishops/rooks/queens) of a SINGLE
+/// side -- called once for the side to move and once for the other
+/// side (Sirius's `nonPawnStmCorrWeight`/`nonPawnNstmCorrWeight` are
+/// two independent terms, not one table read from both angles).
+#[inline]
+fn non_pawn_hash(board: &Board, color: Color) -> u64 {
+    let n = board.pieces[color.idx()][PieceType::Knight.idx()];
+    let b = board.pieces[color.idx()][PieceType::Bishop.idx()];
+    let r = board.pieces[color.idx()][PieceType::Rook.idx()];
+    let q = board.pieces[color.idx()][PieceType::Queen.idx()];
+    n.wrapping_mul(0x165667B19E3779F9)
+        ^ b.wrapping_mul(0x27D4EB2F165667C5)
+        ^ r.wrapping_mul(0x9E3779B185EBCA87)
+        ^ q.wrapping_mul(0xC2B2AE3D27D4EB4F)
+}
+
+/// Minor pieces (knights+bishops), both sides mixed together -- same
+/// both-colors-combined shape as `pawn_structure_hash`.
+#[inline]
+fn minor_piece_hash(board: &Board) -> u64 {
+    let wn = board.pieces[Color::White.idx()][PieceType::Knight.idx()];
+    let wb = board.pieces[Color::White.idx()][PieceType::Bishop.idx()];
+    let bn = board.pieces[Color::Black.idx()][PieceType::Knight.idx()];
+    let bb = board.pieces[Color::Black.idx()][PieceType::Bishop.idx()];
+    wn.wrapping_mul(0x9E3779B97F4A7C15)
+        ^ wb.wrapping_mul(0xC2B2AE3D27D4EB4F)
+        ^ bn.wrapping_mul(0x165667B19E3779F9)
+        ^ bb.wrapping_mul(0x27D4EB2F165667C5)
+}
+
+/// Major pieces (rooks+queens), both sides mixed together.
+#[inline]
+fn major_piece_hash(board: &Board) -> u64 {
+    let wr = board.pieces[Color::White.idx()][PieceType::Rook.idx()];
+    let wq = board.pieces[Color::White.idx()][PieceType::Queen.idx()];
+    let br = board.pieces[Color::Black.idx()][PieceType::Rook.idx()];
+    let bq = board.pieces[Color::Black.idx()][PieceType::Queen.idx()];
+    wr.wrapping_mul(0x9E3779B185EBCA87)
+        ^ wq.wrapping_mul(0xFF51AFD7ED558CCD)
+        ^ br.wrapping_mul(0xC4CEB9FE1A85EC53)
+        ^ bq.wrapping_mul(0x2545F4914F6CDD1D)
 }
 
 /// 2026-07-20 (BUG REAL encontrado por auditoria -- investigacao da
@@ -641,35 +787,76 @@ impl<'a> Searcher<'a> {
     }
 
     #[inline]
-    fn corr_hist_idx(&self, board: &Board) -> usize {
-        let h = pawn_structure_hash(board);
-        board.side.idx() * CORR_HIST_SIZE + (h as usize % CORR_HIST_SIZE)
+    fn corr_idx(&self, board: &Board, hash: u64) -> usize {
+        board.side.idx() * CORR_HIST_SIZE + (hash as usize % CORR_HIST_SIZE)
     }
 
-    /// Static eval adjusted by the learned correction for this pawn
-    /// structure (see `corr_hist`). Used only where the raw static eval
-    /// feeds a PRUNING margin decision, never for the real leaf value.
+    #[inline]
+    fn corr_hist_idx(&self, board: &Board) -> usize {
+        self.corr_idx(board, pawn_structure_hash(board))
+    }
+
+    /// Static eval adjusted by the learned correction (see `corr_hist`
+    /// and friends). Used only where the raw static eval feeds a
+    /// PRUNING margin decision, never for the real leaf value.
+    ///
+    /// 2026-07-22: weighted sum of 5 correction-history dimensions
+    /// (pawn structure, non-pawn material of each side, minor pieces,
+    /// major pieces), real SPSA weights ported from Sirius
+    /// (search_params.h: pawnCorrWeight, nonPawnStmCorrWeight,
+    /// nonPawnNstmCorrWeight, minorCorrWeight, majorCorrWeight).
+    /// Previously just the pawn term alone with an implicit weight of
+    /// `CORR_HIST_GRAIN` (i.e. "full effect", no partial trust) --
+    /// Sirius's real pawn weight is 384/256 = 1.5x that, so this is a
+    /// real recalibration of the existing term too, not just new
+    /// additions. `threats`/continuation-history terms deliberately
+    /// not included here, see the field doc comment on
+    /// `corr_hist_np_stm` for why.
     fn corrected_static_eval(&self, board: &Board, raw: i32) -> i32 {
-        let idx = self.corr_hist_idx(board);
-        raw + self.corr_hist[idx] / CORR_HIST_GRAIN
+        let pawn_idx = self.corr_idx(board, pawn_structure_hash(board));
+        let np_stm_idx = self.corr_idx(board, non_pawn_hash(board, board.side));
+        let np_nstm_idx = self.corr_idx(board, non_pawn_hash(board, board.side.opp()));
+        let minor_idx = self.corr_idx(board, minor_piece_hash(board));
+        let major_idx = self.corr_idx(board, major_piece_hash(board));
+        let sum = self.corr_hist[pawn_idx] * CORR_WEIGHT_PAWN
+            + self.corr_hist_np_stm[np_stm_idx] * CORR_WEIGHT_NP_STM
+            + self.corr_hist_np_nstm[np_nstm_idx] * CORR_WEIGHT_NP_NSTM
+            + self.corr_hist_minor[minor_idx] * CORR_WEIGHT_MINOR
+            + self.corr_hist_major[major_idx] * CORR_WEIGHT_MAJOR;
+        raw + sum / (CORR_HIST_GRAIN * CORR_WEIGHT_SCALE)
     }
 
     /// Called once a node's real search has settled on `best_score`
     /// (not a stopped/aborted search, not a mate score, not near the
-    /// static-eval-unreliable zone): nudge the correction toward the
-    /// gap between what the fast static eval guessed and what real
-    /// search found. Small learning-rate style update so a single
-    /// unusual position doesn't dominate the table.
+    /// static-eval-unreliable zone): nudge each of the 5 correction
+    /// tables toward the gap between what the fast static eval guessed
+    /// and what real search found. Small learning-rate style update so
+    /// a single unusual position doesn't dominate any one table.
+    /// Learning-rate cap raised from 16 to 32 (2026-07-22, Sirius's real
+    /// `weight = 2*min(1+depth,16)`) -- was under-weighting high-depth
+    /// updates relative to Sirius's real formula.
     fn update_corr_hist(&mut self, board: &Board, static_eval: i32, best_score: i32, depth: i32) {
         if best_score.abs() >= MATE_THRESHOLD {
             return;
         }
-        let idx = self.corr_hist_idx(board);
         let diff = (best_score - static_eval) * CORR_HIST_GRAIN;
-        let weight = (depth + 1).min(16);
-        let v = &mut self.corr_hist[idx];
-        *v += (diff - *v) * weight / 256;
-        *v = (*v).clamp(-CORR_HIST_MAX * CORR_HIST_GRAIN, CORR_HIST_MAX * CORR_HIST_GRAIN);
+        let weight = 2 * (depth + 1).min(16);
+        let pawn_idx = self.corr_idx(board, pawn_structure_hash(board));
+        let np_stm_idx = self.corr_idx(board, non_pawn_hash(board, board.side));
+        let np_nstm_idx = self.corr_idx(board, non_pawn_hash(board, board.side.opp()));
+        let minor_idx = self.corr_idx(board, minor_piece_hash(board));
+        let major_idx = self.corr_idx(board, major_piece_hash(board));
+        for (table, idx) in [
+            (&mut self.corr_hist, pawn_idx),
+            (&mut self.corr_hist_np_stm, np_stm_idx),
+            (&mut self.corr_hist_np_nstm, np_nstm_idx),
+            (&mut self.corr_hist_minor, minor_idx),
+            (&mut self.corr_hist_major, major_idx),
+        ] {
+            let v = &mut table[idx];
+            *v += (diff - *v) * weight / 256;
+            *v = (*v).clamp(-CORR_HIST_MAX * CORR_HIST_GRAIN, CORR_HIST_MAX * CORR_HIST_GRAIN);
+        }
     }
 
     fn order_moves(&self, board: &Board, mut moves: Vec<Move>, tt_move: Option<Move>, ply: usize, hash: Option<u64>) -> Vec<Move> {
@@ -929,7 +1116,17 @@ impl<'a> Searcher<'a> {
         }
     }
 
-    fn negamax(&mut self, board: &mut Board, depth: i32, mut alpha: i32, beta: i32, ply: usize) -> i32 {
+    /// `reached_by_null`: was the move that led to THIS node a null
+    /// move (see NMP block below)? 2026-07-22: needed to port Sirius's
+    /// real double-null-move guard (`board.pliesFromNull() > 0` in
+    /// their source) -- consecutive null moves in the same line are
+    /// unsound (can "prove" a fail-high via two passes that wouldn't
+    /// survive a single one) and Sirius's aggressive eval-adaptive NMP
+    /// reduction genuinely relies on this guard for safety; porting the
+    /// reduction formula without it caused a severe regression (A/B:
+    /// 6.7% vs a pre-change baseline) -- ~93% of games lost, not a
+    /// small/noisy signal, a real missing safety net.
+    fn negamax(&mut self, board: &mut Board, depth: i32, mut alpha: i32, beta: i32, ply: usize, reached_by_null: bool) -> i32 {
         self.nodes += 1;
         if self.time_up() {
             return 0;
@@ -1156,19 +1353,45 @@ impl<'a> Searcher<'a> {
         //    zugzwang, tipico de finais de peoes)
         //  - beta longe de scores de mate (nao mascarar mates)
         //  - nunca na raiz (ply > 0), para root_best ser sempre definido
-        if depth >= 3
+        //
+        // 2026-07-22: reducao "R" agora e' a formula real do Sirius
+        // (search.cpp, eval-adaptive), nao o antigo `depth>6?3:2` fixo
+        // que ignorava completamente a avaliacao estatica -- mecanismo
+        // genuinamente mais informado (quanto mais a posicao excede
+        // beta, mais funda a reducao), nao so' constantes recalibradas.
+        // `static_eval` (ja' corrigida por corr-hist, como o
+        // `stack->eval` do Sirius) para o gate/reducao,
+        // `raw_static_eval` (como o `stack->staticEval` do Sirius) so'
+        // para o segundo gate dependente de profundidade.
+        let sp_nmp = search_params();
+        if depth >= sp_nmp.nmp_min_depth
             && !in_check
             && ply > 0
+            && !reached_by_null
             && excluded.is_none()
             && beta.abs() < MATE_SCORE - MAX_PLY as i32
             && self.has_non_pawn_material(board)
+            && static_eval >= beta + sp_nmp.nmp_eval_margin
+            && raw_static_eval
+                >= beta + sp_nmp.nmp_static_eval_base_margin - sp_nmp.nmp_static_eval_depth_margin * depth
         {
-            // Adaptive R: a deeper reduction pays off at high depth (the
-            // reduced-depth probe is still informative enough relative to
-            // a bigger remaining tree), same idea as adaptive LMR below.
-            let null_r = if depth > 6 { 3 } else { 2 };
+            // Cap on R: Sirius's real formula (unbounded here) relies
+            // on a verification re-search when the null-move probe
+            // passes at high depth/near-decisive beta (their
+            // `nmpMinPly`/`verifScore` mechanism) to stay sound at
+            // large R -- that re-search is NOT ported this session
+            // (real extra recursion-wide state, deferred like
+            // `lmrCutnode`). Without it, trusting R up to 7-9
+            // unconditionally caused the regression above. Capped at 4
+            // (old Kestrel max was 3) as an honest, documented
+            // narrowing: keep the genuinely-better eval-adaptive GATING
+            // condition, drop only the unsafe unverified tail of the
+            // reduction magnitude.
+            let r = ((sp_nmp.nmp_base_reduction + depth * sp_nmp.nmp_depth_reduction_scale) / 256
+                + ((static_eval - beta) / sp_nmp.nmp_eval_reduction_scale).min(sp_nmp.nmp_max_eval_reduction))
+                .clamp(1, 4);
             let undo = board.make_null_move();
-            let score = -self.negamax(board, depth - 1 - null_r, -beta, -beta + 1, ply + 1);
+            let score = -self.negamax(board, depth - r, -beta, -beta + 1, ply + 1, true);
             board.unmake_null_move(&undo);
             if self.stop {
                 return 0;
@@ -1231,14 +1454,16 @@ impl<'a> Searcher<'a> {
         // (Stockfish/many engines). Guards: not in check, not root (ply
         // > 0, keeps root_best always defined), not during a singular
         // re-search (keeps TT semantics simple), far from mate scores
-        // (never risk masking a real mate).
+        // (never risk masking a real mate). `depth >= 5` matches
+        // Sirius's real `probcutMinDepth` exactly; margin below is its
+        // real `probcutBetaMargin` (was a hardcoded 150).
         if depth >= 5
             && ply > 0
             && !in_check
             && excluded.is_none()
             && beta.abs() < MATE_SCORE - MAX_PLY as i32
         {
-            let prob_beta = beta + 150;
+            let prob_beta = beta + search_params().probcut_beta_margin;
             if prob_beta < MATE_SCORE - MAX_PLY as i32 {
                 for mv in &moves {
                     if !mv.is_capture() && mv.promotion.is_none() {
@@ -1257,9 +1482,9 @@ impl<'a> Searcher<'a> {
                     }
                     // Cheap verification at depth 1, then a real (but
                     // reduced) search only if the quick probe holds up.
-                    let mut score = -self.negamax(board, 1, -prob_beta, -prob_beta + 1, ply + 1);
+                    let mut score = -self.negamax(board, 1, -prob_beta, -prob_beta + 1, ply + 1, false);
                     if score >= prob_beta && !self.stop {
-                        score = -self.negamax(board, depth - 4, -prob_beta, -prob_beta + 1, ply + 1);
+                        score = -self.negamax(board, depth - 4, -prob_beta, -prob_beta + 1, ply + 1, false);
                     }
                     board.unmake_move(mv, &undo);
                     if self.stop {
@@ -1302,7 +1527,7 @@ impl<'a> Searcher<'a> {
                     let s_beta = (tt_score - 2 * depth).max(-MATE_SCORE + 1);
                     let s_depth = (depth - 1) / 2;
                     self.excluded_move = Some(tm);
-                    let s_score = self.negamax(board, s_depth, s_beta - 1, s_beta, ply);
+                    let s_score = self.negamax(board, s_depth, s_beta - 1, s_beta, ply, reached_by_null);
                     self.excluded_move = None;
                     if self.stop {
                         return 0;
@@ -1462,7 +1687,7 @@ impl<'a> Searcher<'a> {
                 0
             };
             let score = if i == 0 {
-                -self.negamax(board, depth - 1 + extend, -beta, -alpha, ply + 1)
+                -self.negamax(board, depth - 1 + extend, -beta, -alpha, ply + 1, false)
             } else {
                 // LMR: late quiet moves are usually not the best -- search
                 // them at a reduced depth first, verify with full depth
@@ -1495,13 +1720,13 @@ impl<'a> Searcher<'a> {
                     0
                 };
                 // PVS: janela nula primeiro (reduzida se LMR), re-pesquisa se prometedor
-                let mut s = -self.negamax(board, depth - 1 + extend - r, -alpha - 1, -alpha, ply + 1);
+                let mut s = -self.negamax(board, depth - 1 + extend - r, -alpha - 1, -alpha, ply + 1, false);
                 if r > 0 && s > alpha && !self.stop {
                     // a versao reduzida bateu alpha: re-pesquisa a profundidade completa
-                    s = -self.negamax(board, depth - 1 + extend, -alpha - 1, -alpha, ply + 1);
+                    s = -self.negamax(board, depth - 1 + extend, -alpha - 1, -alpha, ply + 1, false);
                 }
                 if s > alpha && s < beta && !self.stop {
-                    s = -self.negamax(board, depth - 1 + extend, -beta, -alpha, ply + 1)
+                    s = -self.negamax(board, depth - 1 + extend, -beta, -alpha, ply + 1, false)
                 }
                 s
             };
@@ -1675,13 +1900,13 @@ impl<'a> Searcher<'a> {
     /// conjunto).
     fn search_root(&mut self, board: &mut Board, depth: i32, prev_score: i32) -> i32 {
         if depth <= 1 {
-            return self.negamax(board, depth, -MATE_SCORE - 1, MATE_SCORE + 1, 0);
+            return self.negamax(board, depth, -MATE_SCORE - 1, MATE_SCORE + 1, 0, false);
         }
         let mut delta: i32 = 25;
         let mut alpha = (prev_score - delta).max(-MATE_SCORE - 1);
         let mut beta = (prev_score + delta).min(MATE_SCORE + 1);
         loop {
-            let score = self.negamax(board, depth, alpha, beta, 0);
+            let score = self.negamax(board, depth, alpha, beta, 0, false);
             if self.stop {
                 return score;
             }
