@@ -1039,3 +1039,33 @@ corrigido (`469770e`), pronta para o próximo lote.
 vez, para confirmar que os fixes não pioraram nada) com o binário
 actual antes de decidir se o degrau é mesmo skill15 ou se os fixes
 mudam a leitura.
+
+**Re-teste com o binário corrigido (3 bugs): pior ainda no arranque**
+(0V-7D-1E nos primeiros 8 jogos) -- pedido do utilizador para estudar
+as derrotas em vez de só ver o placar. Leitura qualitativa de 7 PGNs:
+
+**Padrão real identificado**: pelo menos 3 das 7 derrotas (jogos 1, 4,
+7) mostram o kestrel a entrar em **sacrifícios especulativos sem
+compensação suficiente** -- ex. `12.Bxf7+ Kd8` no jogo 7 e padrão
+semelhante no jogo 1, entrada em complicações táticas a perder material
+no jogo 4. Consistente com o viés agressivo do eval "estilo Polgar"
+(pressão sobre o rei, densidade de atacantes) a empurrar para jogo
+sacrificial que a busca, à profundidade prática de 60+1 contra um
+adversário genuinamente forte (skill15, mesmo reduzido), não consegue
+validar em cálculo suficiente. O jogo 6 (empate por perpétuo sob
+pressão pesada) mostra o oposto -- boa resiliência defensiva, não é um
+padrão de colapso total.
+
+**Isto não é um bug -- é uma tensão real entre o pedido original do
+utilizador** ("estilo Judit Polgar... viés agressivo... nunca forçar a
+busca a jogar pior do que sabe" -- ver secção "O que é" no topo deste
+ficheiro) **e a força bruta contra oponentes fortes e precisos.** A
+mesma hipótese já tinha sido testada em 2026-07-20 via
+`KESTREL_EVAL_MODE=material` e foi REFUTADA -- mas esse teste foi
+self-play (kestrel vs kestrel_material, mesma profundidade de busca
+dos dois lados), que pode não captar a mesma dinâmica que jogar contra
+um oponente mais preciso capaz de refutar sacrifícios que um
+adversário da mesma força não encontraria. Não decidido se vale a pena
+reequilibrar os termos de agressividade -- fica como pergunta em
+aberto para o utilizador, não uma correção automática (mudaria o
+carácter do bot que foi pedido deliberadamente).
