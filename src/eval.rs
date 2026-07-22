@@ -518,6 +518,17 @@ const SCALE_OCB_ONE_ROOK: i32 = 96;
 const SCALE_OCB_ONE_KNIGHT: i32 = 106;
 const SCALE_FALLBACK_BASE: i32 = 96;
 const SCALE_FALLBACK_PER_PAWN: i32 = 8;
+// Complexity adjustment (Ethereal's approach, values ported directly --
+// see complexity_adjustment()/evaluate()). Shrinks the eval toward zero
+// in positions that are "simple" by these signals -- a negative bias
+// means most positions get a small penalty by default, only genuinely
+// complex ones (many pawns, both flanks open, pure pawn endgame) offset
+// it. Clamped so it can never flip which side is better, only reduce
+// the margin (see complexity_adjustment's sign-preserving clamp).
+const COMPLEXITY_TOTAL_PAWNS: i32 = 8;
+const COMPLEXITY_PAWN_FLANKS: i32 = 82;
+const COMPLEXITY_PAWN_ENDGAME: i32 = 76;
+const COMPLEXITY_ADJUSTMENT: i32 = -157;
 
 /// Runtime-adjustable copy of every constant `positional_terms()` uses
 /// (mobility/king-safety/threats/pawn-structure -- NOT material/PST,
@@ -576,6 +587,10 @@ pub struct Weights {
     pub scale_ocb_one_knight: i32,
     pub scale_fallback_base: i32,
     pub scale_fallback_per_pawn: i32,
+    pub complexity_total_pawns: i32,
+    pub complexity_pawn_flanks: i32,
+    pub complexity_pawn_endgame: i32,
+    pub complexity_adjustment: i32,
 }
 
 impl Default for Weights {
@@ -622,6 +637,10 @@ impl Default for Weights {
             scale_ocb_one_knight: SCALE_OCB_ONE_KNIGHT,
             scale_fallback_base: SCALE_FALLBACK_BASE,
             scale_fallback_per_pawn: SCALE_FALLBACK_PER_PAWN,
+            complexity_total_pawns: COMPLEXITY_TOTAL_PAWNS,
+            complexity_pawn_flanks: COMPLEXITY_PAWN_FLANKS,
+            complexity_pawn_endgame: COMPLEXITY_PAWN_ENDGAME,
+            complexity_adjustment: COMPLEXITY_ADJUSTMENT,
         }
     }
 }
@@ -706,6 +725,10 @@ impl Weights {
         v.push(self.scale_ocb_one_knight);
         v.push(self.scale_fallback_base);
         v.push(self.scale_fallback_per_pawn);
+        v.push(self.complexity_total_pawns);
+        v.push(self.complexity_pawn_flanks);
+        v.push(self.complexity_pawn_endgame);
+        v.push(self.complexity_adjustment);
         v
     }
 
@@ -757,6 +780,10 @@ impl Weights {
         let scale_ocb_one_knight = next!();
         let scale_fallback_base = next!();
         let scale_fallback_per_pawn = next!();
+        let complexity_total_pawns = next!();
+        let complexity_pawn_flanks = next!();
+        let complexity_pawn_endgame = next!();
+        let complexity_adjustment = next!();
         assert_eq!(i, v.len(), "from_vec: length mismatch with to_vec's field order");
         Weights {
             bishop_pair, long_diag_bishop, minor_behind_pawn, knight_outpost, rook_open, tempo,
@@ -769,6 +796,7 @@ impl Weights {
             backward_pawn, candidate_passed_pawn, bad_bishop,
             scale_ocb_bishops_only, scale_ocb_one_rook, scale_ocb_one_knight,
             scale_fallback_base, scale_fallback_per_pawn,
+            complexity_total_pawns, complexity_pawn_flanks, complexity_pawn_endgame, complexity_adjustment,
         }
     }
 }
@@ -1361,7 +1389,42 @@ pub fn evaluate(board: &Board) -> i32 {
     } else {
         material_pst(board) + positional_terms_signed(board)
     };
-    scale_endgame(board, raw, default_weights())
+    let w = default_weights();
+    let raw = raw + complexity_adjustment(board, raw, w);
+    scale_endgame(board, raw, w)
+}
+
+/// Complexity adjustment (Ethereal's approach, values ported directly).
+/// Shrinks the eval toward zero for positions that are "simple" by a
+/// few cheap signals (few pawns, pawns confined to one flank, no minor/
+/// major pieces left) -- a hand-crafted eval tends to overstate small
+/// advantages in simple positions that are actually easy to hold/draw.
+/// Sign-preserving clamp (`raw.signum() * complexity.max(-raw.abs())`)
+/// guarantees the adjustment can only shrink the margin toward zero,
+/// never flip who's better -- an easy mistake to make without it
+/// (Ethereal's own comment flags this explicitly).
+fn complexity_adjustment(board: &Board, raw: i32, w: &Weights) -> i32 {
+    if raw == 0 {
+        return 0;
+    }
+    let w_idx = Color::White.idx();
+    let b_idx = Color::Black.idx();
+    let all_pawns = board.pieces[w_idx][PieceType::Pawn.idx()] | board.pieces[b_idx][PieceType::Pawn.idx()];
+    let total_pawns = count(all_pawns) as i32;
+
+    const QUEENSIDE: Bitboard = FILE_A | (FILE_A << 1) | (FILE_A << 2) | (FILE_A << 3);
+    let both_flanks = (all_pawns & QUEENSIDE != 0) && (all_pawns & !QUEENSIDE != 0);
+
+    let no_pieces = [PieceType::Knight, PieceType::Bishop, PieceType::Rook, PieceType::Queen]
+        .iter()
+        .all(|&pt| board.pieces[w_idx][pt.idx()] == 0 && board.pieces[b_idx][pt.idx()] == 0);
+
+    let complexity = w.complexity_total_pawns * total_pawns
+        + if both_flanks { w.complexity_pawn_flanks } else { 0 }
+        + if no_pieces { w.complexity_pawn_endgame } else { 0 }
+        + w.complexity_adjustment;
+
+    raw.signum() * complexity.max(-raw.abs())
 }
 
 /// Endgame scale factor (Ethereal's approach, ported architecture not
