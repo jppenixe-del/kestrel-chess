@@ -509,6 +509,15 @@ mas ainda não confirmado por SPRT quantitativo -- ver plano do Opus
 (quantificar o fix estrutural com SPRT binário-atual vs
 `kestrel_prekillersfix_bin` continua por fazer).
 
+**SPRT estrutural feito (script `/root/kestrel_joao/sprt_structural_fix.py`,
+self-play fixed-nodes 30000/lance, imune a contenção de CPU, aberturas
+aleatórias 4/6/8 lances):** binário atual (todos os fixes de TT/killers/
+history/root_best) vs `kestrel_prekillersfix_bin` (commit `91ea1a7`,
+só TT/panic, SEM os fixes estruturais). **400 jogos: 88.5% (342V-34D-24E)
+para o binário atual, ~+354 Elo equivalente.** Confirma de forma
+quantitativa e inequívoca que os fixes estruturais foram uma melhoria
+enorme, não ruído -- fecha em definitivo o item #1 do plano do Opus.
+
 **Pivot pedido pelo utilizador**: antes de avançar para
 tuning de pesos de eval (que já tem histórico de overfit -- ver
 commits `891cb81`/`6edebf9`, infraestrutura `kestrel selfplay`/
