@@ -1699,8 +1699,19 @@ impl<'a> Searcher<'a> {
                 // (it's usually been good here before), strongly
                 // negative gets more.
                 let gives_check = board.in_check(board.side, self.atk);
-                let r = if i >= 2
-                    && depth >= 2
+                // 2026-07-22: min-move-count gate now matches Sirius's
+                // real split (`lmrMinMovesPv=4`, `lmrMinMovesNonPv=3`,
+                // `lmrMinDepth=3`) instead of a single `i>=2, depth>=2`
+                // threshold for every node type -- PV nodes get one
+                // extra move of "trust" before LMR kicks in, since a PV
+                // node's move ordering has already earned more
+                // confidence than a non-PV scout node's. Pure integer
+                // threshold, no fixed-point/scale conversion involved
+                // (unlike the NMP/corr-hist ports above), so ported
+                // directly without the caution those needed.
+                let min_moves = if is_pv { 4 } else { 3 };
+                let r = if i >= min_moves
+                    && depth >= 3
                     && extend == 0
                     && !mv.is_capture()
                     && mv.promotion.is_none()
@@ -1715,7 +1726,21 @@ impl<'a> Searcher<'a> {
                     // ttPv for. A position that earned full-window search
                     // once is less likely to be a safe-to-skip wasteland.
                     let ttpv_adj = if tt_entry_captured.map(|e| e.pv).unwrap_or(false) { -1 } else { 0 };
-                    (base + hist_adj + ttpv_adj).clamp(0, depth - 1)
+                    // Corrplexity: Sirius's real term is
+                    // `-lmrCorrplexity/1024 (~=0.59 plies) when
+                    // |eval-staticEval| > highCorrplexityMargin(89)` --
+                    // reduce less when the correction-history signal
+                    // says this position's static eval is trending far
+                    // from what raw material/PST said (a "complex"
+                    // position where blind reduction is riskier).
+                    // Rounded to a whole ply here (same integer-
+                    // quantization style already used by `hist_adj`/
+                    // `ttpv_adj` above) rather than threading a
+                    // fixed-point accumulator through just this one
+                    // term.
+                    let corrplexity = (static_eval - raw_static_eval).abs();
+                    let corrplexity_adj = if corrplexity > 89 { -1 } else { 0 };
+                    (base + hist_adj + ttpv_adj + corrplexity_adj).clamp(0, depth - 1)
                 } else {
                     0
                 };

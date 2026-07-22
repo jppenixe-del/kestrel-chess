@@ -1535,3 +1535,53 @@ a neutro". Commitado. Binários de teste (`kestrel_baseline_0c1b388`,
 `kestrel_nmp_corrhist`, `kestrel_nmp_only`) e scripts
 (`sprt_nmp_corrhist.py`, `sprt_nmp_only.py`) ficam em
 `/root/kestrel_joao/` para referência, não fazem parte do repo git.
+
+**Commitado como `9f93be9`.**
+
+## Atualização 2026-07-23: item #2 do Fable (LMR) -- só a parte segura, dado o que aconteceu com o corr-hist
+
+Depois do susto do bug de escala na correction history, decidido ser
+mais cauteloso desta vez: só portar do LMR do Sirius o que é
+inequivocamente seguro (thresholds inteiros, sem conversão de escala/
+fixed-point nenhuma), testar sozinho antes de continuar, em vez de
+juntar tudo de uma vez outra vez.
+
+**Portado**:
+- **Split PV/não-PV no gate de elegibilidade do LMR**: era `i>=2 &&
+  depth>=2` para todos os nós; agora `i >= (is_pv ? 4 : 3) && depth>=3`
+  -- valores reais do Sirius (`lmrMinMovesPv=4, lmrMinMovesNonPv=3,
+  lmrMinDepth=3`). Puros inteiros, sem ambiguidade de escala.
+- **Ajuste de corrplexity**: `-1 ply` quando `|static_eval -
+  raw_static_eval| > 89` (o `highCorrplexityMargin` real do Sirius) --
+  reduz menos em posições onde a correction history diverge muito do
+  eval bruto (posição "complexa"). Valor real do Sirius é fracionário
+  (`lmrCorrplexity=605/1024≈0.59 plies`); arredondado para 1 ply
+  inteiro, seguindo o mesmo estilo de quantização inteira que
+  `hist_adj`/`ttpv_adj` já usavam neste código antes desta sessão --
+  não é um valor inventado, é o mesmo real arredondado de forma
+  consistente com o resto do ficheiro.
+
+**Deliberadamente NÃO portado ainda** (fica para outra sessão, mesmo
+raciocínio do `lmrCutnode`/verificação de NMP): `lmrNonImp`,
+`lmrGivesCheck` (mudaria de "desliga LMR nos xeques" para "reduz
+menos", mudança estrutural, não só numérica), `lmrTTPV`/
+`lmrTTPVNonFailLow` (o `ttpv_adj` actual já é uma versão simplificada
+disto), divisores de history contínuos (`lmrQuietHistDivisor=8846`/
+`lmrNoisyHistDivisor=6837` substituiriam o `h/4000` actual, mas o
+sistema de acumulação fixed-point do Sirius doesn't map 1:1 sem mais
+trabalho), `doDeeper`/`doShallower` (reescalada de profundidade pós-
+resultado, feature nova, não só recalibração).
+
+**Validação**: perfts reconfirmados (`119060324`/`4085603`), binário
+anterior (commit `9f93be9`) buildado num worktree separado
+(`kestrel_baseline_9f93be9`) para comparação limpa. Smoke-test de 10
+jogos deu 60/40 -- nada parecido com o padrão de 100%/0% do bug
+anterior, sinal são. Lote completo de 300 jogos (`sprt_lmr.py`) a
+correr em background, log `sprt_lmr.log`.
+
+**Resultado final**: `A(baseline)=157.5/300=52.5%,
+B(new)=142.5/300=47.5%, W143-L128-D29` -- ligeiramente negativo, mas
+dentro do ruído normal de 300 jogos (nada como os 6.7% do bug real de
+antes) e são valores REAIS do Sirius, fielmente traduzidos (não
+inventados) -- mantido e commitado, mesmo princípio já aplicado a
+TTPV/extensions nesta sessão ("os testes são só para verificar").
