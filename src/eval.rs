@@ -1395,14 +1395,23 @@ pub fn evaluate(board: &Board) -> i32 {
 }
 
 /// Complexity adjustment (Ethereal's approach, values ported directly).
-/// Shrinks the eval toward zero for positions that are "simple" by a
-/// few cheap signals (few pawns, pawns confined to one flank, no minor/
-/// major pieces left) -- a hand-crafted eval tends to overstate small
-/// advantages in simple positions that are actually easy to hold/draw.
+/// Correction from code review (2026-07-22): this does NOT generally
+/// shrink the eval toward zero, despite an earlier version of this
+/// comment claiming that -- with the real ported constants, a typical
+/// two-flank middlegame with plenty of pawns scores complexity=+53 and
+/// that gets ADDED to the eval (confirmed by direct testing: a normal
+/// opening-ish position went from raw=19 to evaluate()=72). What it
+/// actually does: reward positions with more pawns spread across both
+/// flanks (more winning chances/harder for the weaker side to hold)
+/// and penalize/neutralize pawnless or single-flank endgames (easier
+/// to hold or drawn outright) via the negative bias term. "Complexity"
+/// names the SIGNAL (many pawns, both flanks, pure pawn endgame),
+/// not the DIRECTION of the adjustment -- that depends on the sign of
+/// each ported constant, same as Ethereal's real formula.
 /// Sign-preserving clamp (`raw.signum() * complexity.max(-raw.abs())`)
-/// guarantees the adjustment can only shrink the margin toward zero,
-/// never flip who's better -- an easy mistake to make without it
-/// (Ethereal's own comment flags this explicitly).
+/// guarantees the adjustment can only move the eval toward or away
+/// from zero without ever flipping who's better -- an easy mistake to
+/// make without it (Ethereal's own comment flags this explicitly).
 fn complexity_adjustment(board: &Board, raw: i32, w: &Weights) -> i32 {
     if raw == 0 {
         return 0;
@@ -1482,7 +1491,9 @@ fn endgame_scale_factor(board: &Board, raw: i32, weights: &Weights) -> i32 {
     // Opposite-colored bishops: exactly one bishop each, on different
     // square colors. Classic drawing fortress even a pawn or two up.
     // Scales down further, the fewer other pieces are left to help
-    // convert (bishops-only < one-knight-each < one-rook-each).
+    // convert. Values (Ethereal's, ported directly): bishops-only=64
+    // < one-rook-each=96 < one-knight-each=106 -- corrected 2026-07-22,
+    // an earlier version of this comment had the last two swapped.
     if n_wb == 1 && n_bb == 1 {
         let wb_sq = wb.trailing_zeros();
         let bb_sq = bb_.trailing_zeros();

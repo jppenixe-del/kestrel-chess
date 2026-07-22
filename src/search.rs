@@ -1078,6 +1078,7 @@ impl<'a> Searcher<'a> {
                     return tt_score;
                 }
             } else if !is_pv
+                && ply > 0
                 && e.depth == depth - 1
                 && e.bound == Bound::Upper
                 && tt_score + search_params().tt_extended_cutoff_margin <= alpha
@@ -1638,7 +1639,17 @@ impl<'a> Searcher<'a> {
         // durante uma re-pesquisa singular -- score enviesado por
         // janela restrita e excluded_move.
         if excluded.is_none() {
-            self.tt.store(hash, depth, score_to_tt(best_score, ply as i32), bound, best_move, is_pv);
+            // TTPV: OR with whatever the entry already had, not just
+            // this node's own window -- fix from code review
+            // (2026-07-22): with always-replace storage, a PV-written
+            // entry gets overwritten by the next (far more common)
+            // scout-window visit to the same position, erasing the
+            // flag almost immediately. Once true, stays true across
+            // subsequent non-PV writes to the same slot -- same
+            // approach Stockfish/Ethereal use (`ttPv = is_pv ||
+            // (hit && old.pv)`).
+            let store_pv = is_pv || tt_entry_captured.map(|e| e.pv).unwrap_or(false);
+            self.tt.store(hash, depth, score_to_tt(best_score, ply as i32), bound, best_move, store_pv);
             // Correction history update: only on a genuine Exact result
             // (fail-high/fail-low bounds are one-sided, not a real
             // estimate of the true value) and never in check (tactics
