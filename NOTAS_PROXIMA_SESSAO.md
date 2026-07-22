@@ -587,6 +587,48 @@ concretos que a conclusão do Fable não tinha isolado explicitamente:
   o coordinate descent explorar de verdade, antes/além do fix de
   quiescence.
 
+**Ronda de tuning a sério, feita depois da correção acima (2026-07-22):**
+1. Self-play mais profundo: `kestrel selfplay 1500 dataset_round1.epd
+   20000 4` -- 62928 posições, 20000 nós/lance (5x mais fundo que a
+   tentativa anterior de 4000).
+2. **Nova infra, commit `3e736c7`**: `quiescence_leaf()`/
+   `quiescence_leaf_from()` em `search.rs` (funções aditivas, busca de
+   produção intocada -- validado: perft(5)=4865609, mesma busca
+   fixed-node byte a byte, suite tática 19/23 inalterada) + subcomando
+   `kestrel resolvequiet <in.epd> <out.epd>`. Ataca o gap real que o
+   Fable identificou (rotulagem sem quiescence) SEM pagar o custo de
+   qsearch em cada tentativa de parâmetro (calculado: >1 mil milhões de
+   avaliações, intratável) -- resolve cada posição UMA VEZ para o seu
+   sucessor tacticamente quieto antes de tunar. **6804/62928 (10.8%)**
+   das posições estavam mesmo instáveis e foram corrigidas -- confirma
+   que o problema é real, não hipotético. Custo: ~1s para as 63k
+   posições (muito mais barato do que se temia).
+3. `kestrel tune dataset_round1_quiet.epd tuned_round1.txt 40 0.0005`:
+   **convergência real** (época 8, 0 parâmetros a melhorar, não
+   truncado por limite de épocas). Erro 0.078021->0.076783 (~1.6%
+   relativo, 4x mais que a tentativa anterior). **108/460 parâmetros
+   mudaram, desvio máximo 6cp** -- movimento real, não ruído (a
+   tentativa anterior só tinha mexido 43 parâmetros, máx 3cp).
+4. **MAS a suite tática regrediu: 19/23 -> 16/23 (82.6% -> 69.6%)**.
+
+**Conclusão (revista outra vez, com mais evidência agora)**: esta é a
+**terceira** tentativa genuinamente diferente (sem regularização;
+regularização forte demais que mal mexeu nos pesos; agora dataset limpo
+por quiescence com convergência real e movimento real) e as três
+regridem a suite tática. Isto já não é "não testámos a sério" -- é
+sinal real de que afinar SÓ os pesos de eval, sem tocar nas margens de
+poda da busca (RFP, futility, delta pruning, LMR) que foram calibradas
+à mão para a escala ATUAL dos pesos, provavelmente desalinha as duas
+partes mesmo quando o eval isolado fica "melhor" a prever resultados de
+jogos. Não deployado (viola o gate da suite tática, regra do projeto).
+Próximo passo válido se sobrar tempo: re-tunar/re-validar margens de
+poda em conjunto, ou aumentar a suite tática (23 posições é uma amostra
+pequena e pode ela própria ter ruído) antes de tentar mais uma ronda.
+Ficheiros: `dataset_round1.epd`/`dataset_round1_quiet.epd`,
+`tuned_round1.txt`, `tune_round1.log`, `resolvequiet.log` (todos em
+`/root/kestrel_joao/Kestrel/`, não commitados -- são artefactos de
+dados, não código).
+
 **Nota lateral (fora do escopo do Kestrel)**: o utilizador mencionou um
 segundo projeto ("littlerock/half2k", adversário de referência
 "PeachFruit" no Lichess) com prazo até sexta (24 Jul) para bater o Elo
