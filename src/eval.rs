@@ -507,6 +507,17 @@ const CANDIDATE_PASSED_PAWN: (i32, i32) = (6, 18);
 // to be defended twice. Small per-pawn penalty, worse in the endgame
 // (fewer other pieces to compensate for the bad bishop's blind squares).
 const BAD_BISHOP: (i32, i32) = (-2, -4);
+// Endgame scale factors (see scale_endgame/endgame_scale_factor):
+// out of SCALE_NORMAL=128. Were plain hardcoded numbers in
+// endgame_scale_factor's return statements until this commit -- pulled
+// into Weights (single scalars, not ScorePair -- they scale a whole
+// already-tapered eval, not an mg/eg component) so they're swappable
+// the same way every other eval constant is.
+const SCALE_OCB_BISHOPS_ONLY: i32 = 64;
+const SCALE_OCB_ONE_ROOK: i32 = 96;
+const SCALE_OCB_ONE_KNIGHT: i32 = 106;
+const SCALE_FALLBACK_BASE: i32 = 96;
+const SCALE_FALLBACK_PER_PAWN: i32 = 8;
 
 /// Runtime-adjustable copy of every constant `positional_terms()` uses
 /// (mobility/king-safety/threats/pawn-structure -- NOT material/PST,
@@ -560,6 +571,11 @@ pub struct Weights {
     pub backward_pawn: (i32, i32),
     pub candidate_passed_pawn: (i32, i32),
     pub bad_bishop: (i32, i32),
+    pub scale_ocb_bishops_only: i32,
+    pub scale_ocb_one_rook: i32,
+    pub scale_ocb_one_knight: i32,
+    pub scale_fallback_base: i32,
+    pub scale_fallback_per_pawn: i32,
 }
 
 impl Default for Weights {
@@ -601,6 +617,11 @@ impl Default for Weights {
             backward_pawn: BACKWARD_PAWN,
             candidate_passed_pawn: CANDIDATE_PASSED_PAWN,
             bad_bishop: BAD_BISHOP,
+            scale_ocb_bishops_only: SCALE_OCB_BISHOPS_ONLY,
+            scale_ocb_one_rook: SCALE_OCB_ONE_ROOK,
+            scale_ocb_one_knight: SCALE_OCB_ONE_KNIGHT,
+            scale_fallback_base: SCALE_FALLBACK_BASE,
+            scale_fallback_per_pawn: SCALE_FALLBACK_PER_PAWN,
         }
     }
 }
@@ -680,6 +701,11 @@ impl Weights {
         pair!(self.backward_pawn);
         pair!(self.candidate_passed_pawn);
         pair!(self.bad_bishop);
+        v.push(self.scale_ocb_bishops_only);
+        v.push(self.scale_ocb_one_rook);
+        v.push(self.scale_ocb_one_knight);
+        v.push(self.scale_fallback_base);
+        v.push(self.scale_fallback_per_pawn);
         v
     }
 
@@ -726,6 +752,11 @@ impl Weights {
         let backward_pawn = pair!();
         let candidate_passed_pawn = pair!();
         let bad_bishop = pair!();
+        let scale_ocb_bishops_only = next!();
+        let scale_ocb_one_rook = next!();
+        let scale_ocb_one_knight = next!();
+        let scale_fallback_base = next!();
+        let scale_fallback_per_pawn = next!();
         assert_eq!(i, v.len(), "from_vec: length mismatch with to_vec's field order");
         Weights {
             bishop_pair, long_diag_bishop, minor_behind_pawn, knight_outpost, rook_open, tempo,
@@ -736,6 +767,8 @@ impl Weights {
             knight_hit_queen, bishop_hit_queen, rook_hit_queen, push_threat, restricted_squares,
             pawn_phalanx, defended_pawn, isolated_pawn, doubled_pawn, passed_pawn,
             backward_pawn, candidate_passed_pawn, bad_bishop,
+            scale_ocb_bishops_only, scale_ocb_one_rook, scale_ocb_one_knight,
+            scale_fallback_base, scale_fallback_per_pawn,
         }
     }
 }
@@ -1328,7 +1361,7 @@ pub fn evaluate(board: &Board) -> i32 {
     } else {
         material_pst(board) + positional_terms_signed(board)
     };
-    scale_endgame(board, raw)
+    scale_endgame(board, raw, default_weights())
 }
 
 /// Endgame scale factor (Ethereal's approach, ported architecture not
@@ -1347,18 +1380,18 @@ pub fn evaluate(board: &Board) -> i32 {
 /// sign for side-to-move.
 const SCALE_NORMAL: i32 = 128;
 
-fn scale_endgame(board: &Board, raw: i32) -> i32 {
+fn scale_endgame(board: &Board, raw: i32, weights: &Weights) -> i32 {
     if raw == 0 {
         return 0;
     }
-    let scale = endgame_scale_factor(board, raw);
+    let scale = endgame_scale_factor(board, raw, weights);
     if scale == SCALE_NORMAL {
         return raw;
     }
     raw * scale / SCALE_NORMAL
 }
 
-fn endgame_scale_factor(board: &Board, raw: i32) -> i32 {
+fn endgame_scale_factor(board: &Board, raw: i32, weights: &Weights) -> i32 {
     let w = Color::White.idx();
     let b = Color::Black.idx();
     let wp = board.pieces[w][PieceType::Pawn.idx()];
@@ -1394,13 +1427,13 @@ fn endgame_scale_factor(board: &Board, raw: i32) -> i32 {
         let bb_light = (rank_of(bb_sq as Square) + file_of(bb_sq as Square)) % 2 == 1;
         if wb_light != bb_light {
             if n_wn == 0 && n_bn == 0 && n_wr == 0 && n_br == 0 && n_wq == 0 && n_bq == 0 {
-                return 64;
+                return weights.scale_ocb_bishops_only;
             }
             if n_wr == 1 && n_br == 1 && n_wn == 0 && n_bn == 0 && n_wq == 0 && n_bq == 0 {
-                return 96;
+                return weights.scale_ocb_one_rook;
             }
             if n_wn == 1 && n_bn == 1 && n_wr == 0 && n_br == 0 && n_wq == 0 && n_bq == 0 {
-                return 106;
+                return weights.scale_ocb_one_knight;
             }
         }
     }
@@ -1430,7 +1463,7 @@ fn endgame_scale_factor(board: &Board, raw: i32) -> i32 {
     // is actually an endgame" that keeps the approximation safe.
     if n_wq == 0 && n_bq == 0 {
         let strong_pawns = if raw > 0 { n_wp } else { n_bp };
-        return (96 + 8 * strong_pawns).min(SCALE_NORMAL);
+        return (weights.scale_fallback_base + weights.scale_fallback_per_pawn * strong_pawns).min(SCALE_NORMAL);
     }
     SCALE_NORMAL
 }
