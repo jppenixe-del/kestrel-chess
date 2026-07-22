@@ -1427,7 +1427,13 @@ impl<'a> Searcher<'a> {
                     let base = lmr_table()[(depth as usize).min(63)][(i + 1).min(63)];
                     let h = self.history_scores[board.side.idx()][mv.from as usize][mv.to as usize];
                     let hist_adj = -(h / 4000); // +/-1 per ~4000 history points
-                    (base + hist_adj).clamp(0, depth - 1)
+                    // TTPV: this position was reached by a real PV search
+                    // before (full window, not a scout probe) -- reduce
+                    // one ply less here, same idea Stockfish/Ethereal use
+                    // ttPv for. A position that earned full-window search
+                    // once is less likely to be a safe-to-skip wasteland.
+                    let ttpv_adj = if tt_entry_captured.map(|e| e.pv).unwrap_or(false) { -1 } else { 0 };
+                    (base + hist_adj + ttpv_adj).clamp(0, depth - 1)
                 } else {
                     0
                 };
@@ -1576,7 +1582,7 @@ impl<'a> Searcher<'a> {
         // durante uma re-pesquisa singular -- score enviesado por
         // janela restrita e excluded_move.
         if excluded.is_none() {
-            self.tt.store(hash, depth, score_to_tt(best_score, ply as i32), bound, best_move);
+            self.tt.store(hash, depth, score_to_tt(best_score, ply as i32), bound, best_move, is_pv);
             // Correction history update: only on a genuine Exact result
             // (fail-high/fail-low bounds are one-sided, not a real
             // estimate of the true value) and never in check (tactics
