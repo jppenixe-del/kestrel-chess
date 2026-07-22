@@ -548,6 +548,36 @@ ficheiro -- se precisar de o reconsultar, os artefactos-fonte estão em
 `selfplay_big.epd`/`selfplay_quiet.epd`, `tune_reg*.log`/`tuned_reg*.txt`,
 `ab_match.py`/`ab_match.log`).
 
+**Correção importante (utilizador desafiou a conclusão "tuning não
+ajuda", com razão)**: verifiquei diretamente e confirmei dois problemas
+concretos que a conclusão do Fable não tinha isolado explicitamente:
+- `KESTREL_TUNED_WEIGHTS` **carrega corretamente** (validado com
+  `kestrel checkweights`: round-trip ok, eval muda de facto ao carregar
+  `tuned_reg3.txt`).
+- MAS o candidato `tuned_reg3.txt` realmente testado no A/B só mexeu em
+  **43 dos 460 parâmetros**, desvio máximo de **3 centipawns** (a
+  maioria ±1) -- essencialmente ruído. As outras runs de lambda maior
+  (0.05, 5) travaram tudo (0 parâmetros a mexer). **Nenhuma tentativa
+  até agora testou de facto um conjunto de pesos meaningfully diferente
+  do default** -- o resultado nulo (49.6%/50.4%) não prova que os pesos
+  já estão bons, prova que essa run em concreto mal saiu do ponto de
+  partida.
+- Timing: esse A/B correu às 21:52 de 21 Jul, um snapshot do binário
+  nesse momento (dia com 30+ commits); as duas mudanças que aterraram
+  depois nessa noite (`0beddc2` doc-only, `ca8bfce` pinned-piece
+  fastpath, só performance) não deviam enviesar a comparação eval vs
+  eval, mas não há como confirmar retroativamente que o binário do
+  teste estava mesmo atualizado até ao commit imediatamente anterior.
+- **Conclusão revista**: a decisão de não perseguir tuning agora
+  mantém-se válida por falta de tempo/risco nesta janela, mas por
+  razões diferentes das que o Fable deu -- não é "já se provou que não
+  ajuda", é "ainda não foi testado a sério (regularização nunca deixou
+  os pesos mexerem-se o suficiente + falta rotulagem por quiescence)".
+  Se sobrar tempo, a prioridade dentro do tuning seria testar um
+  lambda MENOR que 0.001 (ou um orçamento de épocas maior) para deixar
+  o coordinate descent explorar de verdade, antes/além do fix de
+  quiescence.
+
 **Nota lateral (fora do escopo do Kestrel)**: o utilizador mencionou um
 segundo projeto ("littlerock/half2k", adversário de referência
 "PeachFruit" no Lichess) com prazo até sexta (24 Jul) para bater o Elo
