@@ -469,6 +469,7 @@ impl Engine {
                         corr_hist_np_nstm: vec![0i32; crate::search::CORR_HIST_SIZE * 2].into_boxed_slice(),
                         corr_hist_minor: vec![0i32; crate::search::CORR_HIST_SIZE * 2].into_boxed_slice(),
                         corr_hist_major: vec![0i32; crate::search::CORR_HIST_SIZE * 2].into_boxed_slice(),
+                        corr_hist_threats: vec![0i32; crate::search::CORR_HIST_SIZE * 2].into_boxed_slice(),
                         ply_last_move: [None; crate::search::MAX_PLY],
                         static_evals: [0i32; crate::search::MAX_PLY],
                         root_best: None,
