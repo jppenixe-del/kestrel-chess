@@ -2019,3 +2019,13 @@ Arredondado a 1 ply inteiro, mesmo estilo de quantização de
 
 **Resultado**: 55.0% vs 45.0% (baseline), 300 jogos -- positivo real,
 claramente fora do ruído. Commitado.
+
+**Divisor de history do LMR**: `h/4000` (palpite antigo) -> `h/8846`
+(valor real `lmrQuietHistDivisor` do Sirius). Kestrel não tem o passo
+extra `/1024` que o Sirius tem (a tabela base do Kestrel já produz
+plies directamente), por isso `h/8846` é a tradução directa, sem
+reescala adicional -- e as escalas de history dos dois motores já são
+próximas (16000 vs 16384, confirmado em sessão anterior). Resultado:
+**exactamente 50.0%/50.0%** (300 jogos) -- neutro, mantido por ser
+valor real portado (mesma política já aplicada a RFP/razor/LMR-
+thresholds).

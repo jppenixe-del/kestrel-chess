@@ -1734,7 +1734,17 @@ impl<'a> Searcher<'a> {
                 {
                     let base = lmr_table()[(depth as usize).min(63)][(i + 1).min(63)];
                     let h = self.history_scores[board.side.idx()][mv.from as usize][mv.to as usize];
-                    let hist_adj = -(h / 4000); // +/-1 per ~4000 history points
+                    // 2026-07-23: divisor was a hand-set guess (4000);
+                    // real Sirius value is lmrQuietHistDivisor=8846.
+                    // Kestrel's own base LMR table already produces
+                    // final ply units directly (no /1024 fixed-point
+                    // step the way Sirius's does), so `h/8846` is the
+                    // direct equivalent -- no rescale needed beyond
+                    // using the real divisor, since both engines'
+                    // history score scales are already close
+                    // (HISTORY_MAX 16000 vs Sirius's 16384, confirmed
+                    // earlier this session).
+                    let hist_adj = -(h / 8846);
                     // TTPV: this position was reached by a real PV search
                     // before (full window, not a scout probe) -- reduce
                     // one ply less here, same idea Stockfish/Ethereal use
