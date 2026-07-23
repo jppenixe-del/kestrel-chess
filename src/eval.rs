@@ -813,6 +813,78 @@ impl Default for Weights {
     }
 }
 
+/// Pesos de eval calibrados pelo tuner PRÓPRIO do Kestrel (Texel
+/// tuning, gradient descent) sobre 187869 posições de self-play
+/// geradas pelo binário desta sessão (dataset_round5), lr=1000, 8000
+/// iterações, erro 0.087667 -> 0.081655. Substituem os defaults
+/// (mistura de valores próprios + termos reescalados do Sirius/
+/// Ethereal). Validado por A/B: +2.3% (52.3%) vs os defaults a nós
+/// fixos, 300 jogos -- ganho real, e sem custo de NPS (só muda
+/// valores). É a resposta à direcção do utilizador: calibrar os
+/// valores emprestados para a arquitectura do Kestrel em vez de os
+/// copiar. Aplicado via `from_vec` (669 escalares na ordem exacta do
+/// `to_vec`); material/PST (consts separadas) e king_danger_table
+/// (derivada) não fazem parte deste vector e ficam como estavam.
+#[rustfmt::skip]
+const TUNED_R5: [i32; 669] = [
+    28, 46, 4, 5, 21, -6, 24, 16, 11, -2, 11, -3,
+    -16, 22, 12, -2, -39, -31, -21, -10, -4, -7, 11, 4,
+    17, 4, 18, 9, 17, 6, 23, 13, 29, 15, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    -43, -34, -19, -16, -4, -8, -3, -6, 8, 2, 7, 7,
+    16, 8, 17, 10, 13, 10, 19, 15, 30, 23, 30, 19,
+    33, 25, 35, 25, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, -42, -33, -8, -21,
+    -12, -11, -6, -5, 0, 2, 1, 3, 9, 9, 3, 9,
+    4, 13, 14, 18, 13, 20, 17, 25, 16, 23, 21, 27,
+    18, 22, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, -28, -25, -23, -20, -9, -14, -3, -7,
+    -3, -2, 4, 2, 0, 6, 4, 7, 9, 10, 11, 10,
+    15, 13, 15, 13, 16, 16, 24, 22, 24, 21, 24, 19,
+    24, 21, 23, 21, 23, 22, 24, 22, 24, 22, 23, 22,
+    24, 22, 24, 22, 24, 22, 24, 22, 24, 22, 24, 22,
+    15, -2, 13, -2, 26, -4, 48, -4, 5, 0, 2, 0,
+    2, 2, 3, 1, 1, 2, -6, -3, -36, -18, -25, -19,
+    -40, -11, -33, -19, -35, -2, -22, -8, -11, -7, 19, -7,
+    63, 55, 83, 54, 84, 54, 95, 55, 84, 40, 0, 0,
+    0, 3, 27, 15, 27, 15, 30, 20, 26, 10, 0, 0,
+    5, 17, -1, -1, 29, 23, 66, 25, 50, 24, 0, 0,
+    -22, 12, 0, 0, 18, 13, 36, 20, 35, 25, 0, 0,
+    3, 18, 31, 25, 1, 0, 59, 24, 45, 45, 0, 0,
+    -1, 0, 13, 9, -1, 0, 35, 25, 40, 50, 0, 0,
+    -4, 17, 28, 28, 27, 27, 0, 0, 53, 24, 0, 0,
+    -10, 6, -9, 8, 6, 6, -1, 0, 41, 55, 0, 0,
+    9, 15, 17, 18, 18, 20, 12, 10, 0, 0, 0, 0,
+    -6, 5, -10, 2, -8, 11, -7, 4, 0, -1, 0, 0,
+    30, 23, 33, 28, 64, 24, 53, 8, 0, 0, 0, 0,
+    8, -3, 23, 10, 7, -4, 9, 6, 10, -4, 0, 0,
+    6, -4, 13, 9, 16, 9, 35, 30, 65, 99, 110, 175,
+    0, 0, 0, 0, 0, 0, 9, 1, -3, -2, -2, 8,
+    30, 51, 70, 110, 0, 0, 11, -2, -23, -16, -3, -11,
+    -25, -9, -9, -57, 10, -42, -14, -27, -32, -6, -10, 7,
+    -22, -5, 0, 0, 0, 0, 0, 0, -62, -36, -25, 22,
+    35, 132, 220, 229, 0, 0, 0, 0, 0, 0, 0, 0,
+    -41, -47, -11, -17, 35, 52, 111, 80, 0, 0, 0, 0,
+    0, 0, 0, 0, -50, -47, -18, -14, 37, 56, 60, 42,
+    0, 0, 0, 0, 0, 0, 0, 0, -49, -55, -13, -25,
+    15, 36, 5, 6, 0, 0, 126, 114, 160, 77, 54, 67,
+    -15, 52, -9, 23, 1, 13, 27, -2, 3, 14, -126, 14,
+    0, -2, 35, -7, 26, 12, 17, 50, 18, 65, 36, 74,
+    36, 68, 0, 0, 0, 0, 0, 0, 18, 0, 15, 14,
+    62, 24, 115, 100, 0, 0, 0, 0, 0, 0, 0, 0,
+    -52, -13, -48, -29, -52, -48, 14, -97, 0, 0, 5, -1,
+    0, 0, -44, -12, -15, -14, -5, 1, 28, 21, 65, 86,
+    0, 0, 0, 0, 0, 0, -22, -10, -21, -1, -13, 18,
+    6, 30, 73, 103, 0, 0, 0, 0, 18, -13, 7, 0,
+    -2, 8, -6, -9, -9, -6, -5, -11, -17, -15, -5, -13,
+    11, -2, -1, -1, -12, 10, -1, -14, -22, -3, -10, 4,
+    64, 96, 106, 96, 8, 8, 82, 76, -157,
+];
+
 static DEFAULT_WEIGHTS: OnceLock<Weights> = OnceLock::new();
 /// A/B testing hook for a tuning run's output, same reversible pattern
 /// as `KESTREL_EVAL_MODE` above: with the env var unset (every
@@ -836,7 +908,13 @@ pub fn default_weights() -> &'static Weights {
                 }
             }
         }
-        Weights::default()
+        // Default agora = pesos calibrados pelo tuner do Kestrel (TUNED_R5,
+        // ver doc acima). O env var KESTREL_TUNED_WEIGHTS continua a
+        // permitir testar OUTRO conjunto por cima destes. from_vec só
+        // toca nos campos do Weights presentes no to_vec (mobilidade/
+        // threats/pawn-structure/king-safety weights) -- material/PST e
+        // king_danger_table ficam das consts.
+        Weights::default().from_vec(&TUNED_R5)
     })
 }
 
