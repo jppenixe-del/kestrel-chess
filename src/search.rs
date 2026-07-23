@@ -120,17 +120,28 @@ pub struct SearchParams {
     /// ProbCut margin above beta for the cheap verification search
     /// (was a hardcoded `beta + 150`).
     pub probcut_beta_margin: i32,
-    /// Aspiration window (Sirius's real formula, search.cpp
-    /// `aspWindows`) -- see `search_root()`. Previously: flat initial
-    /// delta of 25, always-narrow window from depth 2 on, doubling on
-    /// every fail. Real Sirius formula: score-scaled initial delta,
-    /// full-width window below `min_asp_depth`, gentler ~1.18x
-    /// widening, AND a depth-reduction-then-recovery on fail-high
-    /// (search the re-try shallower first, escalate back toward full
-    /// depth) instead of always re-searching at the full target depth.
+    /// Aspiration window fields -- 2026-07-23: the real Sirius formula
+    /// built from these was A/B tested and reverted (39% vs baseline,
+    /// clear negative, third such signal for this area in this
+    /// codebase -- see NOTAS). `search_root()` is back to the old flat-
+    /// delta version and no longer reads these. Left in the struct
+    /// (real values, harmless dead data) rather than torn back out,
+    /// in case a future session wants to retry with a different
+    /// integration than a straight swap.
     pub asp_init_delta: i32,
     pub asp_widening_factor: i32,
     pub min_asp_depth: i32,
+    /// doDeeper/doShallower: after an LMR-reduced null-window search
+    /// beats alpha, Sirius doesn't always re-search at the plain
+    /// target depth -- if the reduced score beat alpha by a wide
+    /// margin (relative to this node's best score so far), it goes
+    /// ONE PLY DEEPER than the target on the re-search (the move looks
+    /// unusually strong, worth the extra ply); if it barely beat alpha,
+    /// ONE PLY SHALLOWER (save time on a marginal improvement). Real
+    /// Sirius values (search.cpp).
+    pub do_deeper_margin_base: i32,
+    pub do_deeper_margin_depth: i32,
+    pub do_shallower_margin: i32,
 }
 
 impl Default for SearchParams {
@@ -178,6 +189,9 @@ impl Default for SearchParams {
             asp_init_delta: 10,
             asp_widening_factor: 46,
             min_asp_depth: 6,
+            do_deeper_margin_base: 36,
+            do_deeper_margin_depth: 141,
+            do_shallower_margin: 8,
         }
     }
 }
@@ -215,6 +229,9 @@ impl SearchParams {
             self.asp_init_delta,
             self.asp_widening_factor,
             self.min_asp_depth,
+            self.do_deeper_margin_base,
+            self.do_deeper_margin_depth,
+            self.do_shallower_margin,
         ]
     }
     pub fn from_vec(v: &[i32]) -> Self {
@@ -243,6 +260,9 @@ impl SearchParams {
             asp_init_delta: v[27],
             asp_widening_factor: v[28],
             min_asp_depth: v[29],
+            do_deeper_margin_base: v[30],
+            do_deeper_margin_depth: v[31],
+            do_shallower_margin: v[32],
         }
     }
 }
@@ -1776,13 +1796,33 @@ impl<'a> Searcher<'a> {
                     0
                 };
                 // PVS: janela nula primeiro (reduzida se LMR), re-pesquisa se prometedor
-                let mut s = -self.negamax(board, depth - 1 + extend - r, -alpha - 1, -alpha, ply + 1, false);
+                let new_depth = depth - 1 + extend;
+                let mut research_depth = new_depth;
+                let mut s = -self.negamax(board, new_depth - r, -alpha - 1, -alpha, ply + 1, false);
                 if r > 0 && s > alpha && !self.stop {
-                    // a versao reduzida bateu alpha: re-pesquisa a profundidade completa
-                    s = -self.negamax(board, depth - 1 + extend, -alpha - 1, -alpha, ply + 1, false);
+                    // doDeeper/doShallower (real Sirius, search.cpp):
+                    // a versao reduzida nao so' bateu alpha, bateu por
+                    // MUITO (relativo ao best_score deste no' ate'
+                    // agora) -- vale a pena ir 1 ply MAIS FUNDO que o
+                    // alvo normal na re-pesquisa, o lance parece
+                    // invulgarmente forte. Se so' bateu alpha por
+                    // pouco, 1 ply MAIS RASO poupa tempo numa melhoria
+                    // marginal. Sem margem nenhuma (nem funda nem
+                    // rasa): re-pesquisa normal ao alvo.
+                    let sp = search_params();
+                    let do_deeper = s > best_score + sp.do_deeper_margin_base + sp.do_deeper_margin_depth * new_depth / 64;
+                    let do_shallower = s < best_score + sp.do_shallower_margin;
+                    research_depth = if do_deeper {
+                        new_depth + 1
+                    } else if do_shallower {
+                        (new_depth - 1).max(1)
+                    } else {
+                        new_depth
+                    };
+                    s = -self.negamax(board, research_depth, -alpha - 1, -alpha, ply + 1, false);
                 }
                 if s > alpha && s < beta && !self.stop {
-                    s = -self.negamax(board, depth - 1 + extend, -beta, -alpha, ply + 1, false)
+                    s = -self.negamax(board, research_depth, -beta, -alpha, ply + 1, false)
                 }
                 s
             };

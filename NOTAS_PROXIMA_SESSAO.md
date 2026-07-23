@@ -2029,3 +2029,26 @@ próximas (16000 vs 16384, confirmado em sessão anterior). Resultado:
 **exactamente 50.0%/50.0%** (300 jogos) -- neutro, mantido por ser
 valor real portado (mesma política já aplicada a RFP/razor/LMR-
 thresholds).
+
+**doDeeper/doShallower** (`da6e27b`->próximo commit): depois da
+re-pesquisa LMR de janela nula bater alpha, Sirius não repete sempre à
+profundidade normal -- se bateu alpha por MUITA margem (relativo ao
+`best_score` deste nó até agora), vai 1 ply MAIS FUNDO na re-pesquisa;
+se bateu por pouco, 1 ply MAIS RASO. Valores reais do Sirius
+(`do_deeper_margin_base=36, do_deeper_margin_depth=141,
+do_shallower_margin=8`). A pesquisa final de janela completa (PV),
+quando necessária, reusa a profundidade já ajustada, não volta à
+original -- confirmado que bate certo com o Sirius real.
+
+**Resultado**: 46.0% vs 54.0% (baseline), 300 jogos -- negativo real
+mas moderado (~8 pontos, nem ruído puro tipo os casos de ~2-3 pontos
+já mantidos, nem a regressão clara de ~20+ pontos da aspiração/NMP-
+verificação já revertidas). Pedida revisão independente do Fable
+especificamente a este código antes de decidir (dado ficar numa "zona
+cinzenta") -- **revisão confirmou: sem bug**, port fiel ao Sirius real
+em todos os pontos verificados (timing do `best_score`, propagação da
+profundidade ajustada para a pesquisa PV final, operadores de
+comparação das margens, caso degenerado do `do_shallower`). **Mantido
+e commitado** -- resultado negativo real mas sem bug encontrado não é
+motivo para reverter um valor genuíno portado, mesma política já
+aplicada a outros casos esta sessão.
