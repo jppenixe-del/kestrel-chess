@@ -2134,3 +2134,44 @@ resolver o problema específico de roque tardio que visava corrigir
 rocar"). Verificação directa desse efeito específico (comparar o lance
 médio de roque do novo binário vs o antigo) fica como possível
 follow-up, não crítico agora.
+
+**Verificação directa feita** (`check_castle_timing.py`, self-play em
+4 aberturas diferentes, binário antigo vs novo): **antigo rocou em só
+4/8 casos possíveis** (lado x abertura), lance médio 13.5; **novo
+rocou em 6/8 casos**, lance médio 12.17 -- mais frequente E mais cedo,
+consistente com o efeito pretendido, mesmo a amostra sendo pequena.
+Confirma que o termo está mesmo a resolver o padrão específico visado,
+independentemente do win-rate agregado neutro. Script apagado depois
+de confirmar (`check_castle_timing.py`), não faz parte do repo.
+
+## Atualização 2026-07-23 (continuação): termo `threats` da correction history fechado (6º termo)
+
+Gestão de tempo (item #3 do Fable) explicitamente adiada por ser o
+item mais arriscado que sobra (precisa de testes a controlo de tempo
+REAL, não nós fixos -- reintroduz exactamente o ruído que a
+metodologia de self-play desta sessão foi desenhada para evitar, mais
+matemática de potência fraccionária). Em vez disso, fechado o `threats`
+da correction history (Sirius real, `threatsCorrWeight=252`) -- só
+faltava um helper "todas as casas atacadas pelo lado X"
+(`all_attacks`, nova função em search.rs, itera peça a peça usando as
+tabelas de ataque já existentes) que não existia standalone antes.
+Hash = `enemy_attacks & own_pieces` (quais das nossas peças estão sob
+ataque), mesmo padrão das outras 5 tabelas de corr-hist.
+
+**Peso isolado, não redistribuído**: em vez de reescalar os 5 pesos já
+validados (o que juntaria uma reescala com uma adição, quebrando o
+isolamento de mudanças desta sessão), o `threats` recebeu o seu
+próprio peso usando a MESMA taxa de conversão original
+(256/1762≈0.1453) aplicada só a ele: `252*0.1453≈37`
+(`CORR_WEIGHT_THREATS=37`). Tecto teórico do pior caso sobe de 257
+para 294 (~15% acima), aumento modesto e limitado.
+
+**Resultado**: 47.3% vs 52.7% (baseline), 300 jogos -- negativo leve,
+mesma magnitude de outros casos já mantidos esta sessão (LMR
+thresholds, doDeeper/doShallower). Mantido e commitado -- valor real
+portado, orçamento isolado, sem base para suspeitar de bug.
+
+Correction history agora com 6 dos 7 termos base do Sirius (só falta
+os 6 lags de continuation-history, que precisam duma tabela partilhada
+4D e mais infra -- fica registado como próximo passo se houver
+interesse em continuar).
