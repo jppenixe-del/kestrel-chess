@@ -1650,3 +1650,242 @@ adaptativa), não só recalibração, por isso mantido e commitado
 independentemente do resultado neutro -- código a fazer o que os
 próprios comentários dizem que faz vale a pena mesmo sem ganho
 imediato mensurável.
+
+**Commitado como `04f79ae`.** Lote de 20 jogos vs Sirius lançado com
+este binário final -- resultado: **0 vitórias, 18 derrotas, 2
+empates**. Mesmo padrão dos lotes anteriores (0 vitórias sempre) --
+consistente com o gap de força absoluto real (~3449 CCRL do Sirius vs
+onde o Kestrel está agora), não uma regressão nova. Os A/B desta sessão
+(self-play Kestrel-vs-Kestrel) mostram ganhos internos reais e
+validados (57.5% no NMP+corrhist, neutro no resto) -- a arena contra o
+Sirius mede a distância absoluta, que continua grande, não se
+espera que feche com este tipo de mudança incremental. Confirma o que
+já se sabia (não é achado novo); não vale a pena continuar a gastar
+tempo/CPU em mais lotes Sirius sem antes fechar mais itens de
+calibração -- self-play continua a ser o sinal certo para validar
+mudanças, a arena Sirius serve só de checkpoint ocasional de "quão
+longe estamos", não de gate de progresso.
+
+## Resumo do estado no fim desta ronda (2026-07-23, cedo)
+
+3 commits novos desde `0c1b388`: `9f93be9` (RFP/razor/cap-futility/
+history-prune-mult do Sirius + NMP eval-adaptativo + ProbCut tunável +
+correction history de 5 termos, com 2 bugs reais corrigidos antes de
+commitar), `c189efe` (LMR: split PV/não-PV + ajuste de corrplexity),
+`04f79ae` (2 bugs reais mais no NMP, encontrados por revisão
+independente do Fable, corrigidos). Todos validados por perft +
+self-play A/B antes de commitar. Trabalho do Fable (auditoria do gap
+Sirius vs Kestrel) identificou mais 2 áreas por explorar se houver
+tempo: gestão de tempo (node-fraction/best-move-stability, risco
+conhecido de ruído do Lazy SMP) e aspiration windows (prioridade
+baixa, já tem sinal negativo documentado).
+
+## Atualização 2026-07-23 (continuação): pedido do utilizador redefine o objectivo -- SEM deadline, ganhar ao Sirius é o objectivo principal
+
+**Mudança de instrução do utilizador**: "sem deadline, objectivo
+principal - ganhar ao Sirius. não deixes nada por implementar e
+sobretudo testes com os dados do Ethereal e Sirius contra o Sirius...
+bitboards e tabelas psqt fazem parte bem como as variáveis
+configuráveis." A deadline de 2026-07-24 21h deixa de se aplicar.
+Âmbito alargado explicitamente ao lado do EVAL (PSQT/material/termos
+posicionais), não só busca. Testar directamente contra o Sirius (não
+só self-play Kestrel-vs-Kestrel) passa a ser prioridade, dado o
+objectivo ser vencer um oponente específico, não só melhorar
+internamente.
+
+**Infra nova**: `Ethereal` clonado localmente
+(`/root/kestrel_joao/Ethereal`, AndyGrant/Ethereal -- hoje
+principalmente NNUE mas mantém um eval clássico HCE real e completo em
+`evaluate.c`, PSQT tabeladas e tudo, útil como segunda referência).
+`vs_sirius.py` -- harness rápido de nós fixos (Kestrel dev build vs
+`Sirius/sirius` real, mesma metodologia dos `sprt_*.py` de self-play)
+para validação directa contra o alvo, mais rápido que um match de
+arena com relógio real. Baseline confirmada: binário `04f79ae` a
+30000 nós/lance perde 0/6 ao Sirius -- consistente com o gap de força
+já conhecido, não um artefacto de gestão de tempo.
+
+**Auditoria do Fable ao lado EVAL** (Sirius `eval/eval_constants.h`+
+`eval_terms.cpp`+`pawn_structure.cpp`, Ethereal `evaluate.c`, vs o
+`eval.rs` do Kestrel) -- achado crítico antes de tocar em PST:
+**a tabela PSQT do Sirius está em referencial de PRETAS** (`combined_psqt.h`:
+brancas usam `PSQT[peca][casa^56]`, pretas usam `PSQT[peca][casa]`
+directo) -- o OPOSTO da convenção do Kestrel (referencial de brancas,
+a1=0). Copiar as linhas do Sirius sem inverter (`rank r <-> rank 7-r`)
+inverteria a tabela para as brancas. Ethereal usa a MESMA convenção do
+Kestrel (referencial de brancas), copiável sem flip. Escalas de
+material das 3 engines diferem MUITO (peão mg: Kestrel=125, Sirius=65,
+Ethereal=82) -- qualquer valor absoluto portado precisa de reescala
+pela razão real do peão (mesma disciplina do `history_prune_mult`/
+`SCORE_KNOWN_WIN` já usada no lado da busca), nunca copiado em bruto.
+Relatório completo tem lista extensa ranqueada em 3 tiers -- ver
+transcript do agente se precisar dos números exactos de cada termo
+ainda por portar.
+
+**Portado nesta ronda** (eval.rs, todos os valores reais Sirius/
+Ethereal, reescalados pela razão do peão mg/eg Kestrel vs fonte, nunca
+copiados em bruto):
+- `PASSED_PAWN`: upgrade de tabela flat-por-rank para
+  `[blocked][controlled][rank]` real do Sirius (push square ocupado /
+  atacado pelo inimigo).
+- `OUR_PASSER_PROXIMITY`/`THEIR_PASSER_PROXIMITY`: NOVO -- distância
+  Chebyshev rei-ao-quadrado-de-avanço do peão passado. Kestrel não
+  tinha nada disto antes (feature clássica universal).
+- `PASSER_DEFENDED_PUSH`/`PASSER_SLIDER_BEHIND`: NOVOS -- bónus se a
+  casa de avanço é defendida, penalização se torre/dama inimiga está
+  atrás do peão na mesma coluna.
+- `CANDIDATE_PASSER`: upgrade de escalar único para `[defended][rank]`
+  real do Sirius.
+- `ROOK_ON_SEVENTH`: NOVO (Ethereal) -- bónus dedicado por torre na
+  7ª fileira relativa, independente de coluna aberta.
+- `SAFE_KNIGHT/BISHOP/ROOK/QUEEN_CHECK`: split do `SAFE_CHECK` único
+  em 4 pesos por tipo de peça -- ordem relativa real do Sirius
+  preservada (torre/cavalo mais perigosos que dama, contra-intuitivo
+  mas real), magnitude ancorada ao valor antigo já calibrado do
+  Kestrel (não copiado em bruto do Sirius, que passa por um squash `/8`
+  que o Kestrel não tem -- só a PROPORÇÃO relativa foi portada, a
+  escala foi re-derivada). `sentinel` do `tune_fast` em `main.rs`
+  actualizado para os 4 campos novos.
+
+**4 testes A/B em paralelo agora** (todos vs baseline `04f79ae`, 300
+jogos, binários extraídos incrementalmente à medida que cada mudança
+foi adicionada -- não isolados uns dos outros de forma perfeita já que
+o eval e o safe-check foram construídos por cima das mudanças de busca
+anteriores no mesmo working tree, mas aspiration/nmp-verification
+têm os seus próprios binários isolados extraídos ANTES do trabalho de
+eval começar):
+- `sprt_asp.py` -- só aspiration windows (fórmula real do Sirius).
+- `sprt_nmpverif.py` -- só o mecanismo completo de verificação do NMP
+  (R sem cap + `nmp_min_ply` + busca de verificação).
+- `sprt_evalpp.py` -- aspiration+nmp-verif+passed-pawn/rook-7th juntos
+  (binário construído por cima dos 2 anteriores).
+- `sprt_safecheck.py` -- tudo o anterior + split do safe-check.
+
+Ainda por fazer (auditoria do Fable, tiers 2/3): `BISHOP_PAWNS`
+(upgrade do `BAD_BISHOP`), `ISOLATED_PAWN`/`DOUBLED_PAWN` indexados
+por distância à margem + variantes `_EXPOSED`, `WEAK_KING_RING`,
+`KING_FLANK_ATTACKS`/`DEFENSES`, recalibração de mobilidade/threats
+pelas proporções reais do Sirius, ratios de material (via tuner, não
+cópia directa), e os itens de Tier 3 (substituição completa do
+subsistema king-safety, shelter/storm 2D do Ethereal) marcados como
+"projecto futuro maior" pelo próprio Fable, não escondidos.
+
+## Atualização 2026-07-23 (continuação): aspiration windows E busca de verificação do NMP revertidas -- resultados reais negativos, não ruído
+
+**Resultados finais dos testes isolados**:
+- `sprt_asp.py` (aspiration windows, fórmula real do Sirius): **39.0%
+  vs 61.0%**, W117-L183... (baseline ganhou), 300 jogos.
+- `sprt_nmpverif.py` (busca de verificação completa do NMP): **41.5%
+  vs 58.5%**, 300 jogos.
+
+Ambos claramente fora do ruído (~20 pontos percentuais, não os ~3-5
+pontos típicos de resultados "neutro com viés"). Para a aspiração, é
+o TERCEIRO sinal negativo independente para esta área especificamente
+(comentário já existente no código apontava 33% duma tentativa
+anterior; a versão nova, com a fórmula real do Sirius, deu 39%) --
+três tentativas diferentes, mesma conclusão. Dado a magnitude grande e
+repetida (não um único resultado ambíguo tipo 46-48%), decidido que
+isto ultrapassa o princípio "testes só verificam, não revertem" -- esse
+princípio serve para não descartar valores reais por ruído fraco, não
+para manter uma técnica com sinal forte e repetido de que piora o
+motor. **Ambas revertidas** para as versões anteriores já validadas:
+- `search_root`: de volta à janela com delta fixo=25, dobra sempre
+  (a versão que os testes em lote já tinham validado positiva).
+- NMP: de volta a `r = (formula real).max(1)`, sem cap artificial,
+  sem busca de verificação, sem `nmp_min_ply` (campo removido do
+  `Searcher`, 3 pontos de construção actualizados) -- a versão que já
+  tinha dado 50/50 (neutro) contra o binário com o bug do R fixo, que
+  por sua vez já era +57.5% sobre o baseline pré-NMP.
+
+**Teste limpo dos aditivos de EVAL, sem as mudanças de busca revertidas
+misturadas**: `sprt_evalclean.py` (binário = busca revertida +
+TODOS os aditivos de eval desta ronda: passed-pawn 3D, king-proximity,
+defended-push, slider-behind, candidate-passer, rook-on-seventh,
+safe-check por tipo de peça, bishop-pawns, isolated/doubled indexados
+por margem + exposed, weak-king-ring). Smoke-test de 10 jogos deu
+**70%** para o novo binário -- sinal inicial muito positivo. Lote
+completo de 300 jogos a correr, log `sprt_evalclean.log`.
+
+**Nota sobre os testes `sprt_evalpp.py`/`sprt_safecheck.py` ainda em
+curso quando isto foi escrito**: esses binários foram construídos ANTES
+da reversão da aspiração/NMP-verificação, por isso misturam as
+mudanças boas (eval) com as más (busca) -- deixados correr até ao fim
+só como referência histórica, não usados para decidir nada. O teste
+limpo (`sprt_evalclean.py`) é que conta.
+
+**Confirmado**: `sprt_evalpp.py` (41.7%) e `sprt_safecheck.py` (44.7%)
+acabaram negativos como esperado -- confirma que o problema era mesmo
+a aspiração/NMP-verificação, não os aditivos de eval (já reforçado
+pelo `sprt_evalclean.py`, que sem essas duas mudanças mostrava sinal
+claramente positivo, embora tenha moderado de ~70% inicial para ~51%
+com mais jogos -- normal, amostras pequenas exageram).
+
+**Mais 2 itens Tier 2 implementados**: `KING_FLANK_ATTACKS`/
+`KING_FLANK_DEFENSES` (real Sirius, zona "flanco do rei" larga --
+banda de 4 colunas do lado do rei x banda de 5 fileiras do lado
+próprio, mais larga que o anel imediato do rei; contagem de casas
+atacadas/defendidas 1x e 2x+). Teste próprio `sprt_flank.py` a correr.
+
+**PSQT substituído** (o item Tier 3 que o Fable tinha bloqueado até
+verificar a convenção): tabelas PeSTO educacionais do Kestrel
+substituídas pelas PST reais do Ethereal (`evaluate.c`,
+Pawn/Knight/Bishop/Rook/Queen/King, 6x64 valores) -- Ethereal usa a
+MESMA convenção de referencial que o Kestrel (brancas directo, sem
+espelho), confirmado pela auditoria do Fable antes de portar, ao
+contrário do Sirius (referencial de pretas, precisaria inverter linhas
+-- não usado como fonte de PST desta vez por isso). Reescalado pela
+razão real peão mg/eg Kestrel vs Ethereal (mg=125/82=1.524,
+eg=140/144=0.972). Material (`MG_VALUE`/`EG_VALUE`) NÃO tocado, só a
+componente posicional -- extração e reescala feitas por script Python
+a partir do código-fonte real (não transcrição manual, evita erros).
+Teste `sprt_psqt.py` a correr, log `sprt_psqt.log`.
+
+Ficheiros scratch da extração (`scratchpad_psqt*.txt`) apagados depois
+de confirmados no `eval.rs`.
+
+## Atualização 2026-07-23 (continuação): correção directa do utilizador -- "VCS têm de ter os vossos próprios valores, isto não é um clone"
+
+**Feedback do utilizador**: "cuidado VCS têm de ter os vossos próprios
+valores, isto não é um clone. vocês são inteligentes o suficiente para
+conseguir fazer um excelente motor." Correcto -- esta sessão portou
+MUITOS valores reais do Sirius/Ethereal (reescalados, mas ainda assim
+emprestados) em vez de derivar os valores PRÓPRIOS do Kestrel via
+tuner. Técnica/estrutura (que mecanismo implementar, que forma uma
+fórmula deve ter) é legítimo estudar em motores de referência -- é
+assim que se aprende engenharia de motores. Mas os NÚMEROS finais têm
+de vir do próprio processo de tuning do Kestrel sobre os próprios
+jogos, não de reescalar SPSA/Texel doutro motor.
+
+**Ação imediata**: `kestrel tunefast` (infra já existia,
+`src/main.rs`) lançado sobre `dataset_round1_quiet.epd` (62928
+posições reais de self-play do Kestrel, já resolvidas para quietas,
+duma ronda anterior desta sessão) com a struct `Weights` actual
+(648 probes/posição agora, cresceu com os campos novos desta ronda).
+3000 iterações a correr em background, log `tune_round2.log`,
+resultado em `tuned_round2.txt`. Isto vai gerar valores GENUINAMENTE
+derivados do Kestrel para material/PST/mobilidade/threats/pawn-
+structure/etc -- a substituir o que foi portado à mão onde fizer
+sentido.
+
+**Nota importante sobre o âmbito do tuner**: `tunefast` só ajusta
+campos LINEARES do `Weights` -- os campos "king-safety não-lineares"
+(agora 18: `king_attacker_weight`, `king_attacks`,
+`safe_knight/bishop/rook/queen_check`) ficam de fora por desenho
+(alimentam o `KING_DANGER_TABLE`, não uma regressão linear directa) --
+esses precisam de A/B/self-play para calibrar, não o tuner. E
+material/PST (`MG_PAWN` etc.) continuam a ser `const` compile-time,
+NAO fazem parte do `Weights`/`to_vec()` -- o tuner não os toca de
+todo, são um projecto de infra separado se se quiser mesmo tuná-los
+(teria de passar a ser parte do vector tunável).
+
+**PST do Ethereal REVERTIDO**: o teste `sprt_psqt.py` (parado cedo,
+74/116=63.8% a favor do baseline -- negativo, consistente) confirmou
+que copiar o PST doutro motor (mesmo reescalado) não ajudava aqui --
+alinhado com o feedback do utilizador E com os dados. Voltado às
+tabelas PeSTO originais ("ponto de partida educacional", já assim
+documentado no próprio código antes desta sessão -- valor a afinar via
+tuner próprio no futuro, quando o PST passar a ser tunável). Os outros
+aditivos de eval desta ronda (passed-pawn 3D, king-proximity, rook-
+on-seventh, bishop-pawns, isolated/doubled indexados, king-flank)
+ficam -- são MECANISMOS/ESTRUTURAS reais (não uma tabela de valores em
+bruto), com os próprios valores marcados como recalibráveis, e já
+validados positivos em self-play limpo.

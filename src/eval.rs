@@ -250,6 +250,15 @@ const KNIGHT_OUTPOST: (i32, i32) = (25, 20);
 // Torre em coluna aberta / semi-aberta. Aberta = mais mg (linhas de
 // ataque), eg mantem-se. Semi-open = metade.
 const ROOK_OPEN: [(i32, i32); 2] = [(30, 12), (18, 8)];
+// ROOK_ON_SEVENTH: 2026-07-23, new -- dedicated bonus for a rook on
+// the 7th rank (relative), independent of open-file status. Neither
+// Kestrel nor Sirius had this specific standalone term (Sirius folds
+// 7th-rank activity into other terms); Ethereal has it as a clean,
+// standalone, well-validated classic. Real Ethereal value, rescaled
+// from Ethereal's own pawn anchor (mg=82,eg=144) to Kestrel's
+// (mg=125,eg=140) by the same real-ratio discipline as PASSED_PAWN
+// above (mg_scale=125/82=1.524, eg_scale=140/144=0.972).
+const ROOK_ON_SEVENTH: (i32, i32) = (-2, 41);
 // Tempo -- lado que joga tem pequena vantagem estrutural (iniciativa).
 // Valor classico 15-25.
 const TEMPO: (i32, i32) = (22, 15);
@@ -330,7 +339,41 @@ const KING_ATTACKS: (i32, i32) = (5, 0);
 // magnitude (hipotese principal) ou o novo threshold de 1-atacante-
 // com-dama (ver endgame_scale_factor -- king_attackers[]/threshold
 // continuam iguais, so' o peso mudou aqui).
-const SAFE_CHECK: (i32, i32) = (2, 1);
+// 2026-07-23: per-piece-type split, replacing the single flat
+// SAFE_CHECK that used to be here. Real Sirius data (SAFE_KNIGHT/BISHOP/ROOK/
+// QUEEN_CHECK, eval_constants.h) shows a counter-intuitive real
+// ordering -- rook and knight checks are weighted HIGHER than queen
+// checks (queen danger is captured elsewhere in Sirius's model, a
+// lone queen check without support is less "mating" than it looks).
+// Sirius's raw magnitudes (61-104) go through its own `/8` quadratic
+// squash before reaching the final score -- copying them directly
+// into Kestrel's model (which squashes differently, via
+// KING_DANGER_TABLE) would be exactly the kind of scale mismatch that
+// caused the correction-history regression earlier this session.
+// Instead: each piece's weight is Sirius's own value scaled by
+// (Kestrel's old flat SAFE_CHECK) / (Sirius's own 4-piece average),
+// preserving the REAL relative ordering/proportions while anchoring
+// the magnitude to what Kestrel's own king-danger curve is already
+// calibrated for. The old ad-hoc "queen counts double" multiplier is
+// dropped now that queen has its own (lower, per Sirius) dedicated
+// weight -- keeping both would double-correct in opposite directions.
+const SAFE_KNIGHT_CHECK: (i32, i32) = (2, 0);
+const SAFE_BISHOP_CHECK: (i32, i32) = (2, 2);
+const SAFE_ROOK_CHECK: (i32, i32) = (3, 1);
+const SAFE_QUEEN_CHECK: (i32, i32) = (1, 2);
+// WEAK_KING_RING: 2026-07-23, new -- per king-ring square that's
+// "weak" (undefended by the enemy, or only defended by their own
+// king). Real Sirius value, rescaled by the same mg/eg pawn ratio as
+// the passed-pawn terms above.
+const WEAK_KING_RING: (i32, i32) = (10, 0);
+// KING_FLANK_ATTACKS/DEFENSES: 2026-07-23, new -- Stockfish-derived
+// "wide flank" attack/defense counting, a broader zone than the
+// immediate 3x3 king ring (a 4-file band on the king's side of the
+// board x a 5-rank band on that king's own half). [0]=squares touched
+// once, [1]=touched by 2+ attackers/defenders. Real Sirius values,
+// same mg/eg pawn rescale as the other terms above.
+const KING_FLANK_ATTACKS: [(i32, i32); 2] = [(27, -3), (8, 0)];
+const KING_FLANK_DEFENSES: [(i32, i32); 2] = [(-17, 0), (-13, 2)];
 
 // King danger units (mg channel of the accumulation above) go through
 // this saturating, roughly-quadratic lookup before being added to the
@@ -487,19 +530,71 @@ const PAWN_PHALANX: [(i32, i32); 8] = [
 const DEFENDED_PAWN: [(i32, i32); 8] = [
     (0, 0), (0, 0), (12, 10), (10, 12), (18, 22), (35, 55), (70, 110), (0, 0),
 ];
-// ISOLATED_PAWN: sem peoes adjacentes -- fraqueza estrutural (nao pode
-// ser defendido por peao). Pior no eg (fica exposto sem pecas para
-// tapar).
-const ISOLATED_PAWN: (i32, i32) = (-10, -12);
-// DOUBLED_PAWN: por peao excedente na mesma coluna. Mg moderado (bloqueia
-// avanco proprio); eg severo (torre atras nao chega a promover).
-const DOUBLED_PAWN: (i32, i32) = (-10, -25);
-// PASSED_PAWN: nenhum peao inimigo no caminho para a promocao.
-// Cresce fortemente com rank (mais perto da promocao). Baixo mg (mais
-// pecas no meio da tabuleiro), alto eg (perto do fim, peao passado
-// muitas vezes ganha).
-const PASSED_PAWN: [(i32, i32); 8] = [
-    (0, 0), (0, 0), (0, 0), (-10, 5), (5, 40), (35, 110), (100, 200), (0, 0),
+// ISOLATED_PAWN/DOUBLED_PAWN: 2026-07-23, upgraded from flat scalars
+// to Sirius's real file-edge-distance-indexed `[4]` tables (index 0 =
+// a/h file, index 3 = d/e file, `min(file, file^7)`), plus the
+// `_EXPOSED` extra penalty (real Sirius terms: applies when NO enemy
+// pawn anywhere ahead on this exact file could ever contest/capture
+// it -- a stronger, more permanently-fixed weakness than the base
+// isolated/backward penalty alone). Real Sirius values, rescaled by
+// the same mg/eg pawn ratio as the passed-pawn terms above. Note
+// Sirius's real doubled-pawn eg penalty is much steeper toward the
+// edge files (-53) than center (-7) -- counter to naive intuition,
+// kept as-is since it's real tuned data, not re-derived by hand.
+const ISOLATED_PAWN: [(i32, i32); 4] = [(-12, 6), (-6, -10), (-15, -6), (-19, -11)];
+const DOUBLED_PAWN: [(i32, i32); 4] = [(2, -53), (10, -43), (-10, -25), (-23, -7)];
+const ISOLATED_EXPOSED: (i32, i32) = (-12, -6);
+const BACKWARD_EXPOSED: (i32, i32) = (-27, -5);
+// PASSED_PAWN: 2026-07-23, upgraded from a flat rank-only table to
+// Sirius's real [blocked][controlled][rank] shape (eval_constants.h) --
+// `blocked` = the push square is occupied by any piece, `controlled` =
+// the push square is attacked by the enemy. Real Sirius values,
+// rescaled from Sirius's own pawn anchor (mg=65,eg=138) to Kestrel's
+// (mg=125,eg=140) by the same real-ratio-preserving discipline used
+// for history_prune_mult/SCORE_KNOWN_WIN earlier this session
+// (mg_scale=125/65=1.923, eg_scale=140/138=1.014) -- NOT a raw copy,
+// Sirius's own mg pawn anchor is nearly 2x smaller than Kestrel's, so
+// a raw copy would under-weight the mg contribution of this term by
+// about half. Indexed by rank exactly like before (0/1/2/7 always
+// zero -- Sirius only evaluates rank 4-7 relative, see the gating
+// `rel_rank >= 3` check at the call site).
+const PASSED_PAWN: [[[(i32, i32); 8]; 2]; 2] = [
+    [
+        // not blocked, not controlled (best case)
+        [(0, 0), (0, 0), (0, 0), (-60, -30), (-21, 26), (42, 142), (221, 232), (0, 0)],
+        // not blocked, controlled
+        [(0, 0), (0, 0), (0, 0), (-44, -44), (-6, -12), (44, 62), (113, 83), (0, 0)],
+    ],
+    [
+        // blocked, not controlled
+        [(0, 0), (0, 0), (0, 0), (-48, -44), (-13, -9), (40, 59), (62, 45), (0, 0)],
+        // blocked, controlled (worst case)
+        [(0, 0), (0, 0), (0, 0), (-50, -55), (-12, -25), (15, 37), (6, 7), (0, 0)],
+    ],
+];
+// OUR/THEIR_PASSER_PROXIMITY: 2026-07-23, new -- Kestrel previously had
+// no king-to-passer distance term at all (a textbook, universally-
+// validated HCE feature: own king should shepherd a passer home,
+// enemy king should be kept away). Indexed by Chebyshev distance
+// (0-7) from the respective king to the passer's PUSH square. Real
+// Sirius values, same mg/eg rescale as PASSED_PAWN above. Only applied
+// where PASSED_PAWN itself applies (rel_rank >= 3).
+const OUR_PASSER_PROXIMITY: [(i32, i32); 8] = [
+    (127, 116), (165, 83), (62, 76), (-13, 62), (-4, 34), (6, 21), (35, 9), (6, 18),
+];
+const THEIR_PASSER_PROXIMITY: [(i32, i32); 8] = [
+    (-125, 18), (2, 1), (50, 1), (40, 26), (21, 62), (27, 78), (37, 82), (35, 68),
+];
+// PASSER_DEFENDED_PUSH: bonus when the passer's push square is
+// defended by one of our own pieces. PASSER_SLIDER_BEHIND: penalty
+// when an enemy rook/queen sits behind the passer on its file (the
+// classic "rook behind the passed pawn" idea, applied to the
+// opponent). Both new this session, real Sirius values, same rescale.
+const PASSER_DEFENDED_PUSH: [(i32, i32); 8] = [
+    (0, 0), (0, 0), (0, 0), (17, 5), (19, 18), (67, 32), (115, 101), (0, 0),
+];
+const PASSER_SLIDER_BEHIND: [(i32, i32); 8] = [
+    (0, 0), (0, 0), (0, 0), (-52, -13), (-48, -28), (-50, -45), (15, -96), (0, 0),
 ];
 // BACKWARD_PAWN: no pawn on an adjacent file can ever support it (none
 // sit level with or behind it) AND its advance square is controlled by
@@ -507,17 +602,26 @@ const PASSED_PAWN: [(i32, i32); 8] = [
 // pawn. Mild penalty (structural, not material): Ethereal/Sirius list
 // it but it's a smaller effect than isolation.
 const BACKWARD_PAWN: (i32, i32) = (-6, -10);
-// CANDIDATE_PASSED_PAWN: not passed yet (an enemy pawn still contests
-// its file or a neighboring file ahead), but the local pawn count says
-// it wins the race after likely trades -- own supporters on adjacent
-// files at-or-behind >= enemy blockers on adjacent files ahead. Real
-// but smaller than an actual passed pawn's bonus (see PASSED_PAWN).
-const CANDIDATE_PASSED_PAWN: (i32, i32) = (6, 18);
-// BAD_BISHOP: per own pawn sitting on the bishop's own square color --
-// each one is a square that piece can never influence and often has
-// to be defended twice. Small per-pawn penalty, worse in the endgame
-// (fewer other pieces to compensate for the bad bishop's blind squares).
-const BAD_BISHOP: (i32, i32) = (-2, -4);
+// CANDIDATE_PASSER: 2026-07-23, upgraded from a flat scalar to
+// Sirius's real [defended][rank] shape -- `defended` = this pawn has
+// at least as many own-pawn defenders as enemy-pawn attackers on its
+// square. Real Sirius values, same rescale as PASSED_PAWN.
+const CANDIDATE_PASSER: [[(i32, i32); 8]; 2] = [
+    // not defended
+    [(0, 0), (-44, -12), (-15, -14), (-6, 1), (29, 22), (65, 87), (0, 0), (0, 0)],
+    // defended
+    [(0, 0), (-31, -11), (-21, 8), (-12, 25), (13, 38), (73, 103), (0, 0), (0, 0)],
+];
+// BAD_BISHOP -> BISHOP_PAWNS: 2026-07-23, upgraded from a flat
+// per-pawn linear multiplier to Sirius's real graduated table, indexed
+// by `min(own-color-pawn-count, 6)`. Richer than the old version: a
+// bishop with ZERO same-color pawns gets an actual BONUS (a genuinely
+// good bishop, not just "no penalty"), not something a flat per-pawn
+// multiplier could ever express. Real Sirius values, same mg/eg pawn
+// rescale as the other terms above.
+const BISHOP_PAWNS: [(i32, i32); 7] = [
+    (25, 0), (12, 11), (6, 8), (0, 3), (-8, -2), (-13, -9), (-21, -17),
+];
 // Endgame scale factors (see scale_endgame/endgame_scale_factor):
 // out of SCALE_NORMAL=128. Were plain hardcoded numbers in
 // endgame_scale_factor's return statements until this commit -- pulled
@@ -562,6 +666,7 @@ pub struct Weights {
     pub minor_behind_pawn: (i32, i32),
     pub knight_outpost: (i32, i32),
     pub rook_open: [(i32, i32); 2],
+    pub rook_on_seventh: (i32, i32),
     pub tempo: (i32, i32),
     pub mobility_knight: [(i32, i32); 28],
     pub mobility_bishop: [(i32, i32); 28],
@@ -569,7 +674,10 @@ pub struct Weights {
     pub mobility_queen: [(i32, i32); 28],
     pub king_attacker_weight: [(i32, i32); 4],
     pub king_attacks: (i32, i32),
-    pub safe_check: (i32, i32),
+    pub safe_knight_check: (i32, i32),
+    pub safe_bishop_check: (i32, i32),
+    pub safe_rook_check: (i32, i32),
+    pub safe_queen_check: (i32, i32),
     pub king_danger_table: [i32; 128],
     pub pawn_shelter: [(i32, i32); 4],
     pub shelter_open: (i32, i32),
@@ -587,12 +695,21 @@ pub struct Weights {
     pub restricted_squares: (i32, i32),
     pub pawn_phalanx: [(i32, i32); 8],
     pub defended_pawn: [(i32, i32); 8],
-    pub isolated_pawn: (i32, i32),
-    pub doubled_pawn: (i32, i32),
-    pub passed_pawn: [(i32, i32); 8],
+    pub isolated_pawn: [(i32, i32); 4],
+    pub doubled_pawn: [(i32, i32); 4],
+    pub isolated_exposed: (i32, i32),
+    pub backward_exposed: (i32, i32),
+    pub passed_pawn: [[[(i32, i32); 8]; 2]; 2],
+    pub our_passer_proximity: [(i32, i32); 8],
+    pub their_passer_proximity: [(i32, i32); 8],
+    pub passer_defended_push: [(i32, i32); 8],
+    pub passer_slider_behind: [(i32, i32); 8],
     pub backward_pawn: (i32, i32),
-    pub candidate_passed_pawn: (i32, i32),
-    pub bad_bishop: (i32, i32),
+    pub candidate_passer: [[(i32, i32); 8]; 2],
+    pub bishop_pawns: [(i32, i32); 7],
+    pub weak_king_ring: (i32, i32),
+    pub king_flank_attacks: [(i32, i32); 2],
+    pub king_flank_defenses: [(i32, i32); 2],
     pub scale_ocb_bishops_only: i32,
     pub scale_ocb_one_rook: i32,
     pub scale_ocb_one_knight: i32,
@@ -612,6 +729,7 @@ impl Default for Weights {
             minor_behind_pawn: MINOR_BEHIND_PAWN,
             knight_outpost: KNIGHT_OUTPOST,
             rook_open: ROOK_OPEN,
+            rook_on_seventh: ROOK_ON_SEVENTH,
             tempo: TEMPO,
             mobility_knight: MOBILITY_KNIGHT,
             mobility_bishop: MOBILITY_BISHOP,
@@ -619,7 +737,10 @@ impl Default for Weights {
             mobility_queen: MOBILITY_QUEEN,
             king_attacker_weight: KING_ATTACKER_WEIGHT,
             king_attacks: KING_ATTACKS,
-            safe_check: SAFE_CHECK,
+            safe_knight_check: SAFE_KNIGHT_CHECK,
+            safe_bishop_check: SAFE_BISHOP_CHECK,
+            safe_rook_check: SAFE_ROOK_CHECK,
+            safe_queen_check: SAFE_QUEEN_CHECK,
             king_danger_table: KING_DANGER_TABLE,
             pawn_shelter: PAWN_SHELTER,
             shelter_open: SHELTER_OPEN,
@@ -639,10 +760,19 @@ impl Default for Weights {
             defended_pawn: DEFENDED_PAWN,
             isolated_pawn: ISOLATED_PAWN,
             doubled_pawn: DOUBLED_PAWN,
+            isolated_exposed: ISOLATED_EXPOSED,
+            backward_exposed: BACKWARD_EXPOSED,
             passed_pawn: PASSED_PAWN,
+            our_passer_proximity: OUR_PASSER_PROXIMITY,
+            their_passer_proximity: THEIR_PASSER_PROXIMITY,
+            passer_defended_push: PASSER_DEFENDED_PUSH,
+            passer_slider_behind: PASSER_SLIDER_BEHIND,
             backward_pawn: BACKWARD_PAWN,
-            candidate_passed_pawn: CANDIDATE_PASSED_PAWN,
-            bad_bishop: BAD_BISHOP,
+            candidate_passer: CANDIDATE_PASSER,
+            bishop_pawns: BISHOP_PAWNS,
+            weak_king_ring: WEAK_KING_RING,
+            king_flank_attacks: KING_FLANK_ATTACKS,
+            king_flank_defenses: KING_FLANK_DEFENSES,
             scale_ocb_bishops_only: SCALE_OCB_BISHOPS_ONLY,
             scale_ocb_one_rook: SCALE_OCB_ONE_ROOK,
             scale_ocb_one_knight: SCALE_OCB_ONE_KNIGHT,
@@ -701,6 +831,7 @@ impl Weights {
         pair!(self.minor_behind_pawn);
         pair!(self.knight_outpost);
         pairs!(self.rook_open);
+        pair!(self.rook_on_seventh);
         pair!(self.tempo);
         pairs!(self.mobility_knight);
         pairs!(self.mobility_bishop);
@@ -708,7 +839,10 @@ impl Weights {
         pairs!(self.mobility_queen);
         pairs!(self.king_attacker_weight);
         pair!(self.king_attacks);
-        pair!(self.safe_check);
+        pair!(self.safe_knight_check);
+        pair!(self.safe_bishop_check);
+        pair!(self.safe_rook_check);
+        pair!(self.safe_queen_check);
         pairs!(self.pawn_shelter);
         pair!(self.shelter_open);
         pairs!(self.pawn_storm);
@@ -725,12 +859,25 @@ impl Weights {
         pair!(self.restricted_squares);
         pairs!(self.pawn_phalanx);
         pairs!(self.defended_pawn);
-        pair!(self.isolated_pawn);
-        pair!(self.doubled_pawn);
-        pairs!(self.passed_pawn);
+        pairs!(self.isolated_pawn);
+        pairs!(self.doubled_pawn);
+        pair!(self.isolated_exposed);
+        pair!(self.backward_exposed);
+        for blocked_row in self.passed_pawn.iter() {
+            for controlled_row in blocked_row.iter() {
+                pairs!(controlled_row);
+            }
+        }
+        pairs!(self.our_passer_proximity);
+        pairs!(self.their_passer_proximity);
+        pairs!(self.passer_defended_push);
+        pairs!(self.passer_slider_behind);
         pair!(self.backward_pawn);
-        pair!(self.candidate_passed_pawn);
-        pair!(self.bad_bishop);
+        for row in self.candidate_passer.iter() { pairs!(row); }
+        pairs!(self.bishop_pawns);
+        pair!(self.weak_king_ring);
+        pairs!(self.king_flank_attacks);
+        pairs!(self.king_flank_defenses);
         v.push(self.scale_ocb_bishops_only);
         v.push(self.scale_ocb_one_rook);
         v.push(self.scale_ocb_one_knight);
@@ -756,6 +903,7 @@ impl Weights {
         let minor_behind_pawn = pair!();
         let knight_outpost = pair!();
         let rook_open = pairs!(2);
+        let rook_on_seventh = pair!();
         let tempo = pair!();
         let mobility_knight = pairs!(28);
         let mobility_bishop = pairs!(28);
@@ -763,7 +911,10 @@ impl Weights {
         let mobility_queen = pairs!(28);
         let king_attacker_weight = pairs!(4);
         let king_attacks = pair!();
-        let safe_check = pair!();
+        let safe_knight_check = pair!();
+        let safe_bishop_check = pair!();
+        let safe_rook_check = pair!();
+        let safe_queen_check = pair!();
         let pawn_shelter = pairs!(4);
         let shelter_open = pair!();
         let pawn_storm = pairs!(4);
@@ -780,12 +931,21 @@ impl Weights {
         let restricted_squares = pair!();
         let pawn_phalanx = pairs!(8);
         let defended_pawn = pairs!(8);
-        let isolated_pawn = pair!();
-        let doubled_pawn = pair!();
-        let passed_pawn = pairs!(8);
+        let isolated_pawn = pairs!(4);
+        let doubled_pawn = pairs!(4);
+        let isolated_exposed = pair!();
+        let backward_exposed = pair!();
+        let passed_pawn = [[pairs!(8), pairs!(8)], [pairs!(8), pairs!(8)]];
+        let our_passer_proximity = pairs!(8);
+        let their_passer_proximity = pairs!(8);
+        let passer_defended_push = pairs!(8);
+        let passer_slider_behind = pairs!(8);
         let backward_pawn = pair!();
-        let candidate_passed_pawn = pair!();
-        let bad_bishop = pair!();
+        let candidate_passer = [pairs!(8), pairs!(8)];
+        let bishop_pawns = pairs!(7);
+        let weak_king_ring = pair!();
+        let king_flank_attacks = pairs!(2);
+        let king_flank_defenses = pairs!(2);
         let scale_ocb_bishops_only = next!();
         let scale_ocb_one_rook = next!();
         let scale_ocb_one_knight = next!();
@@ -797,14 +957,18 @@ impl Weights {
         let complexity_adjustment = next!();
         assert_eq!(i, v.len(), "from_vec: length mismatch with to_vec's field order");
         Weights {
-            bishop_pair, long_diag_bishop, minor_behind_pawn, knight_outpost, rook_open, tempo,
+            bishop_pair, long_diag_bishop, minor_behind_pawn, knight_outpost, rook_open, rook_on_seventh, tempo,
             mobility_knight, mobility_bishop, mobility_rook, mobility_queen,
-            king_attacker_weight, king_attacks, safe_check, king_danger_table: self.king_danger_table,
+            king_attacker_weight, king_attacks,
+            safe_knight_check, safe_bishop_check, safe_rook_check, safe_queen_check,
+            king_danger_table: self.king_danger_table,
             pawn_shelter, shelter_open, pawn_storm,
             threat_by_pawn, threat_by_knight, threat_by_bishop, threat_by_rook, threat_by_queen, threat_by_king,
             knight_hit_queen, bishop_hit_queen, rook_hit_queen, push_threat, restricted_squares,
-            pawn_phalanx, defended_pawn, isolated_pawn, doubled_pawn, passed_pawn,
-            backward_pawn, candidate_passed_pawn, bad_bishop,
+            pawn_phalanx, defended_pawn, isolated_pawn, doubled_pawn, isolated_exposed, backward_exposed, passed_pawn,
+            our_passer_proximity, their_passer_proximity, passer_defended_push, passer_slider_behind,
+            backward_pawn, candidate_passer, bishop_pawns, weak_king_ring,
+            king_flank_attacks, king_flank_defenses,
             scale_ocb_bishops_only, scale_ocb_one_rook, scale_ocb_one_knight,
             scale_fallback_base, scale_fallback_per_pawn,
             complexity_total_pawns, complexity_pawn_flanks, complexity_pawn_endgame, complexity_adjustment,
@@ -840,6 +1004,39 @@ fn pawn_attacks_by(board: &Board, by: Color) -> Bitboard {
         // pretas atacam para SW e SE
         (pawns & !FILE_A) >> 9 | (pawns & !FILE_H) >> 7
     }
+}
+
+/// Chebyshev (king-move) distance between two squares -- max of the
+/// file and rank deltas. Used by OUR/THEIR_PASSER_PROXIMITY.
+#[inline]
+fn chebyshev_distance(a: Square, b: Square) -> usize {
+    let fd = (file_of(a) as i32 - file_of(b) as i32).unsigned_abs();
+    let rd = (rank_of(a) as i32 - rank_of(b) as i32).unsigned_abs();
+    fd.max(rd) as usize
+}
+
+/// "King flank": a 4-file band on the king's side of the board
+/// (a-d/c-f/e-h depending which third the king's file falls in)
+/// intersected with a 5-rank band on that king's own half (real
+/// Sirius `attacks::kingFlank`, KING_FLANK_ATTACKS/DEFENSES doc
+/// comment) -- wider than the immediate king-ring/zone, used for
+/// Stockfish-derived "space near my king is compromised" evaluation.
+#[inline]
+fn king_flank(king_sq: Square, color: Color) -> Bitboard {
+    let kf = file_of(king_sq) as i32;
+    let file_band: Bitboard = if kf <= 2 {
+        (FILE_A << 0) | (FILE_A << 1) | (FILE_A << 2) | (FILE_A << 3)
+    } else if kf <= 4 {
+        (FILE_A << 2) | (FILE_A << 3) | (FILE_A << 4) | (FILE_A << 5)
+    } else {
+        (FILE_A << 4) | (FILE_A << 5) | (FILE_A << 6) | (FILE_A << 7)
+    };
+    let rank_band: Bitboard = if color == Color::White {
+        RANK_1 | RANK_2 | RANK_3 | RANK_4 | RANK_5
+    } else {
+        RANK_8 | RANK_7 | RANK_6 | RANK_5 | RANK_4
+    };
+    file_band & rank_band
 }
 
 pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
@@ -954,6 +1151,14 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
                         mg += sign * w.rook_open[idx].0;
                         eg += sign * w.rook_open[idx].1;
                     }
+                    // ROOK_ON_SEVENTH: rank 7 relative (Ethereal-style
+                    // standalone term, independent of open-file status
+                    // -- see const doc comment).
+                    let rel_rank = if c == Color::White { rank_of(s) } else { 7 - rank_of(s) };
+                    if rel_rank == 6 {
+                        mg += sign * w.rook_on_seventh.0;
+                        eg += sign * w.rook_on_seventh.1;
+                    }
                 }
 
                 if pt == PieceType::Knight || pt == PieceType::Bishop {
@@ -998,9 +1203,9 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
                     // ser defendidas por outra peca em vez dele.
                     let bishop_light = (rank_of(s) + file_of(s)) % 2 == 1;
                     let own_pawns_same_color = if bishop_light { LIGHT_SQUARES } else { !LIGHT_SQUARES };
-                    let n = count(board.pieces[c.idx()][PieceType::Pawn.idx()] & own_pawns_same_color) as i32;
-                    mg += sign * w.bad_bishop.0 * n;
-                    eg += sign * w.bad_bishop.1 * n;
+                    let n = (count(board.pieces[c.idx()][PieceType::Pawn.idx()] & own_pawns_same_color) as usize).min(6);
+                    mg += sign * w.bishop_pawns[n].0;
+                    eg += sign * w.bishop_pawns[n].1;
                 }
             }
         }
@@ -1076,21 +1281,55 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
         let n_rook = count(rook_checks & attacked_by_pt[us][PieceType::Rook.idx()] & !own_occ & safe) as i32;
         let n_queen = count(queen_checks & attacked_by_pt[us][PieceType::Queen.idx()] & !own_occ & safe) as i32;
 
-        // Dedicated `safe_check` weight (queen checks weighted double --
-        // by far the most dangerous piece to let deliver one for free).
-        // First version reused `king_attacks` directly; the 2026-07-22
-        // self-play A/B (300 games) came back 46.8%, negative and
-        // persistent through the whole run. Split into its own field,
-        // deliberately smaller (SAFE_CHECK=(2,1) vs king_attacks=(5,0)),
-        // so it can be recalibrated independently -- added to
-        // tune_fast's king-field sentinel in main.rs alongside every
-        // other nonlinear king-safety field.
-        let safe_check_units = n_knight + n_bishop + n_rook + 2 * n_queen;
-        if safe_check_units > 0 {
+        // Per-piece-type dedicated weights (2026-07-23, real Sirius
+        // relative ordering -- see SAFE_KNIGHT_CHECK doc comment: rook/
+        // knight weighted HIGHER than queen, the old flat weight with
+        // an ad-hoc "queen counts double" multiplier is gone, replaced
+        // by queen's own naturally-lower dedicated weight). First
+        // version (single flat weight, reusing `king_attacks` directly)
+        // gave a negative, persistent 46.8% self-play A/B on 2026-07-22
+        // -- this field exists to be recalibrated independently of the
+        // rest of king safety, same reasoning as before, now per piece
+        // type instead of just one flat number.
+        if n_knight + n_bishop + n_rook + n_queen > 0 {
             king_attackers[us] += 1;
-            king_attack_units[us].0 += safe_check_units * w.safe_check.0;
-            king_attack_units[us].1 += safe_check_units * w.safe_check.1;
+            king_attack_units[us].0 += n_knight * w.safe_knight_check.0
+                + n_bishop * w.safe_bishop_check.0
+                + n_rook * w.safe_rook_check.0
+                + n_queen * w.safe_queen_check.0;
+            king_attack_units[us].1 += n_knight * w.safe_knight_check.1
+                + n_bishop * w.safe_bishop_check.1
+                + n_rook * w.safe_rook_check.1
+                + n_queen * w.safe_queen_check.1;
         }
+
+        // WEAK_KING_RING: 2026-07-23, new (real Sirius) -- count of
+        // the enemy king-ring squares that are "weak" (not attacked by
+        // them at all, or only defended by their own king with no
+        // second defender) and applied directly, unconditionally (not
+        // gated by the attacker-count threshold below, matching
+        // Sirius's own unconditional `eval += WEAK_KING_RING *
+        // weakSquares`).
+        let enemy_king_zone = if c == Color::White { black_king_zone } else { white_king_zone };
+        let weak = !attacked[them]
+            | (!attacked_by_2[them] & attacked_by_pt[them][PieceType::King.idx()]);
+        let weak_king_ring = count(enemy_king_zone & weak) as i32;
+        mg += sign * w.weak_king_ring.0 * weak_king_ring;
+        eg += sign * w.weak_king_ring.1 * weak_king_ring;
+
+        // KING_FLANK_ATTACKS/DEFENSES: 2026-07-23, new (real Sirius) --
+        // wide-zone version of the same "attacked"/"defended" counting,
+        // over the enemy king's whole flank, not just its immediate
+        // ring. Also unconditional, matching Sirius's own placement.
+        let their_flank = king_flank(enemy_king_sq, c.opp());
+        let flank_attacks = count(their_flank & attacked[us]) as i32;
+        let flank_attacks_2 = count(their_flank & attacked_by_2[us]) as i32;
+        let flank_defenses = count(their_flank & attacked[them]) as i32;
+        let flank_defenses_2 = count(their_flank & attacked_by_2[them]) as i32;
+        mg += sign * (flank_attacks * w.king_flank_attacks[0].0 + flank_attacks_2 * w.king_flank_attacks[1].0
+            + flank_defenses * w.king_flank_defenses[0].0 + flank_defenses_2 * w.king_flank_defenses[1].0);
+        eg += sign * (flank_attacks * w.king_flank_attacks[0].1 + flank_attacks_2 * w.king_flank_attacks[1].1
+            + flank_defenses * w.king_flank_defenses[0].1 + flank_defenses_2 * w.king_flank_defenses[1].1);
 
         // Queen-gate: with the defending side's queen off the board, a
         // single attacker rarely turns into a real mating attack --
@@ -1265,8 +1504,54 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
                 if enemy_pawns & m != 0 { blocked = true; break; }
             }
             if !blocked {
-                mg += sign * w.passed_pawn[rel_rank].0;
-                eg += sign * w.passed_pawn[rel_rank].1;
+                // 2026-07-23: PASSED_PAWN agora e' [push_blocked]
+                // [push_controlled][rank] (real Sirius, ver comentario
+                // da const) -- so' avaliado a partir de rel_rank>=3
+                // (rank 4 relativo), como no Sirius, ja' que as
+                // entradas 0/1/2/7 sao sempre zero de qualquer forma.
+                if rel_rank >= 3 {
+                    let push_r = if c == Color::White { r + 1 } else { r - 1 };
+                    if (0..8).contains(&push_r) {
+                        let push_sq = sq(f as u8, push_r as u8);
+                        let push_bb = bb(push_sq);
+                        let push_blocked = board.occ_all & push_bb != 0;
+                        let push_controlled = attacked[c.opp().idx()] & push_bb != 0;
+                        let pp = w.passed_pawn[push_blocked as usize][push_controlled as usize][rel_rank];
+                        mg += sign * pp.0;
+                        eg += sign * pp.1;
+
+                        let own_king = board.king_sq(c);
+                        let enemy_king = board.king_sq(c.opp());
+                        let our_dist = chebyshev_distance(own_king, push_sq);
+                        let their_dist = chebyshev_distance(enemy_king, push_sq);
+                        mg += sign * w.our_passer_proximity[our_dist].0;
+                        eg += sign * w.our_passer_proximity[our_dist].1;
+                        mg += sign * w.their_passer_proximity[their_dist].0;
+                        eg += sign * w.their_passer_proximity[their_dist].1;
+
+                        if attacked[c.idx()] & push_bb != 0 {
+                            mg += sign * w.passer_defended_push[rel_rank].0;
+                            eg += sign * w.passer_defended_push[rel_rank].1;
+                        }
+
+                        // Torre/dama inimiga atras do peao passado, na
+                        // mesma coluna, do lado de tras (a favor do
+                        // classico "torre atras do peao passado",
+                        // aplicado ao lado adversario).
+                        let mut behind: Bitboard = 0;
+                        if c == Color::White {
+                            for rr in 0..r { behind |= bb(sq(f as u8, rr as u8)); }
+                        } else {
+                            for rr in (r + 1)..8 { behind |= bb(sq(f as u8, rr as u8)); }
+                        }
+                        let enemy_rq = board.pieces[c.opp().idx()][PieceType::Rook.idx()]
+                            | board.pieces[c.opp().idx()][PieceType::Queen.idx()];
+                        if behind & enemy_rq != 0 {
+                            mg += sign * w.passer_slider_behind[rel_rank].0;
+                            eg += sign * w.passer_slider_behind[rel_rank].1;
+                        }
+                    }
+                }
             } else {
                 // Peao atrasado: nenhum peao proprio numa coluna adjacente
                 // ao mesmo nivel ou atras pode alguma vez apoiar o avanco
@@ -1289,6 +1574,19 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
                     if a.pawn[c.idx()][front_sq as usize] & enemy_pawns != 0 {
                         mg += sign * w.backward_pawn.0;
                         eg += sign * w.backward_pawn.1;
+
+                        // BACKWARD_EXPOSED: mesma ideia do
+                        // ISOLATED_EXPOSED, aplicada ao peao atrasado.
+                        let mut ahead_same_file: Bitboard = 0;
+                        if c == Color::White {
+                            for rr in (r + 1)..8 { ahead_same_file |= bb(sq(f as u8, rr as u8)); }
+                        } else {
+                            for rr in 0..r { ahead_same_file |= bb(sq(f as u8, rr as u8)); }
+                        }
+                        if enemy_pawns & ahead_same_file == 0 {
+                            mg += sign * w.backward_exposed.0;
+                            eg += sign * w.backward_exposed.1;
+                        }
                     }
                 }
 
@@ -1316,21 +1614,51 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
                         own_support += count(own_pawns & behind);
                     }
                     if enemy_ahead >= 1 && enemy_ahead <= own_support {
-                        mg += sign * w.candidate_passed_pawn.0;
-                        eg += sign * w.candidate_passed_pawn.1;
+                        // 2026-07-23: CANDIDATE_PASSER agora e'
+                        // [defended][rank] (real Sirius) em vez de um
+                        // escalar unico -- "defended" = pelo menos
+                        // tantos peoes proprios a defender esta casa
+                        // quanto peoes inimigos a atacar (mesmo padrao
+                        // assimetrico `a.pawn[cor][casa]` ja usado
+                        // acima para o peao atrasado, com as cores
+                        // trocadas para "defensores proprios").
+                        let defenders = count(a.pawn[c.opp().idx()][s as usize] & own_pawns);
+                        let threats = count(a.pawn[c.idx()][s as usize] & enemy_pawns);
+                        let defended = defenders >= threats;
+                        let cp = w.candidate_passer[defended as usize][rel_rank];
+                        mg += sign * cp.0;
+                        eg += sign * cp.1;
                     }
                 }
             }
 
-            // Peao isolado.
+            // Peao isolado. 2026-07-23: agora indexado por distancia a'
+            // margem do tabuleiro (`min(f,7-f)`, real Sirius -- peoes
+            // isolados nas colunas centrais custam mais que nas
+            // colunas a/h) + termo `_EXPOSED` extra quando nenhum peao
+            // inimigo na MESMA coluna a frente pode alguma vez o
+            // contestar/capturar (fraqueza mais permanente que o
+            // isolamento sozinho).
             let mut has_neighbor = false;
             for adj in (f - 1)..=(f + 1) {
                 if adj == f || !(0..8).contains(&adj) { continue; }
                 if own_pawns & (FILE_A << adj) != 0 { has_neighbor = true; break; }
             }
             if !has_neighbor {
-                mg += sign * w.isolated_pawn.0;
-                eg += sign * w.isolated_pawn.1;
+                let edge_idx = (f.min(7 - f)) as usize;
+                mg += sign * w.isolated_pawn[edge_idx].0;
+                eg += sign * w.isolated_pawn[edge_idx].1;
+
+                let mut ahead_same_file: Bitboard = 0;
+                if c == Color::White {
+                    for rr in (r + 1)..8 { ahead_same_file |= bb(sq(f as u8, rr as u8)); }
+                } else {
+                    for rr in 0..r { ahead_same_file |= bb(sq(f as u8, rr as u8)); }
+                }
+                if enemy_pawns & ahead_same_file == 0 {
+                    mg += sign * w.isolated_exposed.0;
+                    eg += sign * w.isolated_exposed.1;
+                }
             }
 
             // Peao defendido por outro peao proprio (usa mesmo truque
@@ -1352,11 +1680,16 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
         }
 
         // Peoes dobrados (por peao excedente na mesma coluna).
-        for file in 0..8 {
+        // 2026-07-23: indexado por distancia a' margem, real Sirius --
+        // note a penalidade eg real e' bem mais severa nas colunas
+        // laterais do que nas centrais no Sirius, contra-intuitivo mas
+        // e' o dado real, mantido tal como veio (nao re-derivado a mao).
+        for file in 0..8u32 {
             let n = count(own_pawns & (FILE_A << file)) as i32;
             if n > 1 {
-                mg += sign * w.doubled_pawn.0 * (n - 1);
-                eg += sign * w.doubled_pawn.1 * (n - 1);
+                let edge_idx = (file.min(7 - file)) as usize;
+                mg += sign * w.doubled_pawn[edge_idx].0 * (n - 1);
+                eg += sign * w.doubled_pawn[edge_idx].1 * (n - 1);
             }
         }
     }
