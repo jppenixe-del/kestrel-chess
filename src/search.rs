@@ -1755,7 +1755,13 @@ impl<'a> Searcher<'a> {
                     // term.
                     let corrplexity = (static_eval - raw_static_eval).abs();
                     let corrplexity_adj = if corrplexity > 89 { -1 } else { 0 };
-                    (base + hist_adj + ttpv_adj + corrplexity_adj).clamp(0, depth - 1)
+                    // lmrNonImp: Sirius's real term is `+lmrNonImp/1024
+                    // (~=1.46 plies) when !improving` -- reduce MORE
+                    // when the position isn't trending better (same
+                    // `improving` signal RFP/futility already use).
+                    // Rounded to 1 whole ply, same quantization style.
+                    let non_imp_adj = if !improving { 1 } else { 0 };
+                    (base + hist_adj + ttpv_adj + corrplexity_adj + non_imp_adj).clamp(0, depth - 1)
                 } else {
                     0
                 };
