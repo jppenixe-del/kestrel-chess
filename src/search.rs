@@ -1,5 +1,5 @@
 use crate::attacks::{bishop_attacks, rook_attacks, Attacks};
-use crate::bitboard::bb;
+use crate::bitboard::{bb, Bitboard};
 use crate::board::Board;
 use crate::book::{encode_move, Book};
 use crate::eval::evaluate;
@@ -376,18 +376,18 @@ pub struct Searcher<'a> {
     /// Sirius (7-term weighted correction, ~104 elo comment in its
     /// source; Kestrel previously had only the pawn term below). Same
     /// table shape/update rule as `corr_hist`, different hash input.
-    /// `threats` (the 6th/7th Sirius terms) deliberately skipped -- it
-    /// needs an "all squares attacked by side X" bitboard that isn't
-    /// factored out of eval.rs as a standalone callable today; porting
-    /// it would mean a real eval.rs refactor, not just new search
-    /// state, so it's left as a documented follow-up rather than
-    /// force-fit. Continuation-history correction (6 more Sirius terms,
-    /// lags 2-7) also deferred for the same reason (real scope, own
+    /// Continuation-history correction (6 more Sirius terms, lags 2-7)
+    /// deferred (needs a shared 4D per-ply-lag table, real scope, own
     /// follow-up).
     pub corr_hist_np_stm: Box<[i32]>,
     pub corr_hist_np_nstm: Box<[i32]>,
     pub corr_hist_minor: Box<[i32]>,
     pub corr_hist_major: Box<[i32]>,
+    /// 2026-07-23: the `threats` term, added once `all_attacks()`
+    /// (a standalone "all squares attacked by side X" helper, not
+    /// dependent on eval.rs's internal loop state) made it possible
+    /// without a real eval.rs refactor -- see `threats_hash()`.
+    pub corr_hist_threats: Box<[i32]>,
     /// For each ply, the (piece type, to-square) of the move that was
     /// played to reach that ply (i.e. the opponent's last move as seen
     /// from this node) -- set by the parent right before recursing, read
@@ -494,6 +494,14 @@ const CORR_WEIGHT_NP_STM: i32 = 59;
 const CORR_WEIGHT_NP_NSTM: i32 = 41;
 const CORR_WEIGHT_MINOR: i32 = 40;
 const CORR_WEIGHT_MAJOR: i32 = 61;
+// 2026-07-23: threats term, added separately from the 5 above rather
+// than folded into the same rescale (which would mean touching the
+// already-validated 5 weights again, bundling a rescale with an
+// addition -- kept isolated instead, same discipline used all
+// session). Same conversion rate as the original 5-term rescale
+// (256/1762 ~= 0.1453) applied individually to Sirius's real
+// threatsCorrWeight=252: 252*0.1453 ~= 37.
+const CORR_WEIGHT_THREATS: i32 = 37;
 
 /// Cheap, non-incremental pawn-structure hash -- just the two pawn
 /// bitboards mixed together. Not the real Zobrist key (which would
@@ -550,6 +558,55 @@ fn major_piece_hash(board: &Board) -> u64 {
         ^ wq.wrapping_mul(0xFF51AFD7ED558CCD)
         ^ br.wrapping_mul(0xC4CEB9FE1A85EC53)
         ^ bq.wrapping_mul(0x2545F4914F6CDD1D)
+}
+
+/// All squares attacked by every piece of `color` (pawns, knights,
+/// bishops/queens via magic sliding attacks, rooks/queens likewise,
+/// king) -- used only by the threats correction-history term below.
+/// Not incremental (recomputed on demand like the other corr-hist
+/// hashes), acceptable since it's touched once or twice per node, not
+/// in the hot per-move loop.
+fn all_attacks(board: &Board, atk: &Attacks, color: Color) -> Bitboard {
+    let us = color.idx();
+    let occ = board.occ_all;
+    let mut att: Bitboard = 0;
+    let mut pawns = board.pieces[us][PieceType::Pawn.idx()];
+    while pawns != 0 {
+        let s = pawns.trailing_zeros() as usize;
+        pawns &= pawns - 1;
+        att |= atk.pawn[us][s];
+    }
+    let mut knights = board.pieces[us][PieceType::Knight.idx()];
+    while knights != 0 {
+        let s = knights.trailing_zeros() as usize;
+        knights &= knights - 1;
+        att |= atk.knight[s];
+    }
+    let mut bishops = board.pieces[us][PieceType::Bishop.idx()] | board.pieces[us][PieceType::Queen.idx()];
+    while bishops != 0 {
+        let s = bishops.trailing_zeros() as u8;
+        bishops &= bishops - 1;
+        att |= bishop_attacks(s, occ);
+    }
+    let mut rooks = board.pieces[us][PieceType::Rook.idx()] | board.pieces[us][PieceType::Queen.idx()];
+    while rooks != 0 {
+        let s = rooks.trailing_zeros() as u8;
+        rooks &= rooks - 1;
+        att |= rook_attacks(s, occ);
+    }
+    let king_sq = board.pieces[us][PieceType::King.idx()].trailing_zeros() as usize;
+    att |= atk.king[king_sq];
+    att
+}
+
+/// Threats correction hash: which of OUR pieces are currently attacked
+/// by the enemy (real Sirius: `threatsKey = hash(threats & ownPieces)`
+/// where `threats` = squares attacked by the opponent).
+fn threats_hash(board: &Board, atk: &Attacks) -> u64 {
+    let enemy_attacks = all_attacks(board, atk, board.side.opp());
+    let own_pieces = board.occ_color[board.side.idx()];
+    let threatened = enemy_attacks & own_pieces;
+    threatened.wrapping_mul(0x2545F4914F6CDD1D) ^ threatened.wrapping_mul(0x9E3779B97F4A7C15).rotate_left(17)
 }
 
 /// 2026-07-20 (BUG REAL encontrado por auditoria -- investigacao da
@@ -837,11 +894,12 @@ impl<'a> Searcher<'a> {
     /// and friends). Used only where the raw static eval feeds a
     /// PRUNING margin decision, never for the real leaf value.
     ///
-    /// 2026-07-22: weighted sum of 5 correction-history dimensions
+    /// 2026-07-22/23: weighted sum of 6 correction-history dimensions
     /// (pawn structure, non-pawn material of each side, minor pieces,
-    /// major pieces), real SPSA weights ported from Sirius
+    /// major pieces, threats), real SPSA weights ported from Sirius
     /// (search_params.h: pawnCorrWeight, nonPawnStmCorrWeight,
-    /// nonPawnNstmCorrWeight, minorCorrWeight, majorCorrWeight).
+    /// nonPawnNstmCorrWeight, minorCorrWeight, majorCorrWeight,
+    /// threatsCorrWeight).
     /// Previously just the pawn term alone with an implicit weight of
     /// `CORR_HIST_GRAIN` (i.e. "full effect", no partial trust) --
     /// Sirius's real pawn weight is 384/256 = 1.5x that, so this is a
@@ -855,11 +913,13 @@ impl<'a> Searcher<'a> {
         let np_nstm_idx = self.corr_idx(board, non_pawn_hash(board, board.side.opp()));
         let minor_idx = self.corr_idx(board, minor_piece_hash(board));
         let major_idx = self.corr_idx(board, major_piece_hash(board));
+        let threats_idx = self.corr_idx(board, threats_hash(board, self.atk));
         let sum = self.corr_hist[pawn_idx] * CORR_WEIGHT_PAWN
             + self.corr_hist_np_stm[np_stm_idx] * CORR_WEIGHT_NP_STM
             + self.corr_hist_np_nstm[np_nstm_idx] * CORR_WEIGHT_NP_NSTM
             + self.corr_hist_minor[minor_idx] * CORR_WEIGHT_MINOR
-            + self.corr_hist_major[major_idx] * CORR_WEIGHT_MAJOR;
+            + self.corr_hist_major[major_idx] * CORR_WEIGHT_MAJOR
+            + self.corr_hist_threats[threats_idx] * CORR_WEIGHT_THREATS;
         raw + sum / (CORR_HIST_GRAIN * CORR_WEIGHT_SCALE)
     }
 
@@ -883,12 +943,14 @@ impl<'a> Searcher<'a> {
         let np_nstm_idx = self.corr_idx(board, non_pawn_hash(board, board.side.opp()));
         let minor_idx = self.corr_idx(board, minor_piece_hash(board));
         let major_idx = self.corr_idx(board, major_piece_hash(board));
+        let threats_idx = self.corr_idx(board, threats_hash(board, self.atk));
         for (table, idx) in [
             (&mut self.corr_hist, pawn_idx),
             (&mut self.corr_hist_np_stm, np_stm_idx),
             (&mut self.corr_hist_np_nstm, np_nstm_idx),
             (&mut self.corr_hist_minor, minor_idx),
             (&mut self.corr_hist_major, major_idx),
+            (&mut self.corr_hist_threats, threats_idx),
         ] {
             let v = &mut table[idx];
             *v += (diff - *v) * weight / 256;
