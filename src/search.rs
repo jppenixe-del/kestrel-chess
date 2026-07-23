@@ -120,6 +120,17 @@ pub struct SearchParams {
     /// ProbCut margin above beta for the cheap verification search
     /// (was a hardcoded `beta + 150`).
     pub probcut_beta_margin: i32,
+    /// Aspiration window (Sirius's real formula, search.cpp
+    /// `aspWindows`) -- see `search_root()`. Previously: flat initial
+    /// delta of 25, always-narrow window from depth 2 on, doubling on
+    /// every fail. Real Sirius formula: score-scaled initial delta,
+    /// full-width window below `min_asp_depth`, gentler ~1.18x
+    /// widening, AND a depth-reduction-then-recovery on fail-high
+    /// (search the re-try shallower first, escalate back toward full
+    /// depth) instead of always re-searching at the full target depth.
+    pub asp_init_delta: i32,
+    pub asp_widening_factor: i32,
+    pub min_asp_depth: i32,
 }
 
 impl Default for SearchParams {
@@ -164,6 +175,9 @@ impl Default for SearchParams {
             nmp_eval_reduction_scale: 208,
             nmp_max_eval_reduction: 4,
             probcut_beta_margin: 182,
+            asp_init_delta: 10,
+            asp_widening_factor: 46,
+            min_asp_depth: 6,
         }
     }
 }
@@ -198,6 +212,9 @@ impl SearchParams {
             self.nmp_eval_reduction_scale,
             self.nmp_max_eval_reduction,
             self.probcut_beta_margin,
+            self.asp_init_delta,
+            self.asp_widening_factor,
+            self.min_asp_depth,
         ]
     }
     pub fn from_vec(v: &[i32]) -> Self {
@@ -223,6 +240,9 @@ impl SearchParams {
             nmp_eval_reduction_scale: v[24],
             nmp_max_eval_reduction: v[25],
             probcut_beta_margin: v[26],
+            asp_init_delta: v[27],
+            asp_widening_factor: v[28],
+            min_asp_depth: v[29],
         }
     }
 }
@@ -1360,6 +1380,16 @@ impl<'a> Searcher<'a> {
         // guardada no stack; confirmado por revisao do Fable 2026-07-
         // 23, o comentario anterior estava trocado e o segundo gate
         // usava `raw_static_eval` por engano) usado nos DOIS gates.
+        // 2026-07-23: tentei portar a busca de verificacao completa do
+        // Sirius (R sem cap + `nmp_min_ply` + re-busca real quando
+        // depth>15 e beta e' quase decisivo) -- A/B isolado (300
+        // jogos) deu 41.5%, negativo e claro. Revertido para esta
+        // versao (formula real do R, `.max(1)` simples, sem cap
+        // artificial nem busca de verificacao) -- e' a versao que já
+        // tinha validado 50/50 (neutro) contra o estado anterior
+        // (R fixo=4 por bug), que por sua vez já era +57.5% sobre o
+        // baseline pre-NMP. Ver NOTAS_PROXIMA_SESSAO para o historico
+        // completo.
         let sp_nmp = search_params();
         if depth >= sp_nmp.nmp_min_depth
             && !in_check
@@ -1372,24 +1402,9 @@ impl<'a> Searcher<'a> {
             && static_eval
                 >= beta + sp_nmp.nmp_static_eval_base_margin - sp_nmp.nmp_static_eval_depth_margin * depth
         {
-            // R: revisao do Fable (2026-07-23) encontrou que a formula
-            // real portada nunca produz menos que ~5 com as constantes
-            // reais do Sirius (nmp_base_reduction=1343 sozinho ja' da'
-            // (1343+78*depth)/256 >= 5 para qualquer depth>=
-            // nmp_min_depth), por isso o `.clamp(1,4)` anterior
-            // colapsava silenciosamente para um R=4 FIXO sempre -- o
-            // comentario "eval-adaptativo" descrevia codigo morto
-            // (ainda assim validado como melhoria real sobre o antigo
-            // `depth>6?3:2` fixo via self-play, mas pela razao errada).
-            // Corrigido subtraindo um offset de seguranca (3) antes do
-            // clamp final, restaurando resposta genuina a
-            // profundidade/eval, mantendo a mesma razao de antes para
-            // ainda precisar de um limite superior (a busca de
-            // verificacao do Sirius, que tornaria seguro confiar num R
-            // grande, continua nao portada -- ver comentario abaixo).
-            let raw_r = (sp_nmp.nmp_base_reduction + depth * sp_nmp.nmp_depth_reduction_scale) / 256
-                + ((static_eval - beta) / sp_nmp.nmp_eval_reduction_scale).min(sp_nmp.nmp_max_eval_reduction);
-            let r = (raw_r - 3).clamp(1, 6);
+            let r = ((sp_nmp.nmp_base_reduction + depth * sp_nmp.nmp_depth_reduction_scale) / 256
+                + ((static_eval - beta) / sp_nmp.nmp_eval_reduction_scale).min(sp_nmp.nmp_max_eval_reduction))
+                .max(1);
             let undo = board.make_null_move();
             let score = -self.negamax(board, depth - r, -beta, -beta + 1, ply + 1, true);
             board.unmake_null_move(&undo);
@@ -1917,12 +1932,20 @@ impl<'a> Searcher<'a> {
     /// primeiro uma janela estreita centrada no score da iteracao
     /// anterior -- corta muito mais no resto da arvore -- e alarga
     /// (dobra o delta) e repete se falhar por baixo ou por cima, ate'
-    /// obter um score dentro da janela ou o tempo esgotar. Testada
-    /// isoladamente com resultado negativo (33%); reintroduzida em lote
-    /// com futility/RFP/razoring/mate-distance-pruning para testar
-    /// possivel sinergia (pedido explicito do utilizador -- pecas
-    /// individuais podem parecer negativas isoladas mas positivas em
-    /// conjunto).
+    /// obter um score dentro da janela ou o tempo esgotar.
+    ///
+    /// 2026-07-23: tentei substituir por a formula REAL do Sirius
+    /// (`aspWindows`, delta escalado por prev_score^2, janela total
+    /// abaixo de profundidade 6, alargamento ~1.18x em vez de 2x,
+    /// fail-high com profundidade reduzida) -- A/B isolado (300 jogos)
+    /// deu 39% negativo, claro e fora do ruido. Combinado com o
+    /// terceiro dado negativo ja' existente para esta area (versao
+    /// antiga isolada: 33%), tres sinais independentes na mesma
+    /// direccao -- revertido para esta versao (delta fixo=25, janela
+    /// estreita desde profundidade 2, dobra sempre), que E' a versao
+    /// que os testes em lote (futility/RFP/razoring/mate-distance)
+    /// validaram como positiva em conjunto. Ver NOTAS_PROXIMA_SESSAO
+    /// para o historico completo.
     fn search_root(&mut self, board: &mut Board, depth: i32, prev_score: i32) -> i32 {
         if depth <= 1 {
             return self.negamax(board, depth, -MATE_SCORE - 1, MATE_SCORE + 1, 0, false);

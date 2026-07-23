@@ -417,7 +417,10 @@ fn tune_fast(dataset_path: &str, out_path: &str, iters: u32, lr: f64) {
     let mut sentinel = default.from_vec(&vec![0i32; dim]);
     sentinel.king_attacker_weight = [(1, 1); 4];
     sentinel.king_attacks = (1, 1);
-    sentinel.safe_check = (1, 1);
+    sentinel.safe_knight_check = (1, 1);
+    sentinel.safe_bishop_check = (1, 1);
+    sentinel.safe_rook_check = (1, 1);
+    sentinel.safe_queen_check = (1, 1);
     let sentinel_vec = sentinel.to_vec();
     let is_king_field: Vec<bool> = sentinel_vec.iter().map(|&x| x == 1).collect();
     let king_field_count = is_king_field.iter().filter(|&&b| b).count();
