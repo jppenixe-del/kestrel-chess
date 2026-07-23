@@ -2091,3 +2091,46 @@ brancas ainda não tinham rocado ao fim de 13 lances quando o xeque
 aconteceu, perdendo o direito de rocar permanentemente a partir daí --
 tema recorrente já visto noutras derrotas (segurança do rei atrasada
 na abertura), fica registado como padrão qualitativo, não como bug.
+
+**Utilizador insistiu no ponto** ("uma das forças do jogo é abrir
+desenvolver Roque depois... e tu não fazes o roque") -- investigado a
+sério em vez de só anotado. Extraí o lance de roque de 14 jogos
+recentes (script Python, parseia o movetext real): **Kestrel roca em
+média ao lance ~11.1, Sirius ao lance ~8.5** -- e mais grave, **Kestrel
+NUNCA roca em 3 de 14 jogos (21%)**, Sirius só em 1 de 14. Padrão real
+e mensurável, confirmado.
+
+**Causa investigada**: nem o Sirius nem o Ethereal têm um termo
+explícito de "direito de roque"/"rei por rocar" -- os dois confiam no
+próprio sistema de segurança do rei (shelter/storm, safe-check,
+king-ring) ser suficientemente bom para penalizar implicitamente um
+rei ainda no centro, uma vez que ataques reais apareçam. Sem valor de
+referência para portar aqui -- **campo genuinamente novo, não um
+porte**, ao contrário de quase tudo o resto desta sessão.
+
+**Implementado**: `UNCASTLED_KING_NO_RIGHTS=(-20,0)` (rei ainda em
+casa E já perdeu os dois direitos de roque -- o pior caso, falhou a
+janela por completo) e `UNCASTLED_KING_HAS_RIGHTS=(-8,0)` (rei ainda
+em casa mas ainda tem pelo menos um direito -- só um empurrão, menos
+severo). Valores modestos escolhidos à mão (sem motor de referência
+para ancorar), taper mg-only (só relevante enquanto há peças para
+atacar o rei). Explicitamente marcado no código como candidato a
+validação por A/B / tuner próprio, não um "valor real" como o resto
+desta sessão. Smoke-test (10 jogos) deu 25% -- negativo, mas amostra
+pequena; lote completo de 300 a correr, `sprt_uncastled.py`.
+
+**Checkpoint Sirius fechado**: 0 vitórias, 20 derrotas, 0 empates (20
+jogos, binário totalmente validado de hoje). Mesma história do gap de
+força absoluto já documentada -- revisão holística do Fable já
+confirmou que o código está limpo, não é regressão.
+
+**Resultado final `sprt_uncastled.py`**: 49.5% vs 50.5% (baseline),
+300 jogos -- essencialmente neutro, o sinal negativo do smoke-test
+pequeno (25%) era ruído de amostra. **Mantido e commitado** -- termo
+motivado por um padrão real e medido (não um palpite às cegas), e um
+resultado neutro no win-rate agregado não significa que não esteja a
+resolver o problema específico de roque tardio que visava corrigir
+(self-play mede força geral, não directamente "quantos lances até
+rocar"). Verificação directa desse efeito específico (comparar o lance
+médio de roque do novo binário vs o antigo) fica como possível
+follow-up, não crítico agora.

@@ -374,6 +374,29 @@ const WEAK_KING_RING: (i32, i32) = (10, 0);
 // same mg/eg pawn rescale as the other terms above.
 const KING_FLANK_ATTACKS: [(i32, i32); 2] = [(27, -3), (8, 0)];
 const KING_FLANK_DEFENSES: [(i32, i32); 2] = [(-17, 0), (-13, 2)];
+// UNCASTLED_KING: 2026-07-23, new -- NOT ported from Sirius or
+// Ethereal (neither has an explicit castling-rights term; both rely
+// on their king-safety systems being rich enough that a king still on
+// its home square scores badly implicitly, once attackers/open files
+// actually threaten it). Added because real games against Sirius
+// showed a genuine, measurable pattern: Kestrel castles ~2.5 moves
+// later than Sirius on average across a sample of recent games, and
+// outright FAILED to castle at all in 3 of 14 games (Sirius: 1 of 14)
+// -- the existing king-safety terms (shelter/storm, safe-check,
+// weak-king-ring, king-flank) are reactive to actual threats, not
+// proactive about the structural risk of staying uncastled. No
+// reference-engine value exists to port here, so these are modest,
+// hand-set placeholders explicitly meant to be self-play-validated
+// (or eventually tuner-derived) rather than trusted as a "real" value
+// the way the rest of this session's ported terms were.
+// [no_rights_left]: king still on its home square AND has already
+// lost ALL castling rights for that side (missed the window
+// entirely, the worse case, matches games where Kestrel never
+// castled at all). [rights_still_available]: king still on its home
+// square but at least one castling right remains (milder -- still
+// time to fix it, just a nudge).
+const UNCASTLED_KING_NO_RIGHTS: (i32, i32) = (-20, 0);
+const UNCASTLED_KING_HAS_RIGHTS: (i32, i32) = (-8, 0);
 
 // King danger units (mg channel of the accumulation above) go through
 // this saturating, roughly-quadratic lookup before being added to the
@@ -710,6 +733,8 @@ pub struct Weights {
     pub weak_king_ring: (i32, i32),
     pub king_flank_attacks: [(i32, i32); 2],
     pub king_flank_defenses: [(i32, i32); 2],
+    pub uncastled_king_no_rights: (i32, i32),
+    pub uncastled_king_has_rights: (i32, i32),
     pub scale_ocb_bishops_only: i32,
     pub scale_ocb_one_rook: i32,
     pub scale_ocb_one_knight: i32,
@@ -773,6 +798,8 @@ impl Default for Weights {
             weak_king_ring: WEAK_KING_RING,
             king_flank_attacks: KING_FLANK_ATTACKS,
             king_flank_defenses: KING_FLANK_DEFENSES,
+            uncastled_king_no_rights: UNCASTLED_KING_NO_RIGHTS,
+            uncastled_king_has_rights: UNCASTLED_KING_HAS_RIGHTS,
             scale_ocb_bishops_only: SCALE_OCB_BISHOPS_ONLY,
             scale_ocb_one_rook: SCALE_OCB_ONE_ROOK,
             scale_ocb_one_knight: SCALE_OCB_ONE_KNIGHT,
@@ -878,6 +905,8 @@ impl Weights {
         pair!(self.weak_king_ring);
         pairs!(self.king_flank_attacks);
         pairs!(self.king_flank_defenses);
+        pair!(self.uncastled_king_no_rights);
+        pair!(self.uncastled_king_has_rights);
         v.push(self.scale_ocb_bishops_only);
         v.push(self.scale_ocb_one_rook);
         v.push(self.scale_ocb_one_knight);
@@ -946,6 +975,8 @@ impl Weights {
         let weak_king_ring = pair!();
         let king_flank_attacks = pairs!(2);
         let king_flank_defenses = pairs!(2);
+        let uncastled_king_no_rights = pair!();
+        let uncastled_king_has_rights = pair!();
         let scale_ocb_bishops_only = next!();
         let scale_ocb_one_rook = next!();
         let scale_ocb_one_knight = next!();
@@ -969,6 +1000,7 @@ impl Weights {
             our_passer_proximity, their_passer_proximity, passer_defended_push, passer_slider_behind,
             backward_pawn, candidate_passer, bishop_pawns, weak_king_ring,
             king_flank_attacks, king_flank_defenses,
+            uncastled_king_no_rights, uncastled_king_has_rights,
             scale_ocb_bishops_only, scale_ocb_one_rook, scale_ocb_one_knight,
             scale_fallback_base, scale_fallback_per_pawn,
             complexity_total_pawns, complexity_pawn_flanks, complexity_pawn_endgame, complexity_adjustment,
@@ -1341,6 +1373,25 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
             let danger_idx = king_attack_units[us].0.clamp(0, 127) as usize;
             mg += sign * w.king_danger_table[danger_idx];
             eg += sign * king_attack_units[us].1;
+        }
+
+        // UNCASTLED_KING: see const doc comment -- added after real
+        // games vs Sirius showed Kestrel castling ~2.5 moves later on
+        // average and outright failing to castle in 3/14 recent games.
+        let home_sq = if c == Color::White { sq(4, 0) } else { sq(4, 7) };
+        if board.king_sq(c) == home_sq {
+            let (king_flag, queen_flag) = if c == Color::White {
+                (crate::board::CASTLE_WK, crate::board::CASTLE_WQ)
+            } else {
+                (crate::board::CASTLE_BK, crate::board::CASTLE_BQ)
+            };
+            if board.castling & (king_flag | queen_flag) == 0 {
+                mg += sign * w.uncastled_king_no_rights.0;
+                eg += sign * w.uncastled_king_no_rights.1;
+            } else {
+                mg += sign * w.uncastled_king_has_rights.0;
+                eg += sign * w.uncastled_king_has_rights.1;
+            }
         }
     }
 
