@@ -2052,3 +2052,42 @@ comparação das margens, caso degenerado do `do_shallower`). **Mantido
 e commitado** -- resultado negativo real mas sem bug encontrado não é
 motivo para reverter um valor genuíno portado, mesma política já
 aplicada a outros casos esta sessão.
+
+## Atualização 2026-07-23 (continuação): revisão holística do Fable a toda a sessão, checkpoint Sirius, castling explicado
+
+**Revisão holística** (todo o diff `0c1b388..6efdba2`, 8 commits) pedida
+para apanhar problemas que só aparecem ao ver tudo junto (interacções
+entre peças, campos mortos deixados por reversões, consistência de
+`to_vec`/`from_vec` depois de 8 commits de adições incrementais).
+**Resultado: limpo** -- nenhum bug novo encontrado. 2 notas cosméticas:
+1. Comentário dizia que os pesos de corr-hist somavam exactamente 256,
+   na realidade somam 257 (arredondamento independente por termo) --
+   comentário corrigido, impacto real desprezável (~0.4% acima do
+   limite antigo, só no caso raro de saturação simultânea das 5
+   tabelas).
+2. `doDeeper`/`doShallower` usava prioridade if/else em vez da
+   aritmética `+/-` real do Sirius (`newDepth += doDeeper - doShallower`)
+   -- com as margens actuais os dois nunca disparam ao mesmo tempo
+   (comportamento idêntico hoje), mas uma reafinação futura das
+   margens para intervalos sobrepostos divergiria silenciosamente do
+   Sirius sob if/else. Corrigido para a forma aritmética real. Ambas
+   as correcções são cosméticas/robustez, sem mudança de comportamento
+   actual -- não precisou de novo A/B.
+
+**Erro de processo (leve, sem consequência real)**: fiz
+`cargo build --release` para estas 2 correcções SEM verificar
+`"running": false` primeiro -- o lote de checkpoint Sirius estava a
+meio (2/20 jogos). Dado que as mudanças são comportamentalmente
+idênticas (confirmado pelo Fable), não há dano real, mas é a MESMA
+lição já documentada antes nesta sessão -- reforçar: verificar sempre
+o estado da arena antes de qualquer build, sem excepções mesmo quando
+a mudança "parece" inofensiva.
+
+**Pergunta do utilizador sobre roque**: no jogo 1 do checkpoint,
+`14. Kf1` não foi "mover o rei em vez de rocar" -- as brancas estavam
+em XEQUE (`13...Bb4+`), e rocar é ilegal em xeque (regra universal do
+xadrez, não bug do motor). Padrão real encontrado ao explicar: as
+brancas ainda não tinham rocado ao fim de 13 lances quando o xeque
+aconteceu, perdendo o direito de rocar permanentemente a partir daí --
+tema recorrente já visto noutras derrotas (segurança do rei atrasada
+na abertura), fica registado como padrão qualitativo, não como bug.

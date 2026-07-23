@@ -484,9 +484,11 @@ const CORR_WEIGHT_SCALE: i32 = 256;
 // Rescaled here to preserve Sirius's REAL relative proportions between
 // the 5 terms (which term matters more than which) while capping the
 // worst-case total (all 5 tables simultaneously maxed the same
-// direction) at exactly the same bound the old single-pawn-term system
-// safely operated at: weights sum to 256 ("1.0"), same as the old
-// implicit pawn-only weight, instead of Sirius's own sum of 1762.
+// direction) close to the same bound the old single-pawn-term system
+// safely operated at: weights sum to 257 (independent per-term
+// rounding of Sirius's real proportions, not tuned to hit exactly
+// 256) -- 0.4% over the old implicit pawn-only weight's bound, instead
+// of Sirius's own much larger sum of 1762.
 const CORR_WEIGHT_PAWN: i32 = 56;
 const CORR_WEIGHT_NP_STM: i32 = 59;
 const CORR_WEIGHT_NP_NSTM: i32 = 41;
@@ -1810,15 +1812,17 @@ impl<'a> Searcher<'a> {
                     // marginal. Sem margem nenhuma (nem funda nem
                     // rasa): re-pesquisa normal ao alvo.
                     let sp = search_params();
-                    let do_deeper = s > best_score + sp.do_deeper_margin_base + sp.do_deeper_margin_depth * new_depth / 64;
-                    let do_shallower = s < best_score + sp.do_shallower_margin;
-                    research_depth = if do_deeper {
-                        new_depth + 1
-                    } else if do_shallower {
-                        (new_depth - 1).max(1)
-                    } else {
-                        new_depth
-                    };
+                    // Arithmetic +/-1, not if/else priority: matches
+                    // Sirius's real `newDepth += doDeeper - doShallower`
+                    // exactly (found by Fable's holistic review
+                    // 2026-07-23 -- with today's margins the two flags
+                    // never fire together so behavior is identical
+                    // either way, but a future margin retune into
+                    // overlapping ranges would silently diverge from
+                    // Sirius under if/else priority).
+                    let do_deeper = (s > best_score + sp.do_deeper_margin_base + sp.do_deeper_margin_depth * new_depth / 64) as i32;
+                    let do_shallower = (s < best_score + sp.do_shallower_margin) as i32;
+                    research_depth = (new_depth + do_deeper - do_shallower).max(1);
                     s = -self.negamax(board, research_depth, -alpha - 1, -alpha, ply + 1, false);
                 }
                 if s > alpha && s < beta && !self.stop {
