@@ -76,6 +76,23 @@ fn main() {
         selfplay_datagen(num_games, out_path, node_limit, threads);
         return;
     }
+    if args.len() >= 4 && args[1] == "selfplaytc" {
+        // 2026-07-23: real time-control self-play, per the standard
+        // Texel-tuning datagen method the user described (games at a
+        // fast real clock, not a node cap) -- separate from
+        // `selfplay` above (node-limited, kept for fast iteration)
+        // since a real clock changes the per-move budget logic
+        // entirely and shouldn't touch that already-working path.
+        let num_games: u32 = args[2].parse().expect("num_games invalido");
+        let out_path = &args[3];
+        let base_ms: u64 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(1000);
+        let inc_ms: u64 = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(80);
+        let threads: usize = args.get(6).and_then(|s| s.parse().ok()).unwrap_or_else(|| {
+            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
+        });
+        selfplay_datagen_tc(num_games, out_path, base_ms, inc_ms, threads);
+        return;
+    }
     if args.len() >= 4 && args[1] == "resolvequiet" {
         resolve_quiet_dataset(&args[2], &args[3]);
         return;
@@ -339,6 +356,232 @@ fn play_one_selfplay_game(
         // the static eval alone can't see), not the settled quiet
         // position Texel tuning is supposed to be trained on. Classical
         // Texel/quiescence-search datasets specifically exclude these.
+        if ply >= SKIP_OPENING_PLIES && !board.in_check(board.side, atk) && !mv.is_capture() && mv.promotion.is_none() {
+            positions.push((board.to_fen(), board.side));
+        }
+
+        board.make_move(&mv);
+        ply += 1;
+        hash_history.push(zob.hash(&board));
+
+        win_plies = if white_score >= WIN_ADJ_THRESHOLD { win_plies + 1 } else { 0 };
+        draw_plies = if white_score.abs() < DRAW_ADJ_THRESHOLD && ply >= DRAW_ADJ_MOVE_NUM * 2 { draw_plies + 1 } else { 0 };
+        loss_plies = if white_score <= -WIN_ADJ_THRESHOLD { loss_plies + 1 } else { 0 };
+
+        if win_plies >= WIN_ADJ_PLIES {
+            result = 1.0;
+            break;
+        }
+        if draw_plies >= DRAW_ADJ_PLIES {
+            result = 0.5;
+            break;
+        }
+        if loss_plies >= WIN_ADJ_PLIES {
+            result = 0.0;
+            break;
+        }
+    }
+
+    positions.into_iter().map(|(fen, _)| (fen, result)).collect()
+}
+
+/// Real time-control self-play datagen, per the standard Texel-tuning
+/// method (base+increment clock per side, e.g. 1000ms+80ms, instead of
+/// a node cap) -- structurally the same game loop/filters as
+/// `selfplay_datagen`/`play_one_selfplay_game` above (random 8-ply
+/// opening, mate/repetition/50-move/adjudication endings, quiet-only
+/// position filter, unbalanced-opening discard), only the per-move
+/// search budget changes.
+fn selfplay_datagen_tc(num_games: u32, out_path: &str, base_ms: u64, inc_ms: u64, threads: usize) {
+    use crate::search::{MATE_SCORE, MAX_PLY};
+    let atk = Attacks::new();
+    let zob = zobrist::Zobrist::new();
+    let mate_threshold = MATE_SCORE - MAX_PLY as i32;
+
+    println!("generating {} games, {} threads, {}ms+{}ms/move time control", num_games, threads, base_ms, inc_ms);
+    let t0 = std::time::Instant::now();
+
+    let games_per_thread = num_games.div_ceil(threads as u32);
+    let results: Vec<Vec<(String, f64)>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..threads)
+            .map(|tid| {
+                let atk = &atk;
+                let zob = &zob;
+                scope.spawn(move || {
+                    let mut rng_state: u64 = 0x9E3779B9u64
+                        .wrapping_add(tid as u64)
+                        .wrapping_add(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64);
+                    let mut out = Vec::new();
+                    for g in 0..games_per_thread {
+                        if tid == 0 && g % 50 == 0 && g > 0 {
+                            let done = (g as u64) * (threads as u64);
+                            println!("  thread 0: {}/{} games, {:.1}s elapsed, ~{:.0} games/s", g, games_per_thread, t0.elapsed().as_secs_f64(), done as f64 / t0.elapsed().as_secs_f64().max(0.001));
+                        }
+                        let positions = play_one_selfplay_game_tc(atk, zob, base_ms, inc_ms, &mut rng_state, mate_threshold);
+                        out.extend(positions);
+                    }
+                    out
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    let mut out_file = std::fs::File::create(out_path).expect("nao consegui criar o ficheiro de saida");
+    let mut total = 0u64;
+    for thread_positions in results {
+        for (fen, res) in thread_positions {
+            writeln!(out_file, "{}\t{}", fen, res).unwrap();
+            total += 1;
+        }
+    }
+    println!(
+        "wrote {} positions from {} games in {:.1}s ({:.1} games/s)",
+        total, num_games, t0.elapsed().as_secs_f64(), num_games as f64 / t0.elapsed().as_secs_f64()
+    );
+}
+
+fn play_one_selfplay_game_tc(
+    atk: &Attacks,
+    zob: &zobrist::Zobrist,
+    base_ms: u64,
+    inc_ms: u64,
+    rng_state: &mut u64,
+    mate_threshold: i32,
+) -> Vec<(String, f64)> {
+    use crate::search::{Searcher, SearchLimits, CONT_HIST_SIZE, CORR_HIST_SIZE, MAX_PLY};
+    use crate::types::Color;
+    use std::time::{Duration, Instant};
+
+    const MAX_OPENING_SCORE: i32 = 300;
+    const WIN_ADJ_THRESHOLD: i32 = 2000;
+    const WIN_ADJ_PLIES: i32 = 5;
+    const DRAW_ADJ_THRESHOLD: i32 = 7;
+    const DRAW_ADJ_MOVE_NUM: i32 = 50;
+    const DRAW_ADJ_PLIES: i32 = 8;
+    const MAX_GAME_PLIES: i32 = 300;
+    const SKIP_OPENING_PLIES: i32 = 16;
+    // Same shape as compute_time_budget's Nivel-1 formula in uci.rs
+    // (elastic: remaining/moves_left + a share of the increment), just
+    // without the panic/low-clock tiers -- at base_ms=1000 those tiers
+    // would dominate almost every move, which isn't the point here
+    // (real games at this time control ARE mostly "panic mode" by
+    // uci.rs's own thresholds, that's expected and fine for datagen).
+    const MOVES_LEFT_ESTIMATE: u64 = 30;
+
+    let (board_start, mut hash_history) = 'opening: loop {
+        let mut board = Board::startpos();
+        let mut hashes = vec![zob.hash(&board)];
+        let mut ok = true;
+        for _ in 0..8 {
+            let legal = movegen::generate_legal(&mut board, atk);
+            if legal.is_empty() {
+                ok = false;
+                break;
+            }
+            let idx = (splitmix64(rng_state) as usize) % legal.len();
+            board.make_move(&legal[idx]);
+            hashes.push(zob.hash(&board));
+        }
+        if !ok || movegen::generate_legal(&mut board, atk).is_empty() {
+            continue 'opening;
+        }
+        break 'opening (board, hashes);
+    };
+
+    let mut board = board_start;
+    let tt = tt::TranspositionTable::new(8);
+    let mut positions: Vec<(String, Color)> = Vec::new();
+    let mut win_plies = 0i32;
+    let mut draw_plies = 0i32;
+    let mut loss_plies = 0i32;
+    let mut ply = 0i32;
+    let mut clock_ms = [base_ms, base_ms]; // [white, black]
+    let result: f64;
+
+    loop {
+        let legal = movegen::generate_legal(&mut board, atk);
+        if legal.is_empty() {
+            result = if board.in_check(board.side, atk) {
+                if board.side == Color::White { 0.0 } else { 1.0 }
+            } else {
+                0.5
+            };
+            break;
+        }
+        if board.halfmove >= 100 {
+            result = 0.5;
+            break;
+        }
+        let cur_hash = *hash_history.last().unwrap();
+        if hash_history.iter().filter(|&&h| h == cur_hash).count() >= 3 {
+            result = 0.5;
+            break;
+        }
+        if ply >= MAX_GAME_PLIES {
+            result = 0.5;
+            break;
+        }
+
+        let stm = board.side.idx();
+        if clock_ms[stm] == 0 {
+            // Time forfeit -- rare at this budget but must be handled.
+            result = if board.side == Color::White { 0.0 } else { 1.0 };
+            break;
+        }
+        let budget_ms = (clock_ms[stm] / MOVES_LEFT_ESTIMATE + inc_ms * 3 / 4).clamp(1, clock_ms[stm]);
+        let move_t0 = Instant::now();
+
+        let mut searcher = Searcher {
+            atk,
+            zob,
+            tt: &tt,
+            nodes: 0,
+            limits: SearchLimits {
+                deadline: Some(move_t0 + Duration::from_millis(budget_ms)),
+                max_depth: 64,
+                max_nodes: None,
+                soft_deadline: None,
+            },
+            stop: false,
+            history: hash_history.clone(),
+            killers: [[None; 2]; MAX_PLY],
+            history_scores: [[[0; 64]; 64]; 2],
+            countermoves: [[None; 64]; 6],
+            cont_hist: vec![0i32; CONT_HIST_SIZE].into_boxed_slice(),
+            corr_hist: vec![0i32; CORR_HIST_SIZE * 2].into_boxed_slice(),
+            corr_hist_np_stm: vec![0i32; CORR_HIST_SIZE * 2].into_boxed_slice(),
+            corr_hist_np_nstm: vec![0i32; CORR_HIST_SIZE * 2].into_boxed_slice(),
+            corr_hist_minor: vec![0i32; CORR_HIST_SIZE * 2].into_boxed_slice(),
+            corr_hist_major: vec![0i32; CORR_HIST_SIZE * 2].into_boxed_slice(),
+            ply_last_move: [None; MAX_PLY],
+            static_evals: [0i32; MAX_PLY],
+            root_best: None,
+            excluded_move: None,
+            excluded_root_moves: vec![],
+            style_book: None,
+            root_move_nodes: Vec::new(),
+            capture_history: [[[0; 6]; 6]; 2],
+            dextensions: [0; MAX_PLY],
+        };
+        let (best, score, _depth, _nodes) = searcher.iterative_deepening(&mut board);
+        let elapsed_ms = move_t0.elapsed().as_millis() as u64;
+        clock_ms[stm] = clock_ms[stm].saturating_sub(elapsed_ms).saturating_add(inc_ms);
+        let Some(mv) = best else {
+            result = 0.5;
+            break;
+        };
+        let white_score = if board.side == Color::White { score } else { -score };
+
+        if ply == 0 && white_score.abs() > MAX_OPENING_SCORE {
+            return Vec::new();
+        }
+
+        if score.abs() >= mate_threshold {
+            result = if white_score > 0 { 1.0 } else { 0.0 };
+            break;
+        }
+
         if ply >= SKIP_OPENING_PLIES && !board.in_check(board.side, atk) && !mv.is_capture() && mv.promotion.is_none() {
             positions.push((board.to_fen(), board.side));
         }
