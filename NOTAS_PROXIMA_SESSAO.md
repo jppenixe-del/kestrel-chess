@@ -1889,3 +1889,104 @@ on-seventh, bishop-pawns, isolated/doubled indexados, king-flank)
 ficam -- são MECANISMOS/ESTRUTURAS reais (não uma tabela de valores em
 bruto), com os próprios valores marcados como recalibráveis, e já
 validados positivos em self-play limpo.
+
+**Commitado como `9f088a9`** (reversão aspiração/NMP-verif + aditivos
+de eval Tier 1/2, sem PST).
+
+**Resultados finais dos 2 A/B de eval limpos**: `sprt_evalclean.py`
+(passed-pawn/proximity/rook-7th/safe-check/bishop-pawns/isolated-
+doubled/weak-king-ring) = 51.0% (300 jogos), `sprt_flank.py`
+(king-flank em cima do resto) = 52.5% (300 jogos). Ambos modestos mas
+reais e positivos, consistentes com mecanismos genuínos em vez de
+valores adivinhados.
+
+**Achado sobre o `tunefast`: taxa de aprendizagem antiga (2.0) estava
+completamente errada de escala**. A 1ª tentativa (3000 iterações,
+lr=2.0, igual ao `tuned_round1.txt` anterior) só moveu 1 de 665
+campos, por apenas 1 unidade -- praticamente inerte, apesar do erro
+"cair" ligeiramente (0.089031->0.088811). Causa: `grad[j]/n_pos` com
+`n_pos=62928` torna o passo por iteração minúsculo para a maioria dos
+campos a este lr. Testado lr=1000 (200 iterações): erro caiu 5.3%,
+127/665 campos moveram-se de forma real, sem sinais de instabilidade.
+**Corrida real lançada**: 8000 iterações, lr=1000 -- erro
+0.087223->0.077338 (-11.3%, ainda a descer suavemente no fim, não
+estagnou), 381/665 campos mudaram de forma substancial
+(`tuned_round3.txt`). Nota para o futuro: lr=2.0 (usado no
+`tuned_round1.txt` da sessão anterior) estava errado -- se esse
+resultado antigo foi usado nalgum lado, reconsiderar.
+
+**Também confirmado, não é bug**: `checkweights` reporta
+`eval() != evaluate_with_weights(default)` para as 3 posições de
+teste -- investigado, não é bug, é arquitectura deliberada:
+`evaluate_with_weights()` (usada pelo tuner) omite propositadamente
+`complexity_adjustment()` e `scale_endgame()` (ambos não-lineares,
+fora do âmbito de uma regressão linear) -- só o `positional_terms()` +
+material é regressão linear real, o resto fica de fora do tuner por
+desenho, tal como os campos de king-safety não-lineares (18 campos,
+já excluídos por sentinel).
+
+**Teste A/B lançado**: `sprt_tuned_eval.py` (`KESTREL_TUNED_WEIGHTS=
+tuned_round3.txt` vs sem a env var, 300 jogos), smoke-test de 10 jogos
+deu 60% a favor dos pesos tunados. Log `sprt_tuned_eval.log`.
+
+**Nota honesta sobre o dataset**: `dataset_round1_quiet.epd` (62928
+posições) foi gerado por self-play com uma versão do Kestrel de ONTEM
+(antes de todas as mudanças de eval desta sessão) -- os resultados dos
+jogos continuam válidos como verdade objectiva (não dependem da versão
+que jogou), mas a distribuição de posições pode não reflectir
+perfeitamente o que o Kestrel de HOJE exploraria. Suficiente para já,
+mas se houver tempo, gerar uma ronda nova de self-play com o binário
+actual seria mais representativo -- fica registado, não escondido.
+
+**Resultado final `sprt_tuned_eval.py`**: 49.3% vs 50.7%, essencialmente
+neutro (300 jogos) -- os pesos tunados (`tuned_round3.txt`) não deram
+ganho real mensurável apesar do erro de fitting ter caído 11.3%. Não é
+incomum em Texel tuning: ajustar melhor à PREVISÃO do resultado do
+jogo não implica automaticamente jogar melhor, sobretudo com um
+dataset pequeno/pouco representativo. Confirma a necessidade dum
+dataset maior e mais realista, exactamente o que o utilizador pediu a
+seguir.
+
+## Atualização 2026-07-23 (continuação): metodologia real de Texel Tuning (utilizador citou chessprogramming.org), bot desligado por segurança
+
+**Pedido do utilizador**: seguir a metodologia real descrita em
+https://www.chessprogramming.org/Texel%27s_Tuning_Method -- 64000
+jogos a controlo de tempo RÁPIDO REAL (ex. 1s+0.08s/lance, não nós
+fixos), extrair todas as posições excepto as do livro de abertura e as
+de jogos onde o motor encontrou mate -- tipicamente ~8.8M posições.
+
+**Implementado**: novo comando `kestrel selfplaytc <jogos> <saida>
+[base_ms] [inc_ms] [threads]` (`main.rs`,
+`selfplay_datagen_tc`/`play_one_selfplay_game_tc`) -- mesmo esqueleto
+do `selfplay`/`play_one_selfplay_game` existente (abertura aleatória
+de 8 lances, adjudicação win/draw/loss, filtro de posições quietas já
+validado em sessão anterior, descarte de aberturas desequilibradas),
+mas com um RELÓGIO REAL por lado (`SearchLimits.deadline`, formula
+elástica simples `remaining/30 + inc*3/4`) em vez do limite de nós.
+Mate/livro já eram efectivamente excluídos pelo código antigo (o loop
+sai ANTES de adicionar a posição onde o mate foi encontrado;
+`SKIP_OPENING_PLIES=16` já cobre e excede os 8 lances de "abertura"
+aleatória) -- confirmado por leitura do código, não precisou de mais
+filtros novos.
+
+**Calibração de tempo**: 30 jogos a 1000ms+80ms, 6 threads = 62.3s
+(~0.5 jogos/s) -- para 64000 jogos, estimativa ~35.6 HORAS. Utilizador
+confirmou que aceita esse custo, desde que o CPU fique dedicado (não
+correr mais nada em paralelo).
+
+**Acções de segurança/limpeza pedidas pelo utilizador**:
+- Bot do Lichess (`lichess_bridge.py`, activo desde 21 Julho) **desligado**
+  (`kill -TERM`, paragem limpa) -- pedido explícito ("desliguem o bot
+  senão pode alguém lançar uma interferência").
+- Processo antigo de self-play a nós fixos (`selfplay_round4`, 5000
+  jogos, ~260/834 por thread quando parado) **parado** -- substituído
+  pela ronda nova a controlo de tempo real, CPU liberto por completo.
+
+**Lançado**: `kestrel selfplaytc 64000 dataset_tc64k.epd 1000 80 6` em
+background, log `selfplay_tc64k.log`, ficheiro de saída
+`dataset_tc64k.epd`. **Nenhum outro trabalho de CPU deve correr em
+paralelo enquanto isto não acabar** (~35h estimadas) -- respeitar o
+pedido do utilizador. Quando acabar: `resolvequiet` (se necessário --
+o filtro de quietude já corre durante a geração, confirmar se ainda
+faz falta um passo extra) + `tunefast` com `lr=1000` (a taxa correcta,
+NÃO 2.0) e iterações suficientes (milhares), depois A/B novo.
