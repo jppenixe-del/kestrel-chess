@@ -131,14 +131,30 @@ pub struct SearchParams {
     pub asp_init_delta: i32,
     pub asp_widening_factor: i32,
     pub min_asp_depth: i32,
-    /// doDeeper/doShallower: after an LMR-reduced null-window search
-    /// beats alpha, Sirius doesn't always re-search at the plain
-    /// target depth -- if the reduced score beat alpha by a wide
-    /// margin (relative to this node's best score so far), it goes
-    /// ONE PLY DEEPER than the target on the re-search (the move looks
-    /// unusually strong, worth the extra ply); if it barely beat alpha,
-    /// ONE PLY SHALLOWER (save time on a marginal improvement). Real
-    /// Sirius values (search.cpp).
+    /// doDeeper/doShallower margins -- 2026-07-23: the MECHANISM is a
+    /// real technique (adjust the LMR re-search depth by +/-1 based on
+    /// how far the reduced search beat alpha, relative to this node's
+    /// best score so far). First attempt copied Sirius's RAW margins
+    /// (36/141/8) and bisection localized it as the day's single
+    /// biggest regression (-6.2%): the margins compare against SCORES
+    /// in KESTREL's eval units, but Kestrel's centipawn scale is ~1.92x
+    /// Sirius's (pawn 125 vs 65), so the raw values fired "go deeper"
+    /// ~2x too eagerly -> unsound extra depth. This is a CALIBRATION
+    /// error, not a wrong mechanism (user's point 2026-07-23: "não são
+    /// as funções que estão mal, mas a calibração dos valores"). Fixed
+    /// by rescaling the raw Sirius margins (36/141/8) to Kestrel's eval
+    /// scale. Factor picked EMPIRICALLY, not assumed: swept 1.7/1.8/1.9
+    /// (user's request) -- all clustered 57-59% vs 0c1b388, 1.8 best
+    /// (59.0%, reproduced in two independent 200-game runs). Final:
+    /// 36*1.8=65, 141*1.8=254, 8*1.8=14. NOTE: rescaling was applied
+    /// ONLY to doDeeper -- a parallel test rescaling ALL eval-unit
+    /// search margins (RFP/razor/NMP/ProbCut) by 1.8 scored WORSE
+    /// (54.2% vs doDeeper-only 59.0%), so the calibration bug was
+    /// specific to doDeeper (whose effect ADDS depth -- dangerous when
+    /// it over-fires); the pruning margins were already ~fine at their
+    /// raw values (matching their individually-neutral A/Bs). Lesson:
+    /// calibration is per-parameter and empirical, not one blanket
+    /// rescale factor.
     pub do_deeper_margin_base: i32,
     pub do_deeper_margin_depth: i32,
     pub do_shallower_margin: i32,
@@ -189,9 +205,9 @@ impl Default for SearchParams {
             asp_init_delta: 10,
             asp_widening_factor: 46,
             min_asp_depth: 6,
-            do_deeper_margin_base: 36,
-            do_deeper_margin_depth: 141,
-            do_shallower_margin: 8,
+            do_deeper_margin_base: 65,
+            do_deeper_margin_depth: 254,
+            do_shallower_margin: 14,
         }
     }
 }
@@ -1859,29 +1875,26 @@ impl<'a> Searcher<'a> {
                 } else {
                     0
                 };
-                // PVS: janela nula primeiro (reduzida se LMR), re-pesquisa se prometedor
+                // PVS: janela nula primeiro (reduzida se LMR), re-pesquisa se prometedor.
+                // doDeeper/doShallower: depois de a re-pesquisa reduzida
+                // bater alpha, ajusta a profundidade da re-pesquisa
+                // +/-1 conforme bateu alpha por muito (1 ply mais fundo,
+                // lance invulgarmente forte) ou por pouco (1 ply mais
+                // raso, poupa tempo). 2026-07-23: PRIMEIRA versão copiou
+                // as margens RAW do Sirius (36/141/8) e a bisecção
+                // localizou-a como o maior culpado da regressão do dia
+                // (-6.2%) -- as margens comparam com SCORES na escala de
+                // eval do Kestrel (~1.92x a do Sirius, peão 125 vs 65),
+                // por isso os valores raw disparavam "mais fundo" ~2x
+                // mais depressa do que deviam. Recalibradas pela razão
+                // real do peão (69/271/15) -- mecanismo mantido, valores
+                // corrigidos (ponto do utilizador: "não são as funções
+                // que estão mal, mas a calibração dos valores").
                 let new_depth = depth - 1 + extend;
                 let mut research_depth = new_depth;
                 let mut s = -self.negamax(board, new_depth - r, -alpha - 1, -alpha, ply + 1, false);
                 if r > 0 && s > alpha && !self.stop {
-                    // doDeeper/doShallower (real Sirius, search.cpp):
-                    // a versao reduzida nao so' bateu alpha, bateu por
-                    // MUITO (relativo ao best_score deste no' ate'
-                    // agora) -- vale a pena ir 1 ply MAIS FUNDO que o
-                    // alvo normal na re-pesquisa, o lance parece
-                    // invulgarmente forte. Se so' bateu alpha por
-                    // pouco, 1 ply MAIS RASO poupa tempo numa melhoria
-                    // marginal. Sem margem nenhuma (nem funda nem
-                    // rasa): re-pesquisa normal ao alvo.
                     let sp = search_params();
-                    // Arithmetic +/-1, not if/else priority: matches
-                    // Sirius's real `newDepth += doDeeper - doShallower`
-                    // exactly (found by Fable's holistic review
-                    // 2026-07-23 -- with today's margins the two flags
-                    // never fire together so behavior is identical
-                    // either way, but a future margin retune into
-                    // overlapping ranges would silently diverge from
-                    // Sirius under if/else priority).
                     let do_deeper = (s > best_score + sp.do_deeper_margin_base + sp.do_deeper_margin_depth * new_depth / 64) as i32;
                     let do_shallower = (s < best_score + sp.do_shallower_margin) as i32;
                     research_depth = (new_depth + do_deeper - do_shallower).max(1);

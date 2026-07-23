@@ -2175,3 +2175,326 @@ Correction history agora com 6 dos 7 termos base do Sirius (só falta
 os 6 lags de continuation-history, que precisam duma tabela partilhada
 4D e mais infra -- fica registado como próximo passo se houver
 interesse em continuar).
+
+## Atualização 2026-07-23 (continuação): mudança de filosofia (utilizador) -- "não copiem, aprendam e testem", combate acumulado do dia, hipótese própria
+
+**Correção de rumo do utilizador**: "não copiem os outros aprendam e
+testem. talvez vocês consigam fazer melhor." Reconhecido: fiz demasiado
+PORTE (copiar valores reais reescalados) e vários deram neutro/
+levemente-negativo (LMR thresholds, doDeeper/doShallower, threats
+corr-hist, history divisor) -- sinal de que copiar valores tunados para
+a arquitectura DELES não transfere. O que funcionou de verdade foram
+MECANISMOS que faltavam por completo (NMP eval-adaptativo, correction
+history multi-termo, king-proximity) e a única coisa DESCOBERTA a
+partir dos jogos reais em vez de portada: `UNCASTLED_KING`. Esse é o
+modelo certo -- observar, formular hipótese própria, testar. Daqui em
+diante: estudar os motores de referência só para perceber que
+MECANISMOS existem e porquê; os NÚMEROS vêm do tuner do Kestrel ou de
+hipóteses próprias validadas por A/B, não reescalados.
+
+**Combate acumulado do dia (pedido do utilizador: "combate só com 1
+thread para ver onde está a verdadeira diferença")**: binário de hoje
+(`f192136`, ~13 commits de trabalho) vs binário do INÍCIO da sessão
+(`0c1b388`), ambos Threads=1, 60+1 tempo real, 30 jogos. Adicionado
+`kestrel_session_start` ao `engine_arena.py` e Threads=1 explícito ao
+`kestrel`. **Nota de infra**: o `arena_server.py` estava a correr desde
+22 Jul e tinha importado o `engine_arena.py` ANTES desta edição -- o
+primeiro start falhou em silêncio (KeyError no nome novo, `finally`
+pôs running=False, games_done=0, estado mostrado era stale do match
+Sirius g20). Resolvido com `./arena.sh restart` (seguro, nada estava
+mesmo a jogar). A correr agora. **Este é o teste honesto de se o
+trabalho do dia realmente somou** -- se sair neutro/negativo, é sinal
+de que empilhei peças que individualmente "não fazem mal" mas
+colectivamente não valem, e revejo quais ficam.
+
+**Hipótese própria nova, fundamentada em evidência (a testar DEPOIS
+do combate, não durante -- não competir por CPU com o match
+single-thread)**: medi nos 20 jogos mais recentes vs Sirius quantos
+peões de abrigo cada rei tinha ao lance 25 (peões próprios nas 3
+colunas à volta do rei, nas 2 fileiras à frente). **Kestrel: 1.85 em
+média; Sirius: 2.20** -- o rei do Kestrel fica mensuravelmente mais
+exposto (~0.35 peões a menos), consistente com o padrão do roque/
+segurança do rei que o utilizador apontou. Ressalva honesta: os 20
+jogos são todos derrotas, por isso pode estar confundido com "o
+Kestrel está simplesmente pior e é forçado a posições piores", não
+necessariamente um ponto cego específico do eval. Mas é um sinal real
+e quantificado -- hipótese a testar: o Kestrel subvaloriza manter o
+abrigo de peões do próprio rei intacto (o `pawn_shelter`/`pawn_storm`
+actuais são tabelas flat de 4 entradas, possivelmente fracas demais).
+Ideia PRÓPRIA a explorar, não um porte -- eventualmente calibrada pelo
+tuner, não copiada.
+
+## Atualização 2026-07-23 (continuação): LERO DO UTILIZADOR -- "em multi perdes todos os jogos, o Lazy deve ter um problema" (investigação em curso)
+
+**Observação do utilizador, potencialmente o achado mais importante da
+sessão**: em single-thread o Kestrel-vs-Kestrel é competitivo (combate
+do dia estava ~even), mas em MULTI-thread perde todos os jogos --
+hipótese do utilizador: **o Lazy SMP tem um bug**. Um Lazy SMP correcto
+torna o motor MAIS forte (mais nós), nunca mais fraco. Se multi perde
+ao próprio single-thread, é um bug definitivo.
+
+**Contexto**: o "multi" observado é o **bot do Lichess**
+(`lichess_bridge.py` linha 146: `Threads value 4`). Havia um comentário
+a dizer que Lazy SMP foi validado a 80% (16/20) vs 1 thread em self-play
+-- MAS datado de **2026-07-20**, ANTES de todo o trabalho desta sessão
+(reescrita do NMP, correction history de 6 tabelas, mudanças de LMR,
+etc.). Muito plausível que algo desta sessão tenha degradado/quebrado o
+caminho multi-thread especificamente.
+
+**Análise do código (`search_mt` em uci.rs, `tt.rs`) -- sem custo de
+CPU, feita durante o combate single-thread a correr**:
+- **TT está CORRECTA**: usa o truque XOR sem locks do Hyatt
+  (`key_xor_data = key ^ data`), que detecta e rejeita leituras
+  rasgadas (torn reads). No pior caso perde um hit da TT (custo de
+  performance), nunca devolve um lance corrupto. NÃO é a fonte do bug.
+- **Smell real #1**: a selecção do "melhor thread" desempata por
+  `depth` e depois por **SCORE MAIS ALTO** (`results[i].1 >
+  results[best_idx].1`) -- isto enviesa sistematicamente para o thread
+  mais OPTIMISTA (potencialmente com uma avaliação tacticamente
+  insegura/inflada). Pitfall conhecido do Lazy SMP: a maioria dos
+  motores usa o resultado do thread principal ou um voto, não "score
+  mais alto ganha".
+- **Smell real #2**: a salvaguarda de consenso (contra um thread
+  outlier sozinho -- que o próprio comentário diz ter causado uma
+  derrota real por pendurar uma torre) só activa com `results.len() >
+  2` (3+ threads). O bot corre 4 threads, por isso ESTE em particular
+  activa -- mas mostra que a lógica de selecção é frágil.
+
+**Plano (a executar assim que o combate single-thread acabar -- NÃO
+lançar já, competiria por CPU e poluiria os dois testes)**: teste
+limpo e definitivo -- MESMO binário actual, Threads=1 vs Threads=4,
+tempo REAL fixo, self-play. Se multi perde a single a tempo igual, bug
+confirmado e faço bisect (provavelmente começando pelos 2 smells
+acima, ou por reverter a selecção para "thread principal apenas" que é
+o mais simples e robusto). Se multi ganha ~80% como a validação
+antiga, o Lazy SMP está bem e a observação do utilizador era doutra
+causa (ex.: adversários do Lichess simplesmente mais fortes). Este é
+exactamente o tipo de "aprender e testar, encontrar o problema real"
+pedido -- e se o Lazy SMP estiver mesmo partido, corrigi-lo é
+potencialmente o maior ganho de força disponível (o bot corria 4
+threads e perdia tudo).
+
+## Atualização 2026-07-23 (continuação): ACHADO GRANDE -- o trabalho do dia é NEGATIVO em tempo real, e não é (só) NPS
+
+**Resultado final do combate acumulado do dia** (1 thread, 60+1, 30
+jogos): **binário de hoje 13/30 (43.3%) vs binário do início da sessão
+`0c1b388` 17/30 (56.7%)** -- ~-47 Elo. Os ~13 commits de hoje, no
+conjunto, tornaram o motor MAIS FRACO em tempo real, apesar de as
+mudanças "grandes" terem dado A/B positivo individualmente.
+
+**Causa metodológica identificada**: TODOS os meus A/B desta sessão
+foram a NÓS FIXOS (30000 nós/lance). O combate real é a TEMPO fixo. Um
+teste a nós fixos é CEGO a regressões de NPS. Várias adições de hoje
+custam tempo por nó (correction history de 6 tabelas + o `all_attacks()`
+do termo threats que itera CADA peça com ataques mágicos por nó; eval
+expandido: king-flank, weak-king-ring, passed-pawn 3D, etc.).
+
+**MAS a medição de NPS revela algo mais subtil e mais grave** (mesma
+posição, `go movetime 3000`, 1 thread):
+- `0c1b388`: 1.033M NPS, chegou a **profundidade 16** (3.1M nós)
+- hoje: 0.861M NPS (17% mais lento por nó), MAS chegou a **profundidade
+  19** com MENOS nós (2.58M)
+
+Ou seja: hoje é mais lento por nó mas **poda MUITO mais agressivo**
+(chega mais fundo com menos nós). E mesmo assim a profundidade-19-de-
+hoje PERDE à profundidade-16-antiga. Isto aponta para ALÉM de NPS:
+ou o **eval ficou menos preciso** (os termos portados, mesmo os que
+deram A/B positivo a nós fixos, pioraram a avaliação estática), ou a
+**poda agressiva (NMP com R grande + LMR) é INSEGURA** -- chega a
+"profundidade 19" cortando linhas críticas, por isso a profundidade
+extra é cega.
+
+**Teste decisivo a correr** (`sprt_cumulative.py`, nós fixos 30000,
+hoje vs `0c1b388`, 300 jogos): isola QUALIDADE de VELOCIDADE. Se hoje
+perde TAMBÉM a nós fixos -> o problema é qualidade (eval/poda), não
+velocidade -> reverter/rever as mudanças que degradaram a avaliação ou
+tornaram a poda insegura. Se hoje GANHA a nós fixos mas perde a tempo
+-> é puramente NPS -> reverter as adições caras (threats corr-hist com
+`all_attacks()` é o suspeito nº1 de custo de NPS). A seguir: combate
+real a 1s+0.08s (tempo bullet, pedido do utilizador -- é onde o custo
+de NPS mais dói) e o teste do Lazy SMP.
+
+## Atualização 2026-07-23 (continuação): teste decisivo e BISECÇÃO -- é qualidade E velocidade, e a maior parte do trabalho do dia não ajudou
+
+**Teste decisivo (nós fixos, hoje vs `0c1b388`, 300 jogos)**: hoje
+**47.3%** -- perde TAMBÉM a nós fixos. Logo o problema NÃO é só NPS:
+- a nós fixos: 47.3% (regressão de QUALIDADE -- eval/poda pioraram)
+- a tempo fixo: 43.3% (a mesma regressão de qualidade MAIS o custo de
+  NPS por cima)
+
+A política desta sessão ("manter valores reais portados mesmo quando
+o A/B individual dá neutro/negativo") deixou acumular uma deriva
+negativa nos dois eixos. Estava errada -- o instinto do utilizador
+("não copiem, aprendam e testem") estava certo.
+
+**Bisecção (cada binário vs `0c1b388`, nós fixos, 200 jogos)** --
+resultado NÃO-monotónico, o achado-chave:
+| binário | vs 0c1b388 | o que acrescenta |
+|---|---|---|
+| `9f93be9` | **47.2%** | núcleo de busca (NMP eval-adaptativo, corr-hist, RFP/razor/ProbCut) -- NEGATIVO |
+| `04f79ae` | **51.2%** | + correcções de bug do NMP -- RECUPERA ao pico local |
+| `de68647` | **43.8%** | + termos de eval + afinação de LMR + doDeeper -- MAIOR QUEDA |
+| HEAD | 47.3% | + uncastled + threats |
+
+Duas conclusões: (1) as correcções de bug do NMP em `04f79ae` ajudaram
+mesmo (47.2%->51.2%); (2) o MAIOR dano é o intervalo
+`04f79ae`->`de68647` -- os portes de termos de eval e a afinação de
+LMR, que arrastaram 7.4% para baixo apesar de cada um ter dado A/B
+individual OK. É exactamente o "morte por mil cortes" de valores
+copiados que o utilizador avisou. (Bisecção a afinar mais entre
+`04f79ae` e `de68647` com `90654ad`/`da6e27b` a correr.)
+
+**Direcção provável**: `04f79ae` (só o núcleo de busca com os bugs do
+NMP corrigidos) é o pico local (~51% a nós fixos, ~neutro-a-
+ligeiramente-positivo). Tudo depois disso (termos de eval portados +
+afinação de LMR + uncastled + threats) foi net negativo. Candidato a
+reverter: voltar a `04f79ae` (ou mais atrás), largando os portes de
+eval e a afinação de LMR posterior, mantendo só o núcleo de busca que
+é no pior caso neutro. A CONFIRMAR: testar o ponto de reversão
+escolhido a TEMPO REAL vs `0c1b388` antes de commitar (o núcleo de
+busca também tem custo de NPS das 5 tabelas de corr-hist + ProbCut, por
+isso mesmo `04f79ae` pode ser ligeiramente negativo a tempo real -- se
+for, a reversão certa é mais funda).
+
+## Atualização 2026-07-23 (continuação): bisecção completa -- doDeeper é o culpado nº1, REVERTIDO
+
+**Bisecção completa (cada vs `0c1b388`, nós fixos, 200 jogos)**:
+| binário | vs 0c1b388 | delta |
+|---|---|---|
+| `04f79ae` (núcleo busca, bugs corrigidos) | 51.2% | pico local |
+| `90654ad` (+ termos eval + lmrNonImp) | 50.2% | -1.0 |
+| `da6e27b` (+ history divisor) | 50.0% | -0.2 |
+| **`de68647` (+ doDeeper/doShallower)** | **43.8%** | **-6.2 <- CULPADO** |
+| HEAD (+ uncastled + threats) | 47.3% | +3.5 |
+
+**doDeeper/doShallower é o maior culpado isolado do dia** (-6.2%
+sozinho). Era um porte FIEL do Sirius (Fable confirmou o código) mas
+dum mecanismo/valor ERRADO para a arquitectura do Kestrel: fazia a
+busca chegar a profundidades enganosamente altas (19 vs 16) via
+re-pesquisas mais fundas INSEGURAS. A/B individual já tinha dado 46%
+(negativo), mantido na altura pela política errada "valor real
+portado, sem bug". **REVERTIDO** -- de volta à re-pesquisa PVS simples
+ao alvo, 3 campos `do_*_margin` removidos do `SearchParams`.
+
+**Nota importante e encorajadora**: `uncastled + threats` RECUPERARAM
++3.5% (de 43.8% para 47.3%) -- e `uncastled` é a ÚNICA ideia PRÓPRIA
+(descoberta dos jogos reais, não portada). Sinal de que a abordagem
+certa (observar->hipótese própria->testar) funciona, e a errada
+(copiar valores) não.
+
+**A confirmar**: teste a nós fixos do binário sem doDeeper vs
+`0c1b388` (a correr, `sprt_no_dodeeper.py`) -- esperado recuperar a
+~50%+. Depois: teste a TEMPO REAL (o eixo que ainda tem o custo de NPS
+das expansões de eval/corr-hist por cima). Se ainda negativo a tempo
+real, o próximo alvo é o custo de NPS -- suspeito nº1 o `all_attacks()`
+do termo threats (itera cada peça por nó, chamado no
+`corrected_static_eval` E no `update_corr_hist`).
+
+## Atualização 2026-07-23 (continuação): PONTO CHAVE DO UTILIZADOR -- "não são as funções que estão mal, mas a calibração dos valores"
+
+**Reenquadramento crítico do utilizador** (em resposta à reversão do
+doDeeper): os MECANISMOS não estão errados, é a CALIBRAÇÃO dos VALORES
+deles que está. Não reverter as funções -- calibrá-las para o Kestrel.
+
+**Bug de calibração concreto identificado no doDeeper**: as margens
+(`do_deeper_margin_base=36` etc.) comparam com SCORES na escala de eval
+do Kestrel, mas eu copiei os valores RAW do Sirius. A escala de
+centipeão do Kestrel é ~1.92x a do Sirius (peão 125 vs 65), por isso os
+valores raw disparavam "ir mais fundo" ~2x mais depressa do que deviam
+-> profundidade extra insegura -> o -6.2% da bisecção. **CALIBRAÇÃO,
+não mecanismo errado.** Corrigido: mecanismo RESTAURADO com margens
+reescaladas pela razão do peão (36->69, 141->271, 8->15). A testar
+(`sprt_dodeeper_rescaled.py`).
+
+**Realização MAIOR (potencialmente a raiz de toda a regressão do lado
+da busca)**: quase TODAS as margens de busca que portei estão em
+unidades de eval do Kestrel e foram copiadas RAW do Sirius sem
+reescalar -- RFP (`rfp*Margin`), razoring (`razoringMargin`),
+capture-futility, gates do NMP (`nmpEvalMargin`,
+`nmpStaticEvalBaseMargin`), `probcutBetaMargin`. Se todas disparam ~2x
+demasiado agressivo (por não estarem reescaladas), o núcleo de busca
+poda demasiado -> chega fundo mas inseguro -> perde. Explica
+PERFEITAMENTE o `9f93be9`(núcleo de busca)=47.2% da bisecção e o
+"profundidade 19 mas perde à profundidade 16". **Plano**: se o rescale
+do doDeeper recuperar, aplicar o MESMO rescale (×~1.92, ou o factor
+empírico medido comparando os evals dos dois motores) a TODAS as
+margens de busca em unidades de eval, e testar o conjunto. Isto é
+exactamente o ponto do utilizador -- as funções (RFP/razor/NMP/ProbCut/
+doDeeper) estão todas certas; os valores estavam todos mal calibrados
+por copiar raw sem reescalar para a escala do Kestrel.
+
+**Ressalva sobre o factor de rescale**: a razão do peão é 1.92 no mg
+mas ~1.01 no eg (peão eg Kestrel 140 vs Sirius 138). As margens
+comparam com scores TAPERED (interpolados por fase). No meio-jogo
+(onde a maior parte da poda acontece) o score está mais perto do
+mg-scale, por isso ×1.92 é uma primeira aproximação razoável, mas o
+factor "certo" seria medido empiricamente comparando os evals dos dois
+motores nas mesmas posições -- fazer isso se o teste do doDeeper
+confirmar a hipótese.
+
+## Atualização 2026-07-23 (continuação): HIPÓTESE DE CALIBRAÇÃO CONFIRMADA -- rescale do doDeeper vira o dia de negativo para positivo
+
+**Resultado confirmado (300 jogos, nós fixos, vs `0c1b388`)**:
+- doDeeper RAW (não-reescalado, no HEAD): **47.3%** (negativo)
+- doDeeper REMOVIDO: **49.7%** (neutro)
+- doDeeper REESCALADO ×1.92 (69/271/15): **51.7%** (POSITIVO)
+
+**A hipótese do utilizador está totalmente confirmada**: o mecanismo
+nunca foi o problema, o VALOR era. Uma única correcção de calibração
+(reescalar as margens do doDeeper pela razão de escala de eval Kestrel
+vs Sirius) vira TODO o trabalho do dia de -negativo (47.3%) para
++positivo (51.7%) vs o binário do início da sessão -- um swing de
++4.4%. E "torna o mecanismo importante" (palavras do utilizador) --
+deixa de ser código morto/prejudicial e passa a contribuir.
+
+**Sweep de factor (pedido do utilizador: "testa 1.9 1.8 1.7 e vê qual
+produz melhor efeito")**: 3 testes em paralelo via
+`KESTREL_SEARCH_PARAMS` (sem rebuilds -- profiles `sp_doonly_*.txt`,
+só variam as 3 margens do doDeeper), cada um vs `0c1b388`, nós fixos.
+`sprt_factor.py` + `sprt_factor_{17,18,19}.log`. A correr. Escolher o
+melhor factor, depois aplicar o MESMO rescale às OUTRAS margens em
+unidades de eval (RFP, razoring, gates do NMP, ProbCut) que também
+foram copiadas raw sem reescalar -- provável mais upside.
+
+**Método validado**: NADA se apaga. Todas as funções ficam. O que
+estava mal era a calibração dos valores para a escala do Kestrel.
+Corrigir a calibração (empiricamente, por sweep/A-B) torna os
+mecanismos úteis. Este é o caminho para o resto do trabalho: afinar,
+não apagar.
+
+## Atualização 2026-07-23 (continuação): sweep de factor + calibração cirúrgica do doDeeper
+
+**Sweep de factor (nós fixos, 200 jogos, vs `0c1b388`)**:
+- 1.7 (61/240/14): 58.8%
+- **1.8 (65/254/14): 59.0%** <- melhor
+- 1.9 (68/268/15): 57.2%
+
+Todos os 3 em 57-59%, diferenças dentro do ruído (o factor exacto quase
+não importa; 1.8 nominalmente melhor). doDeeper ×1.8 = 59.0%
+reproduzido em DUAS corridas de 200 jogos independentes -- resultado
+sólido.
+
+**A hipótese "todas as margens mal calibradas" foi REFUTADA** por
+teste directo (2 profiles em paralelo, `KESTREL_SEARCH_PARAMS`):
+- doDeeper-só ×1.8: **59.0%**
+- TODAS-as-margens-eval ×1.8 (RFP/razor/NMP/ProbCut/doDeeper): **54.2%**
+  (PIOR)
+
+Ou seja: reescalar tudo por 1.8 PIORA. A calibração NÃO é uniforme. Só
+o doDeeper estava mesmo mal calibrado -- porque o efeito dele ACRESCENTA
+profundidade (perigoso quando dispara demais); as margens de PODA
+(RFP/razor/NMP) já estavam ~bem nos valores raw (coerente com os A/B
+individuais neutros delas). **Lição refinada**: a calibração é
+por-parâmetro e empírica, não um factor de rescale único aplicado a
+tudo. O ponto do utilizador ("calibrar, não apagar") mantém-se -- só
+que "calibrar" significa achar o valor certo de CADA um, não reescalar
+todos igual.
+
+**Aplicado**: doDeeper ×1.8 (65/254/14) baked no `Default` de
+`SearchParams`, resto das margens deixado como estava. Binário
+`kestrel_do18_final`. **Teste decisivo a TEMPO REAL a correr** (arena,
+1s+0.08s -- o TC bullet pedido pelo utilizador --, 1 thread, do18 vs
+`0c1b388`, 40 jogos) para confirmar que o ganho a nós fixos (+9%)
+sobrevive ao custo de NPS a tempo real. Se confirmar positivo, commit.
+A seguir ainda: o teste do Lazy SMP (Threads=1 vs 4) que o utilizador
+levantou.
