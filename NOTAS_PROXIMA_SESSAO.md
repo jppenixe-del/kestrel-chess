@@ -1990,3 +1990,32 @@ pedido do utilizador. Quando acabar: `resolvequiet` (se necessário --
 o filtro de quietude já corre durante a geração, confirmar se ainda
 faz falta um passo extra) + `tunefast` com `lr=1000` (a taxa correcta,
 NÃO 2.0) e iterações suficientes (milhares), depois A/B novo.
+
+**Revertido pelo utilizador** ("não mudes nada então, não precisas de
+um dataset de 64000 jogos") -- a corrida de 64k jogos foi PARADA
+(~50/10667 jogos por thread, muito cedo, sem ficheiro de saída
+gerado -- o `selfplaytc` só escreve no fim, nada a recuperar). O
+método estabelecido nesta sessão (portar técnicas reais do Sirius/
+Ethereal uma de cada vez, validar por self-play A/B, commitar mesmo
+ganhos pequenos) já estava a "ganhar elo" segundo o próprio
+utilizador -- volta a ser a prioridade, em vez de investir mais tempo
+na infra-estrutura de dataset/tuning grande. O comando `selfplaytc`
+fica no código (`6aad35b`, já commitado) para uso futuro se algum dia
+fizer sentido, mas não é para usar agora.
+
+**CPU livre outra vez** -- pode retomar-se o padrão de trabalho normal
+(implementar item por item do que falta da auditoria do Fable ou
+outras ideias, validar A/B, commitar). Bot do Lichess continua
+desligado (não foi pedido para religar).
+
+## Atualização 2026-07-23 (continuação): lmrNonImp real do Sirius, resultado positivo claro
+
+Próximo item da lista de LMR "barata" do Fable ainda por fazer:
+`lmrNonImp` -- termo real do Sirius `reduction += lmrNonImp/1024
+(~1.46 plies) quando !improving` (reduz MAIS quando a posição não está
+a melhorar, mesmo sinal `improving` que RFP/futility já usam).
+Arredondado a 1 ply inteiro, mesmo estilo de quantização de
+`hist_adj`/`ttpv_adj`/`corrplexity_adj`.
+
+**Resultado**: 55.0% vs 45.0% (baseline), 300 jogos -- positivo real,
+claramente fora do ruído. Commitado.
