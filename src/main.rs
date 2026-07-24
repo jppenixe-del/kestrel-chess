@@ -66,6 +66,16 @@ fn main() {
         check_weights_roundtrip();
         return;
     }
+    if args.len() >= 2 && args[1] == "checkmatpst" {
+        check_matpst_features();
+        return;
+    }
+    if args.len() >= 4 && args[1] == "tunepst" {
+        let iters: u32 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(8000);
+        let lr: f64 = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(1000.0);
+        tune_matpst(&args[2], &args[3], iters, lr);
+        return;
+    }
     if args.len() >= 4 && args[1] == "selfplay" {
         let num_games: u32 = args[2].parse().expect("num_games invalido");
         let out_path = &args[3];
@@ -153,6 +163,36 @@ fn check_weights_roundtrip() {
         println!("fen ok={} eval()={} evaluate_with_weights(default)={}: {}", a == b, a, b, fen);
     }
     let _ = atk;
+}
+
+/// Valida que `material_pst_features` esta' correcta: para varias
+/// posicoes, `sum(feats[i] * material_pst_current_vec()[i])` tem de bater
+/// com `material_pst_white(board)` (a menos do arredondamento inteiro do
+/// taper). Se isto falhar, o tuner de material/PST esta' a extrair as
+/// features erradas e nao vale a pena correr.
+fn check_matpst_features() {
+    let cur = eval::material_pst_current_vec();
+    println!("MAT_PST_DIM = {}, current_vec len = {}", eval::MAT_PST_DIM, cur.len());
+    let fens = [
+        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+        "r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4",
+        "8/1p3Q1p/p3r3/2pk4/8/5K1P/Pb3PP1/7R b - - 0 30",
+        "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        "8/8/8/4k3/8/4K3/4P3/8 w - - 0 1",
+    ];
+    let mut feats = vec![0f32; eval::MAT_PST_DIM];
+    let mut all_ok = true;
+    for fen in fens {
+        let board = Board::from_fen(fen);
+        eval::material_pst_features(&board, &mut feats);
+        let dot: f64 = feats.iter().zip(cur.iter()).map(|(&f, &v)| f as f64 * v as f64).sum();
+        let real = eval::material_pst_white(&board) as f64;
+        let diff = (dot - real).abs();
+        let ok = diff <= 1.5; // tolerancia do arredondamento inteiro do taper
+        if !ok { all_ok = false; }
+        println!("ok={} feat_dot={:.2} material_pst_white={:.0} diff={:.2}: {}", ok, dot, real, diff, fen);
+    }
+    println!("{}", if all_ok { "MATPST FEATURES OK" } else { "MATPST FEATURES ERRADAS -- nao tunar!" });
 }
 
 /// Dependency-free PRNG (same splitmix64 shape already used in
@@ -797,6 +837,103 @@ fn tune_fast(dataset_path: &str, out_path: &str, iters: u32, lr: f64) {
     let serialized: Vec<String> = out_vec.iter().map(|x| x.to_string()).collect();
     std::fs::write(out_path, serialized.join(",")).expect("nao consegui escrever o output");
     println!("wrote tuned weights ({} scalars) to {}", out_vec.len(), out_path);
+}
+
+/// Tuner Texel dedicado a MATERIAL + PST (as PeSTO genericas). Mesma
+/// matematica do `tune_fast` mas com bias/features TROCADOS: o bias e' o
+/// positional COMPLETO (fixo, com os pesos ja tunados), e as features
+/// tunaveis sao as 780 contagens de material/PST (ver
+/// eval::material_pst_features). Ponto de partida = os valores actuais
+/// das consts. O material do rei (indices 5 e 11) fica fixo a 0 (o rei
+/// nao tem valor material). Output: 780 valores, escritos depois de volta
+/// nas consts de eval.rs.
+fn tune_matpst(dataset_path: &str, out_path: &str, iters: u32, lr: f64) {
+    let text = std::fs::read_to_string(dataset_path).expect("nao consegui ler o dataset");
+    let mut boards: Vec<Board> = Vec::new();
+    let mut results: Vec<f64> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() { continue; }
+        let mut parts = line.split('\t');
+        let fen = parts.next().unwrap();
+        let res: f64 = parts.next().unwrap().parse().unwrap();
+        boards.push(Board::from_fen(fen));
+        results.push(res);
+    }
+    let n_pos = boards.len();
+    let dim = eval::MAT_PST_DIM;
+    println!("dataset: {} positions, tuning {} material/PST scalars", n_pos, dim);
+
+    // fixar o material do rei (nao tem valor): indices 5 (MG_VALUE king)
+    // e 11 (EG_VALUE king). As PST do rei SAO tunaveis.
+    // Fixar TODO o material (indices 0..12 = MG_VALUE + EG_VALUE), tunar
+    // SO' as PST (12..780). Rondas 1 e 1b (tunar o material tambem)
+    // regrediram -120 Elo: o Texel deu razoes de peca desequilibradas
+    // (torre 4.62 peoes, dama 7.5 no mg -- baixas) que fazem o motor
+    // trocar pecas mal, alem de derivar a escala global (descalibra as
+    // margens de busca). Fixando o material nos valores classicos bons,
+    // a escala/razoes ficam ancoradas e o tuner so' ajusta as PST
+    // (posicional por casa) -- ajustes pequenos, muito menos perigosos.
+    let is_fixed: Vec<bool> = (0..dim).map(|i| i < 12).collect();
+
+    let w_pos = eval::default_weights();
+    println!("extracting material/PST features ({} positions)...", n_pos);
+    let t0 = std::time::Instant::now();
+    // bias = positional COMPLETO (fixo), white POV. features = material/PST.
+    let mut biases: Vec<f64> = Vec::with_capacity(n_pos);
+    let mut features: Vec<Vec<f32>> = Vec::with_capacity(n_pos);
+    let mut f = vec![0f32; dim];
+    for board in &boards {
+        let bias = eval::positional_terms(board, w_pos) as f64;
+        eval::material_pst_features(board, &mut f);
+        features.push(f.clone());
+        biases.push(bias);
+    }
+    println!("feature extraction done in {:.1}s", t0.elapsed().as_secs_f64());
+
+    fn sigmoid(x: f64, k: f64) -> f64 { 1.0 / (1.0 + 10f64.powf(-k * x / 400.0)) }
+    let mut w: Vec<f64> = eval::material_pst_current_vec().iter().map(|&x| x as f64).collect();
+    let predict = |w: &[f64], i: usize| -> f64 {
+        let mut e = biases[i];
+        let f = &features[i];
+        for j in 0..dim { if f[j] != 0.0 { e += w[j] * f[j] as f64; } }
+        e
+    };
+    let mean_error = |w: &[f64], k: f64| -> f64 {
+        let mut sum = 0.0;
+        for i in 0..n_pos { let d = results[i] - sigmoid(predict(w, i), k); sum += d * d; }
+        sum / n_pos as f64
+    };
+    let mut best_k = 1.0; let mut best_k_err = f64::MAX; let mut k = 0.2;
+    while k <= 3.0 {
+        let e = mean_error(&w, k);
+        if e < best_k_err { best_k_err = e; best_k = k; }
+        k += 0.1;
+    }
+    println!("best K = {:.2}  (starting error = {:.6})", best_k, best_k_err);
+
+    let ln10 = std::f64::consts::LN_10;
+    let mut grad = vec![0f64; dim];
+    let t1 = std::time::Instant::now();
+    for iter in 0..iters {
+        for g in grad.iter_mut() { *g = 0.0; }
+        for i in 0..n_pos {
+            let s = sigmoid(predict(&w, i), best_k);
+            let d_loss_d_eval = 2.0 * (s - results[i]) * (best_k * ln10 / 400.0) * s * (1.0 - s);
+            let f = &features[i];
+            for j in 0..dim { if f[j] != 0.0 { grad[j] += d_loss_d_eval * f[j] as f64; } }
+        }
+        for j in 0..dim { if !is_fixed[j] { w[j] -= lr * grad[j] / n_pos as f64; } }
+        if iter % 200 == 0 || iter == iters - 1 {
+            println!("iter {}: error={:.6}  ({:.2}s)", iter, mean_error(&w, best_k), t1.elapsed().as_secs_f64());
+        }
+    }
+    let final_err = mean_error(&w, best_k);
+    println!("final error: {:.6} (started {:.6}) in {:.2}s", final_err, best_k_err, t1.elapsed().as_secs_f64());
+    let out_vec: Vec<i32> = w.iter().map(|&x| x.round() as i32).collect();
+    let serialized: Vec<String> = out_vec.iter().map(|x| x.to_string()).collect();
+    std::fs::write(out_path, serialized.join(",")).expect("nao consegui escrever o output");
+    println!("wrote {} material/PST scalars to {}", out_vec.len(), out_path);
 }
 
 /// Real Texel Tuning: coordinate descent on `Weights::to_vec()`'s flat

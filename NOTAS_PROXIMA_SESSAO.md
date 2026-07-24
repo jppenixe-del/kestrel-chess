@@ -2498,3 +2498,283 @@ todos igual.
 sobrevive ao custo de NPS a tempo real. Se confirmar positivo, commit.
 A seguir ainda: o teste do Lazy SMP (Threads=1 vs 4) que o utilizador
 levantou.
+
+## Atualização 2026-07-23 (continuação): doDeeper 1.8 commitado; teste do Lazy SMP REFUTA a hipótese de bug
+
+**doDeeper ×1.8 commitado (`a680bb8`)**. Resultado a tempo real
+(1s+0.08s, 1 thread, 40 jogos vs `0c1b388`): do18 **48.75%** (16-17-7).
+Comparação completa do fix:
+| condição | doDeeper raw (HEAD) | ×1.8 calibrado |
+|---|---|---|
+| nós fixos | 47.3% | ~59% |
+| tempo real 1s+0.08s | 43.3% | 48.75% |
+Melhoria real nos dois eixos (+5.4% a tempo real, +11% a nós fixos).
+Ainda ~1% abaixo do `0c1b388` a tempo real -- o resto é custo de NPS
+das adições caras da sessão (a resolver tornando-as mais baratas, não
+apagando).
+
+**Teste do Lazy SMP (hipótese do utilizador: "em multi perdes todos os
+jogos, o Lazy tem um bug")** -- teste controlado, MESMO binário,
+Threads=1 vs Threads=4, 800ms/lance, CPU livre (essencial p/ timing
+limpo), 40 jogos: **4 threads = 67.5%, 1 thread = 32.5%**. **A hipótese
+está REFUTADA** -- o Lazy SMP FUNCIONA bem, 4 threads é ~+128 Elo sobre
+1 thread, exactamente a direcção certa. Não está partido.
+
+**Explicações honestas para as derrotas do bot em multi (NÃO um bug do
+Lazy SMP)**:
+1. Força do adversário -- o bot joga rated contra bots/humanos mais
+   fortes que o Kestrel (mesmo a 4 threads).
+2. Contenção do servidor -- na máquina partilhada, se outra coisa
+   corria, o bot a 4 threads podia não ter mesmo 4 cores (starvation),
+   problema de deployment, não do motor.
+3. **Único caso NÃO coberto pelo teste**: usei `movetime` fixo, que
+   ignora a gestão de tempo elástica. O bot usa relógio real
+   (`wtime/btime`), que corre o `compute_time_budget` + o early-stop
+   baseado em nós. Se ISSO se portar mal especificamente a 4 threads
+   (contagens de nós por-thread a alimentar o check de estabilidade),
+   o bot pode gerir mal o relógio mesmo com a busca sã. É uma questão
+   de gestão de tempo, não do Lazy SMP -- o único caso genuíno que vale
+   a pena verificar a seguir, dado o que o utilizador observou.
+
+**Achado importante de método**: as duas coisas que o utilizador
+levantou hoje ("não copiem, calibrem" e "o Lazy tem um bug") -- a
+primeira estava CERTA e levou ao maior fix do dia (doDeeper), a segunda
+foi REFUTADA por teste controlado. Ambas valiam a pena investigar; a
+resposta honesta a cada uma veio dos dados, não de assumir.
+
+## Atualização 2026-07-23 (continuação): Lazy SMP a RELÓGIO REAL também confirmado bom -- e uma lição de humildade minha
+
+**Teste do Lazy SMP a relógio real** (o único caso não coberto pelo
+teste de movetime): kestrel(1t) vs kestrel_4t, 10s+0.1s, arena.
+Resultado final (parado aos 15 jogos, conclusão definitiva):
+**4 threads = 73.3%** (11/15), 1 thread = 3/15. Alinhado com o teste
+de movetime fixo (67.5%). **A gestão de tempo a multi-thread está BEM
+-- 4 threads é ~+130 Elo sobre 1 thread mesmo a relógio real.**
+
+**Lição de humildade (registada honestamente)**: a meio deste teste,
+aos 4 jogos, estava 3-1 para 1 thread e eu construí uma hipótese
+elaborada de "bug na gestão de tempo a multi-thread" (o early-stop a
+disparar cedo demais com 4 threads). Estava ERRADO -- era ruído de
+amostra pequena. Aos 9 jogos já era 6-3 para 4 threads, e acabou 73%.
+Sobre-interpretei 4 jogos. A lição: NÃO tirar conclusões de amostras
+de <10 jogos, mesmo quando parecem apontar para uma hipótese
+atraente. Os dados corrigiram-me, como devem.
+
+**Conclusão completa da investigação multi-thread**: Lazy SMP (busca E
+gestão de tempo) funciona correctamente. As derrotas do bot em multi
+que o utilizador observou são força do adversário (o bot joga rated
+contra oponentes mais fortes) e/ou contenção do servidor partilhado
+(o bot a 4 threads pode não ter mesmo 4 cores se outra coisa corre),
+NÃO um bug do motor. `engine_arena.py` ganhou uma entrada
+`kestrel_4t` (mesmo binário, Threads=4) para este tipo de teste no
+futuro.
+
+## Atualização 2026-07-23 (continuação): NPS medido -- threats NÃO é o culpado; próximo passo = calibrar o eval
+
+**Medição de NPS (mesma posição de meio-jogo, movetime 3000, 1 thread)**:
+- `0c1b388`: 842k NPS, profundidade 16
+- actual (`a680bb8`): 776k NPS (~8% mais lento), profundidade 18
+
+**O termo threats NÃO é o culpado de NPS** (hipótese refutada por
+medição directa): com vs sem o `all_attacks()` do threats, NPS
+essencialmente igual (887k vs 883k, dentro do ruído) -- é chamado raro
+o suficiente (só onde o eval corrigido é preciso / em updates Exact)
+que o custo é desprezável. O custo de NPS (~8%) está espalhado por
+TODAS as adições de eval/corr-hist, sem um culpado único -- difícil de
+optimizar sem remover features (que o utilizador não quer).
+
+**Realização estratégica honesta**: a bisecção mostrou que os termos de
+eval PORTADOS (passed-pawn 3D, king-safety, pawn-structure, etc.) são
+~neutros-a-ligeiramente-negativos MESMO a nós fixos (04f79ae 51.2% ->
+90654ad 50.2%). Ou seja, os valores emprestados-e-reescalados do
+Sirius/Ethereal NÃO estão a contribuir -- só custam NPS. Isto é
+EXACTAMENTE o ponto do utilizador: as funções estão certas, os valores
+estão mal calibrados para o Kestrel. A solução (direcção do utilizador)
+NÃO é apagar -- é TUNAR os valores para o Kestrel para que ganhem o seu
+custo.
+
+**Próximo passo em curso**: tuning próprio do eval a sério.
+1. Dataset novo gerado com o binário ACTUAL (`selfplay 4000
+   dataset_round5.epd 20000 nós`, ~a correr) -- mais representativo que
+   o `dataset_round1` antigo (de antes das mudanças da sessão, que deu
+   tuning neutro).
+2. A seguir: `tunefast` com lr=1000 (a taxa corrigida) sobre o dataset
+   novo, tunar os ~477 escalares lineares do `Weights` (todos os termos
+   de eval portados incluídos).
+3. Validar por A/B (`KESTREL_TUNED_WEIGHTS`) vs os defaults actuais E vs
+   `0c1b388`, a nós fixos E a tempo real.
+Isto executa a direcção do utilizador -- calibrar os valores emprestados
+para a escala/arquitectura do Kestrel -- sobre o maior bloco de valores
+não-calibrados que resta (o eval).
+
+## Atualização 2026-07-23 (continuação): pesos tunados ADOPTADOS (+2.3%), teste real no bot, e próximo ciclo
+
+**Pesos tunados adoptados** (`3831cb1`): `TUNED_R5` embutido no
+`default_weights()` via `from_vec` (669 escalares). Validado +2.3%
+(52.3%) vs os defaults antigos a nós fixos. Ganho pequeno mas real --
+"mesmo que ganhes pouco, é um círculo" (utilizador). Sem custo de NPS.
+
+**Teste REAL no bot Lichess (60+0, pedido do utilizador)**: bot
+`KestrelStrike` religado (`lichess_bridge.py`, Threads=4), binário
+`3831cb1`. Como o bridge é REATIVO (só aceita desafios), criei
+`challenge_bots.py` para PROCURAR bots online e desafiá-los a 60+0
+(o bot não faz seek sozinho). Resultado da amostra desta sessão (5
+partidas): **2V 3D**, rating bullet ~2100-2150 (mantido). Das 3
+derrotas, 2 foram vs oponentes ~2390-2395 (esperado), 1 vs par
+(~2088) por mate, 1 por TEMPO (outoftime). **Lição repetida**: não
+sobre-interpretar amostras pequenas -- inicialmente achei a derrota
+por tempo um padrão sistemático, mas foi 1 em 5. Para medir uma
+diferença de Elo de ±20-30 precisam-se ~100+ partidas. O bot joga ao
+nível estabelecido ~2100-2150, coerente com o resultado interno
+(~neutro-a-ligeiramente-positivo a tempo real). NOTA: a 60+0
+(bullet, 0 incremento) o bot desliga o livro e joga "plain engine
+(bullet-speed safety gate)". Objetivo do utilizador: chegar a ganhar
+a oponentes fortes tipo PeachFruit (~2395) -- precisa de ganho de
+FORÇA substancial, não só polir.
+
+**Ciclo em curso**: 2ª volta de tuning (`tune_round6`) sobre um
+dataset COMBINADO (`dataset_round1_quiet` + `dataset_round5` = 250797
+posições, mais diverso), a refinar a partir dos pesos round5 já
+adoptados. Bot PARADO durante o tuning (a 60+0 sem incremento, roubar
+CPU ao bot = derrotas por tempo -- nunca correr trabalho pesado com o
+bot a jogar bullet). Religar o bot com o binário melhorado depois.
+
+## PRÓXIMO GRANDE LEVER (documentado para sessão dedicada): tunar MATERIAL + PST
+
+O maior bloco de valores AINDA não calibrado: **material
+(`MG_VALUE`/`EG_VALUE`, 12 valores) e PST (`MG_PAWN`..`EG_KING`, 6x64x2
+= 768 valores)**. São tabelas PeSTO educacionais genéricas (o próprio
+código diz "ponto de partida educacional, não estado final"). O
+`tunefast` atual NÃO lhes toca -- só tuna os campos lineares do
+`Weights` (mobilidade/threats/pawn-structure/king-safety-lineares/
+passed-pawns). Calibrar material/PST sobre os dados do Kestrel é
+provavelmente o MAIOR ganho de força que resta.
+
+**Como (abordagem de BAIXO RISCO, planeada)**: NÃO mexer no cálculo
+incremental do board (`board.mg_score`/`eg_score` via
+`piece_contribution()`, hot-path crítico -- risco alto de bug). Em vez
+disso:
+1. Criar uma função paralela `material_pst_white_with_weights(board,
+   w)` que calcula material/PST FROM-SCRATCH usando valores de um
+   Weights estendido (só para o tuner extrair features).
+2. Estender o `Weights` + `to_vec`/`from_vec` com material/PST (o
+   `to_vec` cresce de 669 para ~1449). `checkweights` confirma o
+   round-trip antes de tunar.
+3. Estender o `tune_fast` para extrair as features de material/PST: a
+   feature de `MG_PAWN[sq]` = (peões brancos em sq) - (peões pretos em
+   mirror(sq)), ponderada por `phase/MAX_PHASE`; `EG_PAWN[sq]` idem
+   com `(MAX_PHASE-phase)/MAX_PHASE`; `MG_VALUE[pt]` = (nº peças
+   brancas do tipo) - (nº pretas), etc. Esta é a parte não-trivial.
+4. Tunar, validar por A/B.
+5. Escrever os valores tunados de volta nas CONSTS `MG_PAWN`/`MG_VALUE`
+   etc. (compile-time). O board incremental usa as novas consts sem
+   qualquer mudança estrutural -- só os VALORES mudam.
+Fica para uma sessão dedicada (não fazer à pressa no fim duma sessão
+gigante -- risco de bug na extração de features).
+
+## Reflexão estratégica (2026-07-24): como pode um HCE ganhar a um NNUE?
+
+Pergunta do utilizador. A resposta condiciona as prioridades. Análise:
+
+**Vantagem estrutural do HCE = VELOCIDADE (a ÚNICA).** Eval HCE ~dezenas
+de ns; NNUE ~centenas (mesmo incremental). HCE bem otimizado faz 2-4x o
+NPS. Força ≈ `profundidade × qualidade-de-eval`. NNUE ganha na
+qualidade; HCE só compensa com profundidade = velocidade × poda
+eficiente. É a única equação em que o HCE pode ganhar.
+
+**Implicação para nós**: hoje o binário ficou ~8% mais lento e foi isso
+que impediu o dia de ser claramente positivo -- andámos a GASTAR a
+única vantagem estrutural. Regra daqui p/ frente: **cada 1% de NPS é
+sagrado; cada mudança pergunta "custa NPS? vale o custo?"**
+
+**Maiores alavancas, por impacto:**
+1. **NPS máximo (a maior).** Eval barato, movegen rápido, TT eficiente,
+   poda agressiva-mas-sã. HCE a 3-4x o NPS do NNUE ganha vários plies,
+   que compensam muita imprecisão de eval.
+2. **Correction history -- a ponte HCE→NNUE.** Deixa a busca APRENDER
+   durante o jogo a corrigir os erros sistemáticos da eval estática, a
+   custo de NPS quase nulo. É dar ao HCE um bocado da adaptabilidade do
+   NNUE. Já temos 6/7 termos do Sirius; completar (continuation-history
+   correction, 6 lags) + afinar os pesos é o maior ganho "esperto".
+3. **Busca de topo calibrada PARA O KESTREL** (LMR/NMP/singular/probcut).
+   O SF HCE clássico chegou a ~3400 CCRL quase só com busca de elite.
+4. **Eval tunada** (PeSTO agora) -- precisa de estar boa mas tem teto
+   (Texel aproxima o ótimo LINEAR; NNUE é não-linear).
+
+**Verdade honesta**: contra NNUE FORTE, HCE puro dificilmente ganha
+consistente (o SF HCE perdia ~80 Elo p/ o 1º SF NNUE). Contra NNUEs
+fracos/médios (redes pequenas/mal treinadas, e há muitos no Lichess),
+um HCE muito rápido + correction history forte + busca de elite ganha.
+A "maior opção" é essa combinação, com o NPS como fundação inegociável.
+
+## Ciclo autónomo da noite 2026-07-24 (calibração -> teste -> calibração)
+
+**RONDA 1: tuning de MATERIAL + PST (as PeSTO).** Infra nova (`tunepst`/
+`checkmatpst` em main.rs, `material_pst_features` em eval.rs -- features
+validadas exactas). `tunepst` sobre `dataset_combined` (250k pos), 8000
+iter, lr=30000 (o material tem valores grandes, precisa de lr alto).
+Erro 0.078527 -> 0.073381 (**-6.6%**, muito maior que o tuning linear
+~-1-2%, porque as PeSTO eram genéricas com muito espaço). Valores
+aplicados às consts via `apply_matpst.py`. Material subiu bastante:
+MG_VALUE [125,340,355,520,990] -> [153,498,525,707,1148]; EG peão
+140->93. Perft ok. A/B (nós fixos, 300 jogos) vs `3831cb1` (round5) a
+correr -- RISCO a vigiar: a escala do material mudou, as margens de
+busca (em unidades de eval) podem ficar descalibradas. O A/B decide.
+Backup do eval.rs pré-matpst em /tmp/eval_before_matpst.rs para
+descartar se regredir.
+
+**RONDA 1 RESULTADO: REGRESSÃO GRAVE.** material/PST tunado (directo) =
+33.7% vs round5 = 66.3% (~-120 Elo). Erro de fitting -6.6% mas perde
+MUITO em jogo -- exemplo perfeito de "melhor fit != mais força".
+Descartado (eval.rs restaurado). Causa provável: o Texel tuning tem
+AMBIGUIDADE DE ESCALA (o K do sigmoid absorve um factor global), e o
+tuner escalou o material ~1.22x p/ cima (peão mg 125->153) -- essa
+escala inflacionada descalibra a busca (margens em unidades de eval,
+thresholds de mate). Também mudou a relação mg/eg (peão mg subiu, eg
+desceu 140->93), o que uma re-escala uniforme não corrige.
+
+**RONDA 1b: re-escala uniforme** (peão mg -> 125, factor 1.224,
+preserva proporções tunadas). Testa se o problema era SÓ a escala
+global. A correr. NOTA: o eg fica comprimido (peão eg 76) porque a
+relação mg/eg mudou -- se regredir na mesma, o Texel tuning directo do
+material/PST não funciona sobre este dataset e passa-se a calibrar
+outra coisa (validar round6 linear; sweep de margens de busca).
+
+**LIÇÃO (importante p/ o material/PST tuning futuro)**: fixar a escala
+DURANTE o tuning -- ancorar o peão mg a 125 (não tunar) OU adicionar
+regularização que penalize o desvio da escala original. O Texel puro
+deriva para escalas arbitrárias que descalibram a busca. Ver plano na
+secção "PRÓXIMO GRANDE LEVER" -- precisa desta salvaguarda.
+
+**RONDA 1b RESULTADO: REGRESSÃO (34.8% vs 65.2%).** A re-escala uniforme
+não corrige -- as razões das peças tunadas ficaram desequilibradas
+(torre 4.62 peões, dama 7.5 no mg -- baixas), fazendo o motor trocar
+peças mal. Descartado.
+
+**RONDA 1c: tunar SÓ as PST, material ANCORADO** (is_fixed = índices
+<12, todo o MG_VALUE/EG_VALUE fixo nos valores clássicos). As PST são
+ajustes posicionais pequenos por casa -- muito menos perigosos que os
+valores fundamentais das peças. Corrida curta confirmou: material fica
+fixo, erro desce (0.078527->0.077240 em 300 iter). Corrida completa
+(8000 iter) a correr. Esta é a abordagem que os motores usam de
+verdade: tunar PST com material âncorado. Se ganhar, adopta-se; se
+regredir na mesma, o dataset/abordagem não serve para material/PST e o
+ciclo passa a validar o round6 linear + re-tunar linear sobre dados
+novos.
+
+**RONDA 1c RESULTADO: REGRESSÃO (41.7% vs 58.3%, ~-58 Elo).** Menos
+grave que 1/1b mas ainda regride. **CONCLUSÃO: material/PST tuning FALHA
+sobre este dataset** (3 tentativas: -120, -108, -58 Elo), apesar de o
+erro de fitting descer sempre (-5.5% a -6.6%). Isto e' OVERFITTING
+clássico: o dataset de self-play (~2100 Elo) nao e' representativo o
+suficiente para tunar PST/material sem piorar o jogo real. As PeSTO
+estabelecidas sao melhores que o que o tuner produz aqui. O tuning
+LINEAR funcionou (+2.3%) porque os termos posicionais PORTADOS estavam
+mal calibrados; as PST/material ja' estavam bem.
+**LIÇÃO**: para tunar PST/material com sucesso seria preciso (a) um
+dataset de MUITO mais alto nivel (partidas de motores fortes, nao
+self-play a 2100), e/ou (b) regularizacao L2 forte (penalizar desvio
+das PeSTO), e/ou (c) muito mais posicoes. Nao vale a pena insistir com
+o dataset actual. Infra do tuner (`tunepst`) fica no codigo para o
+futuro. Material/PST tuning ABANDONADO por agora; eval.rs restaurado ao
+estado round5 (3831cb1).
