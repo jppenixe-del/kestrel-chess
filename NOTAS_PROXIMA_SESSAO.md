@@ -3143,3 +3143,17 @@ FERRAMENTA NOVA: validacao seria via cutechess-cli SPRT (book UHO_4060,
 STC 8+0.08, bounds [0,5]) -- usar isto para validar dai em diante, nao
 A/Bs de 400 jogos. PROXIMO LEVER: tunar eval COMPLETO (material incluido)
 sobre SF com pinagem, validado por SPRT.
+
+## hand-crafting: eval OK, gargalo e' a BUSCA
+Ferramenta nova: comando `evalbreak`/`eval` (uci.rs) — decompoe o eval
+estatico (material_pst, pieces, mobility, king, threats+pawns) via
+to_vec/from_vec com ranges. Comitado.
+ACHADO: o eval ESTATICO do Kestrel concorda com o SF/referencia no
+julgamento (0 divergencias de SINAL em 20 posicoes; caso disseccado:
+Kestrel eval +65 vs SF +42, MESMO sinal). As divergencias de LANCE sao
+TACTICAS (busca ve' menos fundo), nao erros de eval. Logo o eval NAO e' o
+gargalo -- e' a BUSCA/profundidade.
+LEVER concreto: a qsearch (fora de check) so' gera CAPTURAS+promocoes,
+NAO checks quietos -> nao resolve taticas de xeque. A adicionar quiet
+checks no 1o nivel da qsearch (SEE>=0), validar por SPRT cutechess.
+Isto ataca o gargalo real (busca), nao mais tuning de eval.
