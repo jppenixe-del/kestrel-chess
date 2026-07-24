@@ -622,6 +622,31 @@ impl Engine {
                     self.cmd_go(&tokens[1..], &mut out);
                 }
                 "stop" => {}
+                "eval" | "evalbreak" => {
+                    // Robust breakdown via to_vec/from_vec index ranges (no
+                    // per-field typing). Contribution of a range = positional
+                    // with that range zeroed, subtracted from full positional.
+                    let b = &self.board;
+                    let full = crate::eval::default_weights();
+                    let mat = crate::eval::material_pst_white(b);
+                    let pos = crate::eval::positional_terms(b, full);
+                    let base = full.to_vec();
+                    let contrib = |lo: usize, hi: usize| -> i32 {
+                        let mut v = base.clone();
+                        for i in lo..hi.min(v.len()) { v[i] = 0; }
+                        pos - crate::eval::positional_terms(b, &full.from_vec(&v))
+                    };
+                    // to_vec order: pieces 0..16, mobility 16..240,
+                    // king(attackers/checks/shelter/storm) 240..276,
+                    // rest(threats+pawn-structure+passers) 276..end
+                    let pieces = contrib(0, 16);
+                    let mobility = contrib(16, 240);
+                    let king = contrib(240, 276);
+                    let rest = contrib(276, base.len());
+                    let _ = writeln!(out, "eval(white) total={}  material_pst={}  positional={}", mat + pos, mat, pos);
+                    let _ = writeln!(out, "  pieces={} mobility={} king={} threats+pawns={}", pieces, mobility, king, rest);
+                    let _ = out.flush();
+                }
                 "quit" => break,
                 _ => {}
             }
