@@ -3050,3 +3050,38 @@ adjudicacao; tunar com material fixo/ancorado + pinagem pos-Adam do PSQT
 (le' binpack, tem toda a mecanica), 100M binpack em hce_8buckets, datagen
 do Sirius como referencia. NAO executar tuning pesado com o bot a jogar
 (contencao). Ver [[project_flags_contencao_gestao_tempo]].
+
+## 2026-07-24 ~08:00 UTC — CALIBRACAO A SERIO com dados SF (pista do utilizador)
+
+Sequencia de licoes do utilizador: (1) ver como o Sirius treina; (2)
+mobility e' dos termos mais importantes; (3) CALIBRAR, nao escalar
+(escalar ×1.8 deu 48.2%, escalar mantem a forma, calibrar ajusta cada
+valor); (4) usar o dataset SF binpack e filtrar; (5) o trainer do Sirius
+le' binpack.
+
+**Descobertas:**
+- O reforco por ESCALA da mobilidade (×1.2/×1.8) foi INVALIDO (editei
+  consts MOBILITY_* mas o eval usa TUNED_R5 via default_weights) e, quando
+  testado a serio (via KESTREL_TUNED_WEIGHTS), deu 48.2% -- escalar nao
+  ajuda. Confirmado o ponto do utilizador.
+- TUNED_R5 (round5) REDUZIU a mobilidade (cavalo eg tunado -31..+15 vs
+  const original -32..+25) -- overfitting ao dataset fraco (250k self-play
+  ~2100). Causa provavel: tune_fast NAO tem mean-centering, logo a
+  mobilidade absorve o offset do material fixo (colinearidade, licao do
+  texel_tuner).
+
+**Pipeline montado (dados SF de qualidade):**
+- Dados: /root/hce_8buckets_experiment/shuffled_100M_*.binpack (3× 100M
+  posicoes, rotulos Stockfish). Extrator novo:
+  /root/texel_tuner/src/bin/extract_epd.rs (usa sfbinpack: pos.fen(),
+  pos.is_checked() p/ filtro quiet, entry.result WDL). binpack -> EPD
+  "fen\ttarget" (WDL [0,1] perspetiva brancas), filtrado quiet (~94%
+  passam). 3M extraidas em 4s.
+- Tuning: tune_fast do Kestrel sobre 1.5M SF (limite de RAM: features
+  densas 669 f32/pos; 1.5M~4GB). Material fixo por construcao. Parte de
+  TUNED_R5. -> tuned_sf.txt. A validar em JOGO (nao loss offline).
+- Se a mobilidade ainda ficar mal calibrada, adicionar MEAN-CENTERING das
+  tabelas colineares ao tune_fast (a licao central do texel_tuner:
+  project_out_table_means).
+
+Bot PAUSADO durante o tuning (CPU limpa). Ver [[project_flags_contencao_gestao_tempo]].
