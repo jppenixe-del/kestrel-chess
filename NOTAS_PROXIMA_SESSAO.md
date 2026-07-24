@@ -2778,3 +2778,52 @@ das PeSTO), e/ou (c) muito mais posicoes. Nao vale a pena insistir com
 o dataset actual. Infra do tuner (`tunepst`) fica no codigo para o
 futuro. Material/PST tuning ABANDONADO por agora; eval.rs restaurado ao
 estado round5 (3831cb1).
+
+**ROUND6 (linear/dataset combinado) vs round5: 50.7% vs 49.3% = EMPATE.**
+Retorno decrescente do tuning de eval confirmado: o linear ja' convergiu
+no round5 (+2.3% adoptado, 3831cb1); re-tunar sobre dataset combinado
+nao adiciona nada mensuravel. round6 NAO adoptado; mantido round5.
+Ciclo de eval-tuning esgotado (material/PST falha por overfitting;
+linear convergido). Pivot para calibracao de MARGENS DE BUSCA (onde o
+doDeeper mostrou ganho real de +9% ao ser recalibrado 1.8x).
+
+## 2026-07-24 madrugada — ciclo de calibracao esgotado, bot ligado a testar Elo
+
+**Resumo do ciclo da noite (calibrar->testar->calibrar):**
+- doDeeper 1.8: adoptado (a680bb8) — o maior ganho.
+- Eval weights linear (round5): adoptado (3831cb1), +2.3%.
+- Material/PST tuning: 3 rondas, TODAS regressao (-120/-108/-58 Elo)
+  apesar de menor erro de fitting -> overfitting ao dataset ~2100.
+  ABANDONADO. Infra do tuner comitada (face379), sem mudar o jogo.
+- round6 (re-tune linear sobre dataset combinado): EMPATE 50.7/49.3 ->
+  linear ja' convergido no round5. Nao adoptado.
+- Mecanismos de busca: TODOS ja' presentes e maduros (singular +double
+  extensions a' Ethereal, IIR, multicut, NMP eval-adaptativo, RFP,
+  razor, futility, ProbCut, correction history 6-dim). Nada estrutural
+  a adicionar.
+- Margens de pruning: ja' nos valores SPSA reais do Sirius (A/B neutro);
+  rescale em bloco ja' testado e deu pior. Retorno decrescente.
+
+**Conclusao:** o binario adoptado 3831cb1 (=doDeeper1.8 + eval round5)
+continua a ser o melhor; nada de novo esta noite o superou. O ciclo de
+calibracao "barato" (tuning sobre self-play, sweeps de margens) esta
+esgotado sem mais ganho mensuravel neste dataset.
+
+**Accao alinhada com o utilizador ("quando tiveres bem, ligas o bot e
+tentas partidas 60+0 para testar o elo"):** bot LIGADO.
+- lichess_bridge.py (unbuffered) a jogar, Threads=4.
+- challenge_loop.py NOVO: challenger continuo, mantem 1 jogo de cada vez
+  (NPS limpo com 4 threads), re-desafia quando livre.
+- TC: 60+0 (bullet rated) tem aceitacao quase nula — a maioria dos bots
+  fortes recusa bullet ou bate o limite de 100 jogos/dia vs bots. 180+0
+  (3+0 blitz) e' aceite (FlounderBot 2070 aceitou). O loop tenta AMBOS
+  por adversario, prioriza 180+0. Blitz testa a mesma forca com mais
+  profundidade — decisao tecnica autonoma, documentada aqui.
+- KestrelStrike actual: bullet 2108, blitz 2144.
+
+**Proximo lever real de Elo (para quando o utilizador acordar):** o
+tuning barato esgotou. Ganhos futuros vem de (a) SPSA local dos params
+de busca sobre self-play (caro, milhares de jogos), (b) NPS/velocidade
+(o lever inegociavel do HCE vs NNUE), (c) dataset de MUITO mais alto
+nivel para re-tentar material/PST com regularizacao L2. Ver reflexao
+"maior opcao para o HCE ganhar a um NNUE": velocidade (depth) e' a base.
