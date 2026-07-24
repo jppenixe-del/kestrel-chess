@@ -2827,3 +2827,55 @@ de busca sobre self-play (caro, milhares de jogos), (b) NPS/velocidade
 (o lever inegociavel do HCE vs NNUE), (c) dataset de MUITO mais alto
 nivel para re-tentar material/PST com regularizacao L2. Ver reflexao
 "maior opcao para o HCE ganhar a um NNUE": velocidade (depth) e' a base.
+
+## 2026-07-24 ~02:30 UTC — DIAGNOSTICO: derrotas por TEMPO (flags)
+
+Primeiros jogos do bot apos ligar: W4 L6, mas **3 das 6 derrotas foram
+por outoftime** (flag) — Elo desperdicado (posicoes jogaveis perdidas
+no relogio). Investigacao com PGNs+clocks reais:
+- 2 flags (agv3S9Q8 21:33, cXHBU2SM 21:07 UTC): gastaram >52s NUM SO'
+  lance quando o hard budget era ~16s. Coincidem com os A/Bs pesados a
+  correr de noite -> CONTENCAO DE CPU faz o NPS despencar; o check de
+  tempo do search e' baseado em NOS (`self.nodes % 2048`, search.rs:695)
+  e sob NPS ~40 nao dispara a tempo. Mitigado operacionalmente (A/Bs
+  parados, challenge_loop MAX_CONCURRENT=1).
+- 1 flag (d4RsfCIV 01:35, CPU + livre): sangrou ~3.2s/lance em 51 lances
+  + 18s pontuais no lance 1. Engine local respeita o budget (~4s no
+  lance 1), logo o problema e' EXTERNO/estrutural, nao a busca.
+
+**CAUSA RAIZ do engine (matematica):** `MOVE_OVERHEAD_MS = 60` (uci.rs:9)
+e' subtraido UMA VEZ do relogio total (`safe_time = my_time - 60`), mas
+a latencia de rede do Lichess (~150-250ms) ocorre POR LANCE. Ao longo
+de ~50 lances sao ~10s que o Lichess conta mas o engine nunca reservou
+-> flag. A fórmula `base = safe_time/moves_left` e' auto-corretiva
+(nunca chega a 0 sozinha), portanto o flag vem da latencia acumulada
+nao-reservada, nao da fórmula.
+
+**CORRECAO planeada:** reservar o overhead POR LANCE no deadline
+(search_ms = soft - overhead), e subir o overhead para ~250ms (latencia
+online realista). Validacao: harness NOVO real_clock_selfplay.py joga
+com relogio a decrementar de verdade e CONTA flags (o A/B de nos fixos
+e' cego ao tempo). Repro a correr: atual vs atual, 3+0, latencia 200ms.
+
+## 2026-07-24 ~05:00 UTC — CORRECAO DE FLAGS VALIDADA E ADOPTADA (b7bd5dd)
+
+Repro do bug (real_clock_selfplay.py, 1+0, lat 300ms, 1 thread):
+  baseline atual vs atual -> 3 de 4 jogos perdidos por flag.
+Correcao (MOVE_OVERHEAD_MS 60->250, reservado POR LANCE no deadline:
+  search_ms = soft - overhead, piso 20ms):
+  fixed(A) vs baseline(B), 8 jogos -> **flags A=0 B=4**, A ganhou 4-2.
+A correcao ELIMINA os time forfeits sem custo de forca. Comitada b7bd5dd.
+Como 3 das 6 derrotas reais do bot eram flags, isto vale Elo real.
+
+Harness novo real_clock_selfplay.py: joga com relogio a decrementar de
+verdade e conta flags (o A/B de nos fixos e' cego ao tempo). Uso:
+  python3 real_clock_selfplay.py A B GAMES BASE_MS INC_MS LAT_MS [THREADS]
+Reutilizavel para validar qualquer mudanca de gestao de tempo.
+
+NOTA sobre contencao: os 2 flags de 52s/lance de ontem a' noite eram do
+NPS a despencar sob os A/Bs pesados (check de tempo e' por-nos, %2048).
+Mitigado: nao correr A/Bs pesados enquanto o bot joga (challenge_loop
+MAX_CONCURRENT=1). A correcao do overhead resolve a componente
+estrutural (latencia por-lance); a contencao e' operacional.
+
+Bot religado com o binario corrigido para acumular Elo a 3+0/1+0.
