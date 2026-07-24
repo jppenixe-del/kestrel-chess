@@ -219,6 +219,69 @@ pub fn piece_contribution(kind: PieceType, color: Color, s: Square) -> (i32, i32
     (mg, eg, PHASE_INC[kind.idx()])
 }
 
+// === Tuning de material/PST (comando `tunepst`) =========================
+// As tabelas de material (MG_VALUE/EG_VALUE) e PST (MG_PAWN..EG_KING) sao
+// as PeSTO educacionais genericas ("ponto de partida, nao estado final").
+// Calibra-las sobre os dados do Kestrel e' o maior bloco de valores por
+// afinar. Como o material/PST e' LINEAR nos valores (o material_pst_white
+// e' uma soma ponderada por fase das contribuicoes por peca), pode-se
+// tunar com a mesma matematica Texel do `tune_fast`: bias = positional
+// (fixo), features = as contagens de material/PST por casa/tipo, pesos
+// tunaveis = os 780 valores. Estas funcoes SO' sao usadas pelo tuner --
+// o eval de producao continua a usar as consts via o board incremental;
+// os valores tunados sao escritos de volta nas consts no fim.
+
+/// Dimensao do vector de material/PST: 6+6 material + 6 pecas x 64 x 2
+/// (mg/eg) = 12 + 768 = 780.
+pub const MAT_PST_DIM: usize = 12 + 6 * 64 * 2;
+
+/// Vector actual de material/PST (mesma ordem que `material_pst_features`
+/// abaixo), para servir de ponto de partida ao tuner.
+pub fn material_pst_current_vec() -> Vec<i32> {
+    let mut v = Vec::with_capacity(MAT_PST_DIM);
+    for pt in 0..6 { v.push(MG_VALUE[pt]); }
+    for pt in 0..6 { v.push(EG_VALUE[pt]); }
+    let tables_mg = [&MG_PAWN, &MG_KNIGHT, &MG_BISHOP, &MG_ROOK, &MG_QUEEN, &MG_KING];
+    let tables_eg = [&EG_PAWN, &EG_KNIGHT, &EG_BISHOP, &EG_ROOK, &EG_QUEEN, &EG_KING];
+    for t in tables_mg { for &x in t.iter() { v.push(x); } }
+    for t in tables_eg { for &x in t.iter() { v.push(x); } }
+    v
+}
+
+/// Preenche `feats[0..MAT_PST_DIM]` com a contribuicao marginal de cada
+/// valor de material/PST ao `material_pst_white(board)`, JA' ponderada
+/// pela fase (porque o eval final e' tapered). Garantia (testada em
+/// `checkmatpst`): `sum(feats[i] * material_pst_current_vec()[i]) ~=
+/// material_pst_white(board)` a menos do arredondamento inteiro do taper.
+/// Ordem: [MG_VALUE 0..6][EG_VALUE 6..12][MG_PST pecas 12..396][EG_PST
+/// pecas 396..780], PST por peca na ordem P,N,B,R,Q,K, 64 casas cada.
+pub fn material_pst_features(board: &Board, feats: &mut [f32]) {
+    for f in feats.iter_mut().take(MAT_PST_DIM) { *f = 0.0; }
+    let phase = board.phase.min(MAX_PHASE);
+    let mg_w = phase as f32 / MAX_PHASE as f32;
+    let eg_w = (MAX_PHASE - phase) as f32 / MAX_PHASE as f32;
+    const MG_VAL_OFF: usize = 0;
+    const EG_VAL_OFF: usize = 6;
+    const MG_PST_OFF: usize = 12;
+    const EG_PST_OFF: usize = 12 + 6 * 64;
+    for c in [Color::White, Color::Black] {
+        let sign = if c == Color::White { 1.0 } else { -1.0 };
+        for pt in ALL_PIECES {
+            let mut bb = board.pieces[c.idx()][pt.idx()];
+            while bb != 0 {
+                let s = bb.trailing_zeros() as Square;
+                bb &= bb - 1;
+                let idx = mirror_idx(c, s);
+                let pt_i = pt.idx();
+                feats[MG_VAL_OFF + pt_i] += sign * mg_w;
+                feats[EG_VAL_OFF + pt_i] += sign * eg_w;
+                feats[MG_PST_OFF + pt_i * 64 + idx] += sign * mg_w;
+                feats[EG_PST_OFF + pt_i * 64 + idx] += sign * eg_w;
+            }
+        }
+    }
+}
+
 /// Zona do rei: a propria casa + as 8 vizinhas (igual ao king_attacks).
 fn king_zone(king_sq: Square) -> Bitboard {
     atk().king[king_sq as usize] | bb(king_sq)
