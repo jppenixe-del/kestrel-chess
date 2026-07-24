@@ -2968,3 +2968,18 @@ bots e demorava 20s+/pendurava, o que ja' estava a travar o loop).
 challenge_loop PARADO ate' o cooldown do 429 passar (nada deve enviar
 challenges entretanto). O bridge reativo fica vivo (aceita desafios
 entrantes). Relancar o loop gentil quando o 429 passar.
+
+## 2026-07-24 ~06:10 UTC — contencao causa BLUNDERS tacticos (nao so' flags)
+
+Analise da derrota vs AgileBot (p1R1H3sO, 2100, mate): o blunder foi
+Nxe4 no lance 9 (eval das pretas +45cp -> -300cp). Investigacao:
+- O motor NUNCA escolhe Nxe4 em analise: nem a depth 6-18, nem multipv
+  1/3, nem com livro (sf17/polgar dao b5b4), nem 4 threads (5/5 b5b4).
+- MAS a depth 2/4/5 escolhe Nxe4 (captura peao, refutacao so' vista a
+  depth 6+). Logo no jogo real a busca foi TRUNCADA a depth ~4-5.
+- Num lance 9 de 3+0 com relogio confortavel, so' se chega a depth 4-5
+  com o NPS despenhado -> CONTENCAO (A/Bs a correr as 01:49 UTC).
+CONCLUSAO: a mesma contencao que causava flags tambem causa blunders
+tacticos (busca truncada). Reforca a regra: bot joga com CPU LIMPA.
+Nenhum vazamento de forca sistematico no eval/busca — o motor joga bem
+com profundidade normal. O lever continua a ser NPS + CPU limpa.
