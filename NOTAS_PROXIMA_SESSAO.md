@@ -2954,3 +2954,17 @@ NOTA sobre b7bd5dd/ad5b821 (move-overhead 150 por-lance + piso): foram
 validados contra latencia irrealista (300ms) e NAO sao a cura; mas sao
 inocuos/ligeiramente benaficos (reservam a latencia real 45ms com margem)
 e ficam. A CURA real e' a correcao do ponder acima.
+
+## 2026-07-24 ~05:30 UTC — rate-limit 429 a impedir novos jogos
+
+Correcao do ponder FEITA e bridge reiniciado com ela. Mas o bot nao
+conseguia jogos: o challenge_loop.py estava rate-limited (HTTP 429 "Too
+many requests") por ser agressivo demais (ate' ~50 challenges/ciclo) +
+varios reinicios + testes manuais. Reescrito para ser GENTIL: 1 challenge
+por ciclo, skip de bots recem-desafiados (5min) e recusados (10min),
+backoff 120s em 429, so' 3+0 (180s, melhor aceitacao). Tambem: adicionado
+?nb=40 ao /api/bot/online (sem isto o endpoint fazia stream de TODOS os
+bots e demorava 20s+/pendurava, o que ja' estava a travar o loop).
+challenge_loop PARADO ate' o cooldown do 429 passar (nada deve enviar
+challenges entretanto). O bridge reativo fica vivo (aceita desafios
+entrantes). Relancar o loop gentil quando o 429 passar.
