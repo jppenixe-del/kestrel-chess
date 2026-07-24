@@ -6,7 +6,18 @@ use crate::zobrist::Zobrist;
 use std::io::{self, BufRead, Write};
 use std::time::{Duration, Instant};
 
-const MOVE_OVERHEAD_MS: i64 = 60;
+// Time reserved PER MOVE for network + bridge round-trip latency. This is
+// an online-bot value: when we run on Lichess the clock keeps ticking
+// while our move travels the wire and the Python bridge relays it, and
+// that cost recurs on EVERY move -- not once per game. The old value (60)
+// was reserved a single time from the whole clock (`safe_time = my_time -
+// 60`), so across ~50 moves ~10s of real latency went unreserved and the
+// engine flagged in otherwise-playable positions (repro: real_clock_
+// selfplay.py, 3/4 games lost on time at 300ms latency). Now reserved
+// per move from the search deadline as well (see cmd_go). 250 comfortably
+// covers typical Lichess latency with margin; the base formula is
+// self-correcting so a rare over-latency move is absorbed on the next.
+const MOVE_OVERHEAD_MS: i64 = 250;
 
 /// Gestao de tempo em 4 niveis -- a mesma arquitetura em camadas que
 /// validamos esta sessao no Pond (jogos reais, derrotas por bandeira
@@ -303,7 +314,16 @@ impl Engine {
             // to the flat `soft` baseline until this can be built on a
             // real complexity signal instead of per-thread stability
             // timing.
-            let search_ms = if advisor_enabled { (soft - ADVISOR_RESERVE_MS).max(1) } else { soft };
+            // Reserve MOVE_OVERHEAD_MS from THIS move's think time (not just
+            // once from the whole clock) so search stops early enough for the
+            // move to reach Lichess before our clock would expire. Floor at
+            // 20ms so panic/near-zero budgets still return a move instantly
+            // rather than underflowing.
+            let search_ms = if advisor_enabled {
+                (soft - ADVISOR_RESERVE_MS - MOVE_OVERHEAD_MS).max(20)
+            } else {
+                (soft - MOVE_OVERHEAD_MS).max(20)
+            };
             soft_deadline = Some(Instant::now() + Duration::from_millis((search_ms / 2).max(1) as u64));
             Some(Instant::now() + Duration::from_millis(search_ms.max(1) as u64))
         };
