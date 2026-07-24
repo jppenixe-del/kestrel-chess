@@ -17,7 +17,13 @@ use std::time::{Duration, Instant};
 // per move from the search deadline as well (see cmd_go). 250 comfortably
 // covers typical Lichess latency with margin; the base formula is
 // self-correcting so a rare over-latency move is absorbed on the next.
-const MOVE_OVERHEAD_MS: i64 = 250;
+// Value tuned to MEASURED latency: the server's round-trip to the Lichess
+// API is ~45ms median (measured 2026-07-24), so the real per-move
+// overhead (receive gamestate + bridge parse + send move POST) is ~100ms.
+// 150 covers that ~3x over the median with margin for jitter, without the
+// strength cost of an over-large reserve (250 measurably lost pure,
+// non-flag games in self-play by thinking too little per move).
+const MOVE_OVERHEAD_MS: i64 = 150;
 
 /// Gestao de tempo em 4 niveis -- a mesma arquitetura em camadas que
 /// validamos esta sessao no Pond (jogos reais, derrotas por bandeira
@@ -316,13 +322,18 @@ impl Engine {
             // timing.
             // Reserve MOVE_OVERHEAD_MS from THIS move's think time (not just
             // once from the whole clock) so search stops early enough for the
-            // move to reach Lichess before our clock would expire. Floor at
-            // 20ms so panic/near-zero budgets still return a move instantly
-            // rather than underflowing.
+            // move to reach Lichess before our clock would expire. But never
+            // subtract so much that we play blind: when `soft` itself is below
+            // the overhead (low clock but many estimated moves left, e.g. after
+            // spending big early), a flat `soft - overhead` would collapse to
+            // ~0 and throw away a move at depth 1. Floor the think time at
+            // min(soft, 80ms) so we still get a sane ~depth-6 move; the base
+            // formula is self-correcting, so this rare case doesn't compound.
+            let think_floor = soft.min(80);
             let search_ms = if advisor_enabled {
-                (soft - ADVISOR_RESERVE_MS - MOVE_OVERHEAD_MS).max(20)
+                (soft - ADVISOR_RESERVE_MS - MOVE_OVERHEAD_MS).max(think_floor)
             } else {
-                (soft - MOVE_OVERHEAD_MS).max(20)
+                (soft - MOVE_OVERHEAD_MS).max(think_floor)
             };
             soft_deadline = Some(Instant::now() + Duration::from_millis((search_ms / 2).max(1) as u64));
             Some(Instant::now() + Duration::from_millis(search_ms.max(1) as u64))
