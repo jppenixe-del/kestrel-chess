@@ -3113,3 +3113,20 @@ re-tunar. NOTA: o trainer do Sirius (texel_tuner) le' binpack mas tuna
 features do littleindian (convencao propria) -- nao encaixa no eval do
 Kestrel sem reescrita; por isso o tune_stream (features do Kestrel via
 probing) e' o caminho. Bot pausado durante o tuning/A-B.
+
+## 2026-07-24 tarde — balanco tuning/estrutura
+- Ganho REAL da sessao: SF-tuning eval +6 Elo (streaming Texel sobre 3M
+  posicoes Stockfish binpack), adotado commit 8cd0cbb (669 dims).
+- SEM ganho: escalar dados 10M (convergiu a 3M), rescale margens search
+  x1.5 (45.9%, search ja' otimo), SPSA search (sinal ~0.5), clone dos
+  termos Ethereal em falta 741 dims (48.2%, regride -- clone nao serve).
+- Infra nova: extract_epd.rs (binpack->EPD), tune_stream (streaming Texel,
+  cache esparso, mean-centering), spsa_search.py.
+- Estrutura: Kestrel = Ethereal (safe checks, king_danger_table). Termos
+  do Ethereal em falta: Space, Closedness, ThreatOverloaded, QueenRelPin,
+  KnightSiberia, KingPawnProx (clone testado, regride -> NAO adotado).
+- PROXIMO LEVER (a' nossa maneira, nao clone): material IMBALANCE quadratico
+  (Kaufman) -- o Kestrel so' tem material linear; imbalance capta interacoes
+  par-a-par (par de bispos, redundancia torres, cavalo+peoes). Formular e
+  tunar nos nossos dados SF. Principio: pesquisar NET (chessprogramming,
+  talkchess) por termos que elevem o HCE, implementar com identidade propria.
