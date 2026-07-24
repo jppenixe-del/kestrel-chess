@@ -2983,3 +2983,26 @@ CONCLUSAO: a mesma contencao que causava flags tambem causa blunders
 tacticos (busca truncada). Reforca a regra: bot joga com CPU LIMPA.
 Nenhum vazamento de forca sistematico no eval/busca — o motor joga bem
 com profundidade normal. O lever continua a ser NPS + CPU limpa.
+
+## 2026-07-24 ~07:00 UTC — ponder fix CONFIRMADO em jogo; correcao anti-2-jogos
+
+**Correcao do ponder CONFIRMADA em jogo real:** 3 jogos com o bridge
+corrigido (KonaBot W, IlCorvoChess D, simpleEval W) -> ZERO flags. O
+IlCorvoChess (2258) que antes flagava agora empatou. Rating blitz subiu
+2113 -> 2140. Os flags estao resolvidos.
+
+**Erro operacional (apontado pelo utilizador): 2 jogos em simultaneo.**
+Causa: o meu teste manual do 429 (desafio a FlounderBot) + o loop
+(simpleEval) foram aceites ao mesmo tempo -> 2 jogos -> contencao (2x
+Threads=4 + ponders). Corrigido no lichess_bridge.py:
+- Recusar desafios ENTRANTES quando ja' ha' jogo activo (len(active_games)>0).
+- No gameStart, se ja' ha' jogo activo, ABORTAR o 2o (permitido no
+  arranque, sem perda de Elo; se abort falhar, jogar para nao dar flag).
+- challenge_loop skip 300s->1800s (variar adversarios; os jogos duram
+  ~6min, 300s expirava entre jogos e re-desafiava o mesmo bot).
+Licao: NUNCA criar desafios manuais enquanto o loop corre; testar o 429
+sem criar jogo real (ou cancelar logo). 1 JOGO DE CADA VEZ e' regra dura.
+
+Estado: bridge+loop reiniciados com todas as correcoes. Bot estavel,
+1 jogo de cada vez, ponder corrigido, adversarios variados. A acumular
+Elo. Ver [[project_flags_contencao_gestao_tempo]].
