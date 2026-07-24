@@ -3130,3 +3130,16 @@ probing) e' o caminho. Bot pausado durante o tuning/A-B.
   par-a-par (par de bispos, redundancia torres, cavalo+peoes). Formular e
   tunar nos nossos dados SF. Principio: pesquisar NET (chessprogramming,
   talkchess) por termos que elevem o HCE, implementar com identidade propria.
+
+## imbalance material — NAO ajuda (SPRT cutechess)
+6 features de imbalance nossas (Fable) tunadas sobre SF (681 dims). SPRT
+cutechess STC 8+0.08 vs base 669: -7.6 +/-16 Elo em 1618 jogos, LOS 17.6%
+-> rejeitado. Implementacao CORRECTA (verificado). Causa: material FIXO
+(consts) -- o imbalance so' soma redundancia por cima do que o material
+tunado ja' capta; nao ha' espaco. Para funcionar: tunar material+imbalance
+JUNTOS (o material cede sinal). Descartado. Guardado /tmp/eval_741*.rs e
+implementacao imbalance perdida no checkout (re-derivavel).
+FERRAMENTA NOVA: validacao seria via cutechess-cli SPRT (book UHO_4060,
+STC 8+0.08, bounds [0,5]) -- usar isto para validar dai em diante, nao
+A/Bs de 400 jogos. PROXIMO LEVER: tunar eval COMPLETO (material incluido)
+sobre SF com pinagem, validado por SPRT.
