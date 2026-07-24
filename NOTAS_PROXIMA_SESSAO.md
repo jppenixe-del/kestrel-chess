@@ -3006,3 +3006,47 @@ sem criar jogo real (ou cancelar logo). 1 JOGO DE CADA VEZ e' regra dura.
 Estado: bridge+loop reiniciados com todas as correcoes. Bot estavel,
 1 jogo de cada vez, ponder corrigido, adversarios variados. A acumular
 Elo. Ver [[project_flags_contencao_gestao_tempo]].
+
+## 2026-07-24 ~07:20 UTC — PORQUE o material/PST tuning falhou (pista do utilizador: método do Sirius)
+
+O utilizador apontou o dossier de treino do Sirius (README -> repo
+Sirius-Tune-2 / Texel). Investiguei: Sirius/src/datagen, /root/texel_tuner
+(tuner Rust que le' binpack via sfbinpack), e /root/hce_8buckets_experiment
+(projeto littleindian, 3x 3.2GB = ~100M posicoes binpack, tuner AdamW
+maduro). Os comentarios do texel_tuner explicam a CAUSA RAIZ do nosso
+overfitting, confirmada por motores maduros (Ethereal/Sirius):
+
+1. **COLINEARIDADE Material <-> PSQT/Mobility.** A soma dos buckets de
+   mobilidade de uma peca e' EXATAMENTE igual a' coluna de material
+   (material_knight == Sum(knight_mob[i])). O PSQT (64 g.l. por peca)
+   absorve livremente qualquer correlacao espuria fase<->decisividade nos
+   dados -> material fica desequilibrado (ex. dama -39cp MG vs +420cp EG).
+   ISTO e' o nosso round1: material inflava/desequilibrava. Fixar o
+   material (round1c) foi a direcao CERTA, mas faltou o resto.
+
+2. **Solucao dos motores maduros:** Material FIXO (ancora Ethereal) OU
+   soft-anchor L2; PSQT via PINAGEM POS-ADAM (fixar a media de cada tabela
+   em 0 = o init, deixando livre so' a FORMA relativa entre casas) --
+   mean-centering do GRADIENTE falha sob AdamW; regularizacao ADAPTATIVA
+   por bucket (buckets raros ancorados, buckets com muitos dados livres);
+   zerar casas mortas (peao linhas 1/8).
+
+3. **DADOS: 100M+ posicoes binpack de qualidade** (Stockfish-labeled/
+   self-play forte), filtradas a quiet (is_quiet_position). O nosso
+   dataset era ~250k self-play ~2100 -> POUCO e RUIDOSO -> overfitting.
+   Metodo de datagen do Sirius: aberturas ALEATORIAS (8 lances random,
+   rejeita score>300), self-play com limite de NOS, ADJUDICACAO WDL
+   (win |score|>=2000 x5 plies; draw |score|<7 x8 plies apos lance 50),
+   score guardado por posicao. Volume: milhoes de jogos multi-thread.
+
+4. **"loss offline NAO prediz forca de jogo"** (confirmado pelos gauntlets
+   deles) -- validar SEMPRE em jogo real. Exatamente o que vimos: erro de
+   fitting descia mas o jogo regredia.
+
+**PLANO para o Kestrel (aplicar o metodo, nao copiar valores):** gerar
+(ou reutilizar) dados em volume (>=milhoes) com aberturas aleatorias +
+adjudicacao; tunar com material fixo/ancorado + pinagem pos-Adam do PSQT
++ reg. adaptativa; validar em jogo. Recursos ja' locais: texel_tuner
+(le' binpack, tem toda a mecanica), 100M binpack em hce_8buckets, datagen
+do Sirius como referencia. NAO executar tuning pesado com o bot a jogar
+(contencao). Ver [[project_flags_contencao_gestao_tempo]].
