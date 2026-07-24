@@ -2900,3 +2900,57 @@ os flags foram maioritariamente CONTENCAO (nunca correr A/Bs pesados
 enquanto o bot joga) + a reserva de overhead por-lance como salvaguarda
 estrutural. Rating blitz tinha caido 2144->2131 pelos flags; esperado
 recuperar agora.
+
+## 2026-07-24 ~04:15 UTC — CORRECAO OVERHEAD NAO RESOLVEU; causa e' CONTENCAO DO PONDER
+
+Honestidade: a correcao do move-overhead (b7bd5dd/ad5b821) foi validada
+num cenario ERRADO (real_clock_selfplay com latencia 300ms irrealista).
+A latencia real e' ~45ms, logo o overhead de 150ms mal muda o jogo real.
+Prova: jogo JewkieBot (4aCS2ieb, 03:49 UTC) usou o binario JA' corrigido
+(binario mtime 03:11 UTC) e deu flag na mesma — mesmo padrao: sangramento
+3.4s/lance x 53 lances, e PICOS de 5-7s com relogio baixo (limite devia
+ser <800ms). Local sem contencao o binario respeita o budget (253ms @15s).
+
+**Causa real: CONTENCAO DO PONDER.** lichess_bridge.py corre o ponder
+como 2o PROCESSO (penv = Engine(), Threads=4) durante PONDER_MOVETIME_MS
+=6000ms a cada lance. Em blitz 3+0 o adversario joga em ~3s mas o ponder
+dura 6s -> sobrepoe-se SEMPRE a' nossa busca seguinte -> 8 threads em 6
+nucleos -> NPS despenca -> o check de tempo por-nos (search.rs:695,
+`nodes % 2048`) nao dispara a tempo -> picos de 6s -> flag.
+
+Correcoes planeadas (a validar com repro de contencao, 4 threads):
+1. Bridge: desativar/encurtar o ponder em BLITZ (so' ponderar em rapid+
+   onde o adversario demora >6s e o ponder termina antes da nossa vez).
+2. Engine: reduzir o intervalo do check de tempo (2048 -> ~256) para
+   apanhar excessos mais cedo sob contencao residual. Barato (~0.02%
+   overhead de Instant::now()).
+Repro de contencao a correr: baseline vs baseline, 4 threads, lat 45ms.
+
+## 2026-07-24 ~04:40 UTC — CAUSA REAL DOS FLAGS ENCONTRADA: ponder-hit join
+
+CORRECAO das conclusoes anteriores. A causa dos flags NAO era latencia
+(que e' 45ms) NEM contencao de threads (o engine respeita o budget mesmo
+com 8 threads + ponder paralelo, testado). E' o PONDER no bridge:
+
+`_consume_ponder` num ponder HIT faz `thread.join()` que BLOQUEIA ate' o
+ponder de movetime-fixo (6000ms) terminar. Se o adversario respondeu o
+palpite mais depressa que o movetime (normal em blitz), o join queima o
+tempo RESTANTE do ponder do NOSSO relogio. Medido: **5910ms por hit**.
+Num lance de relogio baixo (budget ~350ms) = pico de 6s = flag imediato.
+Confirmado empiricamente (importando o bridge e medindo o join) e pelo
+mapeamento dos deltas do jogo JewkieBot: os picos eram exactamente ~6s
+(=PONDER_MOVETIME_MS) e cresciam no fim do jogo (relogio baixo).
+
+**Correcao (lichess_bridge.py, nao versionado no git):**
+- PONDER_MOVETIME_MS 6000 -> 2000 (join num hit limitado a ~2s).
+- PONDER_MIN_CLOCK_MS = 30000: so' ponderar com relogio >= 30s (um pico
+  com relogio confortavel e' inofensivo; em relogio baixo, sem ponder ->
+  busca normal, que respeita o budget).
+- join timeout limitado ao movetime (+1s).
+Validado: join num hit caiu 5910ms -> 2351ms. Bridge a reiniciar quando
+o jogo em curso terminar (nunca reiniciar a meio de jogo real).
+
+NOTA sobre b7bd5dd/ad5b821 (move-overhead 150 por-lance + piso): foram
+validados contra latencia irrealista (300ms) e NAO sao a cura; mas sao
+inocuos/ligeiramente benaficos (reservam a latencia real 45ms com margem)
+e ficam. A CURA real e' a correcao do ponder acima.
