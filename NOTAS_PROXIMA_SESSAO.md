@@ -2879,3 +2879,24 @@ MAX_CONCURRENT=1). A correcao do overhead resolve a componente
 estrutural (latencia por-lance); a contencao e' operacional.
 
 Bot religado com o binario corrigido para acumular Elo a 3+0/1+0.
+
+## 2026-07-24 ~05:40 UTC — overhead calibrado a dados (ad5b821), bot religado
+
+Refinamento da correcao de flags apos MEDIR a latencia real:
+- Latencia servidor->Lichess API = ~45ms mediana (medido). Overhead real
+  por lance ~100ms. Logo 250ms era exagero e custava forca (o build 250ms
+  perdia jogos puros em self-play por pensar pouco).
+- MOVE_OVERHEAD_MS = 150 (final). Piso de pensamento min(soft,80)ms.
+- Validacao real_clock_selfplay: overhead150 vs baseline, lat 50ms
+  realista, 10 jogos -> W5 L3 D2, **flags 0-0** (sem custo de forca; com
+  latencia real nem o baseline da flag -> confirma que os flags REAIS
+  foram CONTENCAO dos A/Bs + picos de estabelecimento, nao latencia).
+- Sob stress 300ms: overhead 250 dava 0 flags; overhead 150 tem folga 3x
+  sobre a latencia real (45ms), proteccao garantida no cenario real.
+
+Commits: b7bd5dd (reserva por-lance) + ad5b821 (overhead 150 + piso).
+Bot religado com o binario corrigido para acumular Elo. LICAO principal:
+os flags foram maioritariamente CONTENCAO (nunca correr A/Bs pesados
+enquanto o bot joga) + a reserva de overhead por-lance como salvaguarda
+estrutural. Rating blitz tinha caido 2144->2131 pelos flags; esperado
+recuperar agora.
