@@ -1030,6 +1030,16 @@ fn tune_stream(dataset_path: &str, out_path: &str, epochs: u32, lr: f64, chunk_s
 
     // PHASE 2: fast full-batch gradient iterations over the sparse cache.
     let mut w: Vec<f64> = default_vec.iter().map(|&x| x as f64).collect();
+    // Mean-centering (pinagem) of the mobility tables: fix each table's MEAN
+    // at its init, leaving only the relative SHAPE between slots free. Without
+    // it the mobility tables are collinear with the (fixed) material -- the
+    // sum-of-buckets vector equals the material column -- so the gradient
+    // drifts the table mean (the texel_tuner/Sirius lesson). Default on;
+    // KESTREL_TUNE_MEANCENTER=0 disables it for A/B comparison.
+    let meancenter = std::env::var("KESTREL_TUNE_MEANCENTER").map(|v| v != "0").unwrap_or(true);
+    // (to_vec offset, used-slot count) per mobility table: knight/bishop/rook/queen
+    let mob_tables: [(usize, usize); 4] = [(16, 9), (72, 14), (128, 15), (184, 28)];
+    println!("mean-centering mobility tables: {}", meancenter);
     for iter in 0..epochs {
         let w_ref = &w;
         let (grad, loss) = std::thread::scope(|scope| {
@@ -1064,6 +1074,17 @@ fn tune_stream(dataset_path: &str, out_path: &str, epochs: u32, lr: f64, chunk_s
             }
             (tg, tl)
         });
+        let mut grad = grad;
+        if meancenter {
+            for &(off, n) in &mob_tables {
+                let mg_mean: f64 = (0..n).map(|i| grad[off + 2 * i]).sum::<f64>() / n as f64;
+                let eg_mean: f64 = (0..n).map(|i| grad[off + 2 * i + 1]).sum::<f64>() / n as f64;
+                for i in 0..n {
+                    grad[off + 2 * i] -= mg_mean;
+                    grad[off + 2 * i + 1] -= eg_mean;
+                }
+            }
+        }
         for j in 0..dim {
             if !is_king_field[j] {
                 w[j] -= lr * grad[j] / n_pos as f64;
