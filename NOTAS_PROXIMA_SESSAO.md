@@ -3085,3 +3085,31 @@ le' binpack.
   project_out_table_means).
 
 Bot PAUSADO durante o tuning (CPU limpa). Ver [[project_flags_contencao_gestao_tempo]].
+
+## 2026-07-24 ~08:40 UTC — tuner STREAMING + dados SF (pista do utilizador)
+
+Utilizador: usar dados SF binpack + fazer STREAMING (nao carregar tudo).
+Implementado:
+- extract_epd.rs (/root/texel_tuner/src/bin/): binpack SF -> EPD
+  "fen\tWDL" filtrado quiet (pos.is_checked). 3M extraidas em 4s.
+- tune_stream (main.rs, comando `tunestream`): extrai features ESPARSAS
+  uma vez (streaming do disco em chunks, extracao PARALELA thread::scope),
+  cache esparso em RAM (~720MB p/ 3M vs 8GB denso), depois iters full-batch
+  rapidas. Material fixo, king-safety fixo. Correu 3M SF, 4000 iters, loss
+  0.0896->0.0886.
+
+**RESULTADO (comparacao de valores):** o tuning SF NAO aumentou a
+mobilidade -- manteve-a timida (cavalo eg round5 -31..+15, SF -31..+13;
+vs Sirius -101..+27). Mesmo com dados de qualidade, a mobilidade do
+Kestrel fica ~igual. Hipoteses: (a) colinearidade material<->mobility sem
+mean-centering (a mobilidade fica presa perto do init); (b) no eval do
+Kestrel a mobilidade MARGINAL e' pequena (outros termos capturam o sinal
+-- decomposicao diferente do Sirius). 335/669 pesos mudaram (outros
+termos ajustaram). A validar em JOGO (A/B nos fixos vs round5).
+
+PROXIMO se A/B nao ganhar: adicionar MEAN-CENTERING das tabelas ao
+tune_stream (project_out_table_means, a licao central do texel_tuner) e
+re-tunar. NOTA: o trainer do Sirius (texel_tuner) le' binpack mas tuna
+features do littleindian (convencao propria) -- nao encaixa no eval do
+Kestrel sem reescrita; por isso o tune_stream (features do Kestrel via
+probing) e' o caminho. Bot pausado durante o tuning/A-B.
