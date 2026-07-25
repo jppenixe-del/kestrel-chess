@@ -506,15 +506,14 @@ impl Engine {
             let handles: Vec<_> = (0..n)
                 .map(|ti| {
                     let mut b = board.clone();
-                    // learned tables carried in from the previous move,
-                    // faded first: statistics from earlier in the game are
-                    // still informative but the position has moved on, so
-                    // they should not outweigh what this search learns.
-                    // Fading (rather than keeping raw, or clearing) is what
-                    // keeps the ordering they encode while letting fresh
-                    // evidence take over within a few moves.
-                    let mut ht = pool_iter.next().unwrap_or_default();
-                    ht.fade();
+                    // Learned tables carried in from the previous move.
+                    // Deliberately NOT faded: decaying them 3/4 per move
+                    // was tried and measured worse on the blunder replay
+                    // (45/60 avoided vs 47/60, and 74 improving deviations
+                    // vs 83), so the statistics are carried over intact.
+                    // `HistoryTables::fade` is kept for a future retry with
+                    // a gentler factor or applied to fewer tables.
+                    let ht = pool_iter.next().unwrap_or_default();
                     let searcher = Searcher {
                         atk: atk_ref,
                         zob: zob_ref,

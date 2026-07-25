@@ -494,7 +494,12 @@ pub struct HistoryTables {
 
 impl HistoryTables {
     /// Fade the move-ordering statistics before reusing them in the next
-    /// search of the same game. Kept at 3/4 per move: strong enough that
+    /// search of the same game. CURRENTLY UNUSED: fading at 3/4 measured
+    /// worse than carrying the tables over intact on the blunder replay
+    /// (45/60 blunders avoided vs 47/60, 74 improving deviations vs 83),
+    /// so `uci.rs` does not call it. Kept for a future retry with a
+    /// gentler factor, or applied to only some of the tables.
+    /// Kept at 3/4 per move: strong enough that
     /// evidence from several moves ago stops dominating (after ~5 moves an
     /// old score is down to a quarter), gentle enough that the ordering
     /// carried over is still worth having on the first iterations, which
