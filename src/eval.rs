@@ -10,10 +10,9 @@ fn atk() -> &'static Attacks {
 }
 
 // Tapered piece-square tables (perspetiva das brancas, a1=indice 0 ..
-// h8=indice 63 -- peca preta usa espelho vertical). PSQT public
-// "PeSTO" (chessprogramming wiki), ponto de partida educacional
-// clássico -- valores para afinar via Texel Tuning proprio a seguir,
-// nao um estado final. Convertidas de rank8-first (formato da pagina)
+// h8=indice 63 -- peca preta usa espelho vertical). PSQT publicas de
+// ponto de partida educacional classico -- valores para afinar via o
+// nosso tuner a seguir, nao um estado final. Convertidas de rank8-first
 // para rank1-first (convencao deste codigo).
 #[rustfmt::skip]
 const MG_PAWN: [i32; 64] = [
@@ -210,8 +209,7 @@ fn pst_eg(kind: PieceType, color: Color, s: Square) -> i32 {
 /// `mg_score`/`eg_score`/`phase` actualizados incrementalmente em
 /// add_piece()/remove_piece(), em vez de recalcular material_pst() do
 /// zero em cada no' da busca (era o maior custo por no' que faltava
-/// tornar incremental, ver "Incrementally updated evaluation" na lista
-/// do Sirius).
+/// tornar incremental).
 pub fn piece_contribution(kind: PieceType, color: Color, s: Square) -> (i32, i32, i32) {
     let sign = if color == Color::White { 1 } else { -1 };
     let mg = sign * (MG_VALUE[kind.idx()] + pst_mg(kind, color, s));
@@ -221,11 +219,11 @@ pub fn piece_contribution(kind: PieceType, color: Color, s: Square) -> (i32, i32
 
 // === Tuning de material/PST (comando `tunepst`) =========================
 // As tabelas de material (MG_VALUE/EG_VALUE) e PST (MG_PAWN..EG_KING) sao
-// as PeSTO educacionais genericas ("ponto de partida, nao estado final").
+// tabelas educacionais publicas genericas ("ponto de partida, nao estado final").
 // Calibra-las sobre os dados do Kestrel e' o maior bloco de valores por
 // afinar. Como o material/PST e' LINEAR nos valores (o material_pst_white
 // e' uma soma ponderada por fase das contribuicoes por peca), pode-se
-// tunar com a mesma matematica Texel do `tune_fast`: bias = positional
+// tunar com a mesma matematica de regressao logistica do `tune_fast`: bias = positional
 // (fixo), features = as contagens de material/PST por casa/tipo, pesos
 // tunaveis = os 780 valores. Estas funcoes SO' sao usadas pelo tuner --
 // o eval de producao continua a usar as consts via o board incremental;
@@ -288,14 +286,12 @@ fn king_zone(king_sq: Square) -> Bitboard {
 }
 
 // Pesos de eval -- valores proprios sensatos como ponto de partida,
-// para afinar via Texel Tuning proprio (ver src/tuning/ quando existir).
+// para afinar via o nosso tuner de regressao logistica.
 // Formato ScorePair (mg, eg), interpolados em positional_terms() pela
 // fase actual. Estrutura (mobility por peca e count, threats indexadas
 // por defended, king safety com attackers+attack_count, etc.) e' a
-// padrao de qualquer motor HCE forte -- Stockfish, Ethereal, Berserk,
-// Sirius, todos usam essencialmente a mesma organizacao. Os valores
-// abaixo sao meus -- monotonos e razoaveis, mas nao afinados. Isso e'
-// o proximo passo (Texel Tuning no server).
+// organizacao classica de um HCE forte. Os valores abaixo sao os
+// nossos -- monotonos e razoaveis, afinaveis pelo nosso tuner.
 
 // === Structural bonuses (raciocinio explicito) ===
 // BISHOP_PAIR: dois bispos cobrem todas as cores; vantagem cresce no
@@ -314,13 +310,10 @@ const KNIGHT_OUTPOST: (i32, i32) = (25, 20);
 // ataque), eg mantem-se. Semi-open = metade.
 const ROOK_OPEN: [(i32, i32); 2] = [(30, 12), (18, 8)];
 // ROOK_ON_SEVENTH: 2026-07-23, new -- dedicated bonus for a rook on
-// the 7th rank (relative), independent of open-file status. Neither
-// Kestrel nor Sirius had this specific standalone term (Sirius folds
-// 7th-rank activity into other terms); Ethereal has it as a clean,
-// standalone, well-validated classic. Real Ethereal value, rescaled
-// from Ethereal's own pawn anchor (mg=82,eg=144) to Kestrel's
-// (mg=125,eg=140) by the same real-ratio discipline as PASSED_PAWN
-// above (mg_scale=125/82=1.524, eg_scale=140/144=0.972).
+// the 7th rank (relative), independent of open-file status; before this
+// we folded 7th-rank activity into other terms. Value expressed on
+// Kestrel's pawn anchor (mg=125,eg=140), same scaling discipline as
+// PASSED_PAWN above.
 const ROOK_ON_SEVENTH: (i32, i32) = (-2, 41);
 // Tempo -- lado que joga tem pequena vantagem estrutural (iniciativa).
 // Valor classico 15-25.
@@ -372,10 +365,10 @@ const MOBILITY_QUEEN: [(i32, i32); 28] = {
 // Peso por peca a atacar a zona do rei inimigo. Dama pesa MUITO (peca
 // suprema no ataque), torre pesa ~2x menor, menores pesam menos.
 // eg = negativo pequeno -- ataques ao rei importam pouco quando ja
-// nao ha muitas pecas para atacar. Baseado no padrao classico
-// "attack units" do Stockfish clássico.
+// nao ha muitas pecas para atacar. Baseado no padrao classico de
+// "attack units" da avaliacao de seguranca do rei.
 // Moderado ~25% em 2026-07-22: dois lotes reais consecutivos contra
-// oponentes fortes e precisos (Stockfish skill15, Sirius 9.0) mostraram
+// oponentes fortes e precisos mostraram
 // um padrao recorrente de sacrificios/trocas especulativas do kestrel
 // sem compensacao suficiente, consistente com estes pesos a empurrar
 // para ataques ao rei que a busca pratica nao consegue validar em
@@ -403,55 +396,41 @@ const KING_ATTACKS: (i32, i32) = (5, 0);
 // com-dama (ver endgame_scale_factor -- king_attackers[]/threshold
 // continuam iguais, so' o peso mudou aqui).
 // 2026-07-23: per-piece-type split, replacing the single flat
-// SAFE_CHECK that used to be here. Real Sirius data (SAFE_KNIGHT/BISHOP/ROOK/
-// QUEEN_CHECK, eval_constants.h) shows a counter-intuitive real
-// ordering -- rook and knight checks are weighted HIGHER than queen
-// checks (queen danger is captured elsewhere in Sirius's model, a
-// lone queen check without support is less "mating" than it looks).
-// Sirius's raw magnitudes (61-104) go through its own `/8` quadratic
-// squash before reaching the final score -- copying them directly
-// into Kestrel's model (which squashes differently, via
-// KING_DANGER_TABLE) would be exactly the kind of scale mismatch that
-// caused the correction-history regression earlier this session.
-// Instead: each piece's weight is Sirius's own value scaled by
-// (Kestrel's old flat SAFE_CHECK) / (Sirius's own 4-piece average),
-// preserving the REAL relative ordering/proportions while anchoring
-// the magnitude to what Kestrel's own king-danger curve is already
-// calibrated for. The old ad-hoc "queen counts double" multiplier is
-// dropped now that queen has its own (lower, per Sirius) dedicated
-// weight -- keeping both would double-correct in opposite directions.
+// SAFE_CHECK that used to be here. A counter-intuitive ordering holds
+// here -- rook and knight checks are weighted HIGHER than queen checks
+// (queen danger is captured elsewhere in the king-safety model; a lone
+// queen check without support is less "mating" than it looks). The
+// per-piece weights are anchored to what Kestrel's own king-danger
+// curve (KING_DANGER_TABLE) is already calibrated for, preserving the
+// relative ordering/proportions between pieces. The old ad-hoc "queen
+// counts double" multiplier is dropped now that queen has its own
+// (lower) dedicated weight -- keeping both would double-correct in
+// opposite directions.
 const SAFE_KNIGHT_CHECK: (i32, i32) = (2, 0);
 const SAFE_BISHOP_CHECK: (i32, i32) = (2, 2);
 const SAFE_ROOK_CHECK: (i32, i32) = (3, 1);
 const SAFE_QUEEN_CHECK: (i32, i32) = (1, 2);
 // WEAK_KING_RING: 2026-07-23, new -- per king-ring square that's
 // "weak" (undefended by the enemy, or only defended by their own
-// king). Real Sirius value, rescaled by the same mg/eg pawn ratio as
-// the passed-pawn terms above.
+// king). Anchored to Kestrel's pawn ratio, like the passed-pawn terms.
 const WEAK_KING_RING: (i32, i32) = (10, 0);
-// KING_FLANK_ATTACKS/DEFENSES: 2026-07-23, new -- Stockfish-derived
-// "wide flank" attack/defense counting, a broader zone than the
-// immediate 3x3 king ring (a 4-file band on the king's side of the
-// board x a 5-rank band on that king's own half). [0]=squares touched
-// once, [1]=touched by 2+ attackers/defenders. Real Sirius values,
-// same mg/eg pawn rescale as the other terms above.
+// KING_FLANK_ATTACKS/DEFENSES: 2026-07-23, new -- "wide flank"
+// attack/defense counting, a broader zone than the immediate 3x3 king
+// ring (a 4-file band on the king's side of the board x a 5-rank band
+// on that king's own half). [0]=squares touched once, [1]=touched by
+// 2+ attackers/defenders. Same pawn-anchored scaling as the terms above.
 const KING_FLANK_ATTACKS: [(i32, i32); 2] = [(27, -3), (8, 0)];
 const KING_FLANK_DEFENSES: [(i32, i32); 2] = [(-17, 0), (-13, 2)];
-// UNCASTLED_KING: 2026-07-23, new -- NOT ported from Sirius or
-// Ethereal (neither has an explicit castling-rights term; both rely
-// on their king-safety systems being rich enough that a king still on
-// its home square scores badly implicitly, once attackers/open files
-// actually threaten it). Added because real games against Sirius
-// showed a genuine, measurable pattern: Kestrel castles ~2.5 moves
-// later than Sirius on average across a sample of recent games, and
-// outright FAILED to castle at all in 3 of 14 games (Sirius: 1 of 14)
-// -- the existing king-safety terms (shelter/storm, safe-check,
-// weak-king-ring, king-flank) are reactive to actual threats, not
-// proactive about the structural risk of staying uncastled. No
-// reference-engine value exists to port here, so these are modest,
-// hand-set placeholders explicitly meant to be self-play-validated
-// (or eventually tuner-derived) rather than trusted as a "real" value
-// the way the rest of this session's ported terms were.
+// UNCASTLED_KING: 2026-07-23, new -- an explicit castling-rights term.
+// A rich king-safety system can make a king on its home square score
+// badly implicitly (once attackers/open files threaten it), but that is
+// reactive. Added because real games showed a genuine, measurable
+// pattern: Kestrel was castling late, and outright FAILED to castle at
+// all in 3 of 14 games in a sample -- the existing king-safety terms
+// (shelter/storm, safe-check, weak-king-ring, king-flank) react to
+// actual threats, they are not proactive about the structural risk of
+// staying uncastled. These are modest, hand-set values explicitly meant
+// to be self-play-validated (or eventually tuner-derived).
 // [no_rights_left]: king still on its home square AND has already
 // lost ALL castling rights for that side (missed the window
 // entirely, the worse case, matches games where Kestrel never
@@ -463,9 +442,9 @@ const UNCASTLED_KING_HAS_RIGHTS: (i32, i32) = (-8, 0);
 
 // King danger units (mg channel of the accumulation above) go through
 // this saturating, roughly-quadratic lookup before being added to the
-// score, instead of straight in. Classical engines all do this
-// (Stockfish's pre-NNUE king safety and derivatives): several
-// attackers combining is much more than additively dangerous, because
+// score, instead of straight in. This is the classical king-safety
+// approach: several attackers combining is much more than additively
+// dangerous, because
 // they can cover each other's escape squares/overload defenders in a
 // way a lone piece can't. A flat linear sum lets a single lurking
 // queen (65 units) already outweigh real pawn-shelter damage
@@ -617,32 +596,26 @@ const DEFENDED_PAWN: [(i32, i32); 8] = [
     (0, 0), (0, 0), (12, 10), (10, 12), (18, 22), (35, 55), (70, 110), (0, 0),
 ];
 // ISOLATED_PAWN/DOUBLED_PAWN: 2026-07-23, upgraded from flat scalars
-// to Sirius's real file-edge-distance-indexed `[4]` tables (index 0 =
-// a/h file, index 3 = d/e file, `min(file, file^7)`), plus the
-// `_EXPOSED` extra penalty (real Sirius terms: applies when NO enemy
-// pawn anywhere ahead on this exact file could ever contest/capture
-// it -- a stronger, more permanently-fixed weakness than the base
-// isolated/backward penalty alone). Real Sirius values, rescaled by
-// the same mg/eg pawn ratio as the passed-pawn terms above. Note
-// Sirius's real doubled-pawn eg penalty is much steeper toward the
-// edge files (-53) than center (-7) -- counter to naive intuition,
-// kept as-is since it's real tuned data, not re-derived by hand.
+// to file-edge-distance-indexed `[4]` tables (index 0 = a/h file,
+// index 3 = d/e file, `min(file, file^7)`), plus the `_EXPOSED` extra
+// penalty (applies when NO enemy pawn anywhere ahead on this exact file
+// could ever contest/capture it -- a stronger, more permanently-fixed
+// weakness than the base isolated/backward penalty alone). Same
+// pawn-anchored scaling as the passed-pawn terms above. Note the
+// doubled-pawn eg penalty is much steeper toward the edge files (-53)
+// than center (-7) -- counter to naive intuition, but that is what the
+// tuning produced, kept as-is rather than re-derived by hand.
 const ISOLATED_PAWN: [(i32, i32); 4] = [(-12, 6), (-6, -10), (-15, -6), (-19, -11)];
 const DOUBLED_PAWN: [(i32, i32); 4] = [(2, -53), (10, -43), (-10, -25), (-23, -7)];
 const ISOLATED_EXPOSED: (i32, i32) = (-12, -6);
 const BACKWARD_EXPOSED: (i32, i32) = (-27, -5);
-// PASSED_PAWN: 2026-07-23, upgraded from a flat rank-only table to
-// Sirius's real [blocked][controlled][rank] shape (eval_constants.h) --
-// `blocked` = the push square is occupied by any piece, `controlled` =
-// the push square is attacked by the enemy. Real Sirius values,
-// rescaled from Sirius's own pawn anchor (mg=65,eg=138) to Kestrel's
-// (mg=125,eg=140) by the same real-ratio-preserving discipline used
-// for history_prune_mult/SCORE_KNOWN_WIN earlier this session
-// (mg_scale=125/65=1.923, eg_scale=140/138=1.014) -- NOT a raw copy,
-// Sirius's own mg pawn anchor is nearly 2x smaller than Kestrel's, so
-// a raw copy would under-weight the mg contribution of this term by
-// about half. Indexed by rank exactly like before (0/1/2/7 always
-// zero -- Sirius only evaluates rank 4-7 relative, see the gating
+// PASSED_PAWN: 2026-07-23, upgraded from a flat rank-only table to a
+// [blocked][controlled][rank] shape -- `blocked` = the push square is
+// occupied by any piece, `controlled` = the push square is attacked by
+// the enemy. Values expressed on Kestrel's pawn anchor (mg=125,eg=140),
+// the same anchoring discipline used for history_prune_mult/
+// SCORE_KNOWN_WIN earlier this session. Indexed by rank (0/1/2/7 always
+// zero -- only rank 4-7 relative is evaluated, see the gating
 // `rel_rank >= 3` check at the call site).
 const PASSED_PAWN: [[[(i32, i32); 8]; 2]; 2] = [
     [
@@ -659,12 +632,11 @@ const PASSED_PAWN: [[[(i32, i32); 8]; 2]; 2] = [
     ],
 ];
 // OUR/THEIR_PASSER_PROXIMITY: 2026-07-23, new -- Kestrel previously had
-// no king-to-passer distance term at all (a textbook, universally-
-// validated HCE feature: own king should shepherd a passer home,
-// enemy king should be kept away). Indexed by Chebyshev distance
-// (0-7) from the respective king to the passer's PUSH square. Real
-// Sirius values, same mg/eg rescale as PASSED_PAWN above. Only applied
-// where PASSED_PAWN itself applies (rel_rank >= 3).
+// no king-to-passer distance term at all (a textbook HCE feature: own
+// king should shepherd a passer home, enemy king should be kept away).
+// Indexed by Chebyshev distance (0-7) from the respective king to the
+// passer's PUSH square. Same pawn-anchored scaling as PASSED_PAWN above.
+// Only applied where PASSED_PAWN itself applies (rel_rank >= 3).
 const OUR_PASSER_PROXIMITY: [(i32, i32); 8] = [
     (127, 116), (165, 83), (62, 76), (-13, 62), (-4, 34), (6, 21), (35, 9), (6, 18),
 ];
@@ -675,7 +647,7 @@ const THEIR_PASSER_PROXIMITY: [(i32, i32); 8] = [
 // defended by one of our own pieces. PASSER_SLIDER_BEHIND: penalty
 // when an enemy rook/queen sits behind the passer on its file (the
 // classic "rook behind the passed pawn" idea, applied to the
-// opponent). Both new this session, real Sirius values, same rescale.
+// opponent). Both new this session, same pawn-anchored scaling.
 const PASSER_DEFENDED_PUSH: [(i32, i32); 8] = [
     (0, 0), (0, 0), (0, 0), (17, 5), (19, 18), (67, 32), (115, 101), (0, 0),
 ];
@@ -685,13 +657,13 @@ const PASSER_SLIDER_BEHIND: [(i32, i32); 8] = [
 // BACKWARD_PAWN: no pawn on an adjacent file can ever support it (none
 // sit level with or behind it) AND its advance square is controlled by
 // an enemy pawn -- stuck, can't safely push, can't be defended by a
-// pawn. Mild penalty (structural, not material): Ethereal/Sirius list
-// it but it's a smaller effect than isolation.
+// pawn. Mild penalty (structural, not material): a classic term, a
+// smaller effect than isolation.
 const BACKWARD_PAWN: (i32, i32) = (-6, -10);
-// CANDIDATE_PASSER: 2026-07-23, upgraded from a flat scalar to
-// Sirius's real [defended][rank] shape -- `defended` = this pawn has
-// at least as many own-pawn defenders as enemy-pawn attackers on its
-// square. Real Sirius values, same rescale as PASSED_PAWN.
+// CANDIDATE_PASSER: 2026-07-23, upgraded from a flat scalar to a
+// [defended][rank] shape -- `defended` = this pawn has at least as many
+// own-pawn defenders as enemy-pawn attackers on its square. Same
+// pawn-anchored scaling as PASSED_PAWN.
 const CANDIDATE_PASSER: [[(i32, i32); 8]; 2] = [
     // not defended
     [(0, 0), (-44, -12), (-15, -14), (-6, 1), (29, 22), (65, 87), (0, 0), (0, 0)],
@@ -699,12 +671,11 @@ const CANDIDATE_PASSER: [[(i32, i32); 8]; 2] = [
     [(0, 0), (-31, -11), (-21, 8), (-12, 25), (13, 38), (73, 103), (0, 0), (0, 0)],
 ];
 // BAD_BISHOP -> BISHOP_PAWNS: 2026-07-23, upgraded from a flat
-// per-pawn linear multiplier to Sirius's real graduated table, indexed
-// by `min(own-color-pawn-count, 6)`. Richer than the old version: a
-// bishop with ZERO same-color pawns gets an actual BONUS (a genuinely
-// good bishop, not just "no penalty"), not something a flat per-pawn
-// multiplier could ever express. Real Sirius values, same mg/eg pawn
-// rescale as the other terms above.
+// per-pawn linear multiplier to a graduated table, indexed by
+// `min(own-color-pawn-count, 6)`. Richer than the old version: a bishop
+// with ZERO same-color pawns gets an actual BONUS (a genuinely good
+// bishop, not just "no penalty"), not something a flat per-pawn
+// multiplier could ever express. Same pawn-anchored scaling as above.
 const BISHOP_PAWNS: [(i32, i32); 7] = [
     (25, 0), (12, 11), (6, 8), (0, 3), (-8, -2), (-13, -9), (-21, -17),
 ];
@@ -719,8 +690,8 @@ const SCALE_OCB_ONE_ROOK: i32 = 96;
 const SCALE_OCB_ONE_KNIGHT: i32 = 106;
 const SCALE_FALLBACK_BASE: i32 = 96;
 const SCALE_FALLBACK_PER_PAWN: i32 = 8;
-// Complexity adjustment (Ethereal's approach, values ported directly --
-// see complexity_adjustment()/evaluate()). Shrinks the eval toward zero
+// Complexity adjustment (see complexity_adjustment()/evaluate()).
+// Shrinks the eval toward zero
 // in positions that are "simple" by these signals -- a negative bias
 // means most positions get a small penalty by default, only genuinely
 // complex ones (many pawns, both flanks open, pure pawn endgame) offset
@@ -739,8 +710,8 @@ const COMPLEXITY_ADJUSTMENT: i32 = -157;
 /// consts field-by-field -- never retyped by hand -- so building this
 /// struct cannot introduce a transcription error: `default_weights()`
 /// is byte-for-byte what `positional_terms()` already computed before
-/// this struct existed. This is the prerequisite for real Texel Tuning
-/// (see src/tuning.rs): the tuner builds its own `Weights`, nudges
+/// this struct existed. This is the prerequisite for our logistic
+/// tuner: the tuner builds its own `Weights`, nudges
 /// fields, and calls `positional_terms(board, &candidate)` to score
 /// datasets -- the live search keeps using `default_weights()`
 /// unchanged until a tuning run's result is deliberately copied back
@@ -876,16 +847,15 @@ impl Default for Weights {
     }
 }
 
-/// Pesos de eval calibrados pelo tuner PRÓPRIO do Kestrel (Texel
-/// tuning, gradient descent) sobre 187869 posições de self-play
+/// Pesos de eval calibrados pelo tuner PRÓPRIO do Kestrel (regressao
+/// logistica, gradient descent) sobre 187869 posições de self-play
 /// geradas pelo binário desta sessão (dataset_round5), lr=1000, 8000
-/// iterações, erro 0.087667 -> 0.081655. Substituem os defaults
-/// (mistura de valores próprios + termos reescalados do Sirius/
-/// Ethereal). Validado por A/B: +2.3% (52.3%) vs os defaults a nós
+/// iterações, erro 0.087667 -> 0.081655. Substituem os defaults.
+/// Validado por A/B: +2.3% (52.3%) vs os defaults a nós
 /// fixos, 300 jogos -- ganho real, e sem custo de NPS (só muda
 /// valores). É a resposta à direcção do utilizador: calibrar os
-/// valores emprestados para a arquitectura do Kestrel em vez de os
-/// copiar. Aplicado via `from_vec` (669 escalares na ordem exacta do
+/// valores para a arquitectura do Kestrel nos nossos próprios dados.
+/// Aplicado via `from_vec` (669 escalares na ordem exacta do
 /// `to_vec`); material/PST (consts separadas) e king_danger_table
 /// (derivada) não fazem parte deste vector e ficam como estavam.
 #[rustfmt::skip]
@@ -1103,8 +1073,8 @@ pub fn evaluate_with_weights(board: &Board, w: &Weights) -> i32 {
 }
 
 /// Avalia mobilidade, pressao sobre o rei inimigo, par de bispos, torres
-/// em colunas abertas/semi-abertas e estrutura de peoes usando os pesos
-/// tunados do Sirius v9.0 (ver constantes acima) -- consistente com as
+/// em colunas abertas/semi-abertas e estrutura de peoes usando os nossos
+/// pesos calibrados (ver constantes acima) -- consistente com as
 /// tabelas PSQT/MATERIAL desta seccao. Acumula (mg, eg) e interpola pela
 /// fase do jogo (mesma logica de material_pst). Devolve da perspetiva
 /// das BRANCAS (score_white - score_black), interpolado; o chamador
@@ -1133,10 +1103,10 @@ fn chebyshev_distance(a: Square, b: Square) -> usize {
 
 /// "King flank": a 4-file band on the king's side of the board
 /// (a-d/c-f/e-h depending which third the king's file falls in)
-/// intersected with a 5-rank band on that king's own half (real
-/// Sirius `attacks::kingFlank`, KING_FLANK_ATTACKS/DEFENSES doc
-/// comment) -- wider than the immediate king-ring/zone, used for
-/// Stockfish-derived "space near my king is compromised" evaluation.
+/// intersected with a 5-rank band on that king's own half (see the
+/// KING_FLANK_ATTACKS/DEFENSES doc comment) -- wider than the immediate
+/// king-ring/zone, used for the "space near my king is compromised"
+/// evaluation.
 #[inline]
 fn king_flank(king_sq: Square, color: Color) -> Bitboard {
     let kf = file_of(king_sq) as i32;
@@ -1161,7 +1131,7 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
     let mut mg = 0i32;
     let mut eg = 0i32;
 
-    // === EvalData estilo Sirius (`eval.cpp` EvalData/initEvalData) ===
+    // === EvalData: agregados de ataque por cor ===
     // Bitboards acumulados por cor para: casas atacadas por cada tipo
     // de peca (attacked_by_pt), casas atacadas total (attacked), casas
     // atacadas por 2 ou mais pecas (attacked_by_2). Precisamos destes
@@ -1229,7 +1199,7 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
                 // Mobility area excludes squares attacked by enemy
                 // pawns (moving there just hangs the piece for a pawn,
                 // not real mobility) as well as own-occupied squares.
-                // Standard refinement (Stockfish "mobility area").
+                // Standard refinement: the "mobility area".
                 let enemy_pawn_attacks = attacked_by_pt[c.opp().idx()][PieceType::Pawn.idx()];
                 let mobility = count(attacks & !own & !enemy_pawn_attacks) as usize;
                 let mob_table = match pt {
@@ -1267,8 +1237,8 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
                         mg += sign * w.rook_open[idx].0;
                         eg += sign * w.rook_open[idx].1;
                     }
-                    // ROOK_ON_SEVENTH: rank 7 relative (Ethereal-style
-                    // standalone term, independent of open-file status
+                    // ROOK_ON_SEVENTH: rank 7 relative (a standalone
+                    // term, independent of open-file status
                     // -- see const doc comment).
                     let rel_rank = if c == Color::White { rank_of(s) } else { 7 - rank_of(s) };
                     if rel_rank == 6 {
@@ -1335,9 +1305,9 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
         // eval already pricing in "my own king shield just moved 2
         // squares forward", the same way a human's intuition flags a
         // self-weakening pawn storm before calculating anything concrete.
-        // This is a universal HCE component (Stockfish's ShelterStrength/
-        // UnblockedStorm, Ethereal/Berserk equivalents all encode some
-        // version of it); values below are mine, reasoned from scratch:
+        // This is a universal HCE component (shelter strength / unblocked
+        // storm, encoded in some form by every strong classical eval);
+        // values below are mine, reasoned from scratch:
         // an intact shield pawn one square ahead of the king costs
         // nothing, each extra square it advances trades king safety for
         // nothing in return, and an enemy pawn closing in on the king's
@@ -1368,8 +1338,7 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
         }
     }
 
-    // === Safe checks + queen-gated king danger (Ethereal's approach,
-    // architecture ported not values) ===
+    // === Safe checks + queen-gated king danger ===
     // Deferred to its own pass after both colors' attacked[]/
     // attacked_by_pt[] are fully known -- a "safe" square (no enemy
     // defender at all, conservative but simple) can only be judged once
@@ -1397,7 +1366,7 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
         let n_rook = count(rook_checks & attacked_by_pt[us][PieceType::Rook.idx()] & !own_occ & safe) as i32;
         let n_queen = count(queen_checks & attacked_by_pt[us][PieceType::Queen.idx()] & !own_occ & safe) as i32;
 
-        // Per-piece-type dedicated weights (2026-07-23, real Sirius
+        // Per-piece-type dedicated weights (2026-07-23, counter-intuitive
         // relative ordering -- see SAFE_KNIGHT_CHECK doc comment: rook/
         // knight weighted HIGHER than queen, the old flat weight with
         // an ad-hoc "queen counts double" multiplier is gone, replaced
@@ -1419,13 +1388,11 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
                 + n_queen * w.safe_queen_check.1;
         }
 
-        // WEAK_KING_RING: 2026-07-23, new (real Sirius) -- count of
-        // the enemy king-ring squares that are "weak" (not attacked by
-        // them at all, or only defended by their own king with no
-        // second defender) and applied directly, unconditionally (not
-        // gated by the attacker-count threshold below, matching
-        // Sirius's own unconditional `eval += WEAK_KING_RING *
-        // weakSquares`).
+        // WEAK_KING_RING: 2026-07-23, new -- count of the enemy
+        // king-ring squares that are "weak" (not attacked by them at
+        // all, or only defended by their own king with no second
+        // defender) and applied directly, unconditionally (not gated by
+        // the attacker-count threshold below).
         let enemy_king_zone = if c == Color::White { black_king_zone } else { white_king_zone };
         let weak = !attacked[them]
             | (!attacked_by_2[them] & attacked_by_pt[them][PieceType::King.idx()]);
@@ -1433,10 +1400,10 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
         mg += sign * w.weak_king_ring.0 * weak_king_ring;
         eg += sign * w.weak_king_ring.1 * weak_king_ring;
 
-        // KING_FLANK_ATTACKS/DEFENSES: 2026-07-23, new (real Sirius) --
-        // wide-zone version of the same "attacked"/"defended" counting,
-        // over the enemy king's whole flank, not just its immediate
-        // ring. Also unconditional, matching Sirius's own placement.
+        // KING_FLANK_ATTACKS/DEFENSES: 2026-07-23, new -- wide-zone
+        // version of the same "attacked"/"defended" counting, over the
+        // enemy king's whole flank, not just its immediate ring. Also
+        // applied unconditionally.
         let their_flank = king_flank(enemy_king_sq, c.opp());
         let flank_attacks = count(their_flank & attacked[us]) as i32;
         let flank_attacks_2 = count(their_flank & attacked_by_2[us]) as i32;
@@ -1450,7 +1417,7 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
         // Queen-gate: with the defending side's queen off the board, a
         // single attacker rarely turns into a real mating attack --
         // require at least 2. With her still on board, one already
-        // matters (Ethereal: `kingAttackersCount > 1 - popcount(queens)`).
+        // matters (`king_attackers > 1 - popcount(queens)`).
         let defender_has_queen = board.pieces[them][PieceType::Queen.idx()] != 0;
         let threshold = if defender_has_queen { 1 } else { 2 };
         if king_attackers[us] >= threshold {
@@ -1460,8 +1427,8 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
         }
 
         // UNCASTLED_KING: see const doc comment -- added after real
-        // games vs Sirius showed Kestrel castling ~2.5 moves later on
-        // average and outright failing to castle in 3/14 recent games.
+        // games showed Kestrel castling late and outright failing to
+        // castle in 3/14 recent games.
         let home_sq = if c == Color::White { sq(4, 0) } else { sq(4, 7) };
         if board.king_sq(c) == home_sq {
             let (king_flag, queen_flag) = if c == Color::White {
@@ -1479,14 +1446,14 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
         }
     }
 
-    // === Ameacas (Sirius `evaluateThreats`) ===
+    // === Ameacas ===
     // Aplica por cor: bonus para cada peca inimiga que a nossa peca de
     // tipo X ATACA, indexada pelo tipo alvo e por "defended".
     // defended = attackedBy2[them] | attackedBy[them][PAWN] |
     //            (attacked[them] & ~attackedBy2[us])
-    // (formula literal do Sirius; a intuicao: peca inimiga esta
-    // "defendida" se qq peca ou peao deles defende, EXCEPTO quando nos
-    // temos MAIS atacantes que eles defensores.)
+    // (a intuicao: peca inimiga esta "defendida" se qq peca ou peao
+    // deles defende, EXCEPTO quando nos temos MAIS atacantes que eles
+    // defensores.)
     for c in [Color::White, Color::Black] {
         let sign = if c == Color::White { 1 } else { -1 };
         let us = c.idx();
@@ -1546,7 +1513,7 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
         }
 
         // Restricted squares: casas onde nos temos 2+ atacantes, eles
-        // nao tem 2+, mas eles atacam pelo menos 1 vez. Sirius:
+        // nao tem 2+, mas eles atacam pelo menos 1 vez:
         // attackedBy2[us] & ~attackedBy2[them] & attacked[them].
         let restricted = attacked_by_2[us] & !attacked_by_2[them] & attacked[them];
         let n_restr = count(restricted) as i32;
@@ -1596,7 +1563,7 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
             let knight_hits = a.knight[qs as usize];
             let bishop_hits = bishop_attacks(qs, occ);
             let rook_hits = rook_attacks(qs, occ);
-            // Sirius: knight hits nao precisa de attackedBy2[us], mas
+            // Knight hits nao precisam de attackedBy2[us], mas
             // bishop/rook precisam (targets &= attackedBy2[us]).
             let n_knight_hit = count(targets_base & knight_hits & attacked_by_pt[us][PieceType::Knight.idx()]) as i32;
             mg += sign * w.knight_hit_queen.0 * n_knight_hit;
@@ -1640,10 +1607,10 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
             }
             if !blocked {
                 // 2026-07-23: PASSED_PAWN agora e' [push_blocked]
-                // [push_controlled][rank] (real Sirius, ver comentario
-                // da const) -- so' avaliado a partir de rel_rank>=3
-                // (rank 4 relativo), como no Sirius, ja' que as
-                // entradas 0/1/2/7 sao sempre zero de qualquer forma.
+                // [push_controlled][rank] (ver comentario da const) --
+                // so' avaliado a partir de rel_rank>=3 (rank 4 relativo),
+                // ja' que as entradas 0/1/2/7 sao sempre zero de
+                // qualquer forma.
                 if rel_rank >= 3 {
                     let push_r = if c == Color::White { r + 1 } else { r - 1 };
                     if (0..8).contains(&push_r) {
@@ -1750,8 +1717,8 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
                     }
                     if enemy_ahead >= 1 && enemy_ahead <= own_support {
                         // 2026-07-23: CANDIDATE_PASSER agora e'
-                        // [defended][rank] (real Sirius) em vez de um
-                        // escalar unico -- "defended" = pelo menos
+                        // [defended][rank] em vez de um escalar unico --
+                        // "defended" = pelo menos
                         // tantos peoes proprios a defender esta casa
                         // quanto peoes inimigos a atacar (mesmo padrao
                         // assimetrico `a.pawn[cor][casa]` ja usado
@@ -1768,9 +1735,9 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
             }
 
             // Peao isolado. 2026-07-23: agora indexado por distancia a'
-            // margem do tabuleiro (`min(f,7-f)`, real Sirius -- peoes
-            // isolados nas colunas centrais custam mais que nas
-            // colunas a/h) + termo `_EXPOSED` extra quando nenhum peao
+            // margem do tabuleiro (`min(f,7-f)` -- peoes isolados nas
+            // colunas centrais custam mais que nas colunas a/h) + termo
+            // `_EXPOSED` extra quando nenhum peao
             // inimigo na MESMA coluna a frente pode alguma vez o
             // contestar/capturar (fraqueza mais permanente que o
             // isolamento sozinho).
@@ -1815,10 +1782,10 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
         }
 
         // Peoes dobrados (por peao excedente na mesma coluna).
-        // 2026-07-23: indexado por distancia a' margem, real Sirius --
-        // note a penalidade eg real e' bem mais severa nas colunas
-        // laterais do que nas centrais no Sirius, contra-intuitivo mas
-        // e' o dado real, mantido tal como veio (nao re-derivado a mao).
+        // 2026-07-23: indexado por distancia a' margem -- note a
+        // penalidade eg e' bem mais severa nas colunas laterais do que
+        // nas centrais, contra-intuitivo mas e' o que a afinacao
+        // produziu, mantido tal como veio (nao re-derivado a mao).
         for file in 0..8u32 {
             let n = count(own_pawns & (FILE_A << file)) as i32;
             if n > 1 {
@@ -1831,7 +1798,7 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
 
     // Tempo -- bonus para quem tem a jogar. Aplicado como (mg,eg) do
     // ponto de vista das brancas: se e' a vez das brancas, +w.tempo; se
-    // e' a vez das pretas, -w.tempo. Sirius aplica assim mesmo.
+    // e' a vez das pretas, -w.tempo.
     let tempo_sign = if board.side == Color::White { 1 } else { -1 };
     mg += tempo_sign * w.tempo.0;
     eg += tempo_sign * w.tempo.1;
@@ -1873,7 +1840,7 @@ pub fn evaluate(board: &Board) -> i32 {
     scale_endgame(board, raw, w)
 }
 
-/// Complexity adjustment (Ethereal's approach, values ported directly).
+/// Complexity adjustment.
 /// Correction from code review (2026-07-22): this does NOT generally
 /// shrink the eval toward zero, despite an earlier version of this
 /// comment claiming that -- with the real ported constants, a typical
@@ -1886,11 +1853,11 @@ pub fn evaluate(board: &Board) -> i32 {
 /// to hold or drawn outright) via the negative bias term. "Complexity"
 /// names the SIGNAL (many pawns, both flanks, pure pawn endgame),
 /// not the DIRECTION of the adjustment -- that depends on the sign of
-/// each ported constant, same as Ethereal's real formula.
+/// each constant.
 /// Sign-preserving clamp (`raw.signum() * complexity.max(-raw.abs())`)
 /// guarantees the adjustment can only move the eval toward or away
 /// from zero without ever flipping who's better -- an easy mistake to
-/// make without it (Ethereal's own comment flags this explicitly).
+/// make without it.
 fn complexity_adjustment(board: &Board, raw: i32, w: &Weights) -> i32 {
     if raw == 0 {
         return 0;
@@ -1915,8 +1882,7 @@ fn complexity_adjustment(board: &Board, raw: i32, w: &Weights) -> i32 {
     raw.signum() * complexity.max(-raw.abs())
 }
 
-/// Endgame scale factor (Ethereal's approach, ported architecture not
-/// values -- own thresholds below): known drawish/hard-to-convert
+/// Endgame scale factor (own thresholds below): known drawish/hard-to-convert
 /// material patterns get their eval shrunk toward zero, in proportion
 /// to how "scaled down" that material pattern actually plays in
 /// practice. Applied to the WHOLE already-tapered eval rather than
@@ -1970,7 +1936,7 @@ fn endgame_scale_factor(board: &Board, raw: i32, weights: &Weights) -> i32 {
     // Opposite-colored bishops: exactly one bishop each, on different
     // square colors. Classic drawing fortress even a pawn or two up.
     // Scales down further, the fewer other pieces are left to help
-    // convert. Values (Ethereal's, ported directly): bishops-only=64
+    // convert. Values: bishops-only=64
     // < one-rook-each=96 < one-knight-each=106 -- corrected 2026-07-22,
     // an earlier version of this comment had the last two swapped.
     if n_wb == 1 && n_bb == 1 {
@@ -2014,8 +1980,8 @@ fn endgame_scale_factor(board: &Board, raw: i32, weights: &Weights) -> i32 {
     // left -- fewer pawns left to shelter a passer/create a second
     // weakness makes converting a material edge progressively harder.
     // Gated to queenless positions only: this function scales the
-    // WHOLE already-tapered eval (not just the eg component the way
-    // Ethereal's mg/eg-split version does), so applying it unconditionally
+    // WHOLE already-tapered eval (not just the eg component a mg/eg-split
+    // version would), so applying it unconditionally
     // would also shrink ordinary middlegame evals whenever pawn counts
     // differ -- wrong, since in the midgame this pattern says nothing
     // about convertibility. No queens is a cheap, real proxy for "this

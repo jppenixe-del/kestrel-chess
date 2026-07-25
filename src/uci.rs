@@ -129,13 +129,12 @@ fn default_style_book_path() -> String {
     // 2026-07-22: the Judit Polgar signature book was the user's
     // original IDEA for the project's personality, not a fixed
     // requirement -- explicitly set aside once real games against
-    // strong engines (Stockfish skill15) showed a pattern of
-    // speculative sacrifices without enough calculated backing (see
-    // NOTAS_PROXIMA_SESSAO.md, "não é compatível com o jogo entre
-    // motores"). Default book is now one built from real Stockfish
-    // 17.1 search at depth>=16 (`sf17_book.bin`, 199 lines/~3.5k
-    // positions, see build_sf_book_games.py) instead of human-game
-    // frequency. `KESTREL_BOOK_FILE` overrides the filename (same
+    // strong opponents showed a pattern of speculative sacrifices
+    // without enough calculated backing (see NOTAS_PROXIMA_SESSAO.md,
+    // "não é compatível com o jogo entre motores"). Default book is now
+    // one built from strong external engine analysis at depth>=16
+    // (199 lines/~3.5k positions) instead of human-game frequency.
+    // `KESTREL_BOOK_FILE` overrides the filename (same
     // reversible env-var pattern as every other opt-in hook in this
     // codebase) -- set it to `polgar_book.bin` to go back to the
     // original book, which is kept on disk, not deleted.

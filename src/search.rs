@@ -61,7 +61,7 @@ pub const MAX_PLY: usize = 128;
 /// <path>` loads a `to_vec()`-shaped file the same way
 /// `KESTREL_TUNED_WEIGHTS` does; unset reproduces every default exactly.
 /// No coordinate-descent tuner for this yet (these interact with node
-/// counts nonlinearly -- Texel's static-position method doesn't apply,
+/// counts nonlinearly -- the static-position tuning method doesn't apply,
 /// real tuning here needs SPSA over actual games, same self-play
 /// infrastructure this session already uses for A/B validation) -- this
 /// commit only makes the values swappable, doesn't add a tuner.
