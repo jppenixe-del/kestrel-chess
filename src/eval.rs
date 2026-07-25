@@ -915,9 +915,36 @@ pub fn default_weights() -> &'static Weights {
         // toca nos campos do Weights presentes no to_vec (mobilidade/
         // threats/pawn-structure/king-safety weights) -- material/PST e
         // king_danger_table ficam das consts.
-        Weights::default().from_vec(&TUNED_V46)
+        let w = Weights::default().from_vec(&TUNED_V46);
+        // King-safety scale, for measuring how much this engine should lean
+        // on king safety at all. Comparing our evaluation against a stronger
+        // hand-crafted one term by term (2026-07-26) showed every category
+        // matching its share of the total except this one: king safety moves
+        // their evaluation more than twice as much as it moves ours. Rather
+        // than guess at thirty-six individual weights, scale the whole block
+        // by one number and find out whether leaning harder helps at all.
+        // Unset reproduces the previous behaviour exactly.
+        // The range is the same one the `eval` command reports as "king":
+        // attackers, safe checks, shelter and storm.
+        if let Ok(v) = std::env::var("KESTREL_KING_SCALE") {
+            if let Ok(f) = v.parse::<f64>() {
+                let mut vec = w.to_vec();
+                let hi = KING_RANGE.1.min(vec.len());
+                for x in vec[KING_RANGE.0..hi].iter_mut() {
+                    *x = (*x as f64 * f).round() as i32;
+                }
+                eprintln!("KESTREL_KING_SCALE: king-safety weights scaled by {}", f);
+                return w.from_vec(&vec);
+            }
+        }
+        w
     })
 }
+
+/// Index range of the king-safety block inside `Weights::to_vec()` -- the
+/// same slice the `eval` command sums to report "king". Kept next to the
+/// scale above so the two cannot drift apart silently.
+pub const KING_RANGE: (usize, usize) = (240, 276);
 
 impl Weights {
     /// Flattens every tunable scalar into one Vec<i32>, fixed order,
