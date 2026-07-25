@@ -253,6 +253,7 @@ impl Engine {
         let mut infinite = false;
         let mut nodes: Option<u64> = None;
         let mut multipv: usize = 1;
+        let mut restrict_root: Vec<crate::moves::Move> = Vec::new();
         let mut i = 0;
         while i < tokens.len() {
             match tokens[i] {
@@ -266,6 +267,20 @@ impl Engine {
                 "nodes" => { nodes = tokens.get(i + 1).and_then(|s| s.parse().ok()); i += 2; }
                 "multipv" => { multipv = tokens.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(1).max(1); i += 2; }
                 "infinite" => { infinite = true; i += 1; }
+                // `go searchmoves <m1> <m2> ...`: restrict the root to the
+                // listed moves. Standard UCI, and the only way to ask the
+                // engine what IT thinks a specific move is worth -- without
+                // it, scoring one candidate meant reading the PV and hoping
+                // it happened to start with that move.
+                "searchmoves" => {
+                    i += 1;
+                    while i < tokens.len() {
+                        match self.find_move(tokens[i]) {
+                            Some(mv) => { restrict_root.push(mv); i += 1; }
+                            None => break, // next keyword, not a move
+                        }
+                    }
+                }
                 _ => { i += 1; }
             }
         }
@@ -354,6 +369,17 @@ impl Engine {
         let board_now = self.board.clone();
         let history_now = self.history.clone();
         let mut excluded_root_moves: Vec<crate::moves::Move> = Vec::new();
+        // searchmoves is expressed through the root-exclusion list the
+        // search already honours: exclude every legal root move that was
+        // not asked for.
+        if !restrict_root.is_empty() {
+            let mut b = self.board.clone();
+            for mv in crate::movegen::generate_legal(&mut b, &self.atk) {
+                if !restrict_root.contains(&mv) {
+                    excluded_root_moves.push(mv);
+                }
+            }
+        }
 
         // Optional LLM tie-breaker (see advisor.rs): entirely opt-in via
         // KESTREL_ADVISOR_HOST. When set, always search at least 3 root
