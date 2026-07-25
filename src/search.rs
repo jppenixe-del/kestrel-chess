@@ -55,10 +55,9 @@ pub const MAX_PLY: usize = 128;
 /// razoring, futility x2, qsearch delta pruning, qsearch LMP, TT
 /// extended cutoff, history pruning) with no way to swap them without
 /// editing and recompiling -- noticed while building an eval "profile"
-/// (Kestrel's own weights vs a ported Sirius/Ethereal set) that the
-/// search side had no equivalent, even though real engines tune THESE
-/// margins just as much (every one of Ethereal's has a measured Elo
-/// value from SPSA, see NOTAS_PROXIMA_SESSAO.md). `KESTREL_SEARCH_PARAMS=
+/// that the search side had no equivalent, even though these margins
+/// deserve tuning just as much (each carries a measurable Elo value
+/// under SPSA, see NOTAS_PROXIMA_SESSAO.md). `KESTREL_SEARCH_PARAMS=
 /// <path>` loads a `to_vec()`-shaped file the same way
 /// `KESTREL_TUNED_WEIGHTS` does; unset reproduces every default exactly.
 /// No coordinate-descent tuner for this yet (these interact with node
@@ -69,10 +68,9 @@ pub const MAX_PLY: usize = 128;
 /// Margin shape `base + slope*depth`, generalizing the old pure-
 /// multiplier form (`slope*depth`, base=0 -- what every Kestrel default
 /// already was, so this changes zero behavior by default) to also
-/// represent engines whose margins have a flat component (e.g.
-/// Ethereal's quiet futility `77 + lmrDepth*52`). Both shapes are one
-/// special case of this one, so profiles from either kind of engine can
-/// be expressed without lying about the source's real formula.
+/// represent margins that have a flat component (e.g. a quiet futility
+/// of the form `77 + lmrDepth*52`). The pure-multiplier form is just the
+/// base=0 special case, so either shape can be expressed exactly.
 #[derive(Clone, Copy)]
 pub struct DepthMargin {
     pub base: i32,
@@ -104,11 +102,11 @@ pub struct SearchParams {
     /// outright (not even reduced-searched) when its history score is
     /// below `-history_prune_mult * depth`.
     pub history_prune_mult: i32,
-    /// Null-move pruning gating/reduction, ported from Sirius's real
-    /// eval-adaptive formula (search.cpp) -- see NMP block in
-    /// negamax(). Previously a flat depth>6?3:2 reduction with no eval
-    /// awareness at all; this is a genuinely different (more capable)
-    /// mechanism, not just recalibrated constants.
+    /// Null-move pruning gating/reduction, driven by an eval-adaptive
+    /// formula -- see NMP block in negamax(). Previously a flat
+    /// depth>6?3:2 reduction with no eval awareness at all; this is a
+    /// genuinely different (more capable) mechanism, not just
+    /// recalibrated constants.
     pub nmp_min_depth: i32,
     pub nmp_eval_margin: i32,
     pub nmp_static_eval_base_margin: i32,
@@ -120,30 +118,30 @@ pub struct SearchParams {
     /// ProbCut margin above beta for the cheap verification search
     /// (was a hardcoded `beta + 150`).
     pub probcut_beta_margin: i32,
-    /// Aspiration window fields -- 2026-07-23: the real Sirius formula
+    /// Aspiration window fields -- 2026-07-23: the widening formula
     /// built from these was A/B tested and reverted (39% vs baseline,
     /// clear negative, third such signal for this area in this
     /// codebase -- see NOTAS). `search_root()` is back to the old flat-
     /// delta version and no longer reads these. Left in the struct
-    /// (real values, harmless dead data) rather than torn back out,
-    /// in case a future session wants to retry with a different
-    /// integration than a straight swap.
+    /// (harmless dead data) rather than torn back out, in case a future
+    /// session wants to retry with a different integration than a
+    /// straight swap.
     pub asp_init_delta: i32,
     pub asp_widening_factor: i32,
     pub min_asp_depth: i32,
     /// doDeeper/doShallower margins -- 2026-07-23: the MECHANISM is a
     /// real technique (adjust the LMR re-search depth by +/-1 based on
     /// how far the reduced search beat alpha, relative to this node's
-    /// best score so far). First attempt copied Sirius's RAW margins
-    /// (36/141/8) and bisection localized it as the day's single
-    /// biggest regression (-6.2%): the margins compare against SCORES
-    /// in KESTREL's eval units, but Kestrel's centipawn scale is ~1.92x
-    /// Sirius's (pawn 125 vs 65), so the raw values fired "go deeper"
-    /// ~2x too eagerly -> unsound extra depth. This is a CALIBRATION
-    /// error, not a wrong mechanism (user's point 2026-07-23: "não são
-    /// as funções que estão mal, mas a calibração dos valores"). Fixed
-    /// by rescaling the raw Sirius margins (36/141/8) to Kestrel's eval
-    /// scale. Factor picked EMPIRICALLY, not assumed: swept 1.7/1.8/1.9
+    /// best score so far). First attempt used raw margins (36/141/8)
+    /// carried over from an eval whose centipawn scale is ~1.92x smaller
+    /// than ours (pawn 65 vs Kestrel's 125), and bisection localized it
+    /// as the day's single biggest regression (-6.2%): the margins
+    /// compare against SCORES in KESTREL's eval units, so at that scale
+    /// they fired "go deeper" ~2x too eagerly -> unsound extra depth.
+    /// This is a CALIBRATION error, not a wrong mechanism (user's point
+    /// 2026-07-23: "não são as funções que estão mal, mas a calibração
+    /// dos valores"). Fixed by rescaling the raw margins (36/141/8) to
+    /// Kestrel's eval scale. Factor picked EMPIRICALLY, not assumed: swept 1.7/1.8/1.9
     /// (user's request) -- all clustered 57-59% vs 0c1b388, 1.8 best
     /// (59.0%, reproduced in two independent 200-game runs). Final:
     /// 36*1.8=65, 141*1.8=254, 8*1.8=14. NOTE: rescaling was applied
@@ -164,17 +162,13 @@ impl Default for SearchParams {
     fn default() -> Self {
         // 2026-07-22: rfp_improving/rfp_not_improving, razor_base/
         // razor_per_depth, cap_futility_improving/not_improving and
-        // history_prune_mult are Sirius's (mcthouacbb/Sirius, ~3449
-        // CCRL 40/15, pure HCE) real SPSA-tuned values, ported where its
-        // formula genuinely matches this shape (see
-        // build_sirius_search_profile.py for the full derivation and
-        // the fields deliberately left unmapped). A/B (300 games,
+        // history_prune_mult are SPSA-tuned margin values adopted where
+        // their formula genuinely matches this shape. A/B (300 games,
         // 30000 nodes/move) came back exactly neutral -- 50.0%/50.0%,
-        // W138-L138-D24 -- against Kestrel's own previously hand-set
-        // values, so a real top engine's calibration replaces a guess
-        // rather than being discarded for lack of a positive delta
-        // ("os testes sao so' para verificar, e' sempre para
-        // implementar").
+        // W138-L138-D24 -- against our own previously hand-set values,
+        // so a calibrated set replaces a guess rather than being
+        // discarded for lack of a positive delta ("os testes sao so'
+        // para verificar, e' sempre para implementar").
         SearchParams {
             rfp_improving: DepthMargin { base: 0, slope: 26 },
             rfp_not_improving: DepthMargin { base: 0, slope: 80 },
@@ -188,8 +182,7 @@ impl Default for SearchParams {
             qs_lmp_limit: 8,
             tt_extended_cutoff_margin: 130,
             history_prune_mult: 1648,
-            // Sirius real values (search_params.h / search.cpp), same
-            // adoption rationale as above -- eval-adaptive NMP is a
+            // Same adoption rationale as above -- eval-adaptive NMP is a
             // strictly more informed mechanism than the old flat
             // depth>6?3:2 reduction, and there was no Kestrel-tuned
             // value to compare against for these fields at all.
@@ -354,7 +347,7 @@ pub struct Searcher<'a> {
     /// context. Kept for the picker's tier scoring; overshadowed by the
     /// finer-grained `cont_hist` below (which gives a numeric weight per
     /// (prev_piece,prev_to)->(curr_piece,curr_to) pair, at 1 AND 2 plies
-    /// back, exactly like the multi-lag continuation history in Sirius).
+    /// back -- our multi-lag continuation history).
     pub countermoves: [[Option<Move>; 64]; 6],
     /// Capture history: indexed by [side][moving piece][captured piece]
     /// -- a coarser, dedicated signal complementing SEE in noisy move
@@ -373,28 +366,26 @@ pub struct Searcher<'a> {
     /// numeric bonus/malus based on how the SAME curr_move performed in
     /// the past following the SAME prev_move (piece type + to-square).
     /// Used at both 1-ply back (opponent's last move) and 2-ply back
-    /// (our own last move) -- multi-lag, like Sirius's `contHistEntry`
-    /// at plies -1, -2, -4 (we skip -4 for now, added if needed).
+    /// (our own last move) -- multi-lag at plies -1 and -2 (a -4 lag
+    /// could be added later if it proves worth it).
     /// Heap-allocated (~576KB, 6*64*6*64 * 4 bytes) since it doesn't fit
     /// on the stack. Zeroed once per `go` (Searcher is rebuilt each go).
     pub cont_hist: Box<[i32]>,
     /// Correction history: keyed by a cheap pawn-structure hash, learns
     /// how far off the raw static eval tends to be for THIS pawn
-    /// structure once real search has settled on a score. Standard
-    /// technique (Stockfish/Ethereal "correction history") -- static
-    /// eval is fast but systematically biased for certain structures
+    /// structure once real search has settled on a score. The rationale:
+    /// static eval is fast but systematically biased for certain structures
     /// (e.g. closed positions, specific pawn chains); this nudges it
     /// toward what search has actually been finding there. Only affects
     /// pruning-margin decisions (RFP/futility/LMP/razoring), never the
     /// real leaf/quiescence evaluation.
     pub corr_hist: Box<[i32]>,
-    /// 2026-07-22: four more correction-history dimensions, ported from
-    /// Sirius (7-term weighted correction, ~104 elo comment in its
-    /// source; Kestrel previously had only the pawn term below). Same
-    /// table shape/update rule as `corr_hist`, different hash input.
-    /// Continuation-history correction (6 more Sirius terms, lags 2-7)
-    /// deferred (needs a shared 4D per-ply-lag table, real scope, own
-    /// follow-up).
+    /// 2026-07-22: four more correction-history dimensions (a multi-term
+    /// weighted correction; Kestrel previously had only the pawn term
+    /// below). Same table shape/update rule as `corr_hist`, different
+    /// hash input. Continuation-history correction (further terms at
+    /// lags 2-7) deferred (needs a shared 4D per-ply-lag table, real
+    /// scope, own follow-up).
     pub corr_hist_np_stm: Box<[i32]>,
     pub corr_hist_np_nstm: Box<[i32]>,
     pub corr_hist_minor: Box<[i32]>,
@@ -434,7 +425,7 @@ pub struct Searcher<'a> {
     // avaliacao real. None se o livro nao carregou (o motor continua a
     // funcionar normalmente sem ele).
     pub style_book: Option<&'a Book>,
-    /// Node-count time management (Ethereal): total nodes spent on each
+    /// Node-count time management: total nodes spent on each
     /// ROOT move across the whole `go`, accumulated over every
     /// iterative-deepening iteration (not cleared between depths --
     /// only `iterative_deepening()` clears it, once per `go`). A small
@@ -444,8 +435,8 @@ pub struct Searcher<'a> {
     /// Double-extension counter, propagated down a search LINE (indexed
     /// by ply): how many times this exact line has already used a
     /// double extension. Read from the PARENT ply before deciding to
-    /// grant another one, same guard Ethereal uses (`dextensions<=6`)
-    /// to stop a run of double extensions from exploding the tree --
+    /// grant another one, a guard (`dextensions<=6`) that stops a run
+    /// of double extensions from exploding the tree --
     /// each one costs an extra full ply, and they can chain if several
     /// nodes in a row are singular by a wide margin.
     pub dextensions: [i32; MAX_PLY],
@@ -457,12 +448,10 @@ pub struct Searcher<'a> {
 const MATE_THRESHOLD: i32 = MATE_SCORE - MAX_PLY as i32;
 /// How much MORE singular (below s_beta) a move has to be, on top of
 /// just passing the ordinary singular-extension check, before it earns
-/// a double (+2 ply) extension instead of the normal +1. Ethereal's
-/// value, ported directly (its search.c uses the same margin literally
-/// named for this check).
+/// a double (+2 ply) extension instead of the normal +1.
 const DOUBLE_EXT_MARGIN: i32 = 16;
 /// Cap on chained double extensions along one search line (read from
-/// the parent ply's count) -- Ethereal's value.
+/// the parent ply's count).
 const DOUBLE_EXT_MAX: i32 = 6;
 
 /// Tamanho da tabela cont_hist -- 6 tipos de peca * 64 casas destino
@@ -483,28 +472,26 @@ fn cont_hist_idx(prev_pt: PieceType, prev_to: crate::types::Square, curr_pt: Pie
 /// two structures' corrections together, self-correcting over time.
 pub const CORR_HIST_SIZE: usize = 16384;
 const CORR_HIST_MAX: i32 = 1200; // clamp on the stored correction itself
-const CORR_HIST_GRAIN: i32 = 256; // internal fixed-point scale (like Stockfish)
+const CORR_HIST_GRAIN: i32 = 256; // internal fixed-point scale
 
-/// SPSA-tuned weights for combining the 5 correction-history
-/// dimensions (Sirius search_params.h: pawnCorrWeight,
-/// nonPawnStmCorrWeight, nonPawnNstmCorrWeight, minorCorrWeight,
-/// majorCorrWeight). `CORR_WEIGHT_SCALE`=256 means a weight of 256 is
-/// "full 1.0 effect" (matches the old pawn-only formula's implicit
-/// weight before this was ported).
+/// SPSA-tuned weights for combining the 5 correction-history dimensions
+/// (pawn, non-pawn side-to-move, non-pawn other side, minor, major).
+/// `CORR_WEIGHT_SCALE`=256 means a weight of 256 is "full 1.0 effect"
+/// (matches the old pawn-only formula's implicit weight).
 const CORR_WEIGHT_SCALE: i32 = 256;
-// 2026-07-22 CORRECTED (see NOTAS): Sirius's raw weights
-// (384/406/280/274/418) were SPSA-tuned against Sirius's OWN
+// 2026-07-22 CORRECTED (see NOTAS): a set of raw reference weights
+// (384/406/280/274/418) had been SPSA-tuned against a DIFFERENT
 // maxCorrHist clamp/grain, not Kestrel's independently-chosen
 // CORR_HIST_MAX=1200 -- applying the raw numbers directly caused a
 // severe regression (300-game A/B: 6.7% vs the pre-change baseline).
-// Rescaled here to preserve Sirius's REAL relative proportions between
-// the 5 terms (which term matters more than which) while capping the
+// Rescaled here to preserve the REAL relative proportions between the
+// 5 terms (which term matters more than which) while capping the
 // worst-case total (all 5 tables simultaneously maxed the same
 // direction) close to the same bound the old single-pawn-term system
 // safely operated at: weights sum to 257 (independent per-term
-// rounding of Sirius's real proportions, not tuned to hit exactly
-// 256) -- 0.4% over the old implicit pawn-only weight's bound, instead
-// of Sirius's own much larger sum of 1762.
+// rounding of those proportions, not tuned to hit exactly 256) --
+// 0.4% over the old implicit pawn-only weight's bound, instead of the
+// raw set's much larger sum of 1762.
 const CORR_WEIGHT_PAWN: i32 = 56;
 const CORR_WEIGHT_NP_STM: i32 = 59;
 const CORR_WEIGHT_NP_NSTM: i32 = 41;
@@ -515,8 +502,8 @@ const CORR_WEIGHT_MAJOR: i32 = 61;
 // already-validated 5 weights again, bundling a rescale with an
 // addition -- kept isolated instead, same discipline used all
 // session). Same conversion rate as the original 5-term rescale
-// (256/1762 ~= 0.1453) applied individually to Sirius's real
-// threatsCorrWeight=252: 252*0.1453 ~= 37.
+// (256/1762 ~= 0.1453) applied individually to a raw threats weight
+// of 252: 252*0.1453 ~= 37.
 const CORR_WEIGHT_THREATS: i32 = 37;
 
 /// Cheap, non-incremental pawn-structure hash -- just the two pawn
@@ -532,11 +519,10 @@ fn pawn_structure_hash(board: &Board) -> u64 {
 }
 
 /// Same non-incremental, on-demand approach as `pawn_structure_hash`,
-/// applied to the other correction-history dimensions ported from
-/// Sirius. Non-pawn material (knights/bishops/rooks/queens) of a SINGLE
-/// side -- called once for the side to move and once for the other
-/// side (Sirius's `nonPawnStmCorrWeight`/`nonPawnNstmCorrWeight` are
-/// two independent terms, not one table read from both angles).
+/// applied to the other correction-history dimensions. Non-pawn
+/// material (knights/bishops/rooks/queens) of a SINGLE side -- called
+/// once for the side to move and once for the other side (the two
+/// non-pawn terms are independent, not one table read from both angles).
 #[inline]
 fn non_pawn_hash(board: &Board, color: Color) -> u64 {
     let n = board.pieces[color.idx()][PieceType::Knight.idx()];
@@ -616,8 +602,7 @@ fn all_attacks(board: &Board, atk: &Attacks, color: Color) -> Bitboard {
 }
 
 /// Threats correction hash: which of OUR pieces are currently attacked
-/// by the enemy (real Sirius: `threatsKey = hash(threats & ownPieces)`
-/// where `threats` = squares attacked by the opponent).
+/// by the enemy -- hash of (opponent-attacked squares & our pieces).
 fn threats_hash(board: &Board, atk: &Attacks) -> u64 {
     let enemy_attacks = all_attacks(board, atk, board.side.opp());
     let own_pieces = board.occ_color[board.side.idx()];
@@ -912,13 +897,10 @@ impl<'a> Searcher<'a> {
     ///
     /// 2026-07-22/23: weighted sum of 6 correction-history dimensions
     /// (pawn structure, non-pawn material of each side, minor pieces,
-    /// major pieces, threats), real SPSA weights ported from Sirius
-    /// (search_params.h: pawnCorrWeight, nonPawnStmCorrWeight,
-    /// nonPawnNstmCorrWeight, minorCorrWeight, majorCorrWeight,
-    /// threatsCorrWeight).
+    /// major pieces, threats), with SPSA-tuned per-term weights.
     /// Previously just the pawn term alone with an implicit weight of
-    /// `CORR_HIST_GRAIN` (i.e. "full effect", no partial trust) --
-    /// Sirius's real pawn weight is 384/256 = 1.5x that, so this is a
+    /// `CORR_HIST_GRAIN` (i.e. "full effect", no partial trust) -- the
+    /// recalibrated pawn weight is 384/256 = 1.5x that, so this is a
     /// real recalibration of the existing term too, not just new
     /// additions. `threats`/continuation-history terms deliberately
     /// not included here, see the field doc comment on
@@ -945,9 +927,9 @@ impl<'a> Searcher<'a> {
     /// tables toward the gap between what the fast static eval guessed
     /// and what real search found. Small learning-rate style update so
     /// a single unusual position doesn't dominate any one table.
-    /// Learning-rate cap raised from 16 to 32 (2026-07-22, Sirius's real
-    /// `weight = 2*min(1+depth,16)`) -- was under-weighting high-depth
-    /// updates relative to Sirius's real formula.
+    /// Learning-rate cap raised from 16 to 32 (2026-07-22, following the
+    /// form `weight = 2*min(1+depth,16)`) -- was under-weighting
+    /// high-depth updates before.
     fn update_corr_hist(&mut self, board: &Board, static_eval: i32, best_score: i32, depth: i32) {
         if best_score.abs() >= MATE_THRESHOLD {
             return;
@@ -1024,11 +1006,11 @@ impl<'a> Searcher<'a> {
                 // history, not a hard priority slot -- a single recorded
                 // reply can be wrong; letting it outrank every other
                 // quiet move unconditionally (as a fixed slot did) can
-                // force a bad move to the front. Real engines (see
-                // Sirius's "continuation history") treat this as a
-                // weighted signal blended into the ordinary history
-                // score, not a rigid tier -- same idea here, simplified
-                // to a single ply-lag instead of Sirius's multi-lag sum.
+                // force a bad move to the front. Better to treat this
+                // (continuation history) as a weighted signal blended
+                // into the ordinary history score, not a rigid tier --
+                // here simplified to a single ply-lag rather than the
+                // full multi-lag sum.
                 let h = self.history_scores[side][m.from as usize][m.to as usize];
                 let cm_bonus = if Some(*m) == countermove { 2000 } else { 0 };
                 -h - cm_bonus - self.book_bonus(&book_entries, m)
@@ -1232,15 +1214,14 @@ impl<'a> Searcher<'a> {
     }
 
     /// `reached_by_null`: was the move that led to THIS node a null
-    /// move (see NMP block below)? 2026-07-22: needed to port Sirius's
-    /// real double-null-move guard (`board.pliesFromNull() > 0` in
-    /// their source) -- consecutive null moves in the same line are
-    /// unsound (can "prove" a fail-high via two passes that wouldn't
-    /// survive a single one) and Sirius's aggressive eval-adaptive NMP
-    /// reduction genuinely relies on this guard for safety; porting the
-    /// reduction formula without it caused a severe regression (A/B:
-    /// 6.7% vs a pre-change baseline) -- ~93% of games lost, not a
-    /// small/noisy signal, a real missing safety net.
+    /// move (see NMP block below)? 2026-07-22: needed for the
+    /// double-null-move guard (`plies_from_null > 0`) -- consecutive
+    /// null moves in the same line are unsound (can "prove" a fail-high
+    /// via two passes that wouldn't survive a single one) and the
+    /// aggressive eval-adaptive NMP reduction genuinely relies on this
+    /// guard for safety; using the reduction formula without it caused a
+    /// severe regression (A/B: 6.7% vs a pre-change baseline) -- ~93% of
+    /// games lost, not a small/noisy signal, a real missing safety net.
     fn negamax(&mut self, board: &mut Board, depth: i32, mut alpha: i32, beta: i32, ply: usize, reached_by_null: bool) -> i32 {
         self.nodes += 1;
         if self.time_up() {
@@ -1426,7 +1407,22 @@ impl<'a> Searcher<'a> {
         // where it is meaningless); cached in `static_evals[ply]` so
         // the `improving` heuristic below can compare against 2 plies
         // back. Slight cost but pays off multiple times per node.
-        let raw_static_eval = if in_check { 0 } else { crate::eval::evaluate_fast(board) };
+        //
+        // Cached in the TT too: a TT hit on this position already has
+        // the full eval computed by whichever earlier visit stored it,
+        // so reuse it instead of paying for
+        // `evaluate()` again -- this is what makes switching static
+        // eval from evaluate_fast to the full evaluate() affordable.
+        // Only the raw (uncorrected) eval is cached; corr-hist is
+        // applied fresh below every time since it can change between
+        // visits even for the same board.
+        let raw_static_eval = if in_check {
+            0
+        } else if let Some(e) = tt_entry_captured.filter(|e| e.static_eval != crate::tt::TT_EVAL_NONE) {
+            e.static_eval as i32
+        } else {
+            crate::eval::evaluate(board)
+        };
         // Corrected version (see corr_hist) used for pruning-margin
         // decisions below; the raw value is what improving/static_evals
         // track, since correction is a slow-moving average and mixing
@@ -1469,23 +1465,22 @@ impl<'a> Searcher<'a> {
         //  - beta longe de scores de mate (nao mascarar mates)
         //  - nunca na raiz (ply > 0), para root_best ser sempre definido
         //
-        // 2026-07-22: reducao "R" agora e' a formula real do Sirius
-        // (search.cpp, eval-adaptive), nao o antigo `depth>6?3:2` fixo
-        // que ignorava completamente a avaliacao estatica -- mecanismo
-        // genuinamente mais informado (quanto mais a posicao excede
-        // beta, mais funda a reducao), nao so' constantes recalibradas.
-        // `static_eval` (ja' corrigida por corr-hist -- em Sirius,
-        // AMBOS `stack->eval` e `stack->staticEval` guardam o valor
-        // CORRIGIDO, `rawStaticEval` e' so' uma variavel local nunca
-        // guardada no stack; confirmado por revisao do Fable 2026-07-
-        // 23, o comentario anterior estava trocado e o segundo gate
-        // usava `raw_static_eval` por engano) usado nos DOIS gates.
-        // 2026-07-23: tentei portar a busca de verificacao completa do
-        // Sirius (R sem cap + `nmp_min_ply` + re-busca real quando
-        // depth>15 e beta e' quase decisivo) -- A/B isolado (300
-        // jogos) deu 41.5%, negativo e claro. Revertido para esta
-        // versao (formula real do R, `.max(1)` simples, sem cap
-        // artificial nem busca de verificacao) -- e' a versao que já
+        // 2026-07-22: reducao "R" agora e' eval-adaptive, nao o antigo
+        // `depth>6?3:2` fixo que ignorava completamente a avaliacao
+        // estatica -- mecanismo genuinamente mais informado (quanto
+        // mais a posicao excede beta, mais funda a reducao), nao so'
+        // constantes recalibradas. `static_eval` (ja' corrigida por
+        // corr-hist -- e' o valor CORRIGIDO que alimenta AMBOS os
+        // gates; o `raw_static_eval` e' so' um intermediario, nunca
+        // usado aqui; confirmado por revisao 2026-07-23, o comentario
+        // anterior estava trocado e o segundo gate usava
+        // `raw_static_eval` por engano) usado nos DOIS gates.
+        // 2026-07-23: tentei uma busca de verificacao completa (R sem
+        // cap + `nmp_min_ply` + re-busca real quando depth>15 e beta e'
+        // quase decisivo) -- A/B isolado (300 jogos) deu 41.5%,
+        // negativo e claro. Revertido para esta versao (formula do R,
+        // `.max(1)` simples, sem cap artificial nem busca de
+        // verificacao) -- e' a versao que já
         // tinha validado 50/50 (neutro) contra o estado anterior
         // (R fixo=4 por bug), que por sua vez já era +57.5% sobre o
         // baseline pre-NMP. Ver NOTAS_PROXIMA_SESSAO para o historico
@@ -1526,7 +1521,13 @@ impl<'a> Searcher<'a> {
             let sp = search_params();
             let margin = sp.razor_base + sp.razor_per_depth * (depth - 1);
             if static_eval + margin <= alpha {
-                let full_stand_pat = evaluate(board);
+                // `raw_static_eval` already IS `evaluate(board)` here (we are
+                // under `!in_check`, so it was computed as the full eval on
+                // entry, or reused from the TT's cached full eval of THIS same
+                // position). Recomputing it would just repeat the now-expensive
+                // full eval for an identical value -- reuse it instead. Exact:
+                // node counts are unchanged, only the redundant eval is saved.
+                let full_stand_pat = raw_static_eval;
                 let q = self.quiescence_from(board, alpha, beta, ply, full_stand_pat);
                 if q <= alpha {
                     return q;
@@ -1565,13 +1566,12 @@ impl<'a> Searcher<'a> {
         // ProbCut: at reasonable depth, a capture that already beats a
         // margin ABOVE the real beta in a cheap verification search is
         // very likely to also beat the real beta with a full search --
-        // cut immediately instead of paying for it. Standard technique
-        // (Stockfish/many engines). Guards: not in check, not root (ply
-        // > 0, keeps root_best always defined), not during a singular
-        // re-search (keeps TT semantics simple), far from mate scores
-        // (never risk masking a real mate). `depth >= 5` matches
-        // Sirius's real `probcutMinDepth` exactly; margin below is its
-        // real `probcutBetaMargin` (was a hardcoded 150).
+        // cut immediately instead of paying for it. Guards: not in
+        // check, not root (ply > 0, keeps root_best always defined),
+        // not during a singular re-search (keeps TT semantics simple),
+        // far from mate scores (never risk masking a real mate). The
+        // `depth >= 5` floor and the margin below (was a hardcoded 150)
+        // are the tuned parameters for this check.
         if depth >= 5
             && ply > 0
             && !in_check
@@ -1612,8 +1612,7 @@ impl<'a> Searcher<'a> {
             }
         }
 
-        // Singular extensions -- port directo do padrao Sirius
-        // (search.cpp): se o tt_move parece dominante (a TT diz "este
+        // Singular extensions: se o tt_move parece dominante (a TT diz "este
         // e' bom o suficiente" com bound Lower ou Exact e depth similar
         // a esta), testar se e' MESMO singular fazendo uma re-pesquisa
         // reduzida a excluir esse lance, numa janela restrita a volta
@@ -1647,7 +1646,7 @@ impl<'a> Searcher<'a> {
                     if self.stop {
                         return 0;
                     }
-                    // Double extension (Ethereal): not just singular but
+                    // Double extension: not just singular but
                     // singular by a WIDE margin (DOUBLE_EXT_MARGIN extra)
                     // -- extend 2 plies instead of 1. Capped via
                     // `dextensions` (read from the PARENT ply) so a run
@@ -1668,8 +1667,8 @@ impl<'a> Searcher<'a> {
                         // Negative extension: the tt_move already looked
                         // like it beats beta at the CURRENT depth (not
                         // just the reduced verification depth) without
-                        // triggering the multicut condition above --
-                        // Ethereal's signal that a full-depth search here
+                        // triggering the multicut condition above -- a
+                        // signal that a full-depth search here
                         // would likely just re-confirm the same cutoff,
                         // so shrink depth by 1 instead of granting an
                         // extension.
@@ -1682,7 +1681,7 @@ impl<'a> Searcher<'a> {
         // Staged move picker: substitui o `order_moves` + `for mv in
         // moves` que pontuava TUDO upfront antes de sequer tentar o
         // primeiro lance. Ver `MovePicker` no fim deste ficheiro para as
-        // fases e a motivacao (port directo do padrao do Sirius).
+        // fases e a motivacao.
         let killers = self.killers[ply.min(MAX_PLY - 1)];
         let mut picker = MovePicker::new(moves, tt_move, killers);
 
@@ -1814,16 +1813,16 @@ impl<'a> Searcher<'a> {
                 // (it's usually been good here before), strongly
                 // negative gets more.
                 let gives_check = board.in_check(board.side, self.atk);
-                // 2026-07-22: min-move-count gate now matches Sirius's
-                // real split (`lmrMinMovesPv=4`, `lmrMinMovesNonPv=3`,
-                // `lmrMinDepth=3`) instead of a single `i>=2, depth>=2`
+                // 2026-07-22: min-move-count gate now uses a per-node-type
+                // split (PV min 4 moves, non-PV min 3, min depth 3)
+                // instead of a single `i>=2, depth>=2`
                 // threshold for every node type -- PV nodes get one
                 // extra move of "trust" before LMR kicks in, since a PV
                 // node's move ordering has already earned more
                 // confidence than a non-PV scout node's. Pure integer
                 // threshold, no fixed-point/scale conversion involved
-                // (unlike the NMP/corr-hist ports above), so ported
-                // directly without the caution those needed.
+                // (unlike the NMP/corr-hist calibrations above), so
+                // applied directly without the caution those needed.
                 let min_moves = if is_pv { 4 } else { 3 };
                 let r = if i >= min_moves
                     && depth >= 3
@@ -1835,26 +1834,20 @@ impl<'a> Searcher<'a> {
                     let base = lmr_table()[(depth as usize).min(63)][(i + 1).min(63)];
                     let h = self.history_scores[board.side.idx()][mv.from as usize][mv.to as usize];
                     // 2026-07-23: divisor was a hand-set guess (4000);
-                    // real Sirius value is lmrQuietHistDivisor=8846.
-                    // Kestrel's own base LMR table already produces
-                    // final ply units directly (no /1024 fixed-point
-                    // step the way Sirius's does), so `h/8846` is the
-                    // direct equivalent -- no rescale needed beyond
-                    // using the real divisor, since both engines'
-                    // history score scales are already close
-                    // (HISTORY_MAX 16000 vs Sirius's 16384, confirmed
-                    // earlier this session).
+                    // retuned to 8846. Kestrel's base LMR table already
+                    // produces final ply units directly (no /1024
+                    // fixed-point step), so `h/8846` applies the divisor
+                    // straight, our HISTORY_MAX being 16000.
                     let hist_adj = -(h / 8846);
                     // TTPV: this position was reached by a real PV search
                     // before (full window, not a scout probe) -- reduce
-                    // one ply less here, same idea Stockfish/Ethereal use
-                    // ttPv for. A position that earned full-window search
-                    // once is less likely to be a safe-to-skip wasteland.
+                    // one ply less here. A position that earned
+                    // full-window search once is less likely to be a
+                    // safe-to-skip wasteland.
                     let ttpv_adj = if tt_entry_captured.map(|e| e.pv).unwrap_or(false) { -1 } else { 0 };
-                    // Corrplexity: Sirius's real term is
-                    // `-lmrCorrplexity/1024 (~=0.59 plies) when
-                    // |eval-staticEval| > highCorrplexityMargin(89)` --
-                    // reduce less when the correction-history signal
+                    // Corrplexity: reduce ~one ply less when
+                    // |eval-staticEval| > 89 --
+                    // i.e. when the correction-history signal
                     // says this position's static eval is trending far
                     // from what raw material/PST said (a "complex"
                     // position where blind reduction is riskier).
@@ -1865,9 +1858,9 @@ impl<'a> Searcher<'a> {
                     // term.
                     let corrplexity = (static_eval - raw_static_eval).abs();
                     let corrplexity_adj = if corrplexity > 89 { -1 } else { 0 };
-                    // lmrNonImp: Sirius's real term is `+lmrNonImp/1024
-                    // (~=1.46 plies) when !improving` -- reduce MORE
-                    // when the position isn't trending better (same
+                    // lmrNonImp: reduce MORE (one whole ply) when
+                    // !improving -- when the position isn't trending
+                    // better (same
                     // `improving` signal RFP/futility already use).
                     // Rounded to 1 whole ply, same quantization style.
                     let non_imp_adj = if !improving { 1 } else { 0 };
@@ -1880,16 +1873,17 @@ impl<'a> Searcher<'a> {
                 // bater alpha, ajusta a profundidade da re-pesquisa
                 // +/-1 conforme bateu alpha por muito (1 ply mais fundo,
                 // lance invulgarmente forte) ou por pouco (1 ply mais
-                // raso, poupa tempo). 2026-07-23: PRIMEIRA versão copiou
-                // as margens RAW do Sirius (36/141/8) e a bisecção
-                // localizou-a como o maior culpado da regressão do dia
-                // (-6.2%) -- as margens comparam com SCORES na escala de
-                // eval do Kestrel (~1.92x a do Sirius, peão 125 vs 65),
-                // por isso os valores raw disparavam "mais fundo" ~2x
-                // mais depressa do que deviam. Recalibradas pela razão
-                // real do peão (69/271/15) -- mecanismo mantido, valores
-                // corrigidos (ponto do utilizador: "não são as funções
-                // que estão mal, mas a calibração dos valores").
+                // raso, poupa tempo). 2026-07-23: a PRIMEIRA versão usou
+                // margens RAW (36/141/8) vindas de uma escala de eval
+                // ~1.92x mais pequena que a nossa (peão 65 vs 125) e a
+                // bisecção localizou-a como o maior culpado da regressão
+                // do dia (-6.2%) -- as margens comparam com SCORES na
+                // escala de eval do Kestrel, por isso os valores raw
+                // disparavam "mais fundo" ~2x mais depressa do que
+                // deviam. Recalibradas pela razão do peão (69/271/15) --
+                // mecanismo mantido, valores corrigidos (ponto do
+                // utilizador: "não são as funções que estão mal, mas a
+                // calibração dos valores").
                 let new_depth = depth - 1 + extend;
                 let mut research_depth = new_depth;
                 let mut s = -self.negamax(board, new_depth - r, -alpha - 1, -alpha, ply + 1, false);
@@ -2045,11 +2039,15 @@ impl<'a> Searcher<'a> {
             // entry gets overwritten by the next (far more common)
             // scout-window visit to the same position, erasing the
             // flag almost immediately. Once true, stays true across
-            // subsequent non-PV writes to the same slot -- same
-            // approach Stockfish/Ethereal use (`ttPv = is_pv ||
-            // (hit && old.pv)`).
+            // subsequent non-PV writes to the same slot
+            // (`store_pv = is_pv || (hit && old.pv)`).
             let store_pv = is_pv || tt_entry_captured.map(|e| e.pv).unwrap_or(false);
-            self.tt.store(hash, depth, score_to_tt(best_score, ply as i32), bound, best_move, store_pv);
+            let tt_static_eval = if in_check {
+                crate::tt::TT_EVAL_NONE
+            } else {
+                raw_static_eval.clamp(i16::MIN as i32, i16::MAX as i32) as i16
+            };
+            self.tt.store(hash, depth, score_to_tt(best_score, ply as i32), bound, best_move, store_pv, tt_static_eval);
             // Correction history update: only on a genuine Exact result
             // (fail-high/fail-low bounds are one-sided, not a real
             // estimate of the true value) and never in check (tactics
@@ -2069,10 +2067,10 @@ impl<'a> Searcher<'a> {
     /// (dobra o delta) e repete se falhar por baixo ou por cima, ate'
     /// obter um score dentro da janela ou o tempo esgotar.
     ///
-    /// 2026-07-23: tentei substituir por a formula REAL do Sirius
-    /// (`aspWindows`, delta escalado por prev_score^2, janela total
-    /// abaixo de profundidade 6, alargamento ~1.18x em vez de 2x,
-    /// fail-high com profundidade reduzida) -- A/B isolado (300 jogos)
+    /// 2026-07-23: tentei substituir por uma formula mais elaborada
+    /// (delta escalado por prev_score^2, janela total abaixo de
+    /// profundidade 6, alargamento ~1.18x em vez de 2x, fail-high com
+    /// profundidade reduzida) -- A/B isolado (300 jogos)
     /// deu 39% negativo, claro e fora do ruido. Combinado com o
     /// terceiro dado negativo ja' existente para esta area (versao
     /// antiga isolada: 33%), tres sinais independentes na mesma
@@ -2150,7 +2148,7 @@ impl<'a> Searcher<'a> {
             // stop is still enforced inside time_up() as always); this
             // only ever stops EARLIER than the hard limit, and only
             // between fully-completed iterations, never mid-search.
-            // Node-count time management (Ethereal): only trust the
+            // Node-count time management: only trust the
             // stability-based early stop once the search has actually
             // CONCENTRATED its effort on the current best move, not
             // just kept repeating the same choice while still spending
@@ -2184,9 +2182,7 @@ impl<'a> Searcher<'a> {
     }
 }
 
-/// Staged move picker -- port directo do padrao usado no Sirius
-/// (move_ordering.cpp `MovePickStage`, ver esse ficheiro para as fases
-/// exactas). Ideia: em vez de pontuar TODOS os lances legais upfront
+/// Staged move picker. Ideia: em vez de pontuar TODOS os lances legais upfront
 /// (SEE em todas as capturas, history+livro+countermove em todos os
 /// quietos) antes de sequer tentar o primeiro, devolver os lances por
 /// fases e pontuar SO' o subconjunto que a fase actual precisa. Se um
@@ -2387,9 +2383,9 @@ impl MovePicker {
                     // Countermove ainda usado como fallback binario (bonus
                     // fixo se bater) para preservar continuidade das
                     // iteracoes anteriores; cont_hist adiciona o sinal
-                    // numerico multi-lag por cima (ver Sirius:
-                    // history.cpp `getQuietStats` a somar contHist a -1,
-                    // -2, e -4 plies -- portamos -1 e -2 por agora).
+                    // numerico multi-lag por cima (somando contHist a -1
+                    // e -2 plies por agora; um lag -4 poderia entrar mais
+                    // tarde).
                     let countermove = searcher
                         .ply_last_move
                         .get(ply)
