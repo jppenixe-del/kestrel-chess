@@ -120,18 +120,24 @@ fn decode_move(bits: u64) -> Option<Move> {
 //   bits 45..61  static_eval16 (16 bits, signed -- cached full eval)
 //   bits 61..64  unused        ( 3 bits free)
 //
-// TT structure note (2026-07-25): this stays a single-slot, always-replace
-// table on purpose. A textbook 4-way set-associative cluster + generation
-// aging was implemented and measured against this design across 6 positions
-// at 16MB and 64MB hash: it regressed node-count-to-fixed-depth by 35-45%
-// at realistic hash. Reason -- the smart replacement that justifies buckets
-// (depth-preferred eviction) hurts THIS engine's tree, since its shallow
-// entries are revisited constantly and evicting them by depth starves move
-// ordering; and the fallback (always-replace within a bucket) is just a
-// worse hash than a flat single-slot table using the same total slots. So
-// single-slot always-replace is the measured high-performance choice here,
-// not a placeholder. Revisit only if the search tree's transposition profile
-// changes materially.
+// TT structure note. This is a single-slot, always-replace table. A 4-way
+// set-associative cluster with generation aging was implemented and measured
+// against it across 6 positions, and regressed node-count-to-fixed-depth by
+// 35-45%, which is why the simple design stayed.
+//
+// That comparison is NOT settled, for two reasons found on 2026-07-25, and
+// both cut in favour of re-running it rather than trusting it:
+//   1. It was scored on node-count-to-fixed-depth. This project has since
+//      learned not to trust that metric for tuning decisions (it proved
+//      chaotic and non-monotonic when used on the SEE margins). What decides
+//      a replacement policy is strength at fixed TIME, over real games.
+//   2. It ran at what were believed to be 16MB and 64MB tables -- but the
+//      sizing bug fixed below meant those were really 8MB and 32MB. Table
+//      size is exactly the variable that governs how much replacement policy
+//      matters: the smaller the table, the more eviction hurts. The buckets
+//      were judged in the conditions least favourable to them.
+// So: re-measure at true sizes, over games, before concluding either way.
+// Nothing here is settled by authority -- only by measurement on our tree.
 fn encode_data(depth: i32, score: i32, bound: Bound, best: Option<Move>, pv: bool, static_eval: i16) -> u64 {
     let mv_bits = encode_move(best);
     let score16 = (score.clamp(i16::MIN as i32, i16::MAX as i32) as i16 as u16) as u64;
@@ -164,11 +170,18 @@ impl TranspositionTable {
     pub fn new(mb: usize) -> Self {
         let bytes = mb * 1024 * 1024;
         let slot_size = std::mem::size_of::<TtSlot>();
-        let mut count = (bytes / slot_size).max(1024);
-        count = count.next_power_of_two() / 2; // fica um pouco abaixo do teto
-        if count == 0 {
-            count = 1024;
-        }
+        // The index is masked, so the slot count must be a power of two, and
+        // it must not exceed what was asked for. Round DOWN to the previous
+        // power of two -- which, when the count already IS one, keeps it.
+        //
+        // 2026-07-25: this used to be `next_power_of_two() / 2`, meaning that
+        // whenever the requested size divided into an exact power of two --
+        // which is every realistic setting, since hash is always asked for in
+        // powers of two -- the table was silently halved. `Hash=32` built a
+        // 16MB table. Every measurement ever taken on this engine at a given
+        // Hash value was really taken at half of it.
+        let requested = (bytes / slot_size).max(1024);
+        let count = 1usize << requested.ilog2();
         let mut slots = Vec::with_capacity(count);
         for _ in 0..count {
             slots.push(TtSlot { key_xor_data: AtomicU64::new(0), data: AtomicU64::new(0) });
@@ -198,11 +211,11 @@ impl TranspositionTable {
         let data = encode_data(depth, score, bound, best, pv, static_eval);
         let idx = (key as usize) & self.mask;
         let slot = &self.slots[idx];
-        // Always-replace, and it's the RIGHT choice for this table's shape,
-        // not a placeholder -- see the "TT structure note" above encode_data
-        // (2026-07-25 re-measurement of a full 4-way+aging redesign, which
-        // regressed). Always-replace keeps the most recent (and in iterative
-        // deepening, deepest-so-far) info in every slot, which measured best.
+        // Always-replace: keeps the most recent (and, under iterative
+        // deepening, usually the deepest-so-far) information in every slot.
+        // It measured better than a 4-way bucket here, but see the "TT
+        // structure note" above encode_data for why that comparison is worth
+        // re-running rather than treating as settled.
         slot.data.store(data, Ordering::Relaxed);
         slot.key_xor_data.store(key ^ data, Ordering::Relaxed);
     }
