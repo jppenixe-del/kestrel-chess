@@ -3,14 +3,16 @@
 score: how many positions the engine solves under a per-position time
 budget, plus per-position timing and success/failure.
 
-Also compares against Stockfish (if available) on the same positions
-at the same budget -- gives a concrete answer to "how far are we from
-a reference at this time control?".
+Also compares against an external reference engine (if one is
+configured and present) on the same positions at the same budget --
+gives a concrete answer to "how far are we from a reference at this
+time control?". Point KESTREL_REFERENCE_ENGINE at any UCI binary.
 
 Usage:
-  python3 tests/run_positions.py [--movetime MS] [--stockfish]
+  python3 tests/run_positions.py [--movetime MS] [--reference]
 """
 import argparse
+import os
 import re
 import subprocess
 import sys
@@ -21,7 +23,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 KESTREL = REPO / "target/release/kestrel"
-STOCKFISH = "/usr/local/bin/stockfish"
+REFERENCE = os.environ.get("KESTREL_REFERENCE_ENGINE", "")
 EPD = REPO / "tests/positions.epd"
 
 
@@ -129,7 +131,8 @@ def run_suite(engine_path, movetime_ms, label):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--movetime", type=int, default=2000, help="ms per position")
-    ap.add_argument("--stockfish", action="store_true", help="also run Stockfish reference")
+    ap.add_argument("--reference", action="store_true",
+                    help="also run the reference engine from KESTREL_REFERENCE_ENGINE")
     args = ap.parse_args()
 
     if not KESTREL.exists():
@@ -138,9 +141,9 @@ def main():
 
     ker_correct, total, ker_fails = run_suite(KESTREL, args.movetime, "Kestrel")
 
-    if args.stockfish and Path(STOCKFISH).exists():
-        sf_correct, _, _ = run_suite(STOCKFISH, args.movetime, "Stockfish")
-        print(f"\ngap vs Stockfish: {sf_correct - ker_correct} positions")
+    if args.reference and REFERENCE and Path(REFERENCE).exists():
+        ref_correct, _, _ = run_suite(REFERENCE, args.movetime, "reference")
+        print(f"\ngap vs reference: {ref_correct - ker_correct} positions")
 
 
 if __name__ == "__main__":
