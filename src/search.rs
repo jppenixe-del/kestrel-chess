@@ -25,6 +25,13 @@ use std::time::Instant;
 /// binaries whose provenance couldn't be reconstructed reliably -- this
 /// env var replaces that with a reproducible single-binary comparison.
 static LMR_TABLE: OnceLock<[[i32; 64]; 64]> = OnceLock::new();
+
+/// Same reasoning as `eval::warmup`: build the search-side globals before
+/// the clock matters, not inside the first search.
+pub fn warmup() {
+    let _ = lmr_table();
+    let _ = search_params();
+}
 fn lmr_table() -> &'static [[i32; 64]; 64] {
     LMR_TABLE.get_or_init(|| {
         let divisor = std::env::var("KESTREL_LMR_DIVISOR")
@@ -440,6 +447,14 @@ pub struct Searcher<'a> {
     /// each one costs an extra full ply, and they can chain if several
     /// nodes in a row are singular by a wide margin.
     pub dextensions: [i32; MAX_PLY],
+    /// Report each completed iteration on stdout as a UCI `info` line.
+    /// Set on ONE searcher only (the rest of the Lazy-SMP threads stay
+    /// silent, or every depth would be reported several times over).
+    ///
+    /// Without this the engine only ever announced its final answer, which
+    /// hides how its opinion developed -- the thing you actually need when
+    /// asking why a move was chosen, and what every GUI expects to display.
+    pub report: bool,
 }
 
 /// The learned tables that should OUTLIVE a single `go`.
@@ -475,6 +490,40 @@ pub struct HistoryTables {
     pub corr_hist_minor: Box<[i32]>,
     pub corr_hist_major: Box<[i32]>,
     pub corr_hist_threats: Box<[i32]>,
+}
+
+impl HistoryTables {
+    /// Fade the move-ordering statistics before reusing them in the next
+    /// search of the same game. Kept at 3/4 per move: strong enough that
+    /// evidence from several moves ago stops dominating (after ~5 moves an
+    /// old score is down to a quarter), gentle enough that the ordering
+    /// carried over is still worth having on the first iterations, which
+    /// is the whole point of keeping the tables at all.
+    ///
+    /// Only the move-ordering tables fade. Correction history is left
+    /// intact on purpose: it is not an ordering preference but a measured
+    /// bias of our own static eval for a given structure, which does not
+    /// go stale as the game advances -- fading it would just slow down the
+    /// one signal that needs the longest to become reliable.
+    pub fn fade(&mut self) {
+        for side in self.history_scores.iter_mut() {
+            for from in side.iter_mut() {
+                for v in from.iter_mut() {
+                    *v = *v * 3 / 4;
+                }
+            }
+        }
+        for side in self.capture_history.iter_mut() {
+            for moved in side.iter_mut() {
+                for v in moved.iter_mut() {
+                    *v = *v * 3 / 4;
+                }
+            }
+        }
+        for v in self.cont_hist.iter_mut() {
+            *v = *v * 3 / 4;
+        }
+    }
 }
 
 impl Default for HistoryTables {
@@ -2266,6 +2315,7 @@ impl<'a> Searcher<'a> {
     }
 
     pub fn iterative_deepening(&mut self, board: &mut Board) -> (Option<Move>, i32, i32, u64) {
+        let search_start = std::time::Instant::now();
         let mut best_move = None;
         let mut best_score = 0;
         let mut last_depth = 0;
@@ -2298,6 +2348,24 @@ impl<'a> Searcher<'a> {
                 best_score = score;
                 last_depth = depth;
                 prev_score = score;
+                if self.report && !self.stop {
+                    let pv = self.extract_pv(board, depth.max(1) as usize + 4);
+                    let pv_str: Vec<String> = pv.iter().map(|m| m.to_uci()).collect();
+                    let ms = search_start.elapsed().as_millis().max(1) as u64;
+                    let nps = self.nodes.saturating_mul(1000) / ms;
+                    let score_str = if score.abs() >= MATE_THRESHOLD {
+                        let mate_in = (MATE_SCORE - score.abs() + 1) / 2;
+                        format!("mate {}", if score > 0 { mate_in } else { -mate_in })
+                    } else {
+                        format!("cp {}", score)
+                    };
+                    println!(
+                        "info depth {} multipv 1 score {} nodes {} nps {} time {} pv {}",
+                        depth, score_str, self.nodes, nps, ms, pv_str.join(" ")
+                    );
+                    use std::io::Write;
+                    let _ = std::io::stdout().flush();
+                }
             }
             if self.stop {
                 break;

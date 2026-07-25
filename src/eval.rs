@@ -5,6 +5,30 @@ use crate::types::*;
 use std::sync::OnceLock;
 
 static ATTACKS: OnceLock<Attacks> = OnceLock::new();
+
+/// Force every lazily-built global into existence.
+///
+/// These are built on first use, and first use happens inside the first
+/// search -- with the clock already running. The attack tables in
+/// particular are expensive to build (magic bitboards), and measuring the
+/// per-iteration `info` output showed the first search losing ~600ms
+/// before even completing depth 1, every time a fresh engine process
+/// played its first move. Called once at start-up so the cost is paid
+/// before any clock is ticking.
+pub fn warmup() {
+    let _ = atk();
+    let _ = default_weights();
+    // Touching the globals is not enough: measurement showed the first
+    // real evaluation still costing ~700ms (the first search ran at
+    // ~2.8k nps instead of ~550k until it was paid). Run a full
+    // evaluation of a real position so whatever that first pass sets up
+    // is set up here, off the clock.
+    let mut b = crate::board::Board::startpos();
+    let _ = evaluate(&b);
+    let _ = positional_terms(&b, default_weights());
+    b.side = b.side.opp();
+    let _ = evaluate(&b);
+}
 fn atk() -> &'static Attacks {
     ATTACKS.get_or_init(Attacks::new)
 }

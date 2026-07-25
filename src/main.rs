@@ -390,6 +390,7 @@ fn play_one_selfplay_game(
             root_move_nodes: Vec::new(),
             capture_history: [[[0; 6]; 6]; 2],
             dextensions: [0; MAX_PLY],
+            report: false, // offline tools: no UCI narration
         };
         let (best, score, _depth, _nodes) = searcher.iterative_deepening(&mut board);
         let Some(mv) = best else {
@@ -627,6 +628,7 @@ fn play_one_selfplay_game_tc(
             root_move_nodes: Vec::new(),
             capture_history: [[[0; 6]; 6]; 2],
             dextensions: [0; MAX_PLY],
+            report: false, // offline tools: no UCI narration
         };
         let (best, score, _depth, _nodes) = searcher.iterative_deepening(&mut board);
         let elapsed_ms = move_t0.elapsed().as_millis() as u64;
@@ -1811,6 +1813,7 @@ fn resolve_quiet_dataset(in_path: &str, out_path: &str) {
             root_move_nodes: Vec::new(),
             capture_history: [[[0; 6]; 6]; 2],
             dextensions: [0; MAX_PLY],
+            report: false, // offline tools: no UCI narration
         };
         let (score, leaf) = searcher.quiescence_leaf(&mut board, -MATE_SCORE, MATE_SCORE, 0);
         if score.abs() >= MATE_SCORE - MAX_PLY as i32 {

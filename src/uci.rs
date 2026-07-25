@@ -168,6 +168,10 @@ impl Engine {
         let atk = Attacks::new();
         let zob = Zobrist::new();
         let style_book = crate::book::Book::load(&default_style_book_path()).ok();
+        // Build every lazily-initialised global now, while no clock is
+        // running -- see eval::warmup().
+        crate::eval::warmup();
+        crate::search::warmup();
         Engine {
             board: Board::startpos(),
             atk,
@@ -500,10 +504,17 @@ impl Engine {
         let book_ref = self.style_book.as_ref();
         let (result, returned) = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..n)
-                .map(|_| {
+                .map(|ti| {
                     let mut b = board.clone();
-                    // learned tables carried in from the previous move
-                    let ht = pool_iter.next().unwrap_or_default();
+                    // learned tables carried in from the previous move,
+                    // faded first: statistics from earlier in the game are
+                    // still informative but the position has moved on, so
+                    // they should not outweigh what this search learns.
+                    // Fading (rather than keeping raw, or clearing) is what
+                    // keeps the ordering they encode while letting fresh
+                    // evidence take over within a few moves.
+                    let mut ht = pool_iter.next().unwrap_or_default();
+                    ht.fade();
                     let searcher = Searcher {
                         atk: atk_ref,
                         zob: zob_ref,
@@ -533,6 +544,9 @@ impl Engine {
                         root_move_nodes: Vec::new(),
                         capture_history: ht.capture_history,
                         dextensions: [0; crate::search::MAX_PLY],
+                        // only thread 0 narrates, or each depth would be
+                        // announced once per Lazy-SMP thread
+                        report: ti == 0,
                     };
                     scope.spawn(move || {
                         let mut searcher = searcher;
