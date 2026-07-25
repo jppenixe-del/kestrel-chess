@@ -155,6 +155,12 @@ pub struct Engine {
     last_score: Option<i32>, // score (cp, nossa perspetiva) do ultimo "go" -- para os niveis 2/3 de compute_time_budget
     style_book: Option<crate::book::Book>, // "assinatura" da Judit Polgar -- ver book.rs
     threads: usize, // Lazy SMP -- ver search_mt(). 1 = sem paralelismo (comportamento antigo).
+    /// Learned tables kept ACROSS moves of a game (one set per search
+    /// thread) -- see `HistoryTables`. Cleared on `ucinewgame`, which is
+    /// exactly the lifetime the UCI protocol defines for them. Before
+    /// this, every `go` rebuilt them from zero and the engine relearned
+    /// each position from scratch.
+    hist: Vec<crate::search::HistoryTables>,
 }
 
 impl Engine {
@@ -171,6 +177,7 @@ impl Engine {
             last_score: None,
             style_book,
             threads: 1,
+            hist: Vec::new(),
         }
     }
 
@@ -471,43 +478,60 @@ impl Engine {
     /// `Searcher` so the caller can still call `extract_pv()` against the
     /// TT it populated.
     fn search_mt(
-        &self,
+        &mut self,
         board: &Board,
         history: &[u64],
         excluded: &[crate::moves::Move],
         limits: SearchLimits,
     ) -> (Option<crate::moves::Move>, i32, i32, u64, Vec<crate::moves::Move>) {
         let n = self.threads.max(1);
-        std::thread::scope(|scope| {
+        // Hand the learned tables (one set per thread) into this search;
+        // they come back at the end and survive to the next move. Missing
+        // sets (first search, or after a Threads change) start empty.
+        let mut pool: Vec<crate::search::HistoryTables> = std::mem::take(&mut self.hist);
+        while pool.len() < n {
+            pool.push(crate::search::HistoryTables::default());
+        }
+        pool.truncate(n);
+        let mut pool_iter = pool.into_iter();
+        let tt_ref = &self.tt;
+        let atk_ref = &self.atk;
+        let zob_ref = &self.zob;
+        let book_ref = self.style_book.as_ref();
+        let (result, returned) = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..n)
                 .map(|_| {
                     let mut b = board.clone();
+                    // learned tables carried in from the previous move
+                    let ht = pool_iter.next().unwrap_or_default();
                     let searcher = Searcher {
-                        atk: &self.atk,
-                        zob: &self.zob,
-                        tt: &self.tt,
+                        atk: atk_ref,
+                        zob: zob_ref,
+                        tt: tt_ref,
                         nodes: 0,
                         limits,
                         stop: false,
                         history: history.to_vec(),
+                        // killers stay per-search: they are ply-indexed, and
+                        // ply N means a different point once a move is played
                         killers: [[None; 2]; crate::search::MAX_PLY],
-                        history_scores: [[[0; 64]; 64]; 2],
-                        countermoves: [[None; 64]; 6],
-                        cont_hist: vec![0i32; crate::search::CONT_HIST_SIZE].into_boxed_slice(),
-                        corr_hist: vec![0i32; crate::search::CORR_HIST_SIZE * 2].into_boxed_slice(),
-                        corr_hist_np_stm: vec![0i32; crate::search::CORR_HIST_SIZE * 2].into_boxed_slice(),
-                        corr_hist_np_nstm: vec![0i32; crate::search::CORR_HIST_SIZE * 2].into_boxed_slice(),
-                        corr_hist_minor: vec![0i32; crate::search::CORR_HIST_SIZE * 2].into_boxed_slice(),
-                        corr_hist_major: vec![0i32; crate::search::CORR_HIST_SIZE * 2].into_boxed_slice(),
-                        corr_hist_threats: vec![0i32; crate::search::CORR_HIST_SIZE * 2].into_boxed_slice(),
+                        history_scores: ht.history_scores,
+                        countermoves: ht.countermoves,
+                        cont_hist: ht.cont_hist,
+                        corr_hist: ht.corr_hist,
+                        corr_hist_np_stm: ht.corr_hist_np_stm,
+                        corr_hist_np_nstm: ht.corr_hist_np_nstm,
+                        corr_hist_minor: ht.corr_hist_minor,
+                        corr_hist_major: ht.corr_hist_major,
+                        corr_hist_threats: ht.corr_hist_threats,
                         ply_last_move: [None; crate::search::MAX_PLY],
                         static_evals: [0i32; crate::search::MAX_PLY],
                         root_best: None,
                         excluded_move: None,
                         excluded_root_moves: excluded.to_vec(),
-                        style_book: self.style_book.as_ref(),
+                        style_book: book_ref,
                         root_move_nodes: Vec::new(),
-                        capture_history: [[[0; 6]; 6]; 2],
+                        capture_history: ht.capture_history,
                         dextensions: [0; crate::search::MAX_PLY],
                     };
                     scope.spawn(move || {
@@ -567,8 +591,31 @@ impl Engine {
             let nodes_total: u64 = results.iter().map(|r| r.3).sum();
             let (best, score, depth_reached, _, winner) = results.remove(best_idx);
             let pv_line = winner.extract_pv(board, depth_reached.max(1) as usize + 4);
-            (best, score, depth_reached, nodes_total, pv_line)
-        })
+            // Reclaim every thread's learned tables so the next move in
+            // this game starts from what this search learned, instead of
+            // from zero. The winner's set is kept first so thread 0 (the
+            // one that decided) keeps its own statistics next time.
+            let mut back: Vec<crate::search::HistoryTables> = Vec::with_capacity(n);
+            let harvest = |sr: Searcher| crate::search::HistoryTables {
+                history_scores: sr.history_scores,
+                countermoves: sr.countermoves,
+                capture_history: sr.capture_history,
+                cont_hist: sr.cont_hist,
+                corr_hist: sr.corr_hist,
+                corr_hist_np_stm: sr.corr_hist_np_stm,
+                corr_hist_np_nstm: sr.corr_hist_np_nstm,
+                corr_hist_minor: sr.corr_hist_minor,
+                corr_hist_major: sr.corr_hist_major,
+                corr_hist_threats: sr.corr_hist_threats,
+            };
+            back.push(harvest(winner));
+            for (_, _, _, _, sr) in results {
+                back.push(harvest(sr));
+            }
+            ((best, score, depth_reached, nodes_total, pv_line), back)
+        });
+        self.hist = returned;
+        result
     }
 
     pub fn run(&mut self) {
@@ -611,6 +658,7 @@ impl Engine {
                 "ucinewgame" => {
                     self.board = Board::startpos();
                     self.tt.clear();
+                    self.hist.clear(); // new game -> forget learned tables
                     self.history.clear();
                     self.last_score = None;
                 }

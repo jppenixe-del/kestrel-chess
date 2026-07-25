@@ -442,6 +442,59 @@ pub struct Searcher<'a> {
     pub dextensions: [i32; MAX_PLY],
 }
 
+/// The learned tables that should OUTLIVE a single `go`.
+///
+/// Until this existed, `uci.rs` built a fresh `Searcher` for every search,
+/// which zeroed every one of these -- so each move in a game started from
+/// nothing. That throws away most of what they are for: correction history
+/// in particular is a slow-learning signal (it accumulates how far the
+/// static eval tends to sit from what search finds for a given structure),
+/// and it can only pay off if it survives across the moves of a game. The
+/// same holds, less dramatically, for history/countermoves/capture history,
+/// where consecutive positions in a game are closely related and last
+/// move's statistics are immediately useful for ordering this one.
+///
+/// The UCI protocol assumes exactly this lifetime: `ucinewgame` exists to
+/// tell an engine to forget, which only means something if it otherwise
+/// remembers between searches.
+///
+/// Killers are deliberately NOT carried over: they are indexed by ply, and
+/// ply N means a different point in the game after each move is played, so
+/// keeping them would just mis-attribute cutoffs.
+///
+/// One instance per search thread (Lazy SMP threads keep independent
+/// statistics), held by the UCI layer and handed back and forth.
+pub struct HistoryTables {
+    pub history_scores: [[[i32; 64]; 64]; 2],
+    pub countermoves: [[Option<Move>; 64]; 6],
+    pub capture_history: [[[i32; 6]; 6]; 2],
+    pub cont_hist: Box<[i32]>,
+    pub corr_hist: Box<[i32]>,
+    pub corr_hist_np_stm: Box<[i32]>,
+    pub corr_hist_np_nstm: Box<[i32]>,
+    pub corr_hist_minor: Box<[i32]>,
+    pub corr_hist_major: Box<[i32]>,
+    pub corr_hist_threats: Box<[i32]>,
+}
+
+impl Default for HistoryTables {
+    fn default() -> Self {
+        let corr = || vec![0i32; CORR_HIST_SIZE * 2].into_boxed_slice();
+        HistoryTables {
+            history_scores: [[[0; 64]; 64]; 2],
+            countermoves: [[None; 64]; 6],
+            capture_history: [[[0; 6]; 6]; 2],
+            cont_hist: vec![0i32; CONT_HIST_SIZE].into_boxed_slice(),
+            corr_hist: corr(),
+            corr_hist_np_stm: corr(),
+            corr_hist_np_nstm: corr(),
+            corr_hist_minor: corr(),
+            corr_hist_major: corr(),
+            corr_hist_threats: corr(),
+        }
+    }
+}
+
 /// Limiar a partir do qual um score e' considerado "de mate" (nao so'
 /// avaliacao normal) -- MATE_SCORE menos a profundidade maxima possivel,
 /// para nao confundir avaliacoes normais muito altas com mates reais.
@@ -1739,7 +1792,8 @@ impl<'a> Searcher<'a> {
             // quadratically with depth; tighter when not improving.
             // Never in check, never on capture/promotion, never near
             // mate scores.
-            if !in_check
+            if !is_pv
+                && !in_check
                 && depth <= 5
                 && !mv.is_capture()
                 && mv.promotion.is_none()
@@ -1761,6 +1815,7 @@ impl<'a> Searcher<'a> {
             // are usually not worth searching. Improving-aware: tighter
             // margin when position is trending well (afford more prune).
             if i > 0
+                && !is_pv
                 && !in_check
                 && depth <= 6
                 && !mv.is_capture()
@@ -1786,6 +1841,7 @@ impl<'a> Searcher<'a> {
             // back some material even when it's not tactically decisive,
             // so it needs more slack before being confidently dismissed.
             if i > 0
+                && !is_pv
                 && !in_check
                 && depth <= 6
                 && mv.is_capture()
@@ -1809,6 +1865,7 @@ impl<'a> Searcher<'a> {
             // Separate signal from LMP (which is pure move-count) and
             // from LMR (which still searches, just shallower).
             if i >= 3
+                && !is_pv
                 && !in_check
                 && depth <= 4
                 && !mv.is_capture()
