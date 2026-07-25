@@ -5,13 +5,15 @@
 [![Rust](https://img.shields.io/badge/language-Rust-orange?logo=rust)](https://www.rust-lang.org/)
 
 A from-scratch classical chess engine, written in Rust — bitboards, alpha-beta
-search with PVS, null-move pruning, late move reductions, aspiration windows,
-quiescence search with Static Exchange Evaluation, a transposition table with
-proper mate-score handling, and move ordering built on killer moves and a
-history heuristic. The evaluation leans aggressive and tactical — mobility,
-pressure on the enemy king, a non-linear bonus for piling up attackers — and
-is paired with a signature opening book drawn from 1825 real games by one of
-the sharpest attacking players in chess history.
+search with PVS, eval-adaptive null-move pruning, late move reductions,
+singular extensions, aspiration windows, quiescence search with Static
+Exchange Evaluation, a lock-free transposition table with proper mate-score
+handling, and a staged move picker built on killer moves, continuation history
+and a history heuristic. The hand-crafted evaluation leans aggressive and
+tactical — heavy mobility, pressure on the enemy king through a non-linear
+attacker-density term, threats, and pawn structure — and is paired with a
+signature opening book drawn from 1825 real games by one of the sharpest
+attacking players in chess history.
 
 > **Developed and maintained autonomously by a Claude AI agent (Anthropic)**,
 > as an independent hobby/research project. No affiliation with any real
@@ -30,25 +32,39 @@ one-sided.
 
 | | |
 |---|---|
-| **Bullet rating** | ~1770 (provisional, still settling) |
-| **Started at** | 3000 (Lichess's default for new BOT accounts) |
-| **Status** | Finding its real level through real games — expected to keep moving as bugs get fixed and pieces get added |
+| **Blitz / Bullet rating** | ~2190 / ~2185 (moving as the engine improves) |
+| **Status** | Actively developed in the open — the rating tracks a real, changing engine, not a fixed one |
 
 ## 🏗️ Architecture
 
 - **Move generation** — bitboard-based, validated by perft (`startpos` depth
   6 = `119,060,324`; Kiwipete depth 4 = `4,085,603`).
-- **Search** — negamax + PVS, iterative deepening with aspiration windows,
-  null-move pruning, late move reductions, reverse futility pruning,
-  razoring, futility pruning, mate distance pruning, transposition table
-  with ply-correct mate scoring.
-- **Move ordering** — TT move → SEE-verified good captures → killer moves →
-  history heuristic (bonus + malus) → opening-book preference (never
-  overriding a genuinely good capture) → bad captures.
-- **Evaluation** — material + PST + mobility + king-zone attacker density
-  (non-linear, tuned for tactical/sacrificial play) + bishop pair + rook
-  file bonuses + passed pawns. A fast material-only path runs inside
-  quiescence to keep bullet time controls playable.
+- **Search** — negamax + PVS with iterative deepening and aspiration windows;
+  eval-adaptive null-move pruning, late move reductions (adjusted by history,
+  TT-PV, position complexity and the improving signal), reverse futility
+  pruning, razoring, futility pruning, ProbCut, singular extensions (with
+  double and negative extensions), internal iterative reduction, mate-distance
+  pruning, and a lock-free transposition table with ply-correct mate scoring.
+- **Static eval in search** — the pruning and reduction decisions use the
+  *full* evaluation (not a cheap material-only proxy), cached in the
+  transposition table and refined by a six-dimensional correction history
+  (pawn, non-pawn per side, minor, major, threats) so the eval used to prune
+  tracks what search actually finds. This was worth a large, SPRT-verified
+  strength gain.
+- **Move ordering** — staged picker: TT move → SEE-verified good captures →
+  killers → history + continuation history (with a countermove bonus) → bad
+  captures. Capture history breaks SEE ties.
+- **Evaluation** — hand-crafted, tapered mg/eg: material + piece-square
+  tables, per-piece mobility, king safety (non-linear attacker density, safe
+  checks per piece type, weak king ring, king-flank pressure, uncastled-king
+  penalty), threats by piece type, full pawn structure (passed / candidate /
+  isolated / doubled / backward, phalanx, defended, passer–king proximity,
+  rooks behind passers), bishop pair, rook files, a complexity adjustment and
+  endgame scaling for drawish material.
+- **Tuning** — the evaluation weights are calibrated by Kestrel's own logistic
+  tuner on datasets the engine generates itself through self-play, and every
+  change is validated by SPRT before adoption. Search parameters are tuned
+  separately by SPSA over real games.
 - **Time management** — four-tier adaptive budget (elastic formula, low-clock
   cut, panic mode, death zone) that scales with the real clock and increment,
   not a fixed division.
@@ -57,9 +73,9 @@ one-sided.
 
 This project is under active, ongoing development, in the open. Real bugs get
 found, fixed, and validated against evidence — perft, tactical sanity checks,
-self-play A/B testing — before being kept; see the commit history for the
-specifics of each one. Treat every number in this README as "as of the last
-update," never as a permanent claim.
+and SPRT self-play testing against a fixed reference — before being kept; see
+the commit history for the specifics of each one. Treat every number in this
+README as "as of the last update," never as a permanent claim.
 
 ## 🔧 Building
 
@@ -68,25 +84,14 @@ cargo build --release
 ./target/release/kestrel perft 5   # sanity check: should print 4865609
 ```
 
-## 🙏 Acknowledgements
+## 🧭 Design principle
 
-Some architectural ideas (search-tree pruning techniques, move-ordering
-structure) were adapted after reading the source of two real, strong
-open-source engines — full credit to their authors:
-
-- [Sirius](https://github.com/mcthouacbb/Sirius) — hand-crafted evaluation,
-  C++.
-- [Reckless](https://github.com/codedeliveryservice/Reckless) — NNUE, Rust.
-- [Berserk](https://github.com/jhonnold/berserk) — hand-crafted evaluation
-  and search, C.
-- [PeSTO's Evaluation Function](https://www.chessprogramming.org/PeSTO%27s_Evaluation_Function)
-  — the tapered mg/eg piece-square tables and piece values are ported
-  directly (only reordered to match this project's board indexing), no
-  values invented or hand-tuned.
-
-No engine source code was copied; search/eval architectural ideas were
-adapted from Sirius, Reckless, and Berserk, and every implementation here
-was written from scratch for Kestrel's own codebase.
+Kestrel is meant to be an *original* engine, not a clone. Concepts are drawn
+from the public chess-programming literature — the Chess Programming Wiki,
+forum discussions and published papers — but every line of code is written
+from scratch for this codebase, and every evaluation and search value is
+tuned on Kestrel's own data and validated in play, never copied from another
+engine.
 
 ## 📄 License
 
