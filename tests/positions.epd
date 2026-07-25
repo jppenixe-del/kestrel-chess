@@ -30,7 +30,7 @@ rnbqkbnr/ppp2ppp/3p4/4P3/4P3/8/PPP2PPP/RNBQKBNR b KQkq - 0 3 bm d6e5; id "recapt
 rnbqkbnr/ppp2ppp/8/4p3/4P3/8/PPP2PPP/RNBQKBNR w KQkq - 0 4 bm d1d8; id "queen-trade-after-recap";
 
 # Was mislabeled: f3e5 trades knights evenly, but Bc4b3 keeps the bishop
-# and tension for a bigger edge -- verified against Stockfish 17 (own
+# and tension for a bigger edge -- verified against a strong reference (own
 # search, depth 7: c4b3 +199..264cp vs f3e5 +189cp). Kestrel already
 # plays c4b3 here; the original "must capture the undefended knight"
 # label was the test author's assumption, not a checked fact.

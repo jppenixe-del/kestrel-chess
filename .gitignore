@@ -1,1 +1,12 @@
 /target
+
+# Working journal and tuning artefacts: these name the external tools and
+# reference engines used to measure this engine, which do not belong in the
+# published repository. Kept on disk, out of version control.
+NOTAS_PROXIMA_SESSAO.md
+dataset_*.epd
+tuned_*.txt
+tune_*.log
+selfplay_*.log
+resolvequiet.log
+datagen_*.log
