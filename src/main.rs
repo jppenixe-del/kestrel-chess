@@ -1525,6 +1525,61 @@ fn tune_full(dataset_path: &str, out_path: &str, epochs: u32, lr: f64, chunk_siz
 /// das consts. O material do rei (indices 5 e 11) fica fixo a 0 (o rei
 /// nao tem valor material). Output: 780 valores, escritos depois de volta
 /// nas consts de eval.rs.
+/// The twelve piece-square tables inside a material/PST vector, as
+/// (start_index, live_square_count). Layout matches
+/// `eval::material_pst_current_vec()`: 6 midgame material, 6 endgame
+/// material, then 6 midgame tables of 64, then 6 endgame tables of 64.
+/// Pawns never stand on the first or last rank, so those 16 squares are
+/// dead weight: they are held at zero and left out of the mean.
+fn psqt_tables() -> Vec<(usize, bool)> {
+    let mut v = Vec::new();
+    for phase in 0..2 {
+        for piece in 0..6 {
+            v.push((12 + phase * 384 + piece * 64, piece == 0));
+        }
+    }
+    v
+}
+
+fn table_mean(w: &[f64], start: usize, is_pawn: bool) -> f64 {
+    let (lo, hi) = if is_pawn { (8, 56) } else { (0, 64) };
+    let mut sum = 0.0;
+    for s in lo..hi {
+        sum += w[start + s];
+    }
+    sum / (hi - lo) as f64
+}
+
+/// Hold every piece-square table at the average level it started with, so
+/// only its SHAPE across squares can move.
+///
+/// Without this, anchoring the material values achieves nothing: adding a
+/// constant to all 64 squares of a piece's table is arithmetically the
+/// same as raising that piece's material value, so the fit simply routes
+/// around the anchor and the material/PSQT split goes degenerate again --
+/// which is exactly how this engine ended up with tuned values that put a
+/// pawn at 76 in the endgame and 153 in the midgame.
+///
+/// Applied to the WEIGHTS after each step, not to the gradient. Centering
+/// the gradient looks equivalent and is not: any optimiser with per-
+/// parameter state (momentum, adaptive rates) reintroduces a common
+/// component afterwards, so the constraint quietly stops holding. Acting
+/// on the weights makes it true by construction, whatever the optimiser.
+fn pin_psqt_means(w: &mut [f64], init_means: &[f64]) {
+    for (t, &(start, is_pawn)) in psqt_tables().iter().enumerate() {
+        let drift = table_mean(w, start, is_pawn) - init_means[t];
+        let (lo, hi) = if is_pawn { (8, 56) } else { (0, 64) };
+        for s in lo..hi {
+            w[start + s] -= drift;
+        }
+        if is_pawn {
+            for s in (0..8).chain(56..64) {
+                w[start + s] = 0.0;
+            }
+        }
+    }
+}
+
 fn tune_matpst(dataset_path: &str, out_path: &str, iters: u32, lr: f64) {
     let text = std::fs::read_to_string(dataset_path).expect("nao consegui ler o dataset");
     let mut boards: Vec<Board> = Vec::new();
@@ -1571,6 +1626,11 @@ fn tune_matpst(dataset_path: &str, out_path: &str, iters: u32, lr: f64) {
 
     fn sigmoid(x: f64, k: f64) -> f64 { 1.0 / (1.0 + 10f64.powf(-k * x / 400.0)) }
     let mut w: Vec<f64> = eval::material_pst_current_vec().iter().map(|&x| x as f64).collect();
+    // Level each table starts at -- the value pin_psqt_means() holds it to.
+    let init_means: Vec<f64> = psqt_tables()
+        .iter()
+        .map(|&(start, is_pawn)| table_mean(&w, start, is_pawn))
+        .collect();
     let predict = |w: &[f64], i: usize| -> f64 {
         let mut e = biases[i];
         let f = &features[i];
@@ -1602,6 +1662,7 @@ fn tune_matpst(dataset_path: &str, out_path: &str, iters: u32, lr: f64) {
             for j in 0..dim { if f[j] != 0.0 { grad[j] += d_loss_d_eval * f[j] as f64; } }
         }
         for j in 0..dim { if !is_fixed[j] { w[j] -= lr * grad[j] / n_pos as f64; } }
+        pin_psqt_means(&mut w, &init_means);
         if iter % 200 == 0 || iter == iters - 1 {
             println!("iter {}: error={:.6}  ({:.2}s)", iter, mean_error(&w, best_k), t1.elapsed().as_secs_f64());
         }
