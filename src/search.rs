@@ -799,7 +799,15 @@ impl<'a> Searcher<'a> {
         } else {
             match board.piece_at(to) {
                 Some((pt, _)) => pt.value(),
-                None => return 0,
+                // Quiet move: nothing is captured, so the exchange starts
+                // at zero -- but the sequence below still runs, because the
+                // piece we just moved can be taken on `to`. That makes this
+                // a general "does this move lose material?" test rather
+                // than a capture-only one (it used to bail out with 0 here,
+                // which silently made any SEE-based test on a quiet move a
+                // no-op). Every existing caller guards on is_capture(), so
+                // their behaviour is unchanged.
+                None => 0,
             }
         };
 
@@ -884,6 +892,35 @@ impl<'a> Searcher<'a> {
         let idx = cont_hist_idx(prev_pt, prev_to, curr_pt, curr_to);
         let v = &mut self.cont_hist[idx];
         *v = (*v + delta).clamp(-CONT_HIST_MAX, CONT_HIST_MAX);
+    }
+
+    /// Continuation-history score for moving `curr_pt` to `to` at `ply`:
+    /// how this move has performed before in reply to the SAME preceding
+    /// context, summed over the 1- and 2-ply lags (the same pair the move
+    /// picker scores with). Read where a pruning/reduction decision needs
+    /// the "is this move good IN THIS CONTEXT" signal -- plain history
+    /// alone is context-free and rates a move identically no matter what
+    /// was just played, which is exactly the blind spot continuation
+    /// history fixes.
+    ///
+    /// Takes the piece type explicitly rather than looking it up: the two
+    /// call sites read it from opposite ends (the pruning site runs BEFORE
+    /// make_move, so the piece is still on `mv.from`; the LMR site runs
+    /// AFTER, when it already sits on `mv.to`).
+    #[inline]
+    fn cont_hist_score(&self, curr_pt: PieceType, to: crate::types::Square, ply: usize) -> i32 {
+        let mut ch = 0i32;
+        if ply >= 1 {
+            if let Some((p_pt, p_to)) = self.ply_last_move.get(ply).and_then(|x| *x) {
+                ch += self.cont_hist[cont_hist_idx(p_pt, p_to, curr_pt, to)];
+            }
+        }
+        if ply >= 2 {
+            if let Some((p_pt, p_to)) = self.ply_last_move.get(ply - 1).and_then(|x| *x) {
+                ch += self.cont_hist[cont_hist_idx(p_pt, p_to, curr_pt, to)];
+            }
+        }
+        ch
     }
 
     #[inline]
@@ -1778,12 +1815,60 @@ impl<'a> Searcher<'a> {
                 && mv.promotion.is_none()
                 && alpha.abs() < MATE_SCORE - MAX_PLY as i32
             {
-                let h = self.history_scores[board.side.idx()][mv.from as usize][mv.to as usize];
+                // Main history PLUS continuation history: a move that looks
+                // bad on average can still be the right reply to what was
+                // just played (and vice versa). Pruning on the context-free
+                // signal alone throws those away; summing both means a move
+                // is only skipped when it is bad generally AND bad here.
+                let ch = match board.piece_at(mv.from) {
+                    Some((pt, _)) => self.cont_hist_score(pt, mv.to, ply),
+                    None => 0,
+                };
+                let h = self.history_scores[board.side.idx()][mv.from as usize][mv.to as usize] + ch;
                 if h < -search_params().history_prune_mult * depth {
                     i += 1;
                     continue;
                 }
             }
+
+            // SEE pruning: skip moves that lose material beyond a
+            // depth-scaled allowance, judged purely by Static Exchange
+            // Evaluation. Complements capture futility (which is
+            // eval-relative): this fires on the raw material swing alone,
+            // so it also catches quiets that hang a piece.
+            //
+            // ONLY at non-PV nodes. A first attempt without that gate
+            // measured NEGATIVE (490 games, 48.9%): pruning on material
+            // alone inside the principal variation throws away exactly the
+            // speculative sacrifices this engine is built to find, on the
+            // one line it will actually play. Off the PV, a scout search
+            // is only trying to refute a move cheaply, so a material-losing
+            // continuation is a fair thing to dismiss.
+            //
+            // Allowance shape: quadratic in depth for captures, linear for
+            // quiets -- a losing capture at least resolves a tension and
+            // deserves more slack deeper in the tree, while a quiet that
+            // simply drops material rarely justifies itself. Margins are in
+            // OUR eval units (pawn = 125, not the 100 most published
+            // numbers assume), so they are scaled accordingly rather than
+            // copied.
+            if !is_pv
+                && i > 0
+                && depth <= 8
+                && !in_check
+                && alpha.abs() < MATE_SCORE - MAX_PLY as i32
+            {
+                let see_allowance = if mv.is_capture() {
+                    -40 * depth * depth
+                } else {
+                    -100 * depth
+                };
+                if self.see(board, &mv) < see_allowance {
+                    i += 1;
+                    continue;
+                }
+            }
+
             let root_nodes_before = if ply == 0 { self.nodes } else { 0 };
             let undo = board.make_move(&mv);
             if ply + 1 < MAX_PLY {
@@ -1832,7 +1917,14 @@ impl<'a> Searcher<'a> {
                     && !gives_check
                 {
                     let base = lmr_table()[(depth as usize).min(63)][(i + 1).min(63)];
-                    let h = self.history_scores[board.side.idx()][mv.from as usize][mv.to as usize];
+                    // BUG FIX (2026-07-25): this runs AFTER make_move, so
+                    // `board.side` is already the OPPONENT -- indexing the
+                    // history table with it read the wrong side's stats
+                    // entirely (history is written with the mover's index,
+                    // see update_history at the cutoff below). Use the side
+                    // that actually played `mv`.
+                    let mover = board.side.opp().idx();
+                    let h = self.history_scores[mover][mv.from as usize][mv.to as usize];
                     // 2026-07-23: divisor was a hand-set guess (4000);
                     // retuned to 8846. Kestrel's base LMR table already
                     // produces final ply units directly (no /1024
@@ -1845,6 +1937,19 @@ impl<'a> Searcher<'a> {
                     // full-window search once is less likely to be a
                     // safe-to-skip wasteland.
                     let ttpv_adj = if tt_entry_captured.map(|e| e.pv).unwrap_or(false) { -1 } else { 0 };
+                    // Continuation history as its OWN reduction term, with
+                    // its own divisor -- deliberately NOT folded into `h`
+                    // above. It sums two lags, so its range is ~2x the main
+                    // history's; adding it into `h` and reusing the 8846
+                    // divisor silently tripled the reduction swing and
+                    // measured neutral (1247 games, 50.4%). Scaled here so
+                    // it contributes at most ~1 ply on its own, matching
+                    // every other adjustment's quantization. The piece
+                    // already sits on `mv.to` at this point (post-make_move).
+                    let cont_adj = match board.piece_at(mv.to) {
+                        Some((pt, _)) => -(self.cont_hist_score(pt, mv.to, ply) / 24000).clamp(-1, 1),
+                        None => 0,
+                    };
                     // Corrplexity: reduce ~one ply less when
                     // |eval-staticEval| > 89 --
                     // i.e. when the correction-history signal
@@ -1864,7 +1969,7 @@ impl<'a> Searcher<'a> {
                     // `improving` signal RFP/futility already use).
                     // Rounded to 1 whole ply, same quantization style.
                     let non_imp_adj = if !improving { 1 } else { 0 };
-                    (base + hist_adj + ttpv_adj + corrplexity_adj + non_imp_adj).clamp(0, depth - 1)
+                    (base + hist_adj + cont_adj + ttpv_adj + corrplexity_adj + non_imp_adj).clamp(0, depth - 1)
                 } else {
                     0
                 };
