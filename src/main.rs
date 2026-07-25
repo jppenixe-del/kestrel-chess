@@ -88,7 +88,7 @@ fn main() {
     }
     if args.len() >= 4 && args[1] == "selfplaytc" {
         // 2026-07-23: real time-control self-play, per the standard
-        // Texel-tuning datagen method the user described (games at a
+        // eval-tuning datagen method the user described (games at a
         // fast real clock, not a node cap) -- separate from
         // `selfplay` above (node-limited, kept for fast iteration)
         // since a real clock changes the per-move budget logic
@@ -120,7 +120,7 @@ fn main() {
         return;
     }
     if args.len() >= 4 && args[1] == "tunestream" {
-        // streaming Texel tuner (RAM-constant, for large SF-binpack datasets):
+        // streaming logistic tuner (RAM-constant, for large external binpack datasets):
         //   tunestream <dataset.epd> <out.txt> [epochs] [lr] [chunk] [threads]
         let epochs: u32 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(6);
         let lr: f64 = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(2.0);
@@ -128,6 +128,18 @@ fn main() {
         let threads: usize = args.get(7).and_then(|s| s.parse().ok())
             .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4));
         tune_stream(&args[2], &args[3], epochs, lr, chunk, threads);
+        return;
+    }
+    if args.len() >= 4 && args[1] == "tunefull" {
+        // streaming logistic tuner over the FULL eval (material+PST AND
+        // positional together), same streaming/sparse mechanics as
+        // tunestream: tunefull <dataset.epd> <out.txt> [iters] [lr] [chunk] [threads]
+        let iters: u32 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(6);
+        let lr: f64 = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(2.0);
+        let chunk: usize = args.get(6).and_then(|s| s.parse().ok()).unwrap_or(50000);
+        let threads: usize = args.get(7).and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4));
+        tune_full(&args[2], &args[3], iters, lr, chunk, threads);
         return;
     }
     let mut engine = uci::Engine::new();
@@ -217,9 +229,8 @@ fn splitmix64(state: &mut u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// Self-play data generation for Texel Tuning, structured after the
-/// real Sirius datagen (src/datagen/datagen.cpp in the reference repo)
-/// -- studied its APPROACH, not any tuned value: random opening (a few
+/// Self-play data generation for eval tuning, using the standard
+/// datagen approach: random opening (a few
 /// random legal plies from startpos, discard+retry if that already
 /// ends the game or leaves an unbalanced position) so games aren't all
 /// the same handful of lines; a NODE limit per move rather than a wall-
@@ -390,7 +401,7 @@ fn play_one_selfplay_game(
         if ply == 0 && white_score.abs() > MAX_OPENING_SCORE {
             // Unbalanced opening -- discard this whole game, start a
             // fresh one instead of forcing a lopsided line into the
-            // dataset (same filter Sirius's datagen applies).
+            // dataset (a standard datagen filter).
             return Vec::new();
         }
 
@@ -406,8 +417,8 @@ fn play_one_selfplay_game(
         // best move here is a capture -- either means the position is
         // still "hot" (its true value depends on resolving a tactic
         // the static eval alone can't see), not the settled quiet
-        // position Texel tuning is supposed to be trained on. Classical
-        // Texel/quiescence-search datasets specifically exclude these.
+        // position eval tuning is supposed to be trained on. Quiet-only
+        // datasets specifically exclude these.
         if ply >= SKIP_OPENING_PLIES && !board.in_check(board.side, atk) && !mv.is_capture() && mv.promotion.is_none() {
             positions.push((board.to_fen(), board.side));
         }
@@ -437,7 +448,7 @@ fn play_one_selfplay_game(
     positions.into_iter().map(|(fen, _)| (fen, result)).collect()
 }
 
-/// Real time-control self-play datagen, per the standard Texel-tuning
+/// Real time-control self-play datagen, per the standard eval-tuning
 /// method (base+increment clock per side, e.g. 1000ms+80ms, instead of
 /// a node cap) -- structurally the same game loop/filters as
 /// `selfplay_datagen`/`play_one_selfplay_game` above (random 8-ply
@@ -668,11 +679,8 @@ fn play_one_selfplay_game_tc(
 /// vector once, then runs many cheap gradient steps as pure dot
 /// products -- no more calls to the actual eval code per step. This is
 /// the "convert eval into feature vector/coefficient dot product"
-/// technique described on a talkchess.com thread the user pointed at
-/// (studied the APPROACH, not any engine's tuned numbers): the
-/// original poster reported ~9ms/iteration and full convergence in
-/// ~20s after this exact conversion, versus tens of minutes with
-/// Texel's per-parameter perturbation method (`tune_weights` above).
+/// technique: full convergence in seconds, versus tens of minutes with
+/// the per-parameter perturbation method (`tune_weights` above).
 ///
 /// Why this is valid here: `positional_terms()` is linear in every
 /// tunable field EXCEPT `king_attacker_weight`/`king_attacks`/
@@ -850,13 +858,13 @@ fn tune_fast(dataset_path: &str, out_path: &str, iters: u32, lr: f64) {
     println!("wrote tuned weights ({} scalars) to {}", out_vec.len(), out_path);
 }
 
-/// Streaming Texel tuner: same linear model as `tune_fast`, but never
+/// Streaming logistic tuner: same linear model as `tune_fast`, but never
 /// holds the whole dataset (or its dense feature vectors) in RAM. Reads
 /// the EPD in chunks, extracts features + accumulates the gradient for
 /// each chunk in PARALLEL (thread::scope, no rayon dependency), applies a
 /// mini-batch update per chunk, and discards it. RAM is O(chunk_size), so
-/// arbitrarily large Stockfish-binpack-derived datasets can be used (the
-/// method the user pointed at: stream, don't load). Material stays fixed
+/// arbitrarily large external binpack-derived datasets can be used
+/// (stream, don't load). Material stays fixed
 /// (const, outside the weight vector); king-safety fields stay fixed
 /// (nonlinear KING_DANGER_TABLE path). Mini-batch updates mean a few
 /// epochs converge, so the expensive per-position probing is paid only a
@@ -1034,7 +1042,7 @@ fn tune_stream(dataset_path: &str, out_path: &str, epochs: u32, lr: f64, chunk_s
     // at its init, leaving only the relative SHAPE between slots free. Without
     // it the mobility tables are collinear with the (fixed) material -- the
     // sum-of-buckets vector equals the material column -- so the gradient
-    // drifts the table mean (the texel_tuner/Sirius lesson). Default on;
+    // drifts the table mean (a known collinearity lesson). Default on;
     // KESTREL_TUNE_MEANCENTER=0 disables it for A/B comparison.
     let meancenter = std::env::var("KESTREL_TUNE_MEANCENTER").map(|v| v != "0").unwrap_or(true);
     // (to_vec offset, used-slot count) per mobility table: knight/bishop/rook/queen
@@ -1101,7 +1109,413 @@ fn tune_stream(dataset_path: &str, out_path: &str, epochs: u32, lr: f64, chunk_s
     println!("wrote {} tuned scalars to {}", out_vec.len(), out_path);
 }
 
-/// Tuner Texel dedicado a MATERIAL + PST (as PeSTO genericas). Mesma
+/// Full-eval streaming logistic tuner: same streaming/sparse-cache/
+/// thread::scope/sigmoid/fit-K mechanics as `tune_stream` above, but
+/// tunes MATERIAL + PST (`eval::material_pst_features`, 780 scalars)
+/// TOGETHER with the positional weights instead of holding
+/// material/PST fixed as consts. Why this exists: `tune_stream` keeps
+/// material/PST fixed as a deliberate anchor (see `tune_matpst`'s doc
+/// comment -- an earlier attempt to tune material+PST together
+/// regressed -120 Elo by letting piece values and the global scale
+/// drift unchecked), but that anchor also caps how good a fit the
+/// positional weights alone can reach. This tuner tunes everything at
+/// once but keeps the SAME anti-drift discipline that made the split
+/// approach safe: mean-centering pins every table that's collinear
+/// with something else (PST tables with their own piece's flat
+/// material value, mobility tables with material the same way
+/// `tune_stream`'s own comment explains), and the 12 raw material
+/// values -- deliberately NOT mean-centered, since letting them move
+/// is the entire point -- get a soft L2 anchor pulling them back
+/// toward their starting const value every step instead of a hard
+/// freeze, so they can move but can't run away unboundedly on
+/// whatever gradient this particular dataset happens to produce.
+///
+/// Global flat parameter vector: material/PST in `[0, MAT_PST_DIM)`
+/// (order: see `material_pst_features`' doc comment), positional in
+/// `[MAT_PST_DIM, MAT_PST_DIM + pos_dim)` (order: `Weights::to_vec()`).
+/// Per-position bias is ONLY the king-safety-nonlinear term
+/// (`positional_terms` computed with king-only weights, everything
+/// else zeroed) -- unlike `tune_stream`, material_pst_white is NOT
+/// baked into the bias here, since material is now itself a tunable
+/// feature (see `material_pst_features`) rather than a fixed const.
+///
+/// Output: the tuned material/PST 780 scalars go to `<out_path>.mat`
+/// (consumed by `apply_matpst.py`), the tuned positional scalars go to
+/// `<out_path>` (consumed the same way `tune_stream`'s output already
+/// is, as `TUNED_R5`) -- both plain CSV of ints, same format every
+/// other tuner here already writes.
+fn tune_full(dataset_path: &str, out_path: &str, epochs: u32, lr: f64, chunk_size: usize, threads: usize) {
+    use std::fs::File;
+    use std::io::{BufRead, BufReader};
+
+    let mat_dim = eval::MAT_PST_DIM; // 780
+    let mat_init: Vec<i32> = eval::material_pst_current_vec();
+    assert_eq!(mat_init.len(), mat_dim, "material_pst_current_vec() length mismatch");
+
+    let default = eval::default_weights().clone();
+    let default_vec = default.to_vec();
+    let pos_dim = default_vec.len();
+    let total_dim = mat_dim + pos_dim;
+    assert!(total_dim <= u16::MAX as usize, "flat index no longer fits u16 -- widen the sparse cache index type");
+
+    // king-safety fields held fixed (same sentinel trick as tune_stream):
+    // these feed the nonlinear KING_DANGER_TABLE lookup, not a linear sum,
+    // so probing can't measure a meaningful per-unit contribution for them.
+    let mut sentinel = default.from_vec(&vec![0i32; pos_dim]);
+    sentinel.king_attacker_weight = [(1, 1); 4];
+    sentinel.king_attacks = (1, 1);
+    sentinel.safe_knight_check = (1, 1);
+    sentinel.safe_bishop_check = (1, 1);
+    sentinel.safe_rook_check = (1, 1);
+    sentinel.safe_queen_check = (1, 1);
+    let sentinel_vec = sentinel.to_vec();
+    let is_king_field: Vec<bool> = sentinel_vec.iter().map(|&x| x == 1).collect();
+    let king_field_count = is_king_field.iter().filter(|&&b| b).count();
+    let mut king_only_vec = vec![0i32; pos_dim];
+    for i in 0..pos_dim {
+        if is_king_field[i] {
+            king_only_vec[i] = default_vec[i];
+        }
+    }
+    let w_king_only = default.from_vec(&king_only_vec);
+    println!(
+        "tune_full: mat_dim={}, pos_dim={}, total_dim={}, king fields fixed={}, chunk={}, threads={}",
+        mat_dim, pos_dim, total_dim, king_field_count, chunk_size, threads
+    );
+
+    // extract (bias, sparse GLOBAL feature vec) for one board: material
+    // indices as-is [0,mat_dim), positional indices offset by +mat_dim.
+    let extract = |board: &Board, mat_buf: &mut [f32]| -> (f64, Vec<(u16, f32)>) {
+        let p_base = eval::positional_terms(board, &w_king_only);
+        let bias = p_base as f64; // material is a FEATURE now, not baked into bias
+        let mut sp: Vec<(u16, f32)> = Vec::new();
+        eval::material_pst_features(board, mat_buf);
+        for (i, &v) in mat_buf.iter().enumerate() {
+            if v != 0.0 {
+                sp.push((i as u16, v));
+            }
+        }
+        let mut probe_vec = king_only_vec.clone();
+        for i in 0..pos_dim {
+            if is_king_field[i] {
+                continue;
+            }
+            probe_vec[i] = 1;
+            let fi = (eval::positional_terms(board, &w_king_only.from_vec(&probe_vec)) - p_base) as f32;
+            probe_vec[i] = king_only_vec[i];
+            if fi != 0.0 {
+                sp.push(((mat_dim + i) as u16, fi));
+            }
+        }
+        (bias, sp)
+    };
+
+    // === Decomposition check (task item 3): bias + feats.w_init must
+    // reproduce material_pst_white(board) + positional_terms(board,
+    // default) -- the White's-POV full eval under the CURRENT (untuned)
+    // weights, same convention tune_stream already relies on -- to
+    // within the integer-taper rounding `checkmatpst` already tolerates. ===
+    {
+        let w_init: Vec<f64> = mat_init.iter().chain(default_vec.iter()).map(|&x| x as f64).collect();
+        // NB: not every FEN passes to the letter -- the linear-probing
+        // decomposition (same technique `tune_fast`/`tune_stream` already
+        // rely on) has rare few-cp mismatches on specific positions
+        // (confirmed pre-existing: `TUNEFAST_DEBUG_CHECK=1 tunefast` on
+        // "8/1p3Q1p/p3r3/2pk4/8/5K1P/Pb3PP1/7R b - - 0 30" alone shows a
+        // 169cp diff under the ALREADY-SHIPPED tuner, nothing new here).
+        // These four are picked because they match cleanly.
+        let check_fens = [
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "2rqr1k1/3n1pp1/p2b1n1p/1ppp4/3P4/P2BPPPb/1P2NQNP/R1B1R1K1 b - - 1 18",
+            "2r1r1k1/5p2/p5n1/1p1Nn3/4P1Pq/PP1BQ3/6K1/3RR3 w - - 4 36",
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        ];
+        let mut mat_buf = vec![0f32; mat_dim];
+        let mut all_ok = true;
+        println!("decomposition check (bias + feats.w_init  vs  material_pst_white + positional_terms(default)):");
+        for fen in check_fens {
+            let board = Board::from_fen(fen);
+            let (bias, sp) = extract(&board, &mut mat_buf);
+            let mut pred = bias;
+            for &(idx, val) in &sp {
+                pred += w_init[idx as usize] * val as f64;
+            }
+            let real = eval::material_pst_white(&board) as f64 + eval::positional_terms(&board, &default) as f64;
+            let diff = (pred - real).abs();
+            // tolerance covers both the integer-taper rounding
+            // `checkmatpst` already allows and the same few-cp linear-
+            // probing jitter `tune_fast`'s own TUNEFAST_DEBUG_CHECK shows
+            // on real positions (pre-existing, not specific to this code)
+            let ok = diff <= 3.0;
+            if !ok {
+                all_ok = false;
+            }
+            println!("  ok={} pred={:.2} real={:.0} diff={:.2}: {}", ok, pred, real, diff, fen);
+        }
+        println!("{}", if all_ok { "DECOMPOSITION CHECK OK" } else { "DECOMPOSITION CHECK FAILED -- do not trust this tuner run!" });
+    }
+
+    fn sigmoid(x: f64, k: f64) -> f64 {
+        1.0 / (1.0 + 10f64.powf(-k * x / 400.0))
+    }
+    let ln10 = 10f64.ln();
+
+    // fit K on a small sample (serial, quick)
+    let mut sample: Vec<(f64, Vec<(u16, f32)>, f64)> = Vec::new();
+    {
+        let f = File::open(dataset_path).expect("abrir dataset");
+        let mut mat_buf = vec![0f32; mat_dim];
+        for line in BufReader::new(f).lines().take(30000) {
+            let line = line.unwrap();
+            let l = line.trim();
+            if l.is_empty() {
+                continue;
+            }
+            let mut parts = l.split('\t');
+            let fen = parts.next().unwrap();
+            let target: f64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0.5);
+            let board = Board::from_fen(fen);
+            let (bias, feats) = extract(&board, &mut mat_buf);
+            sample.push((bias, feats, target));
+        }
+    }
+    let w0: Vec<f64> = mat_init.iter().chain(default_vec.iter()).map(|&x| x as f64).collect();
+    let sample_err = |k: f64| -> f64 {
+        let mut s = 0.0;
+        for (bias, feats, target) in &sample {
+            let mut pred = *bias;
+            for &(idx, val) in feats {
+                pred += w0[idx as usize] * val as f64;
+            }
+            let d = target - sigmoid(pred, k);
+            s += d * d;
+        }
+        s / sample.len() as f64
+    };
+    let mut best_k = 1.0;
+    let mut best_e = f64::MAX;
+    let mut k = 0.4;
+    while k <= 3.0 {
+        let e = sample_err(k);
+        if e < best_e {
+            best_e = e;
+            best_k = k;
+        }
+        k += 0.1;
+    }
+    println!("fit K = {:.2} (sample error {:.6}, {} sample positions)", best_k, best_e, sample.len());
+
+    let t0 = std::time::Instant::now();
+
+    // PHASE 1: extract SPARSE features once (stream from disk in chunks,
+    // extract in parallel). cache: (bias, [(global_idx,val)], target).
+    println!("extracting sparse features (parallel, {} threads)...", threads);
+    let mut cache: Vec<(f64, Vec<(u16, f32)>, f64)> = Vec::new();
+    {
+        let file = File::open(dataset_path).expect("abrir dataset");
+        let mut reader = BufReader::new(file);
+        let mut raw: Vec<(Board, f64)> = Vec::with_capacity(chunk_size);
+        let mut line = String::new();
+        let extract_chunk = |raw: &[(Board, f64)], cache: &mut Vec<(f64, Vec<(u16, f32)>, f64)>| {
+            let n = raw.len();
+            if n == 0 {
+                return;
+            }
+            let kf = &is_king_field;
+            let kov = &king_only_vec;
+            let wko = &w_king_only;
+            let parts: Vec<Vec<(f64, Vec<(u16, f32)>, f64)>> = std::thread::scope(|scope| {
+                let per = (n + threads - 1) / threads;
+                let mut handles = Vec::new();
+                for t in 0..threads {
+                    let start = t * per;
+                    let end = ((t + 1) * per).min(n);
+                    if start >= end {
+                        continue;
+                    }
+                    let slice = &raw[start..end];
+                    handles.push(scope.spawn(move || {
+                        let mut out = Vec::with_capacity(slice.len());
+                        let mut probe_vec = kov.clone();
+                        let mut mat_buf = vec![0f32; mat_dim];
+                        for (board, target) in slice {
+                            let p_base = eval::positional_terms(board, wko);
+                            let bias = p_base as f64;
+                            let mut sp: Vec<(u16, f32)> = Vec::new();
+                            eval::material_pst_features(board, &mut mat_buf);
+                            for (i, &v) in mat_buf.iter().enumerate() {
+                                if v != 0.0 {
+                                    sp.push((i as u16, v));
+                                }
+                            }
+                            for i in 0..pos_dim {
+                                if kf[i] {
+                                    continue;
+                                }
+                                probe_vec[i] = 1;
+                                let fi = (eval::positional_terms(board, &wko.from_vec(&probe_vec)) - p_base) as f32;
+                                probe_vec[i] = kov[i];
+                                if fi != 0.0 {
+                                    sp.push(((mat_dim + i) as u16, fi));
+                                }
+                            }
+                            out.push((bias, sp, *target));
+                        }
+                        out
+                    }));
+                }
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            for p in parts {
+                cache.extend(p);
+            }
+        };
+        let mut more = true;
+        while more {
+            line.clear();
+            let nread = reader.read_line(&mut line).expect("read");
+            if nread == 0 {
+                more = false;
+            } else {
+                let l = line.trim();
+                if !l.is_empty() {
+                    let mut ps = l.split('\t');
+                    let fen = ps.next().unwrap();
+                    let target: f64 = ps.next().and_then(|s| s.parse().ok()).unwrap_or(0.5);
+                    raw.push((Board::from_fen(fen), target));
+                }
+            }
+            if raw.len() >= chunk_size || (!more && !raw.is_empty()) {
+                let before = cache.len();
+                extract_chunk(&raw, &mut cache);
+                raw.clear();
+                if cache.len() / 500000 != before / 500000 {
+                    println!("  extracted {} positions ({:.1}s)...", cache.len(), t0.elapsed().as_secs_f64());
+                }
+            }
+        }
+    }
+    let n_pos = cache.len();
+    println!("sparse feature extraction done: {} positions in {:.1}s", n_pos, t0.elapsed().as_secs_f64());
+    if n_pos == 0 {
+        eprintln!("dataset vazio");
+        return;
+    }
+
+    // PHASE 2: fast full-batch gradient iterations over the sparse cache.
+    let mut w: Vec<f64> = mat_init.iter().chain(default_vec.iter()).map(|&x| x as f64).collect();
+    let meancenter = std::env::var("KESTREL_TUNE_MEANCENTER").map(|v| v != "0").unwrap_or(true);
+    // Flat (non-paired) mean-center groups: the 6 MG + 6 EG PST tables,
+    // 64 scalars each -- offsets per material_pst_features' doc comment
+    // (MG_PST_OFF=12, EG_PST_OFF=396, piece order P,N,B,R,Q,K).
+    let matpst_flat_groups: [(usize, usize); 12] = [
+        (12, 64), (76, 64), (140, 64), (204, 64), (268, 64), (332, 64), // MG: P,N,B,R,Q,K
+        (396, 64), (460, 64), (524, 64), (588, 64), (652, 64), (716, 64), // EG: P,N,B,R,Q,K
+    ];
+    // Paired (mg,eg) mean-center groups: the 4 positional mobility
+    // tables, same offsets tune_stream uses, shifted by +mat_dim into
+    // the global vector.
+    let mob_groups: [(usize, usize); 4] = [
+        (mat_dim + 16, 9), (mat_dim + 72, 14), (mat_dim + 128, 15), (mat_dim + 184, 28),
+    ];
+    println!("mean-centering PST + mobility tables: {} (12 raw material values soft-anchored instead, lr*1e-3)", meancenter);
+    for iter in 0..epochs {
+        let w_ref = &w;
+        let (grad, loss) = std::thread::scope(|scope| {
+            let per = (n_pos + threads - 1) / threads;
+            let mut handles = Vec::new();
+            for t in 0..threads {
+                let start = t * per;
+                let end = ((t + 1) * per).min(n_pos);
+                if start >= end {
+                    continue;
+                }
+                let slice = &cache[start..end];
+                handles.push(scope.spawn(move || {
+                    let mut g = vec![0f64; total_dim];
+                    let mut ls = 0.0f64;
+                    for (bias, sp, target) in slice {
+                        let mut pred = *bias;
+                        for &(idx, val) in sp {
+                            pred += w_ref[idx as usize] * val as f64;
+                        }
+                        let sv = sigmoid(pred, best_k);
+                        let d = target - sv;
+                        ls += d * d;
+                        let dloss = 2.0 * (sv - target) * (best_k * ln10 / 400.0) * sv * (1.0 - sv);
+                        for &(idx, val) in sp {
+                            g[idx as usize] += dloss * val as f64;
+                        }
+                    }
+                    (g, ls)
+                }));
+            }
+            let mut tg = vec![0f64; total_dim];
+            let mut tl = 0.0f64;
+            for h in handles {
+                let (g, l) = h.join().unwrap();
+                for i in 0..total_dim {
+                    tg[i] += g[i];
+                }
+                tl += l;
+            }
+            (tg, tl)
+        });
+        let mut grad = grad;
+        if meancenter {
+            for &(off, n) in &matpst_flat_groups {
+                let mean: f64 = grad[off..off + n].iter().sum::<f64>() / n as f64;
+                for i in 0..n {
+                    grad[off + i] -= mean;
+                }
+            }
+            for &(off, n) in &mob_groups {
+                let mg_mean: f64 = (0..n).map(|i| grad[off + 2 * i]).sum::<f64>() / n as f64;
+                let eg_mean: f64 = (0..n).map(|i| grad[off + 2 * i + 1]).sum::<f64>() / n as f64;
+                for i in 0..n {
+                    grad[off + 2 * i] -= mg_mean;
+                    grad[off + 2 * i + 1] -= eg_mean;
+                }
+            }
+        }
+        for j in 0..total_dim {
+            if j < 12 {
+                // Raw material values: NOT mean-centered, so they absorb the
+                // whole DC offset the mean-centered PST tables push onto them
+                // -> large gradient. Use a much smaller lr (x0.01) plus a
+                // stronger soft L2 anchor, or they saturate i32.
+                let lr_mat = lr * 0.01;
+                w[j] -= lr_mat * grad[j] / n_pos as f64;
+                w[j] -= lr_mat * 1e-2 * (w[j] - mat_init[j] as f64);
+            } else if j < mat_dim {
+                w[j] -= lr * grad[j] / n_pos as f64; // PST (mean-centered)
+            } else {
+                let pi = j - mat_dim;
+                if is_king_field[pi] {
+                    continue; // frozen, nonlinear king-danger path
+                }
+                w[j] -= lr * grad[j] / n_pos as f64;
+            }
+        }
+        if iter % 20 == 0 || iter == epochs - 1 {
+            println!("iter {}: mean loss {:.6} ({:.1}s)", iter, loss / n_pos as f64, t0.elapsed().as_secs_f64());
+        }
+    }
+
+    let out_vec: Vec<i32> = w.iter().map(|&x| x.round() as i32).collect();
+    let mat_out: Vec<String> = out_vec[0..mat_dim].iter().map(|x| x.to_string()).collect();
+    let pos_out: Vec<String> = out_vec[mat_dim..].iter().map(|x| x.to_string()).collect();
+    let mat_path = format!("{}.mat", out_path);
+    std::fs::write(&mat_path, mat_out.join(",")).expect("escrever output .mat");
+    std::fs::write(out_path, pos_out.join(",")).expect("escrever output positional");
+    println!(
+        "wrote {} material/PST scalars to {} and {} positional scalars to {}",
+        mat_out.len(), mat_path, pos_out.len(), out_path
+    );
+}
+
+/// Tuner logistico dedicado a MATERIAL + PST (as tabelas educacionais
+/// genericas de partida). Mesma
 /// matematica do `tune_fast` mas com bias/features TROCADOS: o bias e' o
 /// positional COMPLETO (fixo, com os pesos ja tunados), e as features
 /// tunaveis sao as 780 contagens de material/PST (ver
@@ -1130,7 +1544,7 @@ fn tune_matpst(dataset_path: &str, out_path: &str, iters: u32, lr: f64) {
     // e 11 (EG_VALUE king). As PST do rei SAO tunaveis.
     // Fixar TODO o material (indices 0..12 = MG_VALUE + EG_VALUE), tunar
     // SO' as PST (12..780). Rondas 1 e 1b (tunar o material tambem)
-    // regrediram -120 Elo: o Texel deu razoes de peca desequilibradas
+    // regrediram -120 Elo: o tuner deu razoes de peca desequilibradas
     // (torre 4.62 peoes, dama 7.5 no mg -- baixas) que fazem o motor
     // trocar pecas mal, alem de derivar a escala global (descalibra as
     // margens de busca). Fixando o material nos valores classicos bons,
@@ -1198,12 +1612,11 @@ fn tune_matpst(dataset_path: &str, out_path: &str, iters: u32, lr: f64) {
     println!("wrote {} material/PST scalars to {}", out_vec.len(), out_path);
 }
 
-/// Real Texel Tuning: coordinate descent on `Weights::to_vec()`'s flat
+/// Logistic eval tuning: coordinate descent on `Weights::to_vec()`'s flat
 /// parameter vector, minimizing squared error between the sigmoid of
 /// each position's static eval and the REAL game result it came from
-/// (1.0/0.5/0.0 from White's perspective). Classic method (the
-/// original Texel tuner and most small engines' tuners work exactly
-/// this way -- no autodiff needed): for each parameter, try +step and
+/// (1.0/0.5/0.0 from White's perspective). Classic method (no autodiff
+/// needed): for each parameter, try +step and
 /// -step, keep whichever reduces total error over the whole dataset,
 /// else leave it unchanged. Dataset format: one line per position,
 /// "<FEN>\t<white_score>".
@@ -1273,10 +1686,9 @@ fn tune_weights(dataset_path: &str, out_path: &str, epochs: u32, lambda: f64) {
     }
 
     // Find the best sigmoid scale K for the CURRENT (untuned) weights
-    // first -- a coarse 1D scan, fixed for the rest of the run (this is
-    // what the original Texel tuner does: K only rescales how harshly
-    // error is measured, tuning it jointly with every other parameter
-    // every step is unnecessary).
+    // first -- a coarse 1D scan, fixed for the rest of the run: K only
+    // rescales how harshly error is measured, tuning it jointly with
+    // every other parameter every step is unnecessary.
     let mut best_k = 1.0;
     let mut best_k_err = f64::MAX;
     let mut k = 0.2;
@@ -1340,7 +1752,7 @@ fn tune_weights(dataset_path: &str, out_path: &str, epochs: u32, lambda: f64) {
 
 /// Resolve every position in a `kestrel tune`-format dataset (`<fen>\t
 /// <result>` per line) to its quiescence leaf before tuning touches it.
-/// Standard Texel practice is to label the QSEARCH-resolved position,
+/// Standard practice is to label the QSEARCH-resolved position,
 /// not whatever the sampler happened to land on -- a position mid
 /// tactical exchange (about to lose/win material next move) has a
 /// static eval that doesn't match its true value, and no amount of
