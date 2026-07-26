@@ -70,6 +70,10 @@ fn main() {
         check_matpst_features();
         return;
     }
+    if args.len() >= 3 && args[1] == "linprobe" {
+        linearity_probe(&args[2]);
+        return;
+    }
     if args.len() >= 4 && args[1] == "gpuextract" {
         // gpuextract <dataset.epd> <out.bin> [max_positions] [buckets] [threads]
         let maxp: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(usize::MAX);
@@ -1657,6 +1661,66 @@ fn pin_psqt_means(w: &mut [f64], init_means: &[f64]) {
 /// range then owns a private copy of every weight and they are free to
 /// disagree with each other, instead of being tied to one straight line
 /// between a midgame and an endgame value.
+/// Which weight breaks linearity, if any.
+///
+/// The feature extraction assumes `positional_terms` is linear in its
+/// weights. Rather than argue about it: halve the weight vector, evaluate
+/// each half alone, and see whether the halves add up to the whole. Recurse
+/// into whichever half fails and the culprit falls out in a few steps.
+/// Truncation makes each split cost up to a centipawn, so the search only
+/// follows gaps clearly larger than that.
+fn linearity_probe(fen: &str) {
+    let default = eval::default_weights().clone();
+    let base = default.to_vec();
+    let dim = base.len();
+    let board = Board::from_fen(fen);
+    let zero = default.from_vec(&vec![0i32; dim]);
+    let p_zero = eval::positional_terms(&board, &zero);
+
+    let eval_subset = |lo: usize, hi: usize| -> i32 {
+        let mut v = vec![0i32; dim];
+        v[lo..hi].copy_from_slice(&base[lo..hi]);
+        eval::positional_terms(&board, &default.from_vec(&v)) - p_zero
+    };
+
+    println!("position: {}", fen);
+    println!("positional(all) - positional(0) = {}", eval_subset(0, dim));
+    let mut lo = 0usize;
+    let mut hi = dim;
+    loop {
+        let whole = eval_subset(lo, hi);
+        if hi - lo <= 1 {
+            println!("single weight [{}..{}] -- gap {} cp lives here", lo, hi, whole);
+            return;
+        }
+        let mid = (lo + hi) / 2;
+        let a = eval_subset(lo, mid);
+        let b = eval_subset(mid, hi);
+        let gap = whole - a - b;
+        println!("[{:>3}..{:>3}] whole={:>6}  left={:>6}  right={:>6}  gap={:>5}", lo, hi, whole, a, b, gap);
+        if gap.abs() <= 1 {
+            println!("additive here to within truncation -- nothing further to find");
+            return;
+        }
+        // Follow whichever half is itself non-additive; if both are clean the
+        // non-linearity is an interaction BETWEEN them, which is worth saying.
+        let mid_l = (lo + mid) / 2;
+        let gap_l = if mid - lo > 1 { eval_subset(lo, mid) - eval_subset(lo, mid_l) - eval_subset(mid_l, mid) } else { 0 };
+        if gap_l.abs() > 1 {
+            hi = mid;
+        } else {
+            let mid_r = (mid + hi) / 2;
+            let gap_r = if hi - mid > 1 { eval_subset(mid, hi) - eval_subset(mid, mid_r) - eval_subset(mid_r, hi) } else { 0 };
+            if gap_r.abs() > 1 {
+                lo = mid;
+            } else {
+                println!("both halves are additive on their own -- the {} cp comes from an INTERACTION between [{}..{}] and [{}..{}]", gap, lo, mid, mid, hi);
+                return;
+            }
+        }
+    }
+}
+
 fn gpu_extract(dataset_path: &str, out_path: &str, max_positions: usize, buckets: usize, threads: usize) {
     use std::io::Write as _;
 
