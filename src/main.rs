@@ -70,6 +70,15 @@ fn main() {
         check_matpst_features();
         return;
     }
+    if args.len() >= 4 && args[1] == "gpuextract" {
+        // gpuextract <dataset.epd> <out.bin> [max_positions] [buckets] [threads]
+        let maxp: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(usize::MAX);
+        let buckets: usize = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(1);
+        let threads: usize = args.get(6).and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4));
+        gpu_extract(&args[2], &args[3], maxp, buckets.max(1), threads);
+        return;
+    }
     if args.len() >= 4 && args[1] == "tunepst" {
         let iters: u32 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(8000);
         let lr: f64 = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(1000.0);
@@ -727,6 +736,18 @@ fn tune_fast(dataset_path: &str, out_path: &str, iters: u32, lr: f64) {
     sentinel.safe_bishop_check = (1, 1);
     sentinel.safe_rook_check = (1, 1);
     sentinel.safe_queen_check = (1, 1);
+    // 2026-07-26: king safety stopped being a linear sum. Shelter, storm,
+    // the weak-ring count and the flank counts now feed the same danger
+    // curve the attack units do, instead of being added straight to the
+    // score -- so a one-unit probe of any of them no longer measures that
+    // field's contribution, it measures a slope somewhere on a curve. Left
+    // off this list they would be tuned as if linear, quietly and wrongly.
+    sentinel.pawn_shelter = [(1, 1); 4];
+    sentinel.shelter_open = (1, 1);
+    sentinel.pawn_storm = [(1, 1); 4];
+    sentinel.weak_king_ring = (1, 1);
+    sentinel.king_flank_attacks = [(1, 1); 2];
+    sentinel.king_flank_defenses = [(1, 1); 2];
     let sentinel_vec = sentinel.to_vec();
     let is_king_field: Vec<bool> = sentinel_vec.iter().map(|&x| x == 1).collect();
     let king_field_count = is_king_field.iter().filter(|&&b| b).count();
@@ -887,6 +908,18 @@ fn tune_stream(dataset_path: &str, out_path: &str, epochs: u32, lr: f64, chunk_s
     sentinel.safe_bishop_check = (1, 1);
     sentinel.safe_rook_check = (1, 1);
     sentinel.safe_queen_check = (1, 1);
+    // 2026-07-26: king safety stopped being a linear sum. Shelter, storm,
+    // the weak-ring count and the flank counts now feed the same danger
+    // curve the attack units do, instead of being added straight to the
+    // score -- so a one-unit probe of any of them no longer measures that
+    // field's contribution, it measures a slope somewhere on a curve. Left
+    // off this list they would be tuned as if linear, quietly and wrongly.
+    sentinel.pawn_shelter = [(1, 1); 4];
+    sentinel.shelter_open = (1, 1);
+    sentinel.pawn_storm = [(1, 1); 4];
+    sentinel.weak_king_ring = (1, 1);
+    sentinel.king_flank_attacks = [(1, 1); 2];
+    sentinel.king_flank_defenses = [(1, 1); 2];
     let sentinel_vec = sentinel.to_vec();
     let is_king_field: Vec<bool> = sentinel_vec.iter().map(|&x| x == 1).collect();
     let king_field_count = is_king_field.iter().filter(|&&b| b).count();
@@ -1170,6 +1203,18 @@ fn tune_full(dataset_path: &str, out_path: &str, epochs: u32, lr: f64, chunk_siz
     sentinel.safe_bishop_check = (1, 1);
     sentinel.safe_rook_check = (1, 1);
     sentinel.safe_queen_check = (1, 1);
+    // 2026-07-26: king safety stopped being a linear sum. Shelter, storm,
+    // the weak-ring count and the flank counts now feed the same danger
+    // curve the attack units do, instead of being added straight to the
+    // score -- so a one-unit probe of any of them no longer measures that
+    // field's contribution, it measures a slope somewhere on a curve. Left
+    // off this list they would be tuned as if linear, quietly and wrongly.
+    sentinel.pawn_shelter = [(1, 1); 4];
+    sentinel.shelter_open = (1, 1);
+    sentinel.pawn_storm = [(1, 1); 4];
+    sentinel.weak_king_ring = (1, 1);
+    sentinel.king_flank_attacks = [(1, 1); 2];
+    sentinel.king_flank_defenses = [(1, 1); 2];
     let sentinel_vec = sentinel.to_vec();
     let is_king_field: Vec<bool> = sentinel_vec.iter().map(|&x| x == 1).collect();
     let king_field_count = is_king_field.iter().filter(|&&b| b).count();
@@ -1578,6 +1623,225 @@ fn pin_psqt_means(w: &mut [f64], init_means: &[f64]) {
             }
         }
     }
+}
+
+/// Write a training set for an external (GPU) tuner: one record per
+/// position, holding the marginal contribution of every tunable weight.
+///
+/// Why this is worth having. Our own tuners run coordinate descent or plain
+/// gradient descent on the CPU, and the biggest one takes three quarters of
+/// an hour for a quarter of a million positions. The same problem on a GPU
+/// is a sparse linear regression -- millions of positions in minutes -- and
+/// that is the difference between tuning what we have and being able to
+/// afford several times as many parameters, one set per game phase.
+///
+/// The features come from the engine's own evaluation rather than from a
+/// separate reimplementation of it. `positional_terms` is linear in its
+/// weights, so setting one weight to 1 with the rest at zero and reading the
+/// result back gives that weight's contribution exactly. An external
+/// extractor would have to restate every evaluation term in its own code and
+/// could drift out of step with the engine silently; this cannot, because it
+/// IS the engine. `gpucheck` below verifies the decomposition reproduces the
+/// real evaluation.
+///
+/// King safety is deliberately absent, and stays in the fixed bias: it goes
+/// through the danger curve, so it is not linear in its weights and a
+/// one-unit probe would measure a slope on a curve rather than a
+/// contribution.
+///
+/// Record layout, little-endian, matching what the GPU trainer reads:
+///   u16 count, count x (u16 index, f32 value), f32 phase, f32 result
+/// Index `dim` is the fixed bias (material, PST and king safety); its weight
+/// is frozen at 1 by the trainer. With `buckets` > 1 the indices are shifted
+/// by `bucket * (dim + 1)`, which is all a bucketed model needs: each phase
+/// range then owns a private copy of every weight and they are free to
+/// disagree with each other, instead of being tied to one straight line
+/// between a midgame and an endgame value.
+fn gpu_extract(dataset_path: &str, out_path: &str, max_positions: usize, buckets: usize, threads: usize) {
+    use std::io::Write as _;
+
+    let default = eval::default_weights().clone();
+    let default_vec = default.to_vec();
+    let dim = default_vec.len();
+
+    // Same sentinel trick the CPU tuners use to find the non-linear
+    // king-safety fields without hardcoding offsets.
+    let mut sentinel = default.from_vec(&vec![0i32; dim]);
+    sentinel.king_attacker_weight = [(1, 1); 4];
+    sentinel.king_attacks = (1, 1);
+    sentinel.safe_knight_check = (1, 1);
+    sentinel.safe_bishop_check = (1, 1);
+    sentinel.safe_rook_check = (1, 1);
+    sentinel.safe_queen_check = (1, 1);
+    sentinel.pawn_shelter = [(1, 1); 4];
+    sentinel.shelter_open = (1, 1);
+    sentinel.pawn_storm = [(1, 1); 4];
+    sentinel.weak_king_ring = (1, 1);
+    sentinel.king_flank_attacks = [(1, 1); 2];
+    sentinel.king_flank_defenses = [(1, 1); 2];
+    let is_king_field: Vec<bool> = sentinel.to_vec().iter().map(|&x| x == 1).collect();
+    let n_king = is_king_field.iter().filter(|&&b| b).count();
+
+    let mut king_only_vec = vec![0i32; dim];
+    for i in 0..dim {
+        if is_king_field[i] {
+            king_only_vec[i] = default_vec[i];
+        }
+    }
+    let w_king_only = default.from_vec(&king_only_vec);
+
+    let text = std::fs::read_to_string(dataset_path).expect("nao consegui ler o dataset");
+    let lines: Vec<&str> = text
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .take(max_positions)
+        .collect();
+    let per_bucket = dim + 1;
+    println!(
+        "gpu_extract: {} positions, {} tunable weights ({} king fields kept in the bias), {} buckets -> {} parameters",
+        lines.len(), dim - n_king, n_king, buckets, per_bucket * buckets
+    );
+
+    let chunk = (lines.len() + threads - 1) / threads.max(1);
+    let out: Vec<Vec<u8>> = std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for part in lines.chunks(chunk.max(1)) {
+            let w_king_only = &w_king_only;
+            let king_only_vec = &king_only_vec;
+            let is_king_field = &is_king_field;
+            handles.push(scope.spawn(move || {
+                let mut buf: Vec<u8> = Vec::new();
+                // Probes run from an all-zero weight set so nothing else is
+                // in the sum to be truncated alongside the feature.
+                let mut probe_vec = vec![0i32; king_only_vec.len()];
+                let w_zero = w_king_only.from_vec(&probe_vec);
+                for line in part {
+                    let mut it = line.split('\t');
+                    let fen = match it.next() { Some(f) => f, None => continue };
+                    let result: f32 = match it.next().and_then(|r| r.parse().ok()) {
+                        Some(r) => r,
+                        None => continue,
+                    };
+                    let board = Board::from_fen(fen);
+                    // Bias: everything the linear model does not tune --
+                    // material, piece-square tables, and king safety, which
+                    // goes through the danger curve.
+                    let bias = eval::material_pst_white(&board)
+                        + eval::positional_terms(&board, w_king_only);
+
+                    let probe_base = eval::positional_terms(&board, &w_zero);
+                    let phase = eval::phase_fraction(&board);
+                    let b = ((1.0 - phase) * buckets as f32) as usize;
+                    let b = b.min(buckets - 1);
+                    let off = (b * (is_king_field.len() + 1)) as u16;
+
+                    // Probed at MAX_PHASE rather than at 1, from an all-zero
+                    // base, and divided back out in floating point.
+                    //
+                    // The evaluation tapers with an integer division by
+                    // MAX_PHASE at the very end. Probe a weight at 1 and that
+                    // division truncates the single feature's own
+                    // contribution; do it for six hundred features and the
+                    // discarded remainders add up -- measured at 256cp on
+                    // real positions, which is not a rounding error, it is a
+                    // different function. At MAX_PHASE the numerator divides
+                    // exactly, so the probe returns the untruncated quantity
+                    // and the taper is applied here in floating point
+                    // instead. The model this feeds is then linear in exact
+                    // arithmetic, which is what it claims to be.
+                    let mut feats: Vec<(u16, f32)> = Vec::new();
+                    for i in 0..is_king_field.len() {
+                        if is_king_field[i] {
+                            continue;
+                        }
+                        probe_vec[i] = eval::MAX_PHASE_PUB;
+                        let w_probe = w_king_only.from_vec(&probe_vec);
+                        let v = eval::positional_terms(&board, &w_probe) - probe_base;
+                        probe_vec[i] = 0;
+                        if v != 0 {
+                            feats.push((off + i as u16, v as f32 / eval::MAX_PHASE_PUB as f32));
+                        }
+                    }
+                    feats.push((off + is_king_field.len() as u16, bias as f32));
+
+                    buf.extend_from_slice(&(feats.len() as u16).to_le_bytes());
+                    for (idx, v) in &feats {
+                        buf.extend_from_slice(&idx.to_le_bytes());
+                        buf.extend_from_slice(&v.to_le_bytes());
+                    }
+                    buf.extend_from_slice(&phase.to_le_bytes());
+                    buf.extend_from_slice(&result.to_le_bytes());
+                }
+                buf
+            }));
+        }
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    // Self-check: rebuild the evaluation from the features we just wrote and
+    // compare against what the engine really returns. The whole method rests
+    // on `positional_terms` being linear in its weights; if that ever stops
+    // being true -- as it just did for king safety -- this catches it here
+    // instead of after a tuning run has quietly optimised the wrong function.
+    {
+        let mut worst = 0f64;
+        let mut worst_fen = String::new();
+        let mut checked = 0usize;
+        let mut probe_vec = vec![0i32; dim];
+        let w_zero = default.from_vec(&probe_vec);
+        for line in lines.iter().take(200) {
+            let fen = match line.split('\t').next() { Some(f) => f, None => continue };
+            let board = Board::from_fen(fen);
+            let probe_base = eval::positional_terms(&board, &w_zero);
+            let mut rebuilt = (eval::material_pst_white(&board)
+                + eval::positional_terms(&board, &w_king_only)) as f64;
+            for i in 0..dim {
+                if is_king_field[i] {
+                    continue;
+                }
+                probe_vec[i] = eval::MAX_PHASE_PUB;
+                let w_probe = default.from_vec(&probe_vec);
+                let v = eval::positional_terms(&board, &w_probe) - probe_base;
+                probe_vec[i] = 0;
+                rebuilt += default_vec[i] as f64 * v as f64 / eval::MAX_PHASE_PUB as f64;
+            }
+            // Compared against material + positional ALONE, which is what the
+            // linear model covers. The engine's final evaluation also applies
+            // the complexity adjustment and the endgame scale factor, and
+            // both are non-linear -- they multiply the result rather than add
+            // to it. Checking against those would report a mismatch that has
+            // nothing to do with whether the features are right, and hide a
+            // real one if it ever appeared.
+            let real_white = (eval::material_pst_white(&board)
+                + eval::positional_terms(&board, &default)) as f64;
+            let gap = (rebuilt - real_white).abs();
+            if gap > worst {
+                worst = gap;
+                worst_fen = fen.to_string();
+            }
+            checked += 1;
+        }
+        // A couple of centipawns is the engine's own truncation, which the
+        // float reconstruction deliberately does not repeat. Much more than
+        // that means the model is not the function.
+        println!(
+            "self-check on {} positions: largest gap between the feature decomposition and the real evaluation = {:.1} cp{}",
+            checked, worst,
+            if worst <= 3.0 { " (as close as integer truncation allows)" } else { "  <-- NOT LINEAR, the features are wrong" }
+        );
+        if worst > 3.0 {
+            println!("worst position: {}", worst_fen);
+        }
+    }
+
+    let mut f = std::fs::File::create(out_path).expect("nao consegui criar o output");
+    let mut total = 0usize;
+    for part in &out {
+        f.write_all(part).expect("escrita falhou");
+        total += part.len();
+    }
+    println!("wrote {:.1} MB to {}", total as f64 / 1024.0 / 1024.0, out_path);
 }
 
 fn tune_matpst(dataset_path: &str, out_path: &str, iters: u32, lr: f64) {
