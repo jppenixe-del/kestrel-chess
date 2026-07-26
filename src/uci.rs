@@ -303,7 +303,11 @@ impl Engine {
         // search-time + advisor-round-trip together still respect the
         // clock's real budget for this move -- otherwise every advisor
         // consultation would silently overspend the move's allotment.
-        const ADVISOR_RESERVE_MS: i64 = 1500;
+        // Measured against the model this was built for -- 1.5B parameters,
+        // local -- a consultation takes 400 to 500ms warm. The reserve was
+        // 1500ms, set before anyone had timed it, and every millisecond of it
+        // comes out of the search rather than being added to the clock.
+        const ADVISOR_RESERVE_MS: i64 = 700;
         let advisor_enabled = crate::advisor::Advisor::from_env().is_some();
         let mut soft_budget_ms: Option<i64> = None;
         // `soft_deadline`: an EARLIER, purely-advisory checkpoint used
@@ -419,7 +423,18 @@ impl Engine {
             if effective_multipv > 1 {
                 if let Some(end) = limits.deadline {
                     let total = end.saturating_duration_since(t0);
-                    let share = total / effective_multipv as u32;
+                    // Not an equal split. Line 1 is the move that gets played
+                    // unless something overrules it, so it keeps half the
+                    // budget; the alternatives share the rest, which only has
+                    // to be enough for them to be trustworthy, not enough to
+                    // match it. An even three-way split cost the played move
+                    // two thirds of its thinking to buy depth on lines that
+                    // exist only to be compared against it.
+                    let share = if pv_index == 1 {
+                        total / 2
+                    } else {
+                        total / 2 / (effective_multipv as u32 - 1)
+                    };
                     line_limits.deadline = Some(Instant::now() + share);
                     line_limits.soft_deadline = limits.soft_deadline.map(|_| Instant::now() + share / 2);
                 }
