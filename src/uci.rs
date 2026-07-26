@@ -602,6 +602,7 @@ impl Engine {
                         static_evals: [0i32; crate::search::MAX_PLY],
                         root_best: None,
                         root_scores: Vec::new(),
+                        nmp_min_ply: 0,
                         excluded_move: None,
                         excluded_root_moves: excluded.to_vec(),
                         style_book: book_ref,

@@ -134,14 +134,12 @@ pub struct SearchParams {
     /// ProbCut margin above beta for the cheap verification search
     /// (was a hardcoded `beta + 150`).
     pub probcut_beta_margin: i32,
-    /// Aspiration window fields -- 2026-07-23: the widening formula
-    /// built from these was A/B tested and reverted (39% vs baseline,
-    /// clear negative, third such signal for this area in this
-    /// codebase -- see NOTAS). `search_root()` is back to the old flat-
-    /// delta version and no longer reads these. Left in the struct
-    /// (harmless dead data) rather than torn back out, in case a future
-    /// session wants to retry with a different integration than a
-    /// straight swap.
+    /// Aspiration window fields. Reverted once in 2026-07 after a single
+    /// A/B of one integration measured 39%, then adopted again in 2026-07-27
+    /// as part of the whole mechanism rather than as a swap of the widening
+    /// formula alone -- the starting width, the response to each kind of
+    /// failure and the growth rate are one thing, and testing them apart
+    /// tests none of them.
     pub asp_init_delta: i32,
     pub asp_widening_factor: i32,
     pub min_asp_depth: i32,
@@ -426,6 +424,9 @@ pub struct Searcher<'a> {
     /// Per root move: the score from the current iteration, and the score
     /// from the previous one. `NO_SCORE` means "not measured this iteration".
     pub root_scores: Vec<(Move, i32, i32)>,
+    /// Ply below which the null move is not allowed, used to stop the null
+    /// move recursing inside its own verification search.
+    pub nmp_min_ply: i32,
     /// Singular extensions: quando estamos a verificar se o tt_move e'
     /// "singular" (nenhum outro lance bate uma janela restrita), fazemos
     /// uma re-pesquisa no MESMO no' excluindo o tt_move. Este campo diz
@@ -1664,6 +1665,7 @@ impl<'a> Searcher<'a> {
         if depth >= sp_nmp.nmp_min_depth
             && !in_check
             && ply > 0
+            && (ply as i32) >= self.nmp_min_ply
             && !reached_by_null
             && excluded.is_none()
             && beta.abs() < MATE_SCORE - MAX_PLY as i32
@@ -1682,7 +1684,36 @@ impl<'a> Searcher<'a> {
                 return 0;
             }
             if score >= beta {
-                return beta;
+                // Verification, where skipping a move is not safe to trust.
+                //
+                // The null move assumes there is always something useful to
+                // do. In zugzwang there is not, and the deeper the search and
+                // the closer beta is to decisive, the more a wrong cut costs.
+                // Below that, and inside a verification already running, the
+                // cut is taken as before.
+                //
+                // The verification is a real search of the same reduced
+                // depth, in a null window at beta, with the null move
+                // disabled beneath it -- otherwise it would verify itself by
+                // skipping a move again, which is what it exists to check.
+                //
+                // This engine had this, measured 41.5% in one 300-game A/B,
+                // and removed it. That is a mechanism every strong engine
+                // carries, deleted on a single measurement of one integration
+                // of it.
+                if (depth <= 15 && beta.abs() < MATE_SCORE - MAX_PLY as i32) || self.nmp_min_ply > 0 {
+                    return beta;
+                }
+                let saved = self.nmp_min_ply;
+                self.nmp_min_ply = ply as i32 + (depth - r) * 3 / 4;
+                let verify = self.negamax(board, depth - r, beta - 1, beta, ply, false);
+                self.nmp_min_ply = saved;
+                if self.stop {
+                    return 0;
+                }
+                if verify >= beta {
+                    return verify;
+                }
             }
         }
 
