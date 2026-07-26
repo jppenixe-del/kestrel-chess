@@ -1724,6 +1724,21 @@ fn linearity_probe(fen: &str) {
 fn gpu_extract(dataset_path: &str, out_path: &str, max_positions: usize, buckets: usize, threads: usize) {
     use std::io::Write as _;
 
+    // Probe size, and it matters more than it looks. Reading a weight's
+    // contribution means setting it, evaluating, and subtracting -- but the
+    // evaluation truncates, so whatever the probe is worth comes back rounded
+    // down, and six hundred roundings do not cancel. Probing at 1 left a 256cp
+    // hole; at MAX_PHASE, which makes the final taper divide exactly, still
+    // 14cp, because terms round on the way in as well. Ten times MAX_PHASE
+    // puts every rounding an order of magnitude below the quantity being
+    // measured and the reconstruction lands within 2cp of the real
+    // evaluation, which is all the engine's own integer arithmetic allows.
+    //
+    // Adjustable because that is how the question was settled: a residual
+    // that shrinks as this grows was rounding; one that does not means the
+    // model is not the function, and no amount of scaling would hide it.
+    let probe_mult: i32 = std::env::var("KESTREL_PROBE_MULT")
+        .ok().and_then(|v| v.parse().ok()).unwrap_or(10 * eval::MAX_PHASE_PUB);
     let default = eval::default_weights().clone();
     let default_vec = default.to_vec();
     let dim = default_vec.len();
@@ -1819,12 +1834,12 @@ fn gpu_extract(dataset_path: &str, out_path: &str, max_positions: usize, buckets
                         if is_king_field[i] {
                             continue;
                         }
-                        probe_vec[i] = eval::MAX_PHASE_PUB;
+                        probe_vec[i] = probe_mult;
                         let w_probe = w_king_only.from_vec(&probe_vec);
                         let v = eval::positional_terms(&board, &w_probe) - probe_base;
                         probe_vec[i] = 0;
                         if v != 0 {
-                            feats.push((off + i as u16, v as f32 / eval::MAX_PHASE_PUB as f32));
+                            feats.push((off + i as u16, v as f32 / probe_mult as f32));
                         }
                     }
                     feats.push((off + is_king_field.len() as u16, bias as f32));
@@ -1864,11 +1879,11 @@ fn gpu_extract(dataset_path: &str, out_path: &str, max_positions: usize, buckets
                 if is_king_field[i] {
                     continue;
                 }
-                probe_vec[i] = eval::MAX_PHASE_PUB;
+                probe_vec[i] = probe_mult;
                 let w_probe = default.from_vec(&probe_vec);
                 let v = eval::positional_terms(&board, &w_probe) - probe_base;
                 probe_vec[i] = 0;
-                rebuilt += default_vec[i] as f64 * v as f64 / eval::MAX_PHASE_PUB as f64;
+                rebuilt += default_vec[i] as f64 * v as f64 / probe_mult as f64;
             }
             // Compared against material + positional ALONE, which is what the
             // linear model covers. The engine's final evaluation also applies
