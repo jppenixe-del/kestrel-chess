@@ -713,7 +713,11 @@ impl Engine {
                     // per-field typing). Contribution of a range = positional
                     // with that range zeroed, subtracted from full positional.
                     let b = &self.board;
-                    let full = crate::eval::default_weights();
+                    // The set this position's phase actually uses. Reading
+                    // default_weights() here reported numbers the engine was
+                    // not playing with the moment buckets arrived -- a
+                    // diagnostic that lies is worse than none.
+                    let full = crate::eval::weights_for(b);
                     let mat = crate::eval::material_pst_white(b);
                     let pos = crate::eval::positional_terms(b, full);
                     let base = full.to_vec();
