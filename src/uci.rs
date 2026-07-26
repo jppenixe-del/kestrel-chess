@@ -727,8 +727,16 @@ impl Engine {
                     // rest(threats+pawn-structure+passers) 276..end
                     let pieces = contrib(0, 16);
                     let mobility = contrib(16, 240);
-                    let king = contrib(240, 276);
-                    let rest = contrib(276, base.len());
+                    // King safety is not read off by zeroing a slice of the
+                    // weight vector any more: part of it lives outside that
+                    // vector, so a slice leaves inputs behind and the leftover
+                    // still feeds the danger curve. Silence the whole block
+                    // instead and take the difference, which is exact.
+                    let king = pos - crate::eval::positional_terms(b, &full.with_king_silenced());
+                    // Whatever the remaining ranges do not account for. Taken
+                    // as a remainder so the four numbers always add up to
+                    // `positional`, however the blocks are computed.
+                    let rest = pos - pieces - mobility - king;
                     let _ = writeln!(out, "eval(white) total={}  material_pst={}  positional={}", mat + pos, mat, pos);
                     let _ = writeln!(out, "  pieces={} mobility={} king={} threats+pawns={}", pieces, mobility, king, rest);
                     let _ = out.flush();

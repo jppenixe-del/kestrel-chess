@@ -437,6 +437,52 @@ const SAFE_QUEEN_CHECK: (i32, i32) = (1, 2);
 // WEAK_KING_RING: 2026-07-23, new -- per king-ring square that's
 // "weak" (undefended by the enemy, or only defended by their own
 // king). Anchored to Kestrel's pawn ratio, like the passed-pawn terms.
+// UNSAFE_*_CHECK (2026-07-26): a check that the defender CAN meet still
+// costs him something -- it forces the reply, denies him the move he wanted,
+// and the checking square stays a square he must keep watching. Our model
+// counted only checks landing on squares he cannot touch, which throws that
+// away entirely. Worth clearly less than the safe version: roughly a third,
+// at this model's unit scale (safe checks are 2-3 units, KING_ATTACKS is 5).
+// Queen last, for the same reason her safe check is: a queen check that can
+// be answered is often just an invitation to trade her off.
+const UNSAFE_KNIGHT_CHECK: (i32, i32) = (1, 0);
+const UNSAFE_BISHOP_CHECK: (i32, i32) = (1, 0);
+const UNSAFE_ROOK_CHECK: (i32, i32) = (1, 0);
+const UNSAFE_QUEEN_CHECK: (i32, i32) = (1, 1);
+
+// QUEENLESS_ATTACK (2026-07-26): attacking without a queen is a different
+// proposition -- most mating nets need her. This used to be expressed as a
+// GATE (require two attackers instead of one when the defender has no
+// queen), which is a cliff: one attacker short and the entire danger term
+// vanished. Expressed as units removed instead, it says the same thing
+// smoothly, and says it about the ATTACKER's queen, which is what actually
+// determines whether the attack can finish.
+const QUEENLESS_ATTACK: (i32, i32) = (-10, 0);
+
+// SAFETY_PINNED / SAFETY_DISCOVERED (2026-07-26): a defender pinned against
+// his own king cannot do its job, and one of our pieces sitting on a line to
+// his king is a discovered check waiting to happen. Neither was represented
+// at all. Indexed by [piece type involved][sniper: bishop, rook, queen].
+//
+// Shape reasoned, not transcribed: a pin matters more the more valuable the
+// piece stuck (it cannot move at all) and the heavier the sniper behind it.
+// A discovered check is worth more than a pin of the same shape -- it is a
+// tempo we can take at a moment of our choosing, with check.
+const SAFETY_PINNED: [[(i32, i32); 3]; 5] = [
+    [(3, 0), (3, 0), (4, 0)],   // pawn pinned
+    [(5, 0), (5, 0), (7, 0)],   // knight
+    [(5, 0), (5, 0), (7, 0)],   // bishop
+    [(6, 0), (7, 0), (9, 0)],   // rook
+    [(8, 0), (9, 0), (11, 0)],  // queen
+];
+const SAFETY_DISCOVERED: [[(i32, i32); 3]; 5] = [
+    [(5, 0), (5, 0), (6, 0)],
+    [(8, 0), (8, 0), (10, 0)],
+    [(8, 0), (8, 0), (10, 0)],
+    [(9, 0), (10, 0), (12, 0)],
+    [(11, 0), (12, 0), (14, 0)],
+];
+
 const WEAK_KING_RING: (i32, i32) = (10, 0);
 // KING_FLANK_ATTACKS/DEFENSES: 2026-07-23, new -- "wide flank"
 // attack/defense counting, a broader zone than the immediate 3x3 king
@@ -478,6 +524,59 @@ const UNCASTLED_KING_HAS_RIGHTS: (i32, i32) = (-8, 0);
 // unchanged -- then grows superlinearly once several attackers
 // combine past that, capped so it can never swamp material). Not
 // copied from any specific engine's tuned safety table.
+/// The king-danger curve, as a function rather than a 128-entry lookup.
+///
+/// Same shape the table encoded -- one-for-one below the level one or two
+/// ordinary attackers reach, then growing quadratically once several
+/// threats combine -- but it now takes the WHOLE king-safety total,
+/// shelter damage included, so it can no longer be bounded by a table
+/// index. Several attackers against an intact shelter and the same
+/// attackers against a stripped one are not the same position, and only a
+/// curve they both pass through can say so.
+///
+/// Still one-sided: a total at or below zero means nothing is pointed at
+/// that king, and contributes nothing. The ceiling is high rather than
+/// absent -- king danger should be able to outweigh a piece, but never run
+/// away far enough to make the rest of the evaluation irrelevant.
+fn king_danger_curve(v: i32) -> i32 {
+    let (knee, div) = king_curve_params();
+    if v <= knee {
+        // Straight through, negatives included. Clamping the low end to zero
+        // was a mistake worth naming: a king with nothing pointed at him is
+        // not the same as a king who is actively comfortable -- well defended
+        // ring, defended flank, shelter intact -- and flattening every such
+        // position onto the same zero threw away most of what this term was
+        // able to say. Measured: it halved the term's spread across real
+        // positions (32 down to 14), regardless of where the knee sat.
+        v
+    } else {
+        (knee + (v - knee) * (v - knee) / div).min(1200)
+    }
+}
+
+/// Where the curve stops being one-for-one, and how fast it climbs after.
+///
+/// These were set when the accumulator held attack units alone. It now also
+/// carries the shelter damage, which roughly doubles what a given position
+/// feeds in -- so the old knee sits far too low: shelter by itself can reach
+/// it, and the attack that should be amplified gets compressed into the
+/// straight part instead. Adjustable so the right values can be measured
+/// rather than guessed: KESTREL_KING_CURVE=knee,div.
+static KING_CURVE: OnceLock<(i32, i32)> = OnceLock::new();
+fn king_curve_params() -> (i32, i32) {
+    *KING_CURVE.get_or_init(|| {
+        std::env::var("KESTREL_KING_CURVE")
+            .ok()
+            .and_then(|v| {
+                let mut it = v.split(',');
+                let k = it.next()?.trim().parse().ok()?;
+                let d: i32 = it.next()?.trim().parse().ok()?;
+                if d > 0 { Some((k, d)) } else { None }
+            })
+            .unwrap_or((100, 40))
+    })
+}
+
 const KING_DANGER_TABLE: [i32; 128] = {
     let mut t = [0i32; 128];
     let mut i = 0;
@@ -759,6 +858,13 @@ pub struct Weights {
     pub safe_bishop_check: (i32, i32),
     pub safe_rook_check: (i32, i32),
     pub safe_queen_check: (i32, i32),
+    pub unsafe_knight_check: (i32, i32),
+    pub unsafe_bishop_check: (i32, i32),
+    pub unsafe_rook_check: (i32, i32),
+    pub unsafe_queen_check: (i32, i32),
+    pub queenless_attack: (i32, i32),
+    pub safety_pinned: [[(i32, i32); 3]; 5],
+    pub safety_discovered: [[(i32, i32); 3]; 5],
     pub king_danger_table: [i32; 128],
     pub pawn_shelter: [(i32, i32); 4],
     pub shelter_open: (i32, i32),
@@ -824,6 +930,13 @@ impl Default for Weights {
             safe_bishop_check: SAFE_BISHOP_CHECK,
             safe_rook_check: SAFE_ROOK_CHECK,
             safe_queen_check: SAFE_QUEEN_CHECK,
+            unsafe_knight_check: UNSAFE_KNIGHT_CHECK,
+            unsafe_bishop_check: UNSAFE_BISHOP_CHECK,
+            unsafe_rook_check: UNSAFE_ROOK_CHECK,
+            unsafe_queen_check: UNSAFE_QUEEN_CHECK,
+            queenless_attack: QUEENLESS_ATTACK,
+            safety_pinned: SAFETY_PINNED,
+            safety_discovered: SAFETY_DISCOVERED,
             king_danger_table: KING_DANGER_TABLE,
             pawn_shelter: PAWN_SHELTER,
             shelter_open: SHELTER_OPEN,
@@ -895,6 +1008,39 @@ static DEFAULT_WEIGHTS: OnceLock<Weights> = OnceLock::new();
 /// position suite / a real game before ever touching the compiled-in
 /// consts -- nothing is "deployed" by running the tuner, only by a
 /// deliberate later commit copying values back into the consts.
+impl Weights {
+    /// A copy with every king-safety input silenced -- the tunable block in
+    /// `to_vec` AND the fields deliberately kept out of it.
+    ///
+    /// This exists so the `eval` command can report the king's contribution
+    /// exactly, by difference. That method is only honest if zeroing really
+    /// removes the whole block: leave one input behind and the leftover feeds
+    /// the danger curve, the difference stops being the king's contribution,
+    /// and the number quietly lies. It did exactly that the moment king
+    /// safety grew fields outside `to_vec`.
+    ///
+    /// Note the curve itself needs no special handling: with every input at
+    /// zero the accumulated total is zero, and the curve maps zero to zero.
+    /// Non-linearity is not what makes decomposition-by-difference fragile --
+    /// incomplete zeroing is.
+    pub fn with_king_silenced(&self) -> Weights {
+        let mut v = self.to_vec();
+        let hi = KING_RANGE.1.min(v.len());
+        for x in v[KING_RANGE.0..hi].iter_mut() {
+            *x = 0;
+        }
+        let mut w = self.from_vec(&v);
+        w.unsafe_knight_check = (0, 0);
+        w.unsafe_bishop_check = (0, 0);
+        w.unsafe_rook_check = (0, 0);
+        w.unsafe_queen_check = (0, 0);
+        w.queenless_attack = (0, 0);
+        w.safety_pinned = [[(0, 0); 3]; 5];
+        w.safety_discovered = [[(0, 0); 3]; 5];
+        w
+    }
+}
+
 pub fn default_weights() -> &'static Weights {
     DEFAULT_WEIGHTS.get_or_init(|| {
         if let Ok(path) = std::env::var("KESTREL_TUNED_WEIGHTS") {
@@ -1098,6 +1244,18 @@ impl Weights {
             mobility_knight, mobility_bishop, mobility_rook, mobility_queen,
             king_attacker_weight, king_attacks,
             safe_knight_check, safe_bishop_check, safe_rook_check, safe_queen_check,
+            // Carried over from `self`, like king_danger_table: these are
+            // deliberately NOT in to_vec/from_vec. Adding fields to that
+            // vector would change its length and invalidate the tuned weight
+            // file already in production. They are reasoned constants for
+            // now; they join the tuned vector once the shape is settled.
+            unsafe_knight_check: self.unsafe_knight_check,
+            unsafe_bishop_check: self.unsafe_bishop_check,
+            unsafe_rook_check: self.unsafe_rook_check,
+            unsafe_queen_check: self.unsafe_queen_check,
+            queenless_attack: self.queenless_attack,
+            safety_pinned: self.safety_pinned,
+            safety_discovered: self.safety_discovered,
             king_danger_table: self.king_danger_table,
             pawn_shelter, shelter_open, pawn_storm,
             threat_by_pawn, threat_by_knight, threat_by_bishop, threat_by_rook, threat_by_queen, threat_by_king,
@@ -1219,6 +1377,13 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
     // hoisted out of the loop.
     let mut king_attackers = [0i32; 2];
     let mut king_attack_units = [(0i32, 0i32); 2];
+    // How damaged each king's own pawn cover is (negative). Collected in the
+    // shelter pass below and then handed to the OPPONENT as danger, so that
+    // a broken shelter and pieces bearing down on it go through the same
+    // curve together instead of being added up side by side. A king whose
+    // cover is gone and who is also under attack is in far more trouble than
+    // the sum of those two facts, and only a shared non-linearity says so.
+    let mut shelter_penalty = [(0i32, 0i32); 2];
 
     for c in [Color::White, Color::Black] {
         let sign = if c == Color::White { 1 } else { -1 };
@@ -1373,19 +1538,19 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
             let enemy_pawns = board.pieces[c.opp().idx()][PieceType::Pawn.idx()] & file_mask;
             match shield_pawn_offset(own_pawns, kr, white) {
                 None => {
-                    mg += sign * w.shelter_open.0;
-                    eg += sign * w.shelter_open.1;
+                    shelter_penalty[c.idx()].0 += w.shelter_open.0;
+                    shelter_penalty[c.idx()].1 += w.shelter_open.1;
                 }
                 Some(off) => {
                     let idx = (off - 1).clamp(0, 3) as usize;
-                    mg += sign * w.pawn_shelter[idx].0;
-                    eg += sign * w.pawn_shelter[idx].1;
+                    shelter_penalty[c.idx()].0 += w.pawn_shelter[idx].0;
+                    shelter_penalty[c.idx()].1 += w.pawn_shelter[idx].1;
                 }
             }
             if let Some(off) = shield_pawn_offset(enemy_pawns, kr, white) {
                 let idx = (off - 1).clamp(0, 3) as usize;
-                mg += sign * w.pawn_storm[idx].0;
-                eg += sign * w.pawn_storm[idx].1;
+                shelter_penalty[c.idx()].0 += w.pawn_storm[idx].0;
+                shelter_penalty[c.idx()].1 += w.pawn_storm[idx].1;
             }
         }
     }
@@ -1406,17 +1571,37 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
         // all (not even the king). Undercounts some genuinely-safe
         // checks where we'd have enough backup to win the exchange,
         // but is cheap and never wrongly counts an unsafe one.
-        let safe = !attacked[them];
+        // A square defended ONLY by the enemy king counts as weak: he cannot
+        // both hold it and step off it, so a check landing there is not
+        // really answerable. Squares we attack twice over such a defender are
+        // ours too. The old rule (nothing of theirs touches it at all) is
+        // strictly more conservative and threw away real checks -- its own
+        // comment admitted as much.
+        let weak = !attacked[them]
+            | (!attacked_by_2[them] & attacked_by_pt[them][PieceType::King.idx()]);
+        let safe = !own_occ & (!attacked[them] | (weak & attacked_by_2[us]));
 
         let knight_checks = a.knight[enemy_king_sq as usize];
         let bishop_checks = bishop_attacks(enemy_king_sq, occ);
         let rook_checks = rook_attacks(enemy_king_sq, occ);
         let queen_checks = bishop_checks | rook_checks;
 
-        let n_knight = count(knight_checks & attacked_by_pt[us][PieceType::Knight.idx()] & !own_occ & safe) as i32;
-        let n_bishop = count(bishop_checks & attacked_by_pt[us][PieceType::Bishop.idx()] & !own_occ & safe) as i32;
-        let n_rook = count(rook_checks & attacked_by_pt[us][PieceType::Rook.idx()] & !own_occ & safe) as i32;
-        let n_queen = count(queen_checks & attacked_by_pt[us][PieceType::Queen.idx()] & !own_occ & safe) as i32;
+        // Every square from which each piece type would give check, whether
+        // or not we could survive there.
+        let all_knight = knight_checks & attacked_by_pt[us][PieceType::Knight.idx()] & !own_occ;
+        let all_bishop = bishop_checks & attacked_by_pt[us][PieceType::Bishop.idx()] & !own_occ;
+        let all_rook = rook_checks & attacked_by_pt[us][PieceType::Rook.idx()] & !own_occ;
+        let all_queen = queen_checks & attacked_by_pt[us][PieceType::Queen.idx()] & !own_occ;
+
+        let n_knight = count(all_knight & safe) as i32;
+        let n_bishop = count(all_bishop & safe) as i32;
+        let n_rook = count(all_rook & safe) as i32;
+        let n_queen = count(all_queen & safe) as i32;
+
+        let u_knight = count(all_knight & !safe) as i32;
+        let u_bishop = count(all_bishop & !safe) as i32;
+        let u_rook = count(all_rook & !safe) as i32;
+        let u_queen = count(all_queen & !safe) as i32;
 
         // Per-piece-type dedicated weights (2026-07-23, counter-intuitive
         // relative ordering -- see SAFE_KNIGHT_CHECK doc comment: rook/
@@ -1439,6 +1624,64 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
                 + n_rook * w.safe_rook_check.1
                 + n_queen * w.safe_queen_check.1;
         }
+        // Checks he CAN answer, counted separately and for less: they still
+        // force the reply and still tie him to watching the square.
+        king_attack_units[us].0 += u_knight * w.unsafe_knight_check.0
+            + u_bishop * w.unsafe_bishop_check.0
+            + u_rook * w.unsafe_rook_check.0
+            + u_queen * w.unsafe_queen_check.0;
+        king_attack_units[us].1 += u_knight * w.unsafe_knight_check.1
+            + u_bishop * w.unsafe_bishop_check.1
+            + u_rook * w.unsafe_rook_check.1
+            + u_queen * w.unsafe_queen_check.1;
+
+        // Pieces frozen on a line to his king, and our own pieces sitting on
+        // one. A sniper is any of our sliders that would reach his king on an
+        // empty board; if exactly one man stands in the way, he is either his
+        // (pinned, and unable to defend) or ours (a discovered check we can
+        // spring when we choose).
+        let our_bishops_queens = board.pieces[us][PieceType::Bishop.idx()]
+            | board.pieces[us][PieceType::Queen.idx()];
+        let our_rooks_queens = board.pieces[us][PieceType::Rook.idx()]
+            | board.pieces[us][PieceType::Queen.idx()];
+        let mut snipers = (bishop_attacks(enemy_king_sq, 0) & our_bishops_queens)
+            | (rook_attacks(enemy_king_sq, 0) & our_rooks_queens);
+        while snipers != 0 {
+            let sniper_sq = snipers.trailing_zeros() as Square;
+            snipers &= snipers - 1;
+            let blockers = a.between[enemy_king_sq as usize][sniper_sq as usize] & occ;
+            if blockers == 0 || (blockers & (blockers - 1)) != 0 {
+                continue; // clear line, or more than one man in the way
+            }
+            let blocker_sq = blockers.trailing_zeros() as Square;
+            let (sniper_pt, _) = match board.piece_at(sniper_sq) { Some(x) => x, None => continue };
+            let (blocker_pt, blocker_color) = match board.piece_at(blocker_sq) { Some(x) => x, None => continue };
+            // Sniper index: bishop, rook, queen.
+            let si = match sniper_pt {
+                PieceType::Bishop => 0,
+                PieceType::Rook => 1,
+                PieceType::Queen => 2,
+                _ => continue,
+            };
+            let bi = blocker_pt.idx();
+            if bi >= 5 {
+                continue; // a king is never the man in the middle
+            }
+            let entry = if blocker_color.idx() == them {
+                w.safety_pinned[bi][si]
+            } else {
+                w.safety_discovered[bi][si]
+            };
+            king_attack_units[us].0 += entry.0;
+            king_attack_units[us].1 += entry.1;
+        }
+
+        // Attacking without a queen: said as units removed rather than as a
+        // threshold, so it shades instead of switching.
+        if board.pieces[us][PieceType::Queen.idx()] == 0 {
+            king_attack_units[us].0 += w.queenless_attack.0;
+            king_attack_units[us].1 += w.queenless_attack.1;
+        }
 
         // WEAK_KING_RING: 2026-07-23, new -- count of the enemy
         // king-ring squares that are "weak" (not attacked by them at
@@ -1446,11 +1689,10 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
         // defender) and applied directly, unconditionally (not gated by
         // the attacker-count threshold below).
         let enemy_king_zone = if c == Color::White { black_king_zone } else { white_king_zone };
-        let weak = !attacked[them]
-            | (!attacked_by_2[them] & attacked_by_pt[them][PieceType::King.idx()]);
+        // `weak` is the same set computed above for the safe-check rule.
         let weak_king_ring = count(enemy_king_zone & weak) as i32;
-        mg += sign * w.weak_king_ring.0 * weak_king_ring;
-        eg += sign * w.weak_king_ring.1 * weak_king_ring;
+        king_attack_units[us].0 += w.weak_king_ring.0 * weak_king_ring;
+        king_attack_units[us].1 += w.weak_king_ring.1 * weak_king_ring;
 
         // KING_FLANK_ATTACKS/DEFENSES: 2026-07-23, new -- wide-zone
         // version of the same "attacked"/"defended" counting, over the
@@ -1461,22 +1703,47 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
         let flank_attacks_2 = count(their_flank & attacked_by_2[us]) as i32;
         let flank_defenses = count(their_flank & attacked[them]) as i32;
         let flank_defenses_2 = count(their_flank & attacked_by_2[them]) as i32;
-        mg += sign * (flank_attacks * w.king_flank_attacks[0].0 + flank_attacks_2 * w.king_flank_attacks[1].0
-            + flank_defenses * w.king_flank_defenses[0].0 + flank_defenses_2 * w.king_flank_defenses[1].0);
-        eg += sign * (flank_attacks * w.king_flank_attacks[0].1 + flank_attacks_2 * w.king_flank_attacks[1].1
-            + flank_defenses * w.king_flank_defenses[0].1 + flank_defenses_2 * w.king_flank_defenses[1].1);
+        king_attack_units[us].0 += flank_attacks * w.king_flank_attacks[0].0
+            + flank_attacks_2 * w.king_flank_attacks[1].0
+            + flank_defenses * w.king_flank_defenses[0].0
+            + flank_defenses_2 * w.king_flank_defenses[1].0;
+        king_attack_units[us].1 += flank_attacks * w.king_flank_attacks[0].1
+            + flank_attacks_2 * w.king_flank_attacks[1].1
+            + flank_defenses * w.king_flank_defenses[0].1
+            + flank_defenses_2 * w.king_flank_defenses[1].1;
 
-        // Queen-gate: with the defending side's queen off the board, a
-        // single attacker rarely turns into a real mating attack --
-        // require at least 2. With her still on board, one already
-        // matters (`king_attackers > 1 - popcount(queens)`).
-        let defender_has_queen = board.pieces[them][PieceType::Queen.idx()] != 0;
-        let threshold = if defender_has_queen { 1 } else { 2 };
-        if king_attackers[us] >= threshold {
-            let danger_idx = king_attack_units[us].0.clamp(0, 127) as usize;
-            mg += sign * w.king_danger_table[danger_idx];
-            eg += sign * king_attack_units[us].1;
-        }
+        // The attacker-count threshold that used to gate this block is gone.
+        // It was a cliff: one attacker short of it and the whole danger term
+        // contributed exactly zero, leaving the evaluation blind to a king
+        // that is merely uncomfortable -- and it fired on a quarter of the
+        // positions in our own games. What it was really expressing (an
+        // attack without a queen rarely finishes) is now a continuous term,
+        // QUEENLESS_ATTACK, applied in units above.
+        //
+        // king_attackers is still counted: the endgame scale factor reads it.
+        // KESTREL_KING_NOGATE: drop the attacker-count threshold, so the
+        // danger curve applies always instead of switching on at one or two
+        // attackers.
+        //
+        // The threshold is a cliff: one attacker short of it, this whole
+        // block contributes exactly zero, and the evaluation is blind to a
+        // king that is merely uncomfortable. Measuring our evaluation
+        // against a stronger hand-crafted one showed king safety accounting
+        // for less than half the share of the total that it does for them,
+        // and scaling the block's weight failed in both directions (-58 Elo
+        // at 2.0, -60 at 1.4, and 0.7 no worse than 1.0) -- which points at
+        // the term's shape rather than its size. This cliff is the most
+        // obvious piece of shape we have and they do not.
+        // The danger curve now applies always. Negative unit totals (a king
+        // with nothing pointed at him, after the queenless deduction) map to
+        // index 0 and contribute nothing, so the curve stays one-sided
+        // without needing a branch to say so.
+        // His shelter damage is our danger.
+        king_attack_units[us].0 -= shelter_penalty[them].0;
+        king_attack_units[us].1 -= shelter_penalty[them].1;
+
+        mg += sign * king_danger_curve(king_attack_units[us].0);
+        eg += sign * king_danger_curve(king_attack_units[us].1);
 
         // UNCASTLED_KING: see const doc comment -- added after real
         // games showed Kestrel castling late and outright failing to
@@ -2076,6 +2343,18 @@ fn material_pst(board: &Board) -> i32 {
 /// (src/main.rs `tune_fast`) needs, since it builds its per-position
 /// bias directly in White's POV to match `positional_terms()`'s own
 /// convention, rather than negamax's STM-relative one.
+/// How far into the game a position is, as 1.0 at the opening down to 0.0
+/// in a bare endgame -- the same quantity the evaluation tapers with, made
+/// available so tooling can bucket positions by phase the way the
+/// evaluation itself weights them.
+/// The taper denominator, exposed so tooling can probe at a value that
+/// divides exactly and avoid the truncation a unit probe would suffer.
+pub const MAX_PHASE_PUB: i32 = MAX_PHASE;
+
+pub fn phase_fraction(board: &Board) -> f32 {
+    board.phase.min(MAX_PHASE) as f32 / MAX_PHASE as f32
+}
+
 pub fn material_pst_white(board: &Board) -> i32 {
     let phase = board.phase.min(MAX_PHASE);
     (board.mg_score * phase + board.eg_score * (MAX_PHASE - phase)) / MAX_PHASE
