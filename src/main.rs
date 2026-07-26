@@ -122,6 +122,50 @@ fn main() {
         println!("wrote {} values ({} buckets x {}) to {}", out.len(), eval::NUM_BUCKETS, base.len(), args[2]);
         return;
     }
+    if args.len() >= 3 && args[1] == "evaltrace" {
+        // Which evaluation terms fired in this position, and by how much.
+        //
+        // The breakdown command answers "how much came from king safety";
+        // this answers "which weights actually did anything here". Same
+        // probing the feature extractor uses: set one weight, evaluate,
+        // subtract. A term with a zero feature never applied to this
+        // position at all -- which is the first thing worth knowing when a
+        // game was lost and the question is where the evaluation went wrong.
+        //
+        // Contributions are the feature times the weight in force, so the
+        // list is in centipawns of actual effect, not in units of anything.
+        let fen = args[2..].join(" ");
+        let board = Board::from_fen(&fen);
+        let default = eval::default_weights().clone();
+        let base_vec = default.to_vec();
+        let dim = base_vec.len();
+        let mut probe = vec![0i32; dim];
+        let w_zero = default.from_vec(&probe);
+        let zero_base = eval::positional_terms(&board, &w_zero);
+        let mult = 10 * eval::MAX_PHASE_PUB;
+
+        let mut fired: Vec<(usize, i32, f64)> = Vec::new();
+        for i in 0..dim {
+            probe[i] = mult;
+            let w = default.from_vec(&probe);
+            let v = eval::positional_terms(&board, &w) - zero_base;
+            probe[i] = 0;
+            if v != 0 {
+                let contrib = base_vec[i] as f64 * v as f64 / mult as f64;
+                fired.push((i, base_vec[i], contrib));
+            }
+        }
+        fired.sort_by(|a, b| b.2.abs().partial_cmp(&a.2.abs()).unwrap());
+        println!("position: {}", fen);
+        println!("{} of {} weights fired here", fired.len(), dim);
+        println!("{:>6}  {:>8}  {:>10}", "index", "weight", "cp");
+        for (i, w, c) in fired.iter().take(40) {
+            println!("{:>6}  {:>8}  {:>10.1}", i, w, c);
+        }
+        let total: f64 = fired.iter().map(|(_, _, c)| c).sum();
+        println!("sum of fired contributions: {:.1} cp (white's point of view)", total);
+        return;
+    }
     if args.len() >= 3 && args[1] == "linprobe" {
         linearity_probe(&args[2]);
         return;
