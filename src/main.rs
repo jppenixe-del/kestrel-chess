@@ -1786,10 +1786,10 @@ fn gpu_extract(dataset_path: &str, out_path: &str, max_positions: usize, buckets
         .filter(|l| !l.is_empty())
         .take(max_positions)
         .collect();
-    let per_bucket = dim + 1;
+    let per_bucket = dim + eval::MAT_PST_DIM + 1;
     println!(
-        "gpu_extract: {} positions, {} tunable weights ({} king fields kept in the bias), {} buckets -> {} parameters",
-        lines.len(), dim - n_king, n_king, buckets, per_bucket * buckets
+        "gpu_extract: {} positions, {} positional + {} material/PST tunable ({} king fields in the bias), {} buckets -> {} parameters",
+        lines.len(), dim - n_king, eval::MAT_PST_DIM, n_king, buckets, per_bucket * buckets
     );
 
     let chunk = (lines.len() + threads - 1) / threads.max(1);
@@ -1805,6 +1805,7 @@ fn gpu_extract(dataset_path: &str, out_path: &str, max_positions: usize, buckets
                 // in the sum to be truncated alongside the feature.
                 let mut probe_vec = vec![0i32; king_only_vec.len()];
                 let w_zero = w_king_only.from_vec(&probe_vec);
+                let mut mat_feats = vec![0f32; eval::MAT_PST_DIM];
                 for line in part {
                     let mut it = line.split('\t');
                     let fen = match it.next() { Some(f) => f, None => continue };
@@ -1813,17 +1814,17 @@ fn gpu_extract(dataset_path: &str, out_path: &str, max_positions: usize, buckets
                         None => continue,
                     };
                     let board = Board::from_fen(fen);
-                    // Bias: everything the linear model does not tune --
-                    // material, piece-square tables, and king safety, which
-                    // goes through the danger curve.
-                    let bias = eval::material_pst_white(&board)
-                        + eval::positional_terms(&board, w_king_only);
+                    // Bias: only king safety now. It goes through the danger
+                    // curve, so it is not linear in its weights and cannot be
+                    // fitted here. Material and the piece-square tables used
+                    // to sit in here with it; they are features now.
+                    let bias = eval::positional_terms(&board, w_king_only);
 
                     let probe_base = eval::positional_terms(&board, &w_zero);
                     let phase = eval::phase_fraction(&board);
                     let b = ((1.0 - phase) * buckets as f32) as usize;
                     let b = b.min(buckets - 1);
-                    let off = (b * (is_king_field.len() + 1)) as u16;
+                    let off = (b * (is_king_field.len() + eval::MAT_PST_DIM + 1)) as u16;
 
                     // Probed at MAX_PHASE rather than at 1, from an all-zero
                     // base, and divided back out in floating point.
@@ -1852,7 +1853,28 @@ fn gpu_extract(dataset_path: &str, out_path: &str, max_positions: usize, buckets
                             feats.push((off + i as u16, v as f32 / probe_mult as f32));
                         }
                     }
-                    feats.push((off + is_king_field.len() as u16, bias as f32));
+                    // Material and piece-square tables.
+                    //
+                    // These were assumed rather than fitted: the tables came
+                    // in as generic published ones and the piece values were
+                    // set separately, so there has never been any reason to
+                    // believe the two agree with each other. A knight's table
+                    // says what a knight is worth on each square RELATIVE to
+                    // its own value -- if that value was chosen elsewhere,
+                    // the table can be systematically off everywhere and
+                    // nothing in the engine would show it.
+                    //
+                    // Exact, and in floating point: unlike the probe above,
+                    // material_pst_features computes the taper directly
+                    // rather than reading it back out of a truncated
+                    // evaluation, so there is no rounding to work around.
+                    eval::material_pst_features(&board, &mut mat_feats);
+                    for (j, &v) in mat_feats.iter().enumerate() {
+                        if v != 0.0 {
+                            feats.push((off + (is_king_field.len() + j) as u16, v));
+                        }
+                    }
+                    feats.push((off + (is_king_field.len() + eval::MAT_PST_DIM) as u16, bias as f32));
 
                     buf.extend_from_slice(&(feats.len() as u16).to_le_bytes());
                     for (idx, v) in &feats {
@@ -1879,12 +1901,20 @@ fn gpu_extract(dataset_path: &str, out_path: &str, max_positions: usize, buckets
         let mut checked = 0usize;
         let mut probe_vec = vec![0i32; dim];
         let w_zero = default.from_vec(&probe_vec);
+        let mat_pst_now = eval::material_pst_current_vec();
+        let mut mat_feats = vec![0f32; eval::MAT_PST_DIM];
         for line in lines.iter().take(200) {
             let fen = match line.split('\t').next() { Some(f) => f, None => continue };
             let board = Board::from_fen(fen);
             let probe_base = eval::positional_terms(&board, &w_zero);
-            let mut rebuilt = (eval::material_pst_white(&board)
-                + eval::positional_terms(&board, &w_king_only)) as f64;
+            let mut rebuilt = eval::positional_terms(&board, &w_king_only) as f64;
+            // Material and piece-square tables are features now, so the
+            // reconstruction has to add them back the same way the tuner
+            // will: as a dot product against the values in force.
+            eval::material_pst_features(&board, &mut mat_feats);
+            for (j, &v) in mat_feats.iter().enumerate() {
+                rebuilt += mat_pst_now[j] as f64 * v as f64;
+            }
             for i in 0..dim {
                 if is_king_field[i] {
                     continue;
