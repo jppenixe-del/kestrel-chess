@@ -401,8 +401,31 @@ impl Engine {
         let mut nodes_total: u64 = 0;
         let mut collected: Vec<(char, crate::moves::Move, i32)> = Vec::new();
         for pv_index in 1..=effective_multipv {
+            // Each line gets its own share of the clock.
+            //
+            // `limits` carries an ABSOLUTE deadline, computed once. Reusing
+            // it meant the first line spent the entire budget and every line
+            // after it began already past its deadline, returning whatever
+            // depth 7 or 8 could reach. Those shallow lines then came back
+            // with HIGHER scores than the deep one -- a position looks better
+            // the less you understand it -- which put them inside the 30cp
+            // window the advisor treats as a tie. The advisor was choosing
+            // among candidates nobody had searched.
+            //
+            // Splitting the budget costs line 1 some depth, which is the
+            // honest price of asking for more than one line: three lines mean
+            // a third of the time each, not one line and two guesses.
+            let mut line_limits = limits;
+            if effective_multipv > 1 {
+                if let Some(end) = limits.deadline {
+                    let total = end.saturating_duration_since(t0);
+                    let share = total / effective_multipv as u32;
+                    line_limits.deadline = Some(Instant::now() + share);
+                    line_limits.soft_deadline = limits.soft_deadline.map(|_| Instant::now() + share / 2);
+                }
+            }
             let (best, score, depth_reached, nodes_searched, pv_line) =
-                self.search_mt(&board_now, &history_now, &excluded_root_moves, limits);
+                self.search_mt(&board_now, &history_now, &excluded_root_moves, line_limits);
             nodes_total += nodes_searched;
             if pv_index == 1 {
                 self.last_score = Some(score);
