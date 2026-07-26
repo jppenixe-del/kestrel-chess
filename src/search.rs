@@ -52,6 +52,13 @@ fn lmr_table() -> &'static [[i32; 64]; 64] {
     })
 }
 
+static ROOT_TRACE: OnceLock<bool> = OnceLock::new();
+/// Is the root trace switched on? Read once -- the check sits in the root
+/// move loop, so it must not cost an environment lookup per move.
+fn root_trace() -> bool {
+    *ROOT_TRACE.get_or_init(|| std::env::var("KESTREL_ROOT_TRACE").is_ok())
+}
+
 pub const MATE_SCORE: i32 = 30000;
 pub const MAX_PLY: usize = 128;
 
@@ -2150,6 +2157,23 @@ impl<'a> Searcher<'a> {
             // nunca chegava a ser definido e o motor devolvia lance nulo.
             // Agora guarda-se sempre o resultado do lance que JA terminou;
             // so' se para de explorar MAIS lances depois disso.
+            // Root trace: what every root move actually scored, in what
+            // window, at what depth. Set KESTREL_ROOT_TRACE to switch on.
+            //
+            // This exists because "the engine played the wrong move" is not
+            // a debuggable statement -- the interesting question is what the
+            // search believed about each alternative at the moment it chose,
+            // and no other output shows that. It was this trace that showed
+            // the losing pattern: the first move fixes alpha, every later
+            // move is then searched with a null window, and a quiet move
+            // whose value only appears deeper fails low there and is never
+            // re-searched wide enough to reveal it.
+            if ply == 0 && root_trace() {
+                eprintln!(
+                    "ROOT d={} i={} mv={} score={} alpha={} beta={} best={}",
+                    depth, i, mv.to_uci(), score, alpha, beta, best_score
+                );
+            }
             if score > best_score {
                 best_score = score;
                 best_move = Some(mv);
