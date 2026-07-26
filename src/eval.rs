@@ -2303,9 +2303,23 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
     // when a capture moves the position into the next bucket. Buckets change
     // only when a knight, bishop, rook or queen leaves the board, and the
     // evaluation was going to jump at that moment anyway.
-    if flat_buckets() {
-        return mg;
-    }
+    // Flat mode: the phase is quantised to the bucket, not read continuously.
+    //
+    // Within a bucket the taper stops varying, so the bucket's own weights
+    // decide everything and there is no second phase model competing with
+    // them. Across buckets the weights are free to disagree, which is what
+    // buckets are for. The pair is kept rather than collapsed because the
+    // weight vector is not uniformly pairs -- several fields are lone
+    // scalars -- and quantising the phase needs no assumption about which is
+    // which.
+    let phase = if flat_buckets() {
+        let b = ((MAX_PHASE - phase) * NUM_BUCKETS as i32) / (MAX_PHASE + 1);
+        let b = b.clamp(0, NUM_BUCKETS as i32 - 1);
+        // Middle of that bucket's range, in phase units.
+        MAX_PHASE - (2 * b + 1) * MAX_PHASE / (2 * NUM_BUCKETS as i32)
+    } else {
+        phase
+    };
     (mg * phase + eg * (MAX_PHASE - phase)) / MAX_PHASE
 }
 
