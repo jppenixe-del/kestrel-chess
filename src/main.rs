@@ -80,6 +80,15 @@ fn main() {
         println!("wrote {} weights to {}", v.len(), args[2]);
         return;
     }
+    if args.len() >= 3 && args[1] == "dumpmatpst" {
+        // Current material and piece-square values, in the order the
+        // extractor emits their features.
+        let v = eval::material_pst_current_vec();
+        let text: Vec<String> = v.iter().map(|x| x.to_string()).collect();
+        std::fs::write(&args[2], text.join(",")).expect("nao consegui escrever");
+        println!("wrote {} material/PST values to {}", v.len(), args[2]);
+        return;
+    }
     if args.len() >= 3 && args[1] == "linprobe" {
         linearity_probe(&args[2]);
         return;
