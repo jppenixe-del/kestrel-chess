@@ -601,7 +601,6 @@ impl Engine {
                         ply_last_move: [None; crate::search::MAX_PLY],
                         static_evals: [0i32; crate::search::MAX_PLY],
                         root_best: None,
-                        root_scores: Vec::new(),
                         excluded_move: None,
                         excluded_root_moves: excluded.to_vec(),
                         style_book: book_ref,
