@@ -1792,6 +1792,29 @@ fn gpu_extract(dataset_path: &str, out_path: &str, max_positions: usize, buckets
         lines.len(), dim - n_king, eval::MAT_PST_DIM, n_king, buckets, per_bucket * buckets
     );
 
+    // One Weights per probe index, built once and shared by every position.
+    //
+    // The probe loop used to call from_vec for each feature of each position:
+    // that rebuilds the whole struct -- the 128-entry danger table, the
+    // mobility arrays, every threat table -- to change one scalar, and it was
+    // costing more than the evaluation the probe existed to measure. Built
+    // once here it is a few megabytes and the extraction stops being
+    // dominated by work that has nothing to do with the positions.
+    let probes: Vec<eval::Weights> = {
+        let mut v = vec![0i32; dim];
+        (0..dim)
+            .map(|i| {
+                if is_king_field[i] {
+                    return w_king_only.clone();  // never used; keeps indices aligned
+                }
+                v[i] = probe_mult;
+                let w = w_king_only.from_vec(&v);
+                v[i] = 0;
+                w
+            })
+            .collect()
+    };
+
     let chunk = (lines.len() + threads - 1) / threads.max(1);
     let out: Vec<Vec<u8>> = std::thread::scope(|scope| {
         let mut handles = Vec::new();
@@ -1799,6 +1822,7 @@ fn gpu_extract(dataset_path: &str, out_path: &str, max_positions: usize, buckets
             let w_king_only = &w_king_only;
             let king_only_vec = &king_only_vec;
             let is_king_field = &is_king_field;
+            let probes = &probes;
             handles.push(scope.spawn(move || {
                 let mut buf: Vec<u8> = Vec::new();
                 // Probes run from an all-zero weight set so nothing else is
@@ -1845,10 +1869,7 @@ fn gpu_extract(dataset_path: &str, out_path: &str, max_positions: usize, buckets
                         if is_king_field[i] {
                             continue;
                         }
-                        probe_vec[i] = probe_mult;
-                        let w_probe = w_king_only.from_vec(&probe_vec);
-                        let v = eval::positional_terms(&board, &w_probe) - probe_base;
-                        probe_vec[i] = 0;
+                        let v = eval::positional_terms(&board, &probes[i]) - probe_base;
                         if v != 0 {
                             feats.push((off + i as u16, v as f32 / probe_mult as f32));
                         }
