@@ -483,6 +483,29 @@ const SAFETY_DISCOVERED: [[(i32, i32); 3]; 5] = [
     [(11, 0), (12, 0), (14, 0)],
 ];
 
+// STONEWALL (2026-07-26): a named pawn structure the evaluation had no way
+// of seeing. White holds c3-d4-e3-f4, Black c6-d5-e6-f5, and the whole point
+// of the formation is that all four pawns sit on ONE colour -- dark for
+// White, light for Black. Three consequences follow, and they are what these
+// weights price:
+//
+//  * the square in front of the chain (e5 for White, e4 for Black) cannot be
+//    challenged by a pawn ever again, so a knight there is permanent;
+//  * the bishop travelling on the pawns' own colour is shut in behind them,
+//    and unlike the generic "bishop blocked by own pawns" term this one is
+//    not a matter of degree -- the structure is a commitment, not a
+//    tendency;
+//  * the formation itself buys a kingside attack and costs long-term
+//    flexibility, which is why it is worth something in the middlegame and
+//    rather less once the pieces come off.
+//
+// The generic terms we already have -- knight outposts, bishop-blocked-by-
+// pawns -- catch fragments of this by accident. None of them can recognise
+// the structure as a thing with a plan attached.
+const STONEWALL: (i32, i32) = (14, -6);
+const STONEWALL_OUTPOST: (i32, i32) = (22, 10);
+const STONEWALL_BAD_BISHOP: (i32, i32) = (-20, -12);
+
 const WEAK_KING_RING: (i32, i32) = (10, 0);
 // KING_FLANK_ATTACKS/DEFENSES: 2026-07-23, new -- "wide flank"
 // attack/defense counting, a broader zone than the immediate 3x3 king
@@ -908,6 +931,9 @@ pub struct Weights {
     pub complexity_pawn_flanks: i32,
     pub complexity_pawn_endgame: i32,
     pub complexity_adjustment: i32,
+    pub stonewall: (i32, i32),
+    pub stonewall_outpost: (i32, i32),
+    pub stonewall_bad_bishop: (i32, i32),
 }
 
 impl Default for Weights {
@@ -980,6 +1006,9 @@ impl Default for Weights {
             complexity_pawn_flanks: COMPLEXITY_PAWN_FLANKS,
             complexity_pawn_endgame: COMPLEXITY_PAWN_ENDGAME,
             complexity_adjustment: COMPLEXITY_ADJUSTMENT,
+            stonewall: STONEWALL,
+            stonewall_outpost: STONEWALL_OUTPOST,
+            stonewall_bad_bishop: STONEWALL_BAD_BISHOP,
         }
     }
 }
@@ -1228,6 +1257,12 @@ impl Weights {
         v.push(self.complexity_pawn_flanks);
         v.push(self.complexity_pawn_endgame);
         v.push(self.complexity_adjustment);
+        // Appended at the end on purpose: every index before this keeps its
+        // meaning, so weight files written before these existed stay valid
+        // simply by being shorter.
+        pair!(self.stonewall);
+        pair!(self.stonewall_outpost);
+        pair!(self.stonewall_bad_bishop);
         v
     }
 
@@ -1236,7 +1271,13 @@ impl Weights {
     /// copied from `self` unchanged (see `to_vec` doc).
     pub fn from_vec(&self, v: &[i32]) -> Weights {
         let mut i = 0;
-        macro_rules! next { () => { { let x = v[i]; i += 1; x } } }
+        // A vector shorter than to_vec() is not an error: it is a weight
+        // file written before some field existed. Those fields keep the
+        // value they have here rather than making the whole file unusable,
+        // which is what lets new tunable terms be added without invalidating
+        // every set of weights already measured.
+        let base_vec = self.to_vec();
+        macro_rules! next { () => { { let x = if i < v.len() { v[i] } else { base_vec[i] }; i += 1; x } } }
         macro_rules! pair { () => { (next!(), next!()) } }
         macro_rules! pairs { ($n:expr) => { { let mut a = [(0i32,0i32); $n]; for j in 0..$n { a[j] = pair!(); } a } } }
         let bishop_pair = pair!();
@@ -1298,7 +1339,10 @@ impl Weights {
         let complexity_pawn_flanks = next!();
         let complexity_pawn_endgame = next!();
         let complexity_adjustment = next!();
-        assert_eq!(i, v.len(), "from_vec: length mismatch with to_vec's field order");
+        let stonewall = pair!();
+        let stonewall_outpost = pair!();
+        let stonewall_bad_bishop = pair!();
+        debug_assert!(i >= v.len(), "from_vec: read fewer values than supplied");
         Weights {
             bishop_pair, long_diag_bishop, minor_behind_pawn, knight_outpost, rook_open, rook_on_seventh, tempo,
             mobility_knight, mobility_bishop, mobility_rook, mobility_queen,
@@ -1328,6 +1372,7 @@ impl Weights {
             scale_ocb_bishops_only, scale_ocb_one_rook, scale_ocb_one_knight,
             scale_fallback_base, scale_fallback_per_pawn,
             complexity_total_pawns, complexity_pawn_flanks, complexity_pawn_endgame, complexity_adjustment,
+            stonewall, stonewall_outpost, stonewall_bad_bishop,
         }
     }
 }
@@ -1621,6 +1666,61 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
     // defender at all, conservative but simple) can only be judged once
     // the DEFENDING side's full attack set exists, which isn't true yet
     // mid-loop above when processing the attacking side first.
+    // Stonewall.
+    //
+    // White holds c3-d4-e3-f4, Black c6-d5-e6-f5. What makes it a structure
+    // rather than four pawns is that all four stand on ONE colour -- dark
+    // for White, light for Black -- and that is a permanent commitment, not
+    // a tendency. Three things follow, and the evaluation had no way of
+    // seeing any of them as connected:
+    //
+    //   the square ahead of the chain (e5 / e4) can never be challenged by a
+    //   pawn again, so a knight there is not an outpost that might be
+    //   evicted, it is a fixture;
+    //
+    //   the bishop that travels on the pawns' own colour is behind them for
+    //   the rest of the game;
+    //
+    //   the formation buys a kingside attack and sells long-term
+    //   flexibility, which is why it is worth something while the pieces are
+    //   on and rather less afterwards.
+    //
+    // Squares are named from White's side and mirrored for Black.
+    for c in [Color::White, Color::Black] {
+        let sign = if c == Color::White { 1 } else { -1 };
+        let us = c.idx();
+        let pawns = board.pieces[us][PieceType::Pawn.idx()];
+        let wall: [u8; 4] = if c == Color::White {
+            [sq(2, 2), sq(3, 3), sq(4, 2), sq(5, 3)]   // c3 d4 e3 f4
+        } else {
+            [sq(2, 5), sq(3, 4), sq(4, 5), sq(5, 4)]   // c6 d5 e6 f5
+        };
+        if !wall.iter().all(|&x| pawns & bb(x) != 0) {
+            continue;
+        }
+        mg += sign * w.stonewall.0;
+        eg += sign * w.stonewall.1;
+
+        let outpost = if c == Color::White { sq(4, 4) } else { sq(4, 3) };  // e5 / e4
+        if board.pieces[us][PieceType::Knight.idx()] & bb(outpost) != 0 {
+            mg += sign * w.stonewall_outpost.0;
+            eg += sign * w.stonewall_outpost.1;
+        }
+
+        // The bishop sharing the pawns' colour. d4 is dark and d5 is light,
+        // so testing one wall square tells us which one is shut in.
+        let wall_is_dark = (file_of(wall[1]) + rank_of(wall[1])) % 2 == 0;
+        let mut b = board.pieces[us][PieceType::Bishop.idx()];
+        while b != 0 {
+            let s = b.trailing_zeros() as Square;
+            b &= b - 1;
+            if ((file_of(s) + rank_of(s)) % 2 == 0) == wall_is_dark {
+                mg += sign * w.stonewall_bad_bishop.0;
+                eg += sign * w.stonewall_bad_bishop.1;
+            }
+        }
+    }
+
     for c in [Color::White, Color::Black] {
         let sign = if c == Color::White { 1 } else { -1 };
         let us = c.idx();
