@@ -1041,6 +1041,66 @@ impl Weights {
     }
 }
 
+/// How many phase regimes the evaluation keeps separate weights for.
+///
+/// The evaluation used to interpolate every term linearly between a midgame
+/// and an endgame value. That is two points and a straight line, and it
+/// assumes everything worth knowing about a position changes at a constant
+/// rate as pieces come off. Measurement says otherwise: scored against a
+/// stronger hand-crafted evaluation over real games, our bias swings 54cp
+/// depending on how much material is left, non-monotonically, at six sigma.
+/// A straight line cannot follow a swing, whatever its slope.
+///
+/// Eight regimes, chosen by the same phase count the taper uses, each free
+/// to hold its own opinion. Bucket 0 is the opening, bucket 7 the bare
+/// endgame. The mg/eg pair stays inside each bucket -- the taper is still
+/// doing useful work within a regime, it just no longer has to stretch
+/// across the whole game.
+pub const NUM_BUCKETS: usize = 8;
+
+/// Which regime a position belongs to. Matches the extractor exactly, so
+/// weights trained for a bucket are used by that same bucket.
+pub fn bucket_of(board: &Board) -> usize {
+    let f = phase_fraction(board);
+    (((1.0 - f) * NUM_BUCKETS as f32) as usize).min(NUM_BUCKETS - 1)
+}
+
+static BUCKET_WEIGHTS: OnceLock<Vec<Weights>> = OnceLock::new();
+
+/// The weight set for this position's phase.
+///
+/// Every bucket starts as a copy of the single set the engine already used,
+/// so switching this on changes nothing at all -- same moves, same
+/// evaluations, same node counts -- until trained weights are supplied.
+/// That is deliberate: a structural change and a strength change should
+/// never arrive together, or there is no telling which one did what.
+///
+/// KESTREL_BUCKET_WEIGHTS points at a file of NUM_BUCKETS x to_vec() values,
+/// comma separated, which is what a bucketed tuner produces.
+pub fn weights_for(board: &Board) -> &'static Weights {
+    let all = BUCKET_WEIGHTS.get_or_init(|| {
+        let base = default_weights().clone();
+        let dim = base.to_vec().len();
+        if let Ok(path) = std::env::var("KESTREL_BUCKET_WEIGHTS") {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                let v: Vec<i32> = text.trim().split(',').filter_map(|s| s.trim().parse().ok()).collect();
+                if v.len() == dim * NUM_BUCKETS {
+                    eprintln!("KESTREL_BUCKET_WEIGHTS: {} buckets x {} weights from {}", NUM_BUCKETS, dim, path);
+                    return (0..NUM_BUCKETS)
+                        .map(|b| base.from_vec(&v[b * dim..(b + 1) * dim]))
+                        .collect();
+                }
+                eprintln!(
+                    "KESTREL_BUCKET_WEIGHTS: expected {} values ({} buckets x {}), found {} -- ignoring",
+                    dim * NUM_BUCKETS, NUM_BUCKETS, dim, v.len()
+                );
+            }
+        }
+        vec![base; NUM_BUCKETS]
+    });
+    &all[bucket_of(board)]
+}
+
 pub fn default_weights() -> &'static Weights {
     DEFAULT_WEIGHTS.get_or_init(|| {
         if let Ok(path) = std::env::var("KESTREL_TUNED_WEIGHTS") {
@@ -2154,7 +2214,7 @@ pub fn evaluate(board: &Board) -> i32 {
     } else {
         material_pst(board) + positional_terms_signed(board)
     };
-    let w = default_weights();
+    let w = weights_for(board);
     let raw = raw + complexity_adjustment(board, raw, w);
     scale_endgame(board, raw, w)
 }
@@ -2361,7 +2421,7 @@ pub fn material_pst_white(board: &Board) -> i32 {
 }
 
 fn positional_terms_signed(board: &Board) -> i32 {
-    let p = positional_terms(board, default_weights());
+    let p = positional_terms(board, weights_for(board));
     if board.side == Color::White {
         p
     } else {
