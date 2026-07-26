@@ -765,8 +765,27 @@ impl<'a> Searcher<'a> {
     /// there instead of applying it) and against cycles (a repetition
     /// loop in a corrupted chain would otherwise iterate forever).
     pub fn extract_pv(&self, board: &Board, max_len: usize) -> Vec<Move> {
+        let mut b = board.clone();
+        let first = match self.tt.probe(self.zob.hash(&b)).and_then(|e| e.best) {
+            Some(m) => m,
+            None => return Vec::new(),
+        };
+        self.extract_pv_from(board, first, max_len)
+    }
+
+    /// Same reconstruction, but starting from a move the caller names --
+    /// used to make the reported line begin with the move actually chosen.
+    pub fn extract_pv_from(&self, board: &Board, first: Move, max_len: usize) -> Vec<Move> {
         let mut pv = Vec::new();
         let mut b = board.clone();
+        {
+            let legal = generate_legal(&mut b, self.atk);
+            if !legal.contains(&first) {
+                return pv;
+            }
+            b.make_move(&first);
+            pv.push(first);
+        }
         let mut seen = std::collections::HashSet::new();
         for _ in 0..max_len {
             let hash = self.zob.hash(&b);
@@ -2368,6 +2387,7 @@ impl<'a> Searcher<'a> {
             // uci.rs::cmd_go) em vez do lance vencedor que a busca ja'
             // tinha encontrado e guardado em root_best.
             if let Some(rb) = self.root_best {
+                let interrupted = self.stop && Some(rb) != best_move;
                 if Some(rb) == best_move {
                     stable_count += 1;
                 } else {
@@ -2377,8 +2397,34 @@ impl<'a> Searcher<'a> {
                 best_score = score;
                 last_depth = depth;
                 prev_score = score;
-                if self.report && !self.stop {
-                    let pv = self.extract_pv(board, depth.max(1) as usize + 4);
+                // An interrupted iteration is still reported when it
+                // changed the move.
+                //
+                // The engine keeps a better move found by an iteration the
+                // clock cut short -- deliberately, and correctly: a result
+                // already computed should not be thrown away because time ran
+                // out afterwards. But the narration skipped incomplete
+                // iterations, so the last line printed belonged to the
+                // previous depth and named a different move than the one
+                // played. Reproducibly: "pv f7e6 ..." then "bestmove e8d8".
+                // The decision was right and the announcement was wrong,
+                // which is the worse of the two failures to leave in place --
+                // it misleads anyone reading the output and silently
+                // corrupts tools that follow the reported line.
+                if self.report && (!self.stop || interrupted) {
+                    // Anchored on the move actually chosen.
+                    //
+                    // extract_pv rebuilds the line from the transposition
+                    // table, and the table's entry for the root is not
+                    // necessarily the move root_best settled on -- it is
+                    // always-replace, so a later sibling can have overwritten
+                    // it. The engine then announced one move and played
+                    // another: reproducibly, "pv f7e6 ..." followed by
+                    // "bestmove e8d8". That misleads anyone reading the
+                    // output, and it quietly corrupts any tool that walks the
+                    // principal variation, since the line analysed is not the
+                    // line played.
+                    let pv = self.extract_pv_from(board, rb, depth.max(1) as usize + 4);
                     let pv_str: Vec<String> = pv.iter().map(|m| m.to_uci()).collect();
                     let ms = search_start.elapsed().as_millis().max(1) as u64;
                     let nps = self.nodes.saturating_mul(1000) / ms;
