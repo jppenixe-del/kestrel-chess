@@ -421,6 +421,12 @@ pub struct Searcher<'a> {
     /// spend less time (tighter futility, more aggressive pruning).
     pub static_evals: [i32; MAX_PLY],
     pub root_best: Option<Move>,
+    /// Every root move's score this iteration, and its score in the previous
+    /// one. Kept so the choice is "the move that measured best", with the
+    /// previous iteration breaking ties -- rather than "whichever move
+    /// happened to raise alpha last", which is an artefact of move order and
+    /// of the window each move was searched in.
+    pub root_scores: Vec<(Move, i32, i32)>,
     /// Singular extensions: quando estamos a verificar se o tt_move e'
     /// "singular" (nenhum outro lance bate uma janela restrita), fazemos
     /// uma re-pesquisa no MESMO no' excluindo o tt_move. Este campo diz
@@ -2022,6 +2028,13 @@ impl<'a> Searcher<'a> {
             } else {
                 0
             };
+            // Was this move's score a real value, or only a bound?
+            // The first move is searched with the full window, so its score
+            // is exact. Every other move gets a null window first, which can
+            // only report "at least" or "at most" -- and a fail-high bound
+            // can be arbitrarily far from the truth. Only the full-window
+            // re-search below produces a value worth comparing.
+            let mut exact = i == 0;
             let score = if i == 0 {
                 -self.negamax(board, depth - 1 + extend, -beta, -alpha, ply + 1, false)
             } else {
@@ -2137,7 +2150,8 @@ impl<'a> Searcher<'a> {
                     s = -self.negamax(board, research_depth, -alpha - 1, -alpha, ply + 1, false);
                 }
                 if s > alpha && s < beta && !self.stop {
-                    s = -self.negamax(board, research_depth, -beta, -alpha, ply + 1, false)
+                    s = -self.negamax(board, research_depth, -beta, -alpha, ply + 1, false);
+                    exact = true;
                 }
                 s
             };
@@ -2192,6 +2206,16 @@ impl<'a> Searcher<'a> {
                     "ROOT d={} i={} mv={} score={} alpha={} beta={} best={}",
                     depth, i, mv.to_uci(), score, alpha, beta, best_score
                 );
+            }
+            // Only exact scores are recorded. Storing bounds and then taking
+            // the best of them is how a move nobody really evaluated wins:
+            // doing exactly that made this engine play the losing move from
+            // the game this was traced from, six times out of ten.
+            if ply == 0 && exact {
+                match self.root_scores.iter_mut().find(|(m, _, _)| *m == mv) {
+                    Some(e) => e.1 = score,
+                    None => self.root_scores.push((mv, score, -MATE_SCORE - 1)),
+                }
             }
             if score > best_score {
                 best_score = score;
@@ -2371,6 +2395,7 @@ impl<'a> Searcher<'a> {
         let mut stable_count = 0;
         self.killers = [[None; 2]; MAX_PLY];
         self.root_move_nodes.clear();
+        self.root_scores.clear();
         for depth in 1..=self.limits.max_depth {
             let score = self.search_root(board, depth, prev_score);
             // 2026-07-20 (BUG REAL corrigido -- irmao do bug ja' corrigido
@@ -2386,6 +2411,28 @@ impl<'a> Searcher<'a> {
             // jogar o "primeiro lance legal gerado" (fallback de
             // uci.rs::cmd_go) em vez do lance vencedor que a busca ja'
             // tinha encontrado e guardado em root_best.
+            // The move that measured best, not the one that raised alpha last.
+            //
+            // Picking on "last to raise alpha" makes the answer depend on move
+            // order and on the window each move happened to be searched in.
+            // Under several threads that is enough for identical runs to
+            // return different moves: measured on a position from a lost
+            // game, three distinct moves in ten runs at four threads, against
+            // one in ten for a stronger engine at the same clock.
+            //
+            // Ties break on the PREVIOUS iteration's score, which is where the
+            // damping comes from: when two moves look equal now, the one that
+            // looked better a ply ago wins, so a score that merely wobbles
+            // does not change the decision.
+            if !self.root_scores.is_empty() {
+                let mut best = &self.root_scores[0];
+                for e in self.root_scores.iter().skip(1) {
+                    if e.1 > best.1 || (e.1 == best.1 && e.2 > best.2) {
+                        best = e;
+                    }
+                }
+                self.root_best = Some(best.0);
+            }
             if let Some(rb) = self.root_best {
                 let interrupted = self.stop && Some(rb) != best_move;
                 if Some(rb) == best_move {
@@ -2397,6 +2444,10 @@ impl<'a> Searcher<'a> {
                 best_score = score;
                 last_depth = depth;
                 prev_score = score;
+                // This iteration's scores become the next one's tiebreak.
+                for e in self.root_scores.iter_mut() {
+                    e.2 = e.1;
+                }
                 // An interrupted iteration is still reported when it
                 // changed the move.
                 //
