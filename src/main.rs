@@ -89,6 +89,39 @@ fn main() {
         println!("wrote {} material/PST values to {}", v.len(), args[2]);
         return;
     }
+    if args.len() >= 3 && args[1] == "flatbuckets" {
+        // Per-bucket weights for flat mode: each bucket gets the value the
+        // taper would produce in the MIDDLE of that bucket's phase range.
+        //
+        // That makes the flat model start as a staircase approximation of the
+        // line it replaces -- same evaluation to within the width of a step,
+        // so switching modes is not itself a strength change. What it buys is
+        // that the eight steps are then free to move independently, which a
+        // line cannot do. Starting anywhere else would confuse "buckets are
+        // better" with "these particular numbers are better".
+        let base = eval::default_weights().to_vec();
+        let n = base.len() / 2;
+        let mut out: Vec<i32> = Vec::with_capacity(base.len() * eval::NUM_BUCKETS);
+        for b in 0..eval::NUM_BUCKETS {
+            // Bucket 0 is the opening, so its phase is high. Take the middle
+            // of the bucket, in the same units the taper uses.
+            let frac = (b as f64 + 0.5) / eval::NUM_BUCKETS as f64;   // 0 = opening
+            let phase = ((1.0 - frac) * eval::MAX_PHASE_PUB as f64).round() as i32;
+            for i in 0..n {
+                let (mg, eg) = (base[2 * i], base[2 * i + 1]);
+                let v = (mg * phase + eg * (eval::MAX_PHASE_PUB - phase)) / eval::MAX_PHASE_PUB;
+                // Flat mode reads the first of each pair; the second is never
+                // consulted, but is written equal so the file stays readable
+                // by anything that still expects pairs.
+                out.push(v);
+                out.push(v);
+            }
+        }
+        let text: Vec<String> = out.iter().map(|x| x.to_string()).collect();
+        std::fs::write(&args[2], text.join(",")).expect("nao consegui escrever");
+        println!("wrote {} values ({} buckets x {}) to {}", out.len(), eval::NUM_BUCKETS, base.len(), args[2]);
+        return;
+    }
     if args.len() >= 3 && args[1] == "linprobe" {
         linearity_probe(&args[2]);
         return;

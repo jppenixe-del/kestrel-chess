@@ -2286,6 +2286,26 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
     // material_pst; fase mantida incrementalmente em add_piece/
     // remove_piece).
     let phase = board.phase.min(MAX_PHASE);
+    // Flat mode: the bucket does the phase work, so nothing is interpolated.
+    //
+    // Tapering between a midgame and an endgame value IS a phase model, and a
+    // rather good one. Putting eight phase buckets on top of it asks the same
+    // question twice: measured on a stronger engine, giving its
+    // already-tuned terms a per-bucket multiplier cost 40 Elo, because the
+    // taper had already said what the multiplier was trying to say.
+    //
+    // So when buckets carry the weights, the taper steps aside. Each bucket
+    // holds one value per term instead of two, and eight free values beat two
+    // values joined by a straight line -- that is the whole point of having
+    // buckets, and it only holds if they are not competing with the line.
+    //
+    // The cost is a discontinuity where buckets meet: the evaluation jumps
+    // when a capture moves the position into the next bucket. Buckets change
+    // only when a knight, bishop, rook or queen leaves the board, and the
+    // evaluation was going to jump at that moment anyway.
+    if flat_buckets() {
+        return mg;
+    }
     (mg * phase + eg * (MAX_PHASE - phase)) / MAX_PHASE
 }
 
@@ -2510,6 +2530,13 @@ fn material_pst(board: &Board) -> i32 {
 /// The taper denominator, exposed so tooling can probe at a value that
 /// divides exactly and avoid the truncation a unit probe would suffer.
 pub const MAX_PHASE_PUB: i32 = MAX_PHASE;
+
+static FLAT_BUCKETS: OnceLock<bool> = OnceLock::new();
+/// Is the phase taper switched off in favour of the buckets? Only sensible
+/// with KESTREL_BUCKET_WEIGHTS supplying per-bucket values.
+fn flat_buckets() -> bool {
+    *FLAT_BUCKETS.get_or_init(|| std::env::var("KESTREL_FLAT_BUCKETS").is_ok())
+}
 
 pub fn phase_fraction(board: &Board) -> f32 {
     board.phase.min(MAX_PHASE) as f32 / MAX_PHASE as f32
