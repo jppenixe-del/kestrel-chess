@@ -60,6 +60,8 @@ fn root_trace() -> bool {
 }
 
 pub const MATE_SCORE: i32 = 30000;
+/// A root move that failed low this iteration has no usable score.
+pub const NO_SCORE: i32 = -MATE_SCORE - 100;
 pub const MAX_PLY: usize = 128;
 
 /// Every scalar pruning margin/threshold in the search, in one runtime-
@@ -421,6 +423,9 @@ pub struct Searcher<'a> {
     /// spend less time (tighter futility, more aggressive pruning).
     pub static_evals: [i32; MAX_PLY],
     pub root_best: Option<Move>,
+    /// Per root move: the score from the current iteration, and the score
+    /// from the previous one. `NO_SCORE` means "not measured this iteration".
+    pub root_scores: Vec<(Move, i32, i32)>,
     /// Singular extensions: quando estamos a verificar se o tt_move e'
     /// "singular" (nenhum outro lance bate uma janela restrita), fazemos
     /// uma re-pesquisa no MESMO no' excluindo o tt_move. Este campo diz
@@ -2193,6 +2198,33 @@ impl<'a> Searcher<'a> {
                     depth, i, mv.to_uci(), score, alpha, beta, best_score
                 );
             }
+            if ply == 0 {
+                // Bookkeeping per root move, adapted from how a stronger
+                // engine does it -- the details matter and each one was
+                // learned by getting it wrong first.
+                //
+                // The previous score is saved on EVERY visit, before anything
+                // else: it is the tiebreak that stops a score which merely
+                // wobbles from changing the decision.
+                //
+                // The current score is written only for the first move, whose
+                // full window makes it a value, and for moves that raise
+                // alpha, which get the full-window re-search. Anything else
+                // is INVALIDATED rather than left alone. That last part is
+                // the one that matters: leaving a stale score behind lets a
+                // move measured two iterations ago at a shallower depth
+                // compete against one measured now, and it made this engine
+                // open 1.d3 instead of 1.d4.
+                let idx = match self.root_scores.iter().position(|(m, _, _)| *m == mv) {
+                    Some(i) => i,
+                    None => {
+                        self.root_scores.push((mv, NO_SCORE, NO_SCORE));
+                        self.root_scores.len() - 1
+                    }
+                };
+                self.root_scores[idx].2 = self.root_scores[idx].1;
+                self.root_scores[idx].1 = if i == 0 || score > alpha { score } else { NO_SCORE };
+            }
             if score > best_score {
                 best_score = score;
                 best_move = Some(mv);
@@ -2342,23 +2374,58 @@ impl<'a> Searcher<'a> {
         if depth <= 1 {
             return self.negamax(board, depth, -MATE_SCORE - 1, MATE_SCORE + 1, 0, false);
         }
-        let mut delta: i32 = 25;
-        let mut alpha = (prev_score - delta).max(-MATE_SCORE - 1);
-        let mut beta = (prev_score + delta).min(MATE_SCORE + 1);
+        // Adopted whole, rather than assembled a piece at a time.
+        //
+        // Every part of this had a reason behind it in the engine it comes
+        // from, and the parts work together: the starting width, what happens
+        // on each kind of failure, and how the width grows are one mechanism,
+        // not four options. Taking them singly and vetoing each against our
+        // own baseline is how a package that works ends up rejected in
+        // fragments -- which is what happened here before.
+        //
+        // Four things this does that a plain "widen the failing side and
+        // double" does not:
+        //
+        //  * the starting width scales with the previous score, because a
+        //    position already far from equal moves in bigger steps than one
+        //    near it;
+        //  * a full window below a minimum depth, where the previous score is
+        //    too unreliable to aim at;
+        //  * on a fail-low, beta comes DOWN to the midpoint as alpha goes
+        //    out. The score is below the window, so the top of it was never
+        //    the question, and leaving it high keeps searching a range we
+        //    already know is empty;
+        //  * on a fail-high, the re-search goes one ply SHALLOWER, floored
+        //    five below. A move that beats the window will beat it at less
+        //    depth too, and paying full depth to confirm it is what makes
+        //    fail-highs expensive.
+        let sp = search_params();
+        let mut delta: i32 = sp.asp_init_delta + prev_score * prev_score / 16384;
+        let (mut alpha, mut beta) = if depth >= sp.min_asp_depth {
+            (
+                (prev_score - delta).max(-MATE_SCORE - 1),
+                (prev_score + delta).min(MATE_SCORE + 1),
+            )
+        } else {
+            (-MATE_SCORE - 1, MATE_SCORE + 1)
+        };
+        let mut asp_depth = depth;
         loop {
-            let score = self.negamax(board, depth, alpha, beta, 0, false);
+            let score = self.negamax(board, asp_depth.max(1), alpha, beta, 0, false);
             if self.stop {
                 return score;
             }
             if score <= alpha {
+                beta = (alpha + beta) / 2;
                 alpha = (alpha - delta).max(-MATE_SCORE - 1);
-                delta *= 2;
+                asp_depth = depth;
             } else if score >= beta {
                 beta = (beta + delta).min(MATE_SCORE + 1);
-                delta *= 2;
+                asp_depth = (asp_depth - 1).max(depth - 5);
             } else {
                 return score;
             }
+            delta += delta * sp.asp_widening_factor / 256;
         }
     }
 
@@ -2371,6 +2438,7 @@ impl<'a> Searcher<'a> {
         let mut stable_count = 0;
         self.killers = [[None; 2]; MAX_PLY];
         self.root_move_nodes.clear();
+        self.root_scores.clear();
         for depth in 1..=self.limits.max_depth {
             let score = self.search_root(board, depth, prev_score);
             // 2026-07-20 (BUG REAL corrigido -- irmao do bug ja' corrigido
@@ -2386,6 +2454,18 @@ impl<'a> Searcher<'a> {
             // jogar o "primeiro lance legal gerado" (fallback de
             // uci.rs::cmd_go) em vez do lance vencedor que a busca ja'
             // tinha encontrado e guardado em root_best.
+            // Play the move that measured best, ties going to whichever
+            // looked better a ply ago.
+            if !self.stop {
+                if let Some(best) = self
+                    .root_scores
+                    .iter()
+                    .filter(|e| e.1 != NO_SCORE)
+                    .reduce(|a, b| if b.1 > a.1 || (b.1 == a.1 && b.2 > a.2) { b } else { a })
+                {
+                    self.root_best = Some(best.0);
+                }
+            }
             if let Some(rb) = self.root_best {
                 let interrupted = self.stop && Some(rb) != best_move;
                 if Some(rb) == best_move {
