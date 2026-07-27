@@ -25,6 +25,17 @@ use zobrist::Zobrist;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
+    if args.len() >= 2 && args[1] == "bench" {
+        // Fixed-work benchmark, in the shape a distributed test framework
+        // expects: a total node count and a rate, on a fixed position set at
+        // a fixed depth. The node count is a build signature -- two commits
+        // that search identically must report the same number, which is how a
+        // framework detects that a change meant to be non-functional was not,
+        // or that a worker built something other than what it was asked to.
+        let depth: i32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(11);
+        bench(depth);
+        return;
+    }
     if args.len() >= 2 && args[1] == "perft" {
         let depth: u32 = args.get(2).map(|s| s.parse().unwrap()).unwrap_or(5);
         let fen = if args.len() > 3 {
@@ -2727,4 +2738,99 @@ fn tune_king(dataset_path: &str, out_path: &str, max_positions: usize, threads: 
     let out: Vec<String> = cur.iter().map(|v| v.to_string()).collect();
     std::fs::write(out_path, out.join(",")).expect("nao consegui escrever");
     println!("pesos escritos em {}", out_path);
+}
+
+
+/// Positions spanning the phases the search behaves differently in: opening,
+/// sharp middlegame, quiet middlegame, and endgames with and without pawns.
+/// A benchmark drawn from one phase would miss a change that only affects
+/// another, which for a signature is worse than useless.
+const BENCH_FENS: [&str; 12] = [
+    "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+    "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+    "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+    "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
+    "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8",
+    "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10",
+    "r1bq1rk1/pp2bppp/2n1pn2/2pp4/3P1B2/2PBPN2/PP1N1PPP/R2Q1RK1 w - - 0 9",
+    "8/8/4k3/8/8/3KBN2/8/8 w - - 0 1",
+    "2r3k1/2r2qp1/1p1p3p/p2Pppb1/P1P5/1PB3QP/4RPP1/3R2K1 w - - 2 26",
+    "6k1/5ppp/8/8/8/8/5PPP/6K1 w - - 0 40",
+    "r4rk1/1pp1qppp/p1np1n2/4p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 b - - 0 10",
+    "4rrk1/pp1n1pp1/3bp2p/q2p4/3P1P2/1PN1PQ2/P1B3PP/2R2RK1 w - - 0 18",
+];
+
+fn bench(depth: i32) {
+    let atk = Attacks::new();
+    let zob = zobrist::Zobrist::new();
+    let tt = tt::TranspositionTable::new(16);
+    eval::warmup();
+    search::warmup();
+    let start = std::time::Instant::now();
+    let mut total: u64 = 0;
+    for fen in BENCH_FENS.iter() {
+        let mut board = Board::from_fen(fen);
+        tt.clear();
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let mut searcher = search::Searcher {
+            stop_flag: &stop,
+            cut_nodes: 0,
+            cut_first: 0,
+            nmp_tried: 0,
+            nmp_tried_pv: 0,
+            nmp_failed_pv: 0,
+            nmp_cutoff_raw: 0,
+            nmp_cut_taken: 0,
+            nmp_verify_tried: 0,
+            nmp_verify_ok: 0,
+            nmp_verify_failed: 0,
+            nmp_failed_low: 0,
+            qnodes: 0,
+            cut_rfp: 0,
+            cut_razor: 0,
+            cut_futility: 0,
+            nodes_shallow: 0,
+            lmr_quiet_total: 0,
+            lmr_skip_check: 0,
+            lmr_skip_depth: 0,
+            lmr_skip_extend: 0,
+            lmr_skip_early: 0,
+            lmr_tried: 0,
+            lmr_research: 0,
+            lmr_sum: 0,
+            atk: &atk,
+            zob: &zob,
+            tt: &tt,
+            nodes: 0,
+            limits: search::SearchLimits { deadline: None, max_depth: depth, max_nodes: None, soft_budget: None },
+            stop: false,
+            history: Vec::new(),
+            killers: [[None; 2]; search::MAX_PLY],
+            history_scores: [[[0; 64]; 64]; 2],
+            countermoves: [[None; 64]; 6],
+            cont_hist: vec![0i32; search::CONT_HIST_SIZE].into_boxed_slice(),
+            corr_hist: vec![0i32; search::CORR_HIST_SIZE * 2].into_boxed_slice(),
+            corr_hist_np_stm: vec![0i32; search::CORR_HIST_SIZE * 2].into_boxed_slice(),
+            corr_hist_np_nstm: vec![0i32; search::CORR_HIST_SIZE * 2].into_boxed_slice(),
+            corr_hist_minor: vec![0i32; search::CORR_HIST_SIZE * 2].into_boxed_slice(),
+            corr_hist_major: vec![0i32; search::CORR_HIST_SIZE * 2].into_boxed_slice(),
+            corr_hist_threats: vec![0i32; search::CORR_HIST_SIZE * 2].into_boxed_slice(),
+            ply_last_move: [None; search::MAX_PLY],
+            static_evals: [0i32; search::MAX_PLY],
+            root_best: None,
+                        root_scores: Vec::new(),
+                        nmp_min_ply: 0,
+            excluded_move: None,
+            excluded_root_moves: vec![],
+            style_book: None,
+            root_move_nodes: Vec::new(),
+            capture_history: [[[0; 6]; 6]; 2],
+            dextensions: [0; search::MAX_PLY],
+            report: false, // offline tools: no UCI narration
+        };
+        let (_, _, _, nodes) = searcher.iterative_deepening(&mut board);
+        total += nodes;
+    }
+    let ms = start.elapsed().as_millis().max(1) as u64;
+    println!("{} nodes {} nps", total, total * 1000 / ms);
 }
