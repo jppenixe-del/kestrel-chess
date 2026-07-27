@@ -225,13 +225,13 @@ impl Default for SearchParams {
             // Starting points, not tuned values: this engine's tree is not
             // the one these signals were measured on. They are exposed by
             // name so they can be swept without a rebuild.
-            rfp_opp_easy_capture: 19,
-            rfp_opp_worsening: 14,
-            rfp_hist_divisor: 410,
-            hist_beta_margin: 37,
+            rfp_opp_easy_capture: 24,
+            rfp_opp_worsening: 18,
+            rfp_hist_divisor: 615,
+            hist_beta_margin: 46,
             hist_pruning_max_depth: 4,
-            triple_ext_margin: 124,
-            qs_hist_prune_margin: 4096,
+            triple_ext_margin: 155,
+            qs_hist_prune_margin: 6144,
             hist_bonus_quad: 439,
             hist_bonus_linear: 196,
             hist_bonus_offset: 100,
@@ -240,38 +240,38 @@ impl Default for SearchParams {
             hist_malus_linear: 277,
             hist_malus_offset: -44,
             hist_malus_max: 992,
-            lmr_hist_divisor: 24000,
-            rfp_improving: DepthMargin { base: 0, slope: 26 },
-            rfp_not_improving: DepthMargin { base: 0, slope: 80 },
-            razor_base: 458,
-            razor_per_depth: 458,
-            futility_improving: DepthMargin { base: 0, slope: 75 },
-            futility_not_improving: DepthMargin { base: 0, slope: 105 },
-            cap_futility_improving: DepthMargin { base: 2, slope: 115 },
-            cap_futility_not_improving: DepthMargin { base: 2, slope: 115 },
-            delta_margin: 200,
+            lmr_hist_divisor: 36000,
+            rfp_improving: DepthMargin { base: 0, slope: 32 },
+            rfp_not_improving: DepthMargin { base: 0, slope: 100 },
+            razor_base: 572,
+            razor_per_depth: 572,
+            futility_improving: DepthMargin { base: 0, slope: 94 },
+            futility_not_improving: DepthMargin { base: 0, slope: 131 },
+            cap_futility_improving: DepthMargin { base: 2, slope: 144 },
+            cap_futility_not_improving: DepthMargin { base: 2, slope: 144 },
+            delta_margin: 250,
             qs_lmp_limit: 8,
-            tt_extended_cutoff_margin: 130,
-            history_prune_mult: 1648,
+            tt_extended_cutoff_margin: 162,
+            history_prune_mult: 2472,
             // Same adoption rationale as above -- eval-adaptive NMP is a
             // strictly more informed mechanism than the old flat
             // depth>6?3:2 reduction, and there was no Kestrel-tuned
             // value to compare against for these fields at all.
             nmp_min_depth: 2,
-            nmp_eval_margin: 29,
-            nmp_static_eval_base_margin: 193,
-            nmp_static_eval_depth_margin: 18,
+            nmp_eval_margin: 36,
+            nmp_static_eval_base_margin: 241,
+            nmp_static_eval_depth_margin: 22,
             nmp_base_reduction: 1343,
             nmp_depth_reduction_scale: 78,
             nmp_eval_reduction_scale: 208,
             nmp_max_eval_reduction: 4,
-            probcut_beta_margin: 182,
-            asp_init_delta: 10,
+            probcut_beta_margin: 228,
+            asp_init_delta: 12,
             asp_widening_factor: 46,
             min_asp_depth: 6,
-            do_deeper_margin_base: 65,
-            do_deeper_margin_depth: 254,
-            do_shallower_margin: 14,
+            do_deeper_margin_base: 81,
+            do_deeper_margin_depth: 318,
+            do_shallower_margin: 18,
         }
     }
 }
@@ -1452,6 +1452,16 @@ impl<'a> Searcher<'a> {
         }
         if ply >= 2 {
             if let Some((p_pt, p_to)) = self.ply_last_move.get(ply - 1).and_then(|x| *x) {
+                ch += self.cont_hist[cont_hist_idx(p_pt, p_to, curr_pt, to)];
+            }
+        }
+        // Four plies back as well, not just one and two. One and two capture
+        // the immediate exchange -- what the opponent just did and what we did
+        // before that. Four reaches past it, to the move that set up the
+        // structure the current one is working within, and a plan that takes
+        // several moves to pay off is invisible at the shorter lags.
+        if ply >= 4 {
+            if let Some((p_pt, p_to)) = self.ply_last_move.get(ply - 3).and_then(|x| *x) {
                 ch += self.cont_hist[cont_hist_idx(p_pt, p_to, curr_pt, to)];
             }
         }
@@ -2876,6 +2886,12 @@ impl<'a> Searcher<'a> {
                     if let Some((curr_pt, _)) = board.piece_at(mv.from) {
                         let prev1 = if ply >= 1 { self.ply_last_move.get(ply).and_then(|x| *x) } else { None };
                         let prev2 = if ply >= 2 { self.ply_last_move.get(ply - 1).and_then(|x| *x) } else { None };
+                        // The lag-4 entry has to be written as well as read,
+                        // or the accessor sums a table nothing ever fills.
+                        let prev4 = if ply >= 4 { self.ply_last_move.get(ply - 3).and_then(|x| *x) } else { None };
+                        if let Some((p4_pt, p4_to)) = prev4 {
+                            self.update_cont_hist(p4_pt, p4_to, curr_pt, mv.to, bonus);
+                        }
                         if let Some((p1_pt, p1_to)) = prev1 {
                             self.update_cont_hist(p1_pt, p1_to, curr_pt, mv.to, bonus);
                         }
@@ -2884,6 +2900,9 @@ impl<'a> Searcher<'a> {
                         }
                         for qm in &quiets_tried[..n] {
                             if let Some((q_pt, _)) = board.piece_at(qm.from) {
+                                if let Some((p4_pt, p4_to)) = prev4 {
+                                    self.update_cont_hist(p4_pt, p4_to, q_pt, qm.to, -malus);
+                                }
                                 if let Some((p1_pt, p1_to)) = prev1 {
                                     self.update_cont_hist(p1_pt, p1_to, q_pt, qm.to, -malus);
                                 }
