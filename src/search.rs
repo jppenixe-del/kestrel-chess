@@ -414,6 +414,20 @@ pub struct Searcher<'a> {
     /// Nodes spent in quiescence. It obeys neither the depth limit nor
     /// LMR nor LMP, so it is the one part of the tree that can grow without
     /// showing up in any of the other telemetry.
+    /// Null-move telemetry. Both of the last two attempts at this gate were
+    /// built on the assumption that a sharp position explodes because the
+    /// null move FIRES and then has to be verified. Measurement inverted it:
+    /// blocking the null move there doubled the tree, so it was firing and
+    /// paying for itself. These counters replace the assumption with numbers.
+    pub nmp_tried: u64,
+    pub nmp_tried_pv: u64,
+    pub nmp_failed_pv: u64,
+    pub nmp_cutoff_raw: u64,
+    pub nmp_cut_taken: u64,
+    pub nmp_verify_tried: u64,
+    pub nmp_verify_ok: u64,
+    pub nmp_verify_failed: u64,
+    pub nmp_failed_low: u64,
     pub qnodes: u64,
     /// How often each shallow, eval-based pruning actually fires. The tree is
     /// wide and shallow, which points at whatever decides how many low-depth
@@ -1718,7 +1732,8 @@ impl<'a> Searcher<'a> {
 
         // Reverse futility pruning -- scaled by `improving` so we prune
         // more when we're winning (position better than 2 plies ago).
-        if !in_check
+        if !is_pv
+            && !in_check
             && ply > 0
             && depth <= 6
             && beta.abs() < MATE_SCORE - MAX_PLY as i32
@@ -1762,7 +1777,15 @@ impl<'a> Searcher<'a> {
         // baseline pre-NMP. Ver NOTAS_PROXIMA_SESSAO para o historico
         // completo.
         let sp_nmp = search_params();
-        if depth >= sp_nmp.nmp_min_depth
+        // Whole-node pruning belongs OUTSIDE the principal variation.
+        // RFP, razoring, ProbCut and the null move all decide a node without
+        // searching it properly, which is a trade the principal variation
+        // cannot make: a wrong cut there does not lose a side branch, it
+        // corrupts the line the engine is going to play and sends the search
+        // back to redo it. Measured before this guard existed, the null move
+        // was attempted in PV nodes and failed 100% of the time.
+        if !is_pv
+            && depth >= sp_nmp.nmp_min_depth
             && !in_check
             && ply > 0
             && (ply as i32) >= self.nmp_min_ply
@@ -1777,13 +1800,24 @@ impl<'a> Searcher<'a> {
             let r = ((sp_nmp.nmp_base_reduction + depth * sp_nmp.nmp_depth_reduction_scale) / 256
                 + ((static_eval - beta) / sp_nmp.nmp_eval_reduction_scale).min(sp_nmp.nmp_max_eval_reduction))
                 .max(1);
+            self.nmp_tried += 1;
+            if is_pv {
+                self.nmp_tried_pv += 1;
+            }
             let undo = board.make_null_move();
             let score = -self.negamax(board, depth - r, -beta, -beta + 1, ply + 1, true);
             board.unmake_null_move(&undo);
             if self.stop {
                 return 0;
             }
+            if score < beta {
+                self.nmp_failed_low += 1;
+                if is_pv {
+                    self.nmp_failed_pv += 1;
+                }
+            }
             if score >= beta {
+                self.nmp_cutoff_raw += 1;
                 // Verification, where skipping a move is not safe to trust.
                 //
                 // The null move assumes there is always something useful to
@@ -1802,8 +1836,10 @@ impl<'a> Searcher<'a> {
                 // carries, deleted on a single measurement of one integration
                 // of it.
                 if (depth <= 15 && beta.abs() < MATE_SCORE - MAX_PLY as i32) || self.nmp_min_ply > 0 {
+                    self.nmp_cut_taken += 1;
                     return beta;
                 }
+                self.nmp_verify_tried += 1;
                 let saved = self.nmp_min_ply;
                 self.nmp_min_ply = ply as i32 + (depth - r) * 3 / 4;
                 let verify = self.negamax(board, depth - r, beta - 1, beta, ply, false);
@@ -1812,8 +1848,10 @@ impl<'a> Searcher<'a> {
                     return 0;
                 }
                 if verify >= beta {
+                    self.nmp_verify_ok += 1;
                     return verify;
                 }
+                self.nmp_verify_failed += 1;
             }
         }
 
@@ -1823,7 +1861,7 @@ impl<'a> Searcher<'a> {
         // diferenca -- verifica-se com uma chamada real a quiescence
         // (nao um corte cego) e so' se aceita o resultado se confirmar
         // o fail-low, para nunca perder uma tactica real.
-        if !in_check && ply > 0 && depth <= 3 {
+        if !is_pv && !in_check && ply > 0 && depth <= 3 {
             let sp = search_params();
             let margin = sp.razor_base + sp.razor_per_depth * (depth - 1);
             if static_eval + margin <= alpha {
@@ -1879,7 +1917,8 @@ impl<'a> Searcher<'a> {
         // far from mate scores (never risk masking a real mate). The
         // `depth >= 5` floor and the margin below (was a hardcoded 150)
         // are the tuned parameters for this check.
-        if depth >= 5
+        if !is_pv
+            && depth >= 5
             && ply > 0
             && !in_check
             && excluded.is_none()
@@ -2771,6 +2810,26 @@ impl<'a> Searcher<'a> {
             eprintln!(
                 "lmr-stats: reduzidos={} repesquisados={} ({:.1}%) reducao-media={:.2}",
                 self.lmr_tried, self.lmr_research, rr, avg
+            );
+            let t = self.nmp_tried.max(1) as f64;
+            eprintln!(
+                "nmp: tentado={} corte-cru={} ({:.0}%) aceite-sem-verificar={} verificado={} ok={} falhou={} fail-low={} ({:.0}%)",
+                self.nmp_tried,
+                self.nmp_cutoff_raw, 100.0 * self.nmp_cutoff_raw as f64 / t,
+                self.nmp_cut_taken,
+                self.nmp_verify_tried, self.nmp_verify_ok, self.nmp_verify_failed,
+                self.nmp_failed_low, 100.0 * self.nmp_failed_low as f64 / t
+            );
+            let pv = self.nmp_tried_pv.max(1) as f64;
+            let nonpv = (self.nmp_tried - self.nmp_tried_pv).max(1) as f64;
+            let nonpv_fail = self.nmp_failed_low - self.nmp_failed_pv;
+            eprintln!(
+                "nmp-pv: em-PV={} ({:.0}% do total) falha-em-PV={:.0}% | fora-de-PV={} falha={:.0}%",
+                self.nmp_tried_pv,
+                100.0 * self.nmp_tried_pv as f64 / t,
+                100.0 * self.nmp_failed_pv as f64 / pv,
+                self.nmp_tried - self.nmp_tried_pv,
+                100.0 * nonpv_fail as f64 / nonpv
             );
             let sh = self.nodes_shallow.max(1) as f64;
             eprintln!(
