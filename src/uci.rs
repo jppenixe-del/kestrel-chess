@@ -702,7 +702,20 @@ impl Engine {
                     })
                 })
                 .collect();
-            let mut results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+            // A thread that died takes its result with it, not the engine.
+            // `unwrap` here turned any panic inside a search thread into a
+            // crash of the whole process -- and the way that happens in
+            // practice is stdout closing when the controlling program goes
+            // away, which is a normal end, not a fault. Survivors are enough
+            // to pick a move; if none survived there is nothing to report and
+            // the caller falls back as it does for any empty search.
+            let mut results: Vec<_> = handles
+                .into_iter()
+                .filter_map(|h| h.join().ok())
+                .collect();
+            if results.is_empty() {
+                return ((None, 0, 0, 0, Vec::new()), Vec::new());
+            }
             let mut best_idx = 0;
             for i in 1..results.len() {
                 let better = results[i].2 > results[best_idx].2
@@ -813,6 +826,19 @@ impl Engine {
                     } else if tokens.len() >= 5 && tokens[1] == "name" && tokens[2] == "Threads" && tokens[3] == "value" {
                         if let Ok(n) = tokens[4].parse::<usize>() {
                             self.threads = n.max(1);
+                        }
+                    } else if tokens.len() >= 5 && tokens[1] == "name" && tokens[3] == "value" {
+                        // Search parameters by name. Sweeping a pruning margin
+                        // used to mean editing a constant and waiting for a
+                        // build; now it is one line into a running engine,
+                        // which is the difference between trying three values
+                        // and trying thirty. An unknown name is reported, not
+                        // ignored -- a silent typo looks exactly like "this
+                        // parameter has no effect".
+                        if let Ok(v) = tokens[4].parse::<i32>() {
+                            if !crate::search::set_param(tokens[2], v) {
+                                eprintln!("setoption: parametro desconhecido '{}'", tokens[2]);
+                            }
                         }
                     }
                 }

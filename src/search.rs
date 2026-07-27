@@ -31,7 +31,12 @@ static LMR_TABLE: OnceLock<[[i32; 64]; 64]> = OnceLock::new();
 /// the clock matters, not inside the first search.
 pub fn warmup() {
     let _ = lmr_table();
-    let _ = search_params();
+    // Deliberately NOT touching `search_params()` here. It is a OnceLock, so
+    // the first read fixes it for the process -- warming it at startup meant
+    // every `setoption` that followed was silently ignored, which is the
+    // worst possible failure for a sweep: the engine accepts the option,
+    // reports nothing wrong, and searches with the old value. The cost of
+    // building it lazily is one branch on the first node.
 }
 fn lmr_table() -> &'static [[i32; 64]; 64] {
     LMR_TABLE.get_or_init(|| {
@@ -203,7 +208,14 @@ impl Default for SearchParams {
             // value to compare against for these fields at all.
             nmp_min_depth: 2,
             nmp_eval_margin: 29,
-            nmp_static_eval_base_margin: 193,
+            // 250, not 193. The old value was the reference engine's tuned
+            // number, copied -- and it was tuned against a search that visits
+            // a quarter of our nodes for the same depth, so there is no
+            // reason it should sit in the same place here. A node-count sweep
+            // put 300 ahead and games disagreed (47.6% over 474); a games
+            // sweep put 250 at 51.1% and 120 and 400 clearly below. This is
+            // that measurement, at a size worth acting on.
+            nmp_static_eval_base_margin: 250,
             nmp_static_eval_depth_margin: 18,
             nmp_base_reduction: 1343,
             nmp_depth_reduction_scale: 78,
@@ -291,9 +303,79 @@ impl SearchParams {
     }
 }
 
+/// Names of the search parameters, in the exact order `to_vec` emits them.
+/// Exposed so they can be set over UCI (`setoption name <n> value <v>`) and
+/// swept without a rebuild -- the difference between an experiment costing
+/// minutes and costing a compile each. Generated from `to_vec` rather than
+/// written out, so it cannot drift from it.
+pub const PARAM_NAMES: [&str; 33] = [
+    "rfp_improving_base",
+    "rfp_improving_slope",
+    "rfp_not_improving_base",
+    "rfp_not_improving_slope",
+    "razor_base",
+    "razor_per_depth",
+    "futility_improving_base",
+    "futility_improving_slope",
+    "futility_not_improving_base",
+    "futility_not_improving_slope",
+    "cap_futility_improving_base",
+    "cap_futility_improving_slope",
+    "cap_futility_not_improving_base",
+    "cap_futility_not_improving_slope",
+    "delta_margin",
+    "qs_lmp_limit",
+    "tt_extended_cutoff_margin",
+    "history_prune_mult",
+    "nmp_min_depth",
+    "nmp_eval_margin",
+    "nmp_static_eval_base_margin",
+    "nmp_static_eval_depth_margin",
+    "nmp_base_reduction",
+    "nmp_depth_reduction_scale",
+    "nmp_eval_reduction_scale",
+    "nmp_max_eval_reduction",
+    "probcut_beta_margin",
+    "asp_init_delta",
+    "asp_widening_factor",
+    "min_asp_depth",
+    "do_deeper_margin_base",
+    "do_deeper_margin_depth",
+    "do_shallower_margin",
+];
+
+/// Overrides applied on top of the defaults, set over UCI before the first
+/// search. A `OnceLock` cannot be changed after it is read, so these are held
+/// separately and folded in when the parameters are first needed.
+pub static PARAM_OVERRIDES: std::sync::Mutex<Vec<(usize, i32)>> = std::sync::Mutex::new(Vec::new());
+
+/// Set one parameter by name. Returns false if the name is unknown, so the
+/// caller can say so rather than silently ignoring a typo -- the failure mode
+/// that makes a sweep look like "no effect".
+pub fn set_param(name: &str, value: i32) -> bool {
+    match PARAM_NAMES.iter().position(|&n| n == name) {
+        Some(i) => {
+            PARAM_OVERRIDES.lock().unwrap().push((i, value));
+            true
+        }
+        None => false,
+    }
+}
+
 static SEARCH_PARAMS: OnceLock<SearchParams> = OnceLock::new();
 pub fn search_params() -> &'static SearchParams {
     SEARCH_PARAMS.get_or_init(|| {
+        let overrides = PARAM_OVERRIDES.lock().unwrap().clone();
+        if !overrides.is_empty() {
+            let mut v = SearchParams::default().to_vec();
+            for (i, val) in &overrides {
+                if *i < v.len() {
+                    v[*i] = *val;
+                }
+            }
+            eprintln!("setoption: {} parametro(s) de busca alterado(s)", overrides.len());
+            return SearchParams::from_vec(&v);
+        }
         if let Ok(path) = std::env::var("KESTREL_SEARCH_PARAMS") {
             if let Ok(text) = std::fs::read_to_string(&path) {
                 let parsed: Vec<i32> = text.trim().split(',').filter_map(|s| s.parse().ok()).collect();
@@ -2724,9 +2806,19 @@ impl<'a> Searcher<'a> {
                     } else {
                         format!("cp {}", score)
                     };
-                    println!(
+                    // Write, do not `println!`. A search thread that prints
+                    // to a closed stdout panics, and the panic does not stay
+                    // local: the scoped join propagates it and takes the whole
+                    // engine with it. That is exactly what happens when the
+                    // controlling process goes away mid-search -- a GUI
+                    // closing, a test harness moving on -- and an engine
+                    // should end quietly there, not crash.
+                    use std::io::Write as _;
+                    let _ = writeln!(
+                        std::io::stdout(),
                         "info depth {} multipv 1 score {} nodes {} nps {} time {} pv {}",
                         depth, score_str, self.nodes, nps, ms, pv_str.join(" ")
+                    
                     );
                     use std::io::Write;
                     let _ = std::io::stdout().flush();
