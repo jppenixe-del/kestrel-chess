@@ -10,6 +10,7 @@ mod movegen;
 mod moves;
 mod perft;
 mod search;
+mod syzygy;
 mod tt;
 mod types;
 mod uci;

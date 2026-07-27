@@ -187,6 +187,71 @@ const EG_KING: [i32; 64] = [
 const MG_VALUE: [i32; 6] = [125, 340, 355, 520, 990, 0];
 const EG_VALUE: [i32; 6] = [140, 300, 350, 570, 990, 0];
 
+/// Material values, overridable at runtime so they can be swept without a
+/// rebuild.
+///
+/// These are the only evaluation numbers on the same footing as the search
+/// margins, and they turned out to be the ones most worth questioning: in the
+/// endgame our pieces are worth about three quarters of what they should be
+/// relative to a pawn -- a rook prices at 3.8 pawns instead of 5 -- which is
+/// the difference between finding the trade that wins an endgame and shuffling
+/// in a position that is already won. Two real games against a 2367 bot showed
+/// the same signature both times: middlegame accuracy at or above the
+/// opponent, endgame accuracy below it.
+///
+/// Atomics rather than a OnceLock, and that is not a style choice. `warmup()`
+/// evaluates a real position to pay the first-call cost off the clock, which
+/// would seal a OnceLock before any `setoption` arrived -- the engine would
+/// accept the option, report nothing wrong, and evaluate with the old number.
+/// That exact failure cost a whole parameter sweep earlier today. A relaxed
+/// atomic load costs the same as a plain load here and cannot be sealed.
+static MG_ATOMIC: [std::sync::atomic::AtomicI32; 6] = [
+    std::sync::atomic::AtomicI32::new(125),
+    std::sync::atomic::AtomicI32::new(340),
+    std::sync::atomic::AtomicI32::new(355),
+    std::sync::atomic::AtomicI32::new(520),
+    std::sync::atomic::AtomicI32::new(990),
+    std::sync::atomic::AtomicI32::new(0),
+];
+static EG_ATOMIC: [std::sync::atomic::AtomicI32; 6] = [
+    std::sync::atomic::AtomicI32::new(140),
+    std::sync::atomic::AtomicI32::new(300),
+    std::sync::atomic::AtomicI32::new(350),
+    std::sync::atomic::AtomicI32::new(570),
+    std::sync::atomic::AtomicI32::new(990),
+    std::sync::atomic::AtomicI32::new(0),
+];
+
+#[inline]
+fn mg_value(i: usize) -> i32 {
+    MG_ATOMIC[i].load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[inline]
+fn eg_value(i: usize) -> i32 {
+    EG_ATOMIC[i].load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Set one material value by name, e.g. `eg_rook`. Returns false for an
+/// unknown name so a typo is reported rather than silently ignored.
+pub fn set_material(name: &str, value: i32) -> bool {
+    const PIECES: [&str; 5] = ["pawn", "knight", "bishop", "rook", "queen"];
+    let (phase, piece) = match name.split_once('_') {
+        Some(x) => x,
+        None => return false,
+    };
+    let idx = match PIECES.iter().position(|&p| p == piece) {
+        Some(i) => i,
+        None => return false,
+    };
+    match phase {
+        "mg" => MG_ATOMIC[idx].store(value, std::sync::atomic::Ordering::Relaxed),
+        "eg" => EG_ATOMIC[idx].store(value, std::sync::atomic::Ordering::Relaxed),
+        _ => return false,
+    }
+    true
+}
+
 /// Incremento de fase por peca -- 4 cavalos+4 bispos+4 torres+2 damas =
 /// 4*1+4*1+4*2+2*4 = 24 = fase maxima (abertura). Fase 0 = so' reis e
 /// peoes (final puro). Peao nao conta (fase so' mede pecas maiores).
@@ -236,8 +301,8 @@ fn pst_eg(kind: PieceType, color: Color, s: Square) -> i32 {
 /// tornar incremental).
 pub fn piece_contribution(kind: PieceType, color: Color, s: Square) -> (i32, i32, i32) {
     let sign = if color == Color::White { 1 } else { -1 };
-    let mg = sign * (MG_VALUE[kind.idx()] + pst_mg(kind, color, s));
-    let eg = sign * (EG_VALUE[kind.idx()] + pst_eg(kind, color, s));
+    let mg = sign * (mg_value(kind.idx()) + pst_mg(kind, color, s));
+    let eg = sign * (eg_value(kind.idx()) + pst_eg(kind, color, s));
     (mg, eg, PHASE_INC[kind.idx()])
 }
 
