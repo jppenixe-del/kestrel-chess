@@ -239,6 +239,14 @@ fn main() {
         tune_stream(&args[2], &args[3], epochs, lr, chunk, threads);
         return;
     }
+    if args.len() >= 4 && args[1] == "tuneking" {
+        // tuneking <dataset.epd> <out.txt> [max_positions] [threads]
+        let maxpos: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(300_000);
+        let threads: usize = args.get(5).and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4));
+        tune_king(&args[2], &args[3], maxpos, threads);
+        return;
+    }
     if args.len() >= 4 && args[1] == "tunefull" {
         // streaming logistic tuner over the FULL eval (material+PST AND
         // positional together), same streaming/sparse mechanics as
@@ -2487,4 +2495,163 @@ fn build_book(games_path: &str, out_path: &str) {
         "livro construido: {} jogos, {} lances processados, {} posicoes unicas, {} registos -> {}",
         n_games, n_moves, keys.len(), n_records, out_path
     );
+}
+
+/// Calibrate the king-safety weights, the one block the regression tuner
+/// cannot reach.
+///
+/// Every king-safety field feeds a single danger curve, so a one-unit probe
+/// of any of them measures a slope on that curve rather than the field's own
+/// contribution -- which is why `tune_fast` holds them all fixed and why they
+/// have only ever been set by hand. This optimiser does not linearise
+/// anything: it calls the real evaluation with candidate weights and keeps
+/// whatever lowers the error. Slower per step, and indifferent to the shape
+/// of the function underneath.
+///
+/// Coordinate descent with a shrinking step. With ~46 parameters that is a
+/// few thousand full passes over the sample, which is minutes rather than
+/// hours at this size, and it cannot diverge the way a gradient step through
+/// a curve of unknown slope can.
+///
+/// K is measured for THIS pair of data and model and then held. Fitting K
+/// alongside the weights lets the optimiser lower the error by flattening the
+/// sigmoid instead of improving the evaluation -- an error already made twice
+/// on this project, once by fitting it during training and once by reusing a
+/// K measured against different targets.
+fn tune_king(dataset_path: &str, out_path: &str, max_positions: usize, threads: usize) {
+    use std::sync::Arc;
+
+    let text = std::fs::read_to_string(dataset_path).expect("nao consegui ler o dataset");
+    let mut boards: Vec<Board> = Vec::new();
+    let mut results: Vec<f64> = Vec::new();
+    for line in text.lines() {
+        if boards.len() >= max_positions {
+            break;
+        }
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.split('\t');
+        let fen = match parts.next() { Some(f) => f, None => continue };
+        let res: f64 = match parts.next().and_then(|s| s.parse().ok()) { Some(r) => r, None => continue };
+        boards.push(Board::from_fen(fen));
+        results.push(res);
+    }
+    drop(text);
+    let n = boards.len();
+    println!("dataset: {} posicoes, {} threads", n, threads);
+
+    let boards = Arc::new(boards);
+    let results = Arc::new(results);
+
+    // Mean squared error of sigmoid(eval/K) against the game result, split
+    // across threads by contiguous slice.
+    let mse = |w: &eval::Weights, k: f64| -> f64 {
+        let chunk = (n + threads - 1) / threads.max(1);
+        std::thread::scope(|s| {
+            let handles: Vec<_> = (0..threads)
+                .map(|t| {
+                    let boards = Arc::clone(&boards);
+                    let results = Arc::clone(&results);
+                    let w = w.clone();
+                    s.spawn(move || {
+                        let lo = t * chunk;
+                        let hi = ((t + 1) * chunk).min(n);
+                        let mut acc = 0.0;
+                        for i in lo..hi {
+                            // White's point of view. `evaluate_with` returns
+                            // the score for the side to move, and the labels
+                            // are game results for White -- comparing them
+                            // directly disagrees on sign for every position
+                            // where Black is to move, which is half of them.
+                            // Symptom, before this was fixed: the measured K
+                            // ran off to the top of whatever range it was
+                            // given, because a flat sigmoid genuinely does fit
+                            // a signal that has been randomised.
+                            let raw = eval::evaluate_with(&boards[i], &w);
+                            let e = if boards[i].side == types::Color::White { raw } else { -raw } as f64;
+                            let p = 1.0 / (1.0 + (-e / k).exp());
+                            let d = p - results[i];
+                            acc += d * d;
+                        }
+                        acc
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).sum::<f64>() / n as f64
+        })
+    };
+
+    let base = eval::default_weights().clone();
+
+    // Which flat indices are king-safety fields: mark them and read the
+    // vector back, so this never goes stale against the struct's field order.
+    let dim = base.to_vec().len();
+    let mut sentinel = base.from_vec(&vec![0i32; dim]);
+    sentinel.king_attacker_weight = [(1, 1); 4];
+    sentinel.king_attacks = (1, 1);
+    sentinel.safe_knight_check = (1, 1);
+    sentinel.safe_bishop_check = (1, 1);
+    sentinel.safe_rook_check = (1, 1);
+    sentinel.safe_queen_check = (1, 1);
+    sentinel.pawn_shelter = [(1, 1); 4];
+    sentinel.shelter_open = (1, 1);
+    sentinel.pawn_storm = [(1, 1); 4];
+    sentinel.weak_king_ring = (1, 1);
+    sentinel.king_flank_attacks = [(1, 1); 2];
+    sentinel.king_flank_defenses = [(1, 1); 2];
+    let sv = sentinel.to_vec();
+    let idx: Vec<usize> = (0..dim).filter(|&i| sv[i] == 1).collect();
+    println!("campos de king safety a calibrar: {}", idx.len());
+
+    // K first, and then never again.
+    // Wide enough that the optimum cannot sit on the boundary. A first
+    // version scanned 120..580 and returned exactly 580 -- the top of its own
+    // range, which is not a measurement, it is a clipped one.
+    let mut best_k = 200.0;
+    let mut best_e = f64::INFINITY;
+    for step in 0..60 {
+        let k = 100.0 + step as f64 * 40.0;
+        let e = mse(&base, k);
+        if e < best_e {
+            best_e = e;
+            best_k = k;
+        }
+    }
+    println!("K medido para este par (dados, modelo): {:.0}  erro base {:.6}", best_k, best_e);
+
+    let mut cur = base.to_vec();
+    let mut cur_err = best_e;
+    let mut step = 16i32;
+    while step >= 1 {
+        let mut improved_any = false;
+        loop {
+            let mut improved_this_pass = false;
+            for &i in &idx {
+                for dir in [step, -step] {
+                    let mut trial = cur.clone();
+                    trial[i] += dir;
+                    let e = mse(&base.from_vec(&trial), best_k);
+                    if e < cur_err - 1e-9 {
+                        cur = trial;
+                        cur_err = e;
+                        improved_this_pass = true;
+                        improved_any = true;
+                        break;
+                    }
+                }
+            }
+            if !improved_this_pass {
+                break;
+            }
+        }
+        println!("passo {:>3}: erro {:.6}{}", step, cur_err, if improved_any { "" } else { "  (sem melhoria)" });
+        step /= 2;
+    }
+    let gain = (best_e - cur_err) / best_e * 100.0;
+    println!("erro {:.6} -> {:.6}  ({:.2}% melhor)", best_e, cur_err, gain);
+    let out: Vec<String> = cur.iter().map(|v| v.to_string()).collect();
+    std::fs::write(out_path, out.join(",")).expect("nao consegui escrever");
+    println!("pesos escritos em {}", out_path);
 }

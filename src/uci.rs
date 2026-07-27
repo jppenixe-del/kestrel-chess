@@ -53,6 +53,13 @@ const HARD_CAP_PERCENT: i64 = 45;
 /// above the largest scaling the search can award itself, so a move that has
 /// earned every extension still gets cut before it can overshoot.
 const HARD_CAP_BUDGET_MULT: i64 = 25;
+/// How much of the game counts as the opening for the time cap below. Sixteen
+/// plies is where the book's own preparation runs out.
+const OPENING_PLIES: i64 = 16;
+/// Ceiling on a single opening move once the book has no answer. Small on
+/// purpose: the phase is theory, and the clock it saves is spent where the
+/// position is actually unique.
+const OPENING_MAX_MS: i64 = 70;
 
 /// Gestao de tempo em 4 niveis -- a mesma arquitetura em camadas que
 /// validamos esta sessao no Pond (jogos reais, derrotas por bandeira
@@ -174,14 +181,14 @@ fn default_style_book_path() -> String {
     // requirement -- explicitly set aside once real games against
     // strong opponents showed a pattern of speculative sacrifices
     // without enough calculated backing (see NOTAS_PROXIMA_SESSAO.md,
-    // "não é compatível com o jogo entre motores"). Default book is now
-    // one built from strong external engine analysis at depth>=16
-    // (199 lines/~3.5k positions) instead of human-game frequency.
-    // `KESTREL_BOOK_FILE` overrides the filename (same
-    // reversible env-var pattern as every other opt-in hook in this
-    // codebase) -- set it to `polgar_book.bin` to go back to the
-    // original book, which is kept on disk, not deleted.
-    let filename = std::env::var("KESTREL_BOOK_FILE").unwrap_or_else(|_| "sf17_book.bin".to_string());
+    // "não é compatível com o jogo entre motores"). The book it replaced
+    // held 3.6k positions and answered 16% of opening moves in play; the
+    // current one holds 26k reaching ply 16 and answers 57%.
+    // `KESTREL_BOOK_FILE` overrides the filename (same reversible
+    // env-var pattern as every other opt-in hook in this codebase) --
+    // set it to `polgar_book.bin` to go back to the original book,
+    // which is kept on disk, not deleted.
+    let filename = std::env::var("KESTREL_BOOK_FILE").unwrap_or_else(|_| "kestrel_book.bin".to_string());
     std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join(&filename)))
@@ -285,6 +292,36 @@ impl Engine {
         legal.into_iter().find(|m| m.to_uci() == uci)
     }
 
+    /// The book's answer for the position on the board, if it has one and it
+    /// is legal. Highest recorded count wins; ties keep the first, so the
+    /// choice is deterministic and a game can be reproduced from its moves.
+    ///
+    /// Legality is re-checked rather than trusted. A 64-bit position key can
+    /// collide, and a book built by another tool can disagree about castling
+    /// or en-passant rights in ways the key does not capture. Playing an
+    /// illegal move loses the game outright, which is far worse than the cost
+    /// of generating the move list once.
+    fn book_move(&self) -> Option<crate::moves::Move> {
+        let book = self.style_book.as_ref()?;
+        let entries = book.lookup(self.zob.hash(&self.board));
+        if entries.is_empty() {
+            return None;
+        }
+        let mut b = self.board.clone();
+        let legal = crate::movegen::generate_legal(&mut b, &self.atk);
+        entries
+            .iter()
+            .filter_map(|(m16, count)| {
+                let (from, to, promo) = crate::book::decode_move16(*m16);
+                legal
+                    .iter()
+                    .find(|l| l.from == from && l.to == to && l.promotion == promo)
+                    .map(|l| (*count, *l))
+            })
+            .max_by_key(|(count, _)| *count)
+            .map(|(_, mv)| mv)
+    }
+
     fn cmd_go(&mut self, tokens: &[&str], out: &mut impl Write) {
         let mut wtime = 0i64;
         let mut btime = 0i64;
@@ -332,6 +369,38 @@ impl Engine {
         let (my_time, my_inc) = if side_white { (wtime, winc) } else { (btime, binc) };
         let opp_time = if side_white { btime } else { wtime };
 
+        // Book moves are played, not researched.
+        //
+        // The book was only ever consulted for move ORDERING, so a position
+        // it had a prepared answer for still cost a full slice of clock to
+        // rederive: measured, 24-30% of a 60+0 clock spent on the first ten
+        // moves. The opening is the one phase where the answer is already
+        // known, and the book carries analysis far deeper than the few
+        // seconds a live clock could ever buy here.
+        //
+        // Deliberately a whole-position lookup, not a line replay: it is
+        // keyed by hash, so a game that leaves the book and transposes back
+        // into it is answered again. Out of book, the search runs normally --
+        // the book never has to cover everything, only what it covers.
+        //
+        // The condition to be careful about is a book too shallow or too
+        // narrow for the position it is answering, which is a property of the
+        // book file rather than of this code. `KESTREL_NO_BOOK_INSTANT=1`
+        // turns it off without a rebuild.
+        let instant_book_ok = restrict_root.is_empty()
+            && !infinite
+            && depth.is_none()
+            && nodes.is_none()
+            && std::env::var_os("KESTREL_NO_BOOK_INSTANT").is_none();
+        if instant_book_ok {
+            if let Some(mv) = self.book_move() {
+                let _ = writeln!(out, "info depth 0 multipv 1 score cp 0 nodes 0 nps 0 time 0 pv {}", mv.to_uci());
+                let _ = writeln!(out, "bestmove {}", mv.to_uci());
+                let _ = out.flush();
+                return;
+            }
+        }
+
         // `soft_budget_ms` tracks the real per-move time budget derived
         // from wtime/btime specifically (None for movetime/infinite/depth
         // requests, which aren't live-clock scenarios) -- used below as a
@@ -374,7 +443,33 @@ impl Engine {
             // time cutoff for that case.
             None
         } else {
-            let (soft, hard_cap) = compute_time_budget(my_time, my_inc, opp_time, movestogo, self.last_score);
+            let (mut soft, mut hard_cap) = compute_time_budget(my_time, my_inc, opp_time, movestogo, self.last_score);
+            // The opening is played, not calculated -- including the parts of
+            // it the book does not reach.
+            //
+            // Book positions already answer instantly. The moves in between
+            // did not: leaving book at ply 2 and searching it normally cost
+            // 1594ms, and out-of-book opening moves at 1.5s each are how a
+            // quarter of the clock disappears before the game starts. What
+            // makes that affordable in the middlegame -- the position is
+            // unique and the clock is there to be spent on it -- is exactly
+            // what is not true here.
+            //
+            // So the whole opening is capped, book or not. The engine still
+            // searches, and at this speed still reaches a sensible depth; it
+            // simply cannot spend middlegame money on a phase where the answer
+            // is either already known or is one of several equally playable
+            // moves. Tunable without a rebuild, because the right number
+            // depends on the book underneath it.
+            let game_ply = (self.board.fullmove as i64 - 1) * 2 + if side_white { 0 } else { 1 };
+            if game_ply < OPENING_PLIES {
+                let cap = std::env::var("KESTREL_OPENING_MS")
+                    .ok()
+                    .and_then(|v| v.parse::<i64>().ok())
+                    .unwrap_or(OPENING_MAX_MS);
+                soft = soft.min(cap);
+                hard_cap = hard_cap.min(cap);
+            }
             soft_budget_ms = Some(soft);
             // `hard_cap` is live again, and this time it is a ceiling rather
             // than a target. It was tried as the deadline once (2026-07-21)
