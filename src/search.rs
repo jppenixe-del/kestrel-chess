@@ -9,7 +9,8 @@ use crate::tt::{Bound, TranspositionTable};
 use crate::types::{file_of, rank_of, sq, Color, PieceType};
 use crate::zobrist::Zobrist;
 use std::sync::OnceLock;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 /// LMR reduction table indexed by [depth][move_index], both clamped to
 /// 63. Logarithmic formula (standard shape used by essentially every
@@ -324,17 +325,72 @@ pub struct SearchLimits {
     pub deadline: Option<Instant>,
     pub max_depth: i32,
     pub max_nodes: Option<u64>,
-    /// Optional earlier checkpoint than `deadline` -- purely advisory,
-    /// never used inside a single search (time_up() only ever checks
-    /// `deadline`, keeping the well-tested hard-stop logic untouched).
-    /// iterative_deepening() uses it BETWEEN completed iterations: if
-    /// we're past this point AND the root move has been stable for a
-    /// few iterations in a row, stop early and give the clock back --
-    /// no point spending the full soft budget re-confirming an obvious
-    /// move. If the move keeps changing, we ignore this and keep going
-    /// up to the real (hard) deadline as before.
-    pub soft_deadline: Option<Instant>,
+    /// The normal per-move allowance, as a duration from the start of the
+    /// search. `deadline` above is the hard ceiling and exists to stop a
+    /// disaster; THIS is the number the engine actually aims at, and
+    /// iterative_deepening() scales it up or down between iterations
+    /// according to how the search is going (see `time_scale`). A hard move
+    /// can be given several times this; an obvious one gives most of it back.
+    pub soft_budget: Option<Duration>,
 }
+
+/// How much of the soft budget this search has earned, judged between
+/// iterations. Two independent readings of "does this position still need
+/// thinking", multiplied together.
+///
+/// `effort` is the share of nodes that went into the move we intend to play.
+/// A search that has poured almost everything into one move has found its
+/// answer and is re-confirming it; one still splitting nodes across rivals
+/// has not decided yet. This is the sturdier of the two signals, because it
+/// is a ratio over millions of nodes rather than a verdict that can flip on
+/// one.
+///
+/// `settle` counts consecutive iterations that kept the same root move, and
+/// decays fast: a move that just changed is worth far more time than one
+/// that has held for five iterations. It is deliberately the weaker term
+/// here. Lazy SMP makes root-move stability partly a matter of which thread
+/// got where first -- an earlier attempt at elastic time management keyed on
+/// stability ALONE and had to be reverted the same day, because it read
+/// thread timing as position difficulty and burned 10-16s on ordinary moves.
+/// The lesson kept: stability may lengthen a search, never on its own, and
+/// never without the hard ceiling standing behind it.
+fn time_scale(effort_frac: f64, settle: u32) -> f64 {
+    let effort = (TM_EFFORT_BASE - effort_frac) * TM_EFFORT_SCALE;
+    let settle = (TM_SETTLE_BASE + TM_SETTLE_SCALE * (settle as f64 + TM_SETTLE_OFFSET).powf(TM_SETTLE_POWER))
+        .max(TM_SETTLE_MIN);
+    (effort * settle).clamp(TM_SCALE_MIN, TM_SCALE_MAX)
+}
+
+// Effort carries most of the decision. Measured across easy and hard
+// positions the fraction runs from about 0.13 (nothing decided yet) to about
+// 0.80 (everything behind one move): 0.80 -> 0.93x, 0.50 -> 1.40x,
+// 0.30 -> 1.71x. A steeper version that cut to 0.77x at the easy end was
+// tried and pulled back -- it halved the median move time, and cutting that
+// hard is only worth doing on a signal that deserves the confidence.
+const TM_EFFORT_BASE: f64 = 1.40;
+const TM_EFFORT_SCALE: f64 = 1.55;
+// Settle is deliberately the gentler term -- 1.48x when the move has just
+// changed, decaying to 1.0x, never below. A much steeper curve was tried
+// first, and tracing showed why it cannot be trusted here: on a FORCED
+// RECAPTURE, where there is nothing to decide, the root move still changed
+// at three separate depths and each change threw the multiplier back to its
+// maximum. That is Lazy SMP thread timing, not the position being hard, and
+// it is the same signal that made the 2026-07-21 attempt burn 10-16s on
+// ordinary moves. It stays in because a genuinely changing move IS worth
+// more time; it stays small because here it lies often.
+const TM_SETTLE_BASE: f64 = 0.95;
+const TM_SETTLE_SCALE: f64 = 2.2;
+const TM_SETTLE_OFFSET: f64 = 2.6;
+const TM_SETTLE_POWER: f64 = -1.5;
+const TM_SETTLE_MIN: f64 = 1.0;
+// The envelope, on top of which the hard deadline is a second and
+// independent bound.
+const TM_SCALE_MIN: f64 = 0.65;
+const TM_SCALE_MAX: f64 = 2.2;
+
+/// For single-threaded callers that have no search to coordinate with -- the
+/// command-line tools, which stop on node counts and nothing else. Never set.
+pub static NO_STOP: AtomicBool = AtomicBool::new(false);
 
 pub struct Searcher<'a> {
     pub atk: &'a Attacks,
@@ -343,6 +399,14 @@ pub struct Searcher<'a> {
     pub nodes: u64,
     pub limits: SearchLimits,
     pub stop: bool,
+    /// Shared across every thread of one search, so that whoever decides the
+    /// move is settled ends the search rather than only its own thread.
+    /// Without it the per-thread stop was near useless: the move takes as
+    /// long as the SLOWEST thread, so one thread giving the clock back saved
+    /// nothing while the others kept going. Set by the reporting thread when
+    /// the soft budget is spent, and by any thread that hits the hard
+    /// deadline (there is no reason for the rest to carry on past that).
+    pub stop_flag: &'a AtomicBool,
     pub history: Vec<u64>, // hashes da partida real ate' agora (para repeticao)
     pub killers: [[Option<Move>; 2]; MAX_PLY],
     /// History heuristic ("butterfly boards" classicos): [cor][from][to],
@@ -817,14 +881,20 @@ impl<'a> Searcher<'a> {
             return true;
         }
         if self.nodes % 2048 == 0 {
+            if self.stop_flag.load(Ordering::Relaxed) {
+                self.stop = true;
+                return true;
+            }
             if let Some(d) = self.limits.deadline {
                 if Instant::now() >= d {
                     self.stop = true;
+                    self.stop_flag.store(true, Ordering::Relaxed);
                 }
             }
             if let Some(mx) = self.limits.max_nodes {
                 if self.nodes >= mx {
                     self.stop = true;
+                    self.stop_flag.store(true, Ordering::Relaxed);
                 }
             }
         }
@@ -2466,7 +2536,7 @@ impl<'a> Searcher<'a> {
         let mut best_score = 0;
         let mut last_depth = 0;
         let mut prev_score = 0;
-        let mut stable_count = 0;
+        let mut stable_count: u32 = 0;
         self.killers = [[None; 2]; MAX_PLY];
         self.root_move_nodes.clear();
         self.root_scores.clear();
@@ -2556,40 +2626,54 @@ impl<'a> Searcher<'a> {
             if self.stop {
                 break;
             }
-            // Best-move-stability early stop: past the soft checkpoint
-            // AND the root move hasn't changed in the last 3 completed
-            // iterations -- confident enough to hand the clock back
-            // instead of spending the full allotted time re-confirming
-            // an obvious move. Never overrides the hard deadline (that
-            // stop is still enforced inside time_up() as always); this
-            // only ever stops EARLIER than the hard limit, and only
-            // between fully-completed iterations, never mid-search.
-            // Node-count time management: only trust the
-            // stability-based early stop once the search has actually
-            // CONCENTRATED its effort on the current best move, not
-            // just kept repeating the same choice while still spending
-            // comparable nodes on alternatives (root move counts can
-            // stay "stable" while the search is still genuinely
-            // uncertain -- e.g. it keeps re-confirming move A each
-            // iteration but is spending nearly as much time weighing
-            // move B every time too). Requires >=70% of this go's total
-            // nodes on the best move before an early stop is trusted;
-            // below that, keep going even if the move hasn't changed in
-            // 3 iterations. Complements best-move-stability, doesn't
-            // replace it -- both gates must pass.
-            if depth >= 6 && stable_count >= 3 {
-                let concentrated = if let Some(bm) = best_move {
-                    let total = self.nodes.max(1);
-                    let on_best = self.root_move_nodes.iter().find(|(m, _)| *m == bm).map(|(_, n)| *n).unwrap_or(0);
-                    (on_best as f64 / total as f64) >= 0.70
-                } else {
-                    false
-                };
-                if concentrated {
-                    if let Some(soft) = self.limits.soft_deadline {
-                        if Instant::now() >= soft {
-                            break;
-                        }
+            // Spend the clock where the position asks for it.
+            //
+            // What stood here judged the two signals below as a pair of
+            // yes/no gates that could only ever END the search early: stable
+            // for 3 iterations AND 70% of nodes on the best move AND past the
+            // checkpoint -> stop, otherwise run out the full budget. Every
+            // move therefore cost the same, whether it was a forced recapture
+            // or the one move the game turned on. Measured over 25 real games
+            // at 180+0: median 3.0s a move, mean 2.84s, with a budget of
+            // ~3.5s -- an almost flat line where there should be a range.
+            //
+            // The same two signals, read as continuous quantities instead of
+            // gates, give a multiplier that moves in BOTH directions. A move
+            // that just changed with its effort still spread across rivals
+            // earns several times the budget; one that has held for
+            // iterations with nearly every node behind it gives most of it
+            // back. Only the reporting thread decides -- the others would
+            // each reach their own verdict from their own noisy statistics,
+            // and the move costs as long as the slowest of them.
+            if self.report && depth >= 5 {
+                if let Some(budget) = self.limits.soft_budget {
+                    let effort_frac = best_move
+                        .map(|bm| {
+                            let on_best = self
+                                .root_move_nodes
+                                .iter()
+                                .find(|(m, _)| *m == bm)
+                                .map(|(_, n)| *n)
+                                .unwrap_or(0);
+                            on_best as f64 / self.nodes.max(1) as f64
+                        })
+                        .unwrap_or(0.0);
+                    let scale = time_scale(effort_frac, stable_count);
+                    let allowed = budget.mul_f64(scale);
+                    if std::env::var_os("KESTREL_TM_TRACE").is_some() {
+                        eprintln!(
+                            "tm d={:<3} elapsed={:>6}ms effort={:.2} settle={} scale={:.2} allowed={:>6}ms",
+                            depth,
+                            search_start.elapsed().as_millis(),
+                            effort_frac,
+                            stable_count,
+                            scale,
+                            allowed.as_millis()
+                        );
+                    }
+                    if search_start.elapsed() >= allowed {
+                        self.stop_flag.store(true, Ordering::Relaxed);
+                        break;
                     }
                 }
             }
