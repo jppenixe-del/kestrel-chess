@@ -473,11 +473,12 @@ fn play_one_selfplay_game(
         }
 
         let mut searcher = Searcher {
+            stop_flag: &crate::search::NO_STOP,
             atk,
             zob,
             tt: &tt,
             nodes: 0,
-            limits: SearchLimits { deadline: None, max_depth: 64, max_nodes: Some(node_limit), soft_deadline: None },
+            limits: SearchLimits { deadline: None, max_depth: 64, max_nodes: Some(node_limit), soft_budget: None },
             stop: false,
             history: hash_history.clone(),
             killers: [[None; 2]; MAX_PLY],
@@ -708,6 +709,7 @@ fn play_one_selfplay_game_tc(
         let move_t0 = Instant::now();
 
         let mut searcher = Searcher {
+            stop_flag: &crate::search::NO_STOP,
             atk,
             zob,
             tt: &tt,
@@ -716,7 +718,7 @@ fn play_one_selfplay_game_tc(
                 deadline: Some(move_t0 + Duration::from_millis(budget_ms)),
                 max_depth: 64,
                 max_nodes: None,
-                soft_deadline: None,
+                soft_budget: None,
             },
             stop: false,
             history: hash_history.clone(),
@@ -2342,11 +2344,12 @@ fn resolve_quiet_dataset(in_path: &str, out_path: &str) {
         let mut board = Board::from_fen(fen);
 
         let mut searcher = Searcher {
+            stop_flag: &crate::search::NO_STOP,
             atk: &atk,
             zob: &zob,
             tt: &tt,
             nodes: 0,
-            limits: SearchLimits { deadline: None, max_depth: 64, max_nodes: None, soft_deadline: None },
+            limits: SearchLimits { deadline: None, max_depth: 64, max_nodes: None, soft_budget: None },
             stop: false,
             history: Vec::new(),
             killers: [[None; 2]; MAX_PLY],

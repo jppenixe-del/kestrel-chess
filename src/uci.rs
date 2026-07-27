@@ -24,6 +24,35 @@ use std::time::{Duration, Instant};
 // strength cost of an over-large reserve (250 measurably lost pure,
 // non-flag games in self-play by thinking too little per move).
 const MOVE_OVERHEAD_MS: i64 = 150;
+/// Sudden-death base slice: this many moves' worth of the remaining clock.
+/// The search scales that allowance by how hard the position is turning out
+/// to be (see `time_scale` in search.rs), so this is a pivot, not the amount
+/// spent -- and the scaling does NOT average out to one. Measured over 29
+/// positions from a real game, the multiplier averaged 1.32 and the time
+/// actually spent averaged 1.66x this slice once the last iteration's
+/// overshoot is counted. A divisor picked as if the scaling were neutral had
+/// the engine spending 6.4% of its remaining clock per move against a healthy
+/// 4-5%, which drained the clock and produced a loss on time in self-play.
+/// This number is therefore the pivot DIVIDED by the measured multiplier, and
+/// it has to be re-measured whenever those curves change.
+///
+/// Its VALUE is set by matching what the previous, flat scheme actually spent
+/// -- 1665ms a move on a fixed set of 14 real positions at a 60s clock, or
+/// 2.8% of the clock. An earlier attempt aimed instead at a figure derived
+/// from how another engine divides its clock (~4.5%), which made this engine
+/// spend 56% more time per move than the version it was being compared
+/// against, and it lost 2-7. That comparison could not have answered
+/// anything: it varied the SHAPE of the allocation and the TOTAL at once.
+/// Matched on the total, the only remaining difference is the shape, which is
+/// the whole point of the change.
+const TIME_SLICE_DIVISOR: i64 = 55;
+/// The hard ceiling, as a percentage of the remaining clock. Guards the game
+/// as a whole; on a healthy clock the ceiling below binds long before it.
+const HARD_CAP_PERCENT: i64 = 45;
+/// The hard ceiling as a multiple of the base slice, in tenths. Sits just
+/// above the largest scaling the search can award itself, so a move that has
+/// earned every extension still gets cut before it can overshoot.
+const HARD_CAP_BUDGET_MULT: i64 = 25;
 
 /// Gestao de tempo em 4 niveis -- a mesma arquitetura em camadas que
 /// validamos esta sessao no Pond (jogos reais, derrotas por bandeira
@@ -38,21 +67,25 @@ fn compute_time_budget(
     my_time: i64,
     my_inc: i64,
     opp_time: i64,
-    fullmove: u32,
     movestogo: Option<i64>,
     last_score: Option<i32>,
 ) -> (i64, i64) {
     let safe_time = (my_time - MOVE_OVERHEAD_MS).max(1);
 
-    // Nivel 1: formula elastica normal. Sem movestogo (sudden death, o
-    // nosso caso habitual): estima quantos lances proprios ainda faltam
-    // a partir do numero do lance atual -- e o incremento conta como
-    // "rendimento" ao longo desses lances, nao so' o relogio em bruto
-    // (licao central desta sessao com o Pond).
-    let moves_left = movestogo.unwrap_or_else(|| {
-        let estimate = 45i64 - (fullmove as i64 - 1);
-        estimate.clamp(12, 45)
-    });
+    // Nivel 1: a base allowance. The increment still counts as income spread
+    // over the moves ahead rather than raw clock, which is why it is added
+    // here rather than to `safe_time`.
+    //
+    // Sudden death: a fixed slice of what is left, not a guess at how many
+    // moves remain. The old estimate (45 - fullmove, floored at 12) had the
+    // budget GROW as a share of the clock the longer a game ran -- from
+    // 1/45th of it at move 1 to a twelfth of it from move 34 on. In a game
+    // that reached move 51 the engine was handing itself 8% of its remaining
+    // clock per move while still needing to reach move 73, which it did not:
+    // it played the last twenty moves at roughly zero. A constant fraction
+    // decays with the clock instead of accelerating against it, and it does
+    // not need to know how long the game will be -- which is not knowable.
+    let moves_left = movestogo.unwrap_or(TIME_SLICE_DIVISOR);
     let base = safe_time / moves_left + my_inc * 3 / 4;
     // 2026-07-20 (BUG REAL/CRASH corrigido -- encontrado ao testar
     // manualmente "go depth N" sem wtime, um pedido perfeitamente valido
@@ -65,7 +98,17 @@ fn compute_time_budget(
     // o limite superior nunca fica abaixo do limite inferior.
     let soft_max = (safe_time / 2).max(10);
     let mut soft = base.clamp(10, soft_max);
-    let mut hard_cap = (safe_time * 3 / 10).max(soft); // nunca mais de ~30% do relogio numa jogada
+    // Two ceilings, whichever binds first. The percentage of the clock guards
+    // against a single move eating the game; the multiple of the allowance
+    // guards against something subtler and, measured, more likely -- the soft
+    // stop can only act BETWEEN iterations, and a tracked search went from
+    // 8.9s to 15.1s inside one iteration, because each iteration can cost as
+    // much as every iteration before it put together. Without a ceiling close
+    // enough to bite mid-search, the allowance is a suggestion the last
+    // iteration is free to overshoot by half.
+    let mut hard_cap = (safe_time * HARD_CAP_PERCENT / 100)
+        .min(soft * HARD_CAP_BUDGET_MULT / 10)
+        .max(soft);
 
     // Nivel 1.5: "olhar para o adversario" antes de decidir quanto gastar
     // -- pedido directo depois de reparar que o motor por vezes joga
@@ -310,13 +353,12 @@ impl Engine {
         const ADVISOR_RESERVE_MS: i64 = 700;
         let advisor_enabled = crate::advisor::Advisor::from_env().is_some();
         let mut soft_budget_ms: Option<i64> = None;
-        // `soft_deadline`: an EARLIER, purely-advisory checkpoint used
-        // only by iterative_deepening()'s best-move-stability early
-        // exit (see search.rs) -- always <= `deadline`, so worst case
-        // (move never stabilizes) search behaves exactly as before,
-        // identical hard cutoff. Only set in the real-clock branch,
-        // half of that branch's own search budget.
-        let mut soft_deadline: Option<Instant> = None;
+        // `soft_budget`: the allowance the search aims at, which it then
+        // scales up or down between iterations (see `time_scale` in
+        // search.rs). Only set on the real-clock branch -- `movetime`,
+        // `infinite` and fixed-depth searches mean exactly what they say and
+        // must not be second-guessed by time management.
+        let mut soft_budget: Option<Duration> = None;
         let deadline: Option<Instant> = if let Some(mt) = movetime {
             Some(Instant::now() + Duration::from_millis(mt.max(1) as u64))
         } else if infinite || my_time == 0 {
@@ -332,23 +374,21 @@ impl Engine {
             // time cutoff for that case.
             None
         } else {
-            let (soft, _hard_cap) = compute_time_budget(my_time, my_inc, opp_time, self.board.fullmove, movestogo, self.last_score);
+            let (soft, hard_cap) = compute_time_budget(my_time, my_inc, opp_time, movestogo, self.last_score);
             soft_budget_ms = Some(soft);
-            // REVERTED (2026-07-21, same day): using `hard_cap` as the
-            // real deadline looked safe in isolated single-threaded
-            // tests, but the live bot runs Threads=4 (see
-            // lichess_bridge.py), and Lazy SMP has genuine run-to-run
-            // variance in when a thread's root move stabilizes. Repro
-            // on the exact position from a real lost game (5 runs, same
-            // FEN, same clock, Threads=4): 1.0s, 6.8s, 2.5s, 1.5s,
-            // 10.6s. That matches a real pattern seen across 3 games in
-            // a 4-game series played right after this shipped: 10-16s
-            // burned on an ordinary move around move 4-8, then panic
-            // mode for the rest of the game. `hard_cap` is thread-count-
-            // sensitive noise, not a genuine difficulty signal -- back
-            // to the flat `soft` baseline until this can be built on a
-            // real complexity signal instead of per-thread stability
-            // timing.
+            // `hard_cap` is live again, and this time it is a ceiling rather
+            // than a target. It was tried as the deadline once (2026-07-21)
+            // and reverted the same day: the search ran to it whenever the
+            // root move had not settled, and under Lazy SMP that is partly
+            // thread timing rather than position difficulty -- 5 runs on one
+            // real position gave 1.0s, 6.8s, 2.5s, 1.5s, 10.6s, and live
+            // games showed 10-16s burned on ordinary moves followed by panic
+            // for the rest of the game. What changed is what ends a normal
+            // search: no longer this number, but the soft budget scaled by a
+            // continuous reading of the position (see `time_scale`), which
+            // shrinks back as soon as the move settles instead of committing
+            // the whole ceiling the moment it does not. The ceiling now only
+            // catches the case where that judgement is badly wrong.
             // Reserve MOVE_OVERHEAD_MS from THIS move's think time (not just
             // once from the whole clock) so search stops early enough for the
             // move to reach Lichess before our clock would expire. But never
@@ -364,12 +404,13 @@ impl Engine {
             } else {
                 (soft - MOVE_OVERHEAD_MS).max(think_floor)
             };
-            soft_deadline = Some(Instant::now() + Duration::from_millis((search_ms / 2).max(1) as u64));
-            Some(Instant::now() + Duration::from_millis(search_ms.max(1) as u64))
+            let hard_ms = (hard_cap - MOVE_OVERHEAD_MS).max(search_ms);
+            soft_budget = Some(Duration::from_millis(search_ms.max(1) as u64));
+            Some(Instant::now() + Duration::from_millis(hard_ms.max(1) as u64))
         };
 
         let max_depth = depth.unwrap_or(64);
-        let limits = SearchLimits { deadline, max_depth, max_nodes: nodes, soft_deadline };
+        let limits = SearchLimits { deadline, max_depth, max_nodes: nodes, soft_budget };
         let board_now = self.board.clone();
         let history_now = self.history.clone();
         let mut excluded_root_moves: Vec<crate::moves::Move> = Vec::new();
@@ -421,22 +462,23 @@ impl Engine {
             // a third of the time each, not one line and two guesses.
             let mut line_limits = limits;
             if effective_multipv > 1 {
+                // Not an equal split. Line 1 is the move that gets played
+                // unless something overrules it, so it keeps half the
+                // budget; the alternatives share the rest, which only has
+                // to be enough for them to be trustworthy, not enough to
+                // match it. An even three-way split cost the played move
+                // two thirds of its thinking to buy depth on lines that
+                // exist only to be compared against it.
+                //
+                // Both bounds are divided, and the soft one is what matters:
+                // `deadline` is now a hard ceiling at a large fraction of the
+                // clock, so slicing that alone would have handed line 1 half
+                // of the emergency limit instead of half of the allowance.
+                let divisor = if pv_index == 1 { 2 } else { 2 * (effective_multipv as u32 - 1) };
+                line_limits.soft_budget = limits.soft_budget.map(|b| b / divisor);
                 if let Some(end) = limits.deadline {
                     let total = end.saturating_duration_since(t0);
-                    // Not an equal split. Line 1 is the move that gets played
-                    // unless something overrules it, so it keeps half the
-                    // budget; the alternatives share the rest, which only has
-                    // to be enough for them to be trustworthy, not enough to
-                    // match it. An even three-way split cost the played move
-                    // two thirds of its thinking to buy depth on lines that
-                    // exist only to be compared against it.
-                    let share = if pv_index == 1 {
-                        total / 2
-                    } else {
-                        total / 2 / (effective_multipv as u32 - 1)
-                    };
-                    line_limits.deadline = Some(Instant::now() + share);
-                    line_limits.soft_deadline = limits.soft_deadline.map(|_| Instant::now() + share / 2);
+                    line_limits.deadline = Some(Instant::now() + total / divisor);
                 }
             }
             let (best, score, depth_reached, nodes_searched, pv_line) =
@@ -562,6 +604,10 @@ impl Engine {
         }
         pool.truncate(n);
         let mut pool_iter = pool.into_iter();
+        // One flag for the whole search: when the thread that reports decides
+        // the position is settled, every thread stops, not just that one.
+        let stop_flag = std::sync::atomic::AtomicBool::new(false);
+        let stop_ref = &stop_flag;
         let tt_ref = &self.tt;
         let atk_ref = &self.atk;
         let zob_ref = &self.zob;
@@ -585,6 +631,7 @@ impl Engine {
                         nodes: 0,
                         limits,
                         stop: false,
+                        stop_flag: stop_ref,
                         history: history.to_vec(),
                         // killers stay per-search: they are ply-indexed, and
                         // ply N means a different point once a move is played
