@@ -407,6 +407,30 @@ pub struct Searcher<'a> {
     /// the soft budget is spent, and by any thread that hits the hard
     /// deadline (there is no reason for the rest to carry on past that).
     pub stop_flag: &'a AtomicBool,
+    /// Nodes where a beta cutoff happened, and how many of those took only
+    /// the first move. See the note at the increment.
+    pub cut_nodes: u64,
+    pub cut_first: u64,
+    /// Nodes spent in quiescence. It obeys neither the depth limit nor
+    /// LMR nor LMP, so it is the one part of the tree that can grow without
+    /// showing up in any of the other telemetry.
+    pub qnodes: u64,
+    /// How often each shallow, eval-based pruning actually fires. The tree is
+    /// wide and shallow, which points at whatever decides how many low-depth
+    /// nodes get to exist at all -- and constants that look aggressive on the
+    /// page have already fooled me twice tonight.
+    pub cut_rfp: u64,
+    pub cut_razor: u64,
+    pub cut_futility: u64,
+    pub nodes_shallow: u64,
+    pub lmr_quiet_total: u64,
+    pub lmr_skip_check: u64,
+    pub lmr_skip_depth: u64,
+    pub lmr_skip_extend: u64,
+    pub lmr_skip_early: u64,
+    pub lmr_tried: u64,
+    pub lmr_research: u64,
+    pub lmr_sum: u64,
     pub history: Vec<u64>, // hashes da partida real ate' agora (para repeticao)
     pub killers: [[Option<Move>; 2]; MAX_PLY],
     /// History heuristic ("butterfly boards" classicos): [cor][from][to],
@@ -1284,6 +1308,7 @@ impl<'a> Searcher<'a> {
 
     fn quiescence_leaf_from(&mut self, board: &mut Board, mut alpha: i32, beta: i32, ply: usize, stand_pat: i32) -> (i32, Board) {
         self.nodes += 1;
+        self.qnodes += 1;
         let leaf_here = board.clone();
         if self.time_up() || ply >= MAX_PLY - 1 {
             return (stand_pat, leaf_here);
@@ -1354,6 +1379,7 @@ impl<'a> Searcher<'a> {
     /// ver negamax()).
     fn quiescence_from(&mut self, board: &mut Board, mut alpha: i32, beta: i32, ply: usize, stand_pat: i32) -> i32 {
         self.nodes += 1;
+        self.qnodes += 1;
         if self.time_up() {
             return stand_pat;
         }
@@ -1470,6 +1496,9 @@ impl<'a> Searcher<'a> {
     /// games lost, not a small/noisy signal, a real missing safety net.
     fn negamax(&mut self, board: &mut Board, depth: i32, mut alpha: i32, beta: i32, ply: usize, reached_by_null: bool) -> i32 {
         self.nodes += 1;
+        if depth <= 6 {
+            self.nodes_shallow += 1;
+        }
         if self.time_up() {
             return 0;
         }
@@ -1697,6 +1726,7 @@ impl<'a> Searcher<'a> {
             let sp = search_params();
             let margin = if improving { sp.rfp_improving.at(depth) } else { sp.rfp_not_improving.at(depth) };
             if static_eval - margin >= beta {
+                self.cut_rfp += 1;
                 return static_eval - margin;
             }
         }
@@ -1806,6 +1836,7 @@ impl<'a> Searcher<'a> {
                 let full_stand_pat = raw_static_eval;
                 let q = self.quiescence_from(board, alpha, beta, ply, full_stand_pat);
                 if q <= alpha {
+                    self.cut_razor += 1;
                     return q;
                 }
             }
@@ -2013,6 +2044,7 @@ impl<'a> Searcher<'a> {
                 let fe = *futility_eval.get_or_insert(static_eval);
                 if fe + margin <= alpha {
                     i += 1;
+                    self.cut_futility += 1;
                     continue;
                 }
             }
@@ -2152,6 +2184,24 @@ impl<'a> Searcher<'a> {
                 // (unlike the NMP/corr-hist calibrations above), so
                 // applied directly without the caution those needed.
                 let min_moves = if is_pv { 4 } else { 3 };
+                // Which condition is granting immunity to quiet moves. The
+                // reductions we DO apply almost never need a re-search (1.5%),
+                // which is not a healthy sign -- it says we only reduce what
+                // was obviously bad already. So the question is not how hard
+                // we reduce, it is how much never reaches the reduction at
+                // all, and which test is letting it past.
+                if !mv.is_capture() && mv.promotion.is_none() {
+                    self.lmr_quiet_total += 1;
+                    if gives_check {
+                        self.lmr_skip_check += 1;
+                    } else if depth < 3 {
+                        self.lmr_skip_depth += 1;
+                    } else if extend != 0 {
+                        self.lmr_skip_extend += 1;
+                    } else if i < min_moves {
+                        self.lmr_skip_early += 1;
+                    }
+                }
                 let r = if i >= min_moves
                     && depth >= 3
                     && extend == 0
@@ -2235,7 +2285,17 @@ impl<'a> Searcher<'a> {
                 let new_depth = depth - 1 + extend;
                 let mut research_depth = new_depth;
                 let mut s = -self.negamax(board, new_depth - r, -alpha - 1, -alpha, ply + 1, false);
+                if r > 0 {
+                    self.lmr_tried += 1;
+                    self.lmr_sum += r as u64;
+                }
                 if r > 0 && s > alpha && !self.stop {
+                    // A reduced search that beats alpha has to be redone at
+                    // full depth, so this branch cost MORE than not reducing
+                    // it. The share of reductions that end up here is what
+                    // decides whether LMR is saving nodes or buying them --
+                    // a healthy engine re-searches a small minority.
+                    self.lmr_research += 1;
                     let sp = search_params();
                     let do_deeper = (s > best_score + sp.do_deeper_margin_base + sp.do_deeper_margin_depth * new_depth / 64) as i32;
                     let do_shallower = (s < best_score + sp.do_shallower_margin) as i32;
@@ -2341,6 +2401,16 @@ impl<'a> Searcher<'a> {
                 alpha = score;
             }
             if alpha >= beta {
+                // Move-ordering telemetry. The share of beta cutoffs produced
+                // by the FIRST move tried is the number that decides how wide
+                // this tree is: every cutoff that takes until the fifth move
+                // has paid for four subtrees nobody needed. Measured against
+                // a reference at the same depth we visit 2.76 nodes per node
+                // where it visits 2.48, and that gap is where it lives.
+                self.cut_nodes += 1;
+                if i == 0 {
+                    self.cut_first += 1;
+                }
                 if !mv.is_capture() && ply < MAX_PLY {
                     let k = &mut self.killers[ply];
                     if k[0] != Some(mv) {
@@ -2677,6 +2747,57 @@ impl<'a> Searcher<'a> {
                     }
                 }
             }
+        }
+        if std::env::var_os("KESTREL_CUT_STATS").is_some() && self.report {
+            let pct = if self.cut_nodes > 0 {
+                100.0 * self.cut_first as f64 / self.cut_nodes as f64
+            } else {
+                0.0
+            };
+            eprintln!(
+                "cut-stats: cortes={} ao-primeiro-lance={} ({:.1}%)",
+                self.cut_nodes, self.cut_first, pct
+            );
+            let rr = if self.lmr_tried > 0 {
+                100.0 * self.lmr_research as f64 / self.lmr_tried as f64
+            } else {
+                0.0
+            };
+            let avg = if self.lmr_tried > 0 {
+                self.lmr_sum as f64 / self.lmr_tried as f64
+            } else {
+                0.0
+            };
+            eprintln!(
+                "lmr-stats: reduzidos={} repesquisados={} ({:.1}%) reducao-media={:.2}",
+                self.lmr_tried, self.lmr_research, rr, avg
+            );
+            let sh = self.nodes_shallow.max(1) as f64;
+            eprintln!(
+                "poda-rasa: nos-com-prof<=6={} | RFP={} ({:.1}%) razor={} ({:.1}%) futility={} ({:.1}%)",
+                self.nodes_shallow,
+                self.cut_rfp, 100.0 * self.cut_rfp as f64 / sh,
+                self.cut_razor, 100.0 * self.cut_razor as f64 / sh,
+                self.cut_futility, 100.0 * self.cut_futility as f64 / sh
+            );
+            eprintln!(
+                "qsearch: total={} quiescencia={} ({:.1}%) principal={} ({:.1}%)",
+                self.nodes,
+                self.qnodes,
+                100.0 * self.qnodes as f64 / self.nodes.max(1) as f64,
+                self.nodes - self.qnodes,
+                100.0 * (self.nodes - self.qnodes) as f64 / self.nodes.max(1) as f64
+            );
+            let q = self.lmr_quiet_total.max(1) as f64;
+            eprintln!(
+                "lmr-skip: quietos={} | xeque={} ({:.0}%) prof<3={} ({:.0}%) extensao={} ({:.0}%) i<min={} ({:.0}%) | reduzidos={} ({:.0}%)",
+                self.lmr_quiet_total,
+                self.lmr_skip_check, 100.0 * self.lmr_skip_check as f64 / q,
+                self.lmr_skip_depth, 100.0 * self.lmr_skip_depth as f64 / q,
+                self.lmr_skip_extend, 100.0 * self.lmr_skip_extend as f64 / q,
+                self.lmr_skip_early, 100.0 * self.lmr_skip_early as f64 / q,
+                self.lmr_tried, 100.0 * self.lmr_tried as f64 / q
+            );
         }
         (best_move, best_score, last_depth, self.nodes)
     }

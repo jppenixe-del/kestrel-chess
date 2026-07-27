@@ -457,6 +457,9 @@ const UNSAFE_QUEEN_CHECK: (i32, i32) = (1, 1);
 // vanished. Expressed as units removed instead, it says the same thing
 // smoothly, and says it about the ATTACKER's queen, which is what actually
 // determines whether the attack can finish.
+/// Starting point of the king-danger accumulator, mg/eg. Larger in the
+/// endgame, where a bare king is in danger from much less.
+const KING_SAFETY_OFFSET: (i32, i32) = (60, 120);
 const QUEENLESS_ATTACK: (i32, i32) = (-10, 0);
 
 // SAFETY_PINNED / SAFETY_DISCOVERED (2026-07-26): a defender pinned against
@@ -886,6 +889,17 @@ pub struct Weights {
     pub unsafe_rook_check: (i32, i32),
     pub unsafe_queen_check: (i32, i32),
     pub queenless_attack: (i32, i32),
+    /// Added to the king-danger accumulator before the curve, always.
+    ///
+    /// Not decoration. The curve is linear below its knee and quadratic
+    /// above, so where the accumulator SITS decides whether an attack gets
+    /// amplified or merely added. With no offset an ordinary attack never
+    /// reaches the knee, the term stays in its linear stretch, and king
+    /// safety ends up driving this evaluation less than half as much as it
+    /// drives a stronger one -- measured over 400 positions, a share of 0.19
+    /// against 0.48. The constant moves the whole term into the regime where
+    /// the curve does its work.
+    pub king_safety_offset: (i32, i32),
     pub safety_pinned: [[(i32, i32); 3]; 5],
     pub safety_discovered: [[(i32, i32); 3]; 5],
     pub king_danger_table: [i32; 128],
@@ -961,6 +975,7 @@ impl Default for Weights {
             unsafe_rook_check: UNSAFE_ROOK_CHECK,
             unsafe_queen_check: UNSAFE_QUEEN_CHECK,
             queenless_attack: QUEENLESS_ATTACK,
+            king_safety_offset: KING_SAFETY_OFFSET,
             safety_pinned: SAFETY_PINNED,
             safety_discovered: SAFETY_DISCOVERED,
             king_danger_table: KING_DANGER_TABLE,
@@ -1064,6 +1079,7 @@ impl Weights {
         w.unsafe_rook_check = (0, 0);
         w.unsafe_queen_check = (0, 0);
         w.queenless_attack = (0, 0);
+        w.king_safety_offset = (0, 0);
         w.safety_pinned = [[(0, 0); 3]; 5];
         w.safety_discovered = [[(0, 0); 3]; 5];
         w
@@ -1085,13 +1101,40 @@ impl Weights {
 /// endgame. The mg/eg pair stays inside each bucket -- the taper is still
 /// doing useful work within a regime, it just no longer has to stretch
 /// across the whole game.
-pub const NUM_BUCKETS: usize = 8;
+/// Four, not eight, and indexed by PAWN COUNT rather than material phase.
+///
+/// Two separate corrections to what was here.
+///
+/// The index: every term in this evaluation is already a (midgame, endgame)
+/// pair interpolated by material phase, so bucketing by material phase again
+/// splits the data along an axis the evaluation has already accounted for --
+/// the same information, with a fraction of the samples behind each copy of
+/// it. That is a fair explanation for the earlier eight-bucket attempt
+/// measuring worse rather than better. Pawn count is close to orthogonal to
+/// it: a middlegame with fourteen pawns is a closed position where knights
+/// beat bishops and a king is safe behind a wall, and one with six is an open
+/// one where neither is true, at identical material phase.
+///
+/// The count: measured on 400k positions from this engine's own games, the
+/// pawn-count distribution is far from uniform -- 16 pawns is 2.1% of
+/// positions and 12 is 9.8%. Equal-width slices would leave the end buckets
+/// with a few thousand positions and dozens of weights, which is not
+/// calibration but noise-fitting, and a search this wide finds and exploits
+/// exactly that kind of mirage. These boundaries are set so each bucket holds
+/// a comparable share: 23% / 28% / 29% / 19%.
+pub const NUM_BUCKETS: usize = 4;
 
-/// Which regime a position belongs to. Matches the extractor exactly, so
-/// weights trained for a bucket are used by that same bucket.
 pub fn bucket_of(board: &Board) -> usize {
-    let f = phase_fraction(board);
-    (((1.0 - f) * NUM_BUCKETS as f32) as usize).min(NUM_BUCKETS - 1)
+    let pawns = crate::bitboard::count(
+        board.pieces[Color::White.idx()][PieceType::Pawn.idx()]
+            | board.pieces[Color::Black.idx()][PieceType::Pawn.idx()],
+    );
+    match pawns {
+        0..=5 => 0,
+        6..=9 => 1,
+        10..=12 => 2,
+        _ => 3,
+    }
 }
 
 static BUCKET_WEIGHTS: OnceLock<Vec<Weights>> = OnceLock::new();
@@ -1358,6 +1401,7 @@ impl Weights {
             unsafe_rook_check: self.unsafe_rook_check,
             unsafe_queen_check: self.unsafe_queen_check,
             queenless_attack: self.queenless_attack,
+            king_safety_offset: self.king_safety_offset,
             safety_pinned: self.safety_pinned,
             safety_discovered: self.safety_discovered,
             king_danger_table: self.king_danger_table,
@@ -1902,8 +1946,12 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
         king_attack_units[us].0 -= shelter_penalty[them].0;
         king_attack_units[us].1 -= shelter_penalty[them].1;
 
-        mg += sign * king_danger_curve(king_attack_units[us].0);
-        eg += sign * king_danger_curve(king_attack_units[us].1);
+        // The offset goes in HERE, before the curve, not after it. Added
+        // afterwards it would be a constant that cancels between the two
+        // sides and changes nothing; added before, it decides which part of
+        // the curve the attack is measured on, which is the entire point.
+        mg += sign * king_danger_curve(king_attack_units[us].0 + w.king_safety_offset.0);
+        eg += sign * king_danger_curve(king_attack_units[us].1 + w.king_safety_offset.1);
 
         // UNCASTLED_KING: see const doc comment -- added after real
         // games showed Kestrel castling late and outright failing to
@@ -2343,6 +2391,27 @@ fn eval_mode_material_only() -> bool {
     })
 }
 pub fn evaluate(board: &Board) -> i32 {
+    // Known endgames answer for themselves, before anything is counted.
+    // Material is the wrong instrument here: it scored two knights against a
+    // bare king at +4.20, a position with no mate in it at all, higher than
+    // rook against king which is a forced win. See endgame.rs.
+    match crate::endgame::probe(board, eg_material_white(board), eg_queen_minus_pawn()) {
+        Some((strong, crate::endgame::Verdict::Exact(v))) => {
+            let white_pov = if strong == Color::White { v } else { -v };
+            return if board.side == Color::White { white_pov } else { -white_pov };
+        }
+        Some((_, crate::endgame::Verdict::Scale(f))) if f != crate::endgame::SCALE_NORMAL => {
+            let raw = if eval_mode_material_only() {
+                material_pst(board)
+            } else {
+                material_pst(board) + positional_terms_signed(board)
+            };
+            let w = weights_for(board);
+            let raw = raw + complexity_adjustment(board, raw, w);
+            return scale_endgame(board, raw, w) * f / crate::endgame::SCALE_NORMAL;
+        }
+        _ => {}
+    }
     let raw = if eval_mode_material_only() {
         material_pst(board)
     } else {
@@ -2351,6 +2420,21 @@ pub fn evaluate(board: &Board) -> i32 {
     let w = weights_for(board);
     let raw = raw + complexity_adjustment(board, raw, w);
     scale_endgame(board, raw, w)
+}
+
+/// Endgame-phase material only, from White's point of view -- the baseline the
+/// known-endgame handlers build their progress terms on top of.
+fn eg_material_white(board: &Board) -> i32 {
+    let mut v = 0;
+    for pt in [PieceType::Pawn, PieceType::Knight, PieceType::Bishop, PieceType::Rook, PieceType::Queen] {
+        v += EG_VALUE[pt.idx()] * count(board.pieces[Color::White.idx()][pt.idx()]) as i32;
+        v -= EG_VALUE[pt.idx()] * count(board.pieces[Color::Black.idx()][pt.idx()]) as i32;
+    }
+    v
+}
+
+fn eg_queen_minus_pawn() -> i32 {
+    EG_VALUE[PieceType::Queen.idx()] - EG_VALUE[PieceType::Pawn.idx()]
 }
 
 /// Complexity adjustment.
