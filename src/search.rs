@@ -109,6 +109,8 @@ pub struct SearchParams {
     pub rfp_opp_worsening: i32,
     /// Divides the previous move's continuation-history score into the margin.
     pub rfp_hist_divisor: i32,
+    /// Slack above beta that promotes a cutoff to a deeper history bonus.
+    pub hist_beta_margin: i32,
     pub rfp_improving: DepthMargin,
     pub rfp_not_improving: DepthMargin,
     pub razor_base: i32,
@@ -198,6 +200,7 @@ impl Default for SearchParams {
             rfp_opp_easy_capture: 19,
             rfp_opp_worsening: 14,
             rfp_hist_divisor: 410,
+            hist_beta_margin: 37,
             rfp_improving: DepthMargin { base: 0, slope: 26 },
             rfp_not_improving: DepthMargin { base: 0, slope: 80 },
             razor_base: 458,
@@ -276,6 +279,7 @@ impl SearchParams {
             self.rfp_opp_easy_capture,
             self.rfp_opp_worsening,
             self.rfp_hist_divisor,
+            self.hist_beta_margin,
         ]
     }
     pub fn from_vec(v: &[i32]) -> Self {
@@ -310,6 +314,7 @@ impl SearchParams {
             rfp_opp_easy_capture: v[33],
             rfp_opp_worsening: v[34],
             rfp_hist_divisor: v[35],
+            hist_beta_margin: v[36],
         }
     }
 }
@@ -2576,6 +2581,15 @@ impl<'a> Searcher<'a> {
                 if i == 0 {
                     self.cut_first += 1;
                 }
+                // How much a cutoff is worth to the history tables is not the
+                // same as how deep the search was. A move that beats beta by a
+                // wide margin refuted the node outright; one that scrapes past
+                // it by a centipawn may not survive one more ply. Crediting
+                // both identically teaches the ordering that a marginal move
+                // is as trustworthy as a decisive one. A comfortable cutoff is
+                // scored as if the search had been a ply deeper.
+                let hist_depth =
+                    depth + (best_score > beta + search_params().hist_beta_margin) as i32;
                 if !mv.is_capture() && ply < MAX_PLY {
                     let k = &mut self.killers[ply];
                     if k[0] != Some(mv) {
@@ -2587,7 +2601,7 @@ impl<'a> Searcher<'a> {
                     // no' que NAO cortaram (quiets_tried inclui `mv` como
                     // ultimo elemento, ja' que foi empurrado logo acima --
                     // excluido do malus).
-                    let bonus = (depth * depth).min(HISTORY_MAX);
+                    let bonus = (hist_depth * hist_depth).min(HISTORY_MAX);
                     let side = board.side.idx();
                     self.update_history(side, &mv, bonus);
                     let n = quiets_tried.len().saturating_sub(1);
@@ -2632,7 +2646,7 @@ impl<'a> Searcher<'a> {
                     // captured) piece type instead of (from, to).
                     // Complements SEE in ordering (see MovePicker) --
                     // never touches SEE itself.
-                    let bonus = (depth * depth).min(HISTORY_MAX);
+                    let bonus = (hist_depth * hist_depth).min(HISTORY_MAX);
                     let side = board.side.idx();
                     let n = captures_tried.len().saturating_sub(1);
                     if let Some(&(_, moving_pt, captured_pt)) = captures_tried.last() {
