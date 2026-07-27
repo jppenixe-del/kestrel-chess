@@ -387,6 +387,24 @@ const TM_SETTLE_MIN: f64 = 1.0;
 // independent bound.
 const TM_SCALE_MIN: f64 = 0.65;
 const TM_SCALE_MAX: f64 = 2.2;
+// A score that moves by less than this between iterations has not told us
+// anything. Three such iterations in a row and the allowance drops back to the
+// plain slice: no extension is bought by depth that keeps agreeing with itself.
+const TM_QUIET_CP: i32 = 10;
+const TM_QUIET_ITERS: u32 = 3;
+/// Ceiling on the allowance while the position is still in the opening book.
+/// Enough to confirm the prepared move and notice if it is refuted, not enough
+/// to spend the opening's share of the clock on a decision already made.
+const TM_BOOK_SCALE: f64 = 0.35;
+/// Ceiling on the allowance during the opening once out of book. Not a cut --
+/// the full slice is still available, it simply cannot be multiplied by
+/// signals that measurement showed to be noise this early.
+const TM_OPENING_SCALE: f64 = 1.0;
+/// How many full moves count as "the opening" for the ceiling above.
+const TM_OPENING_MOVES: u32 = 10;
+/// A score swing this large between iterations is a real change of mind, not
+/// search noise, and lifts the opening ceiling.
+const TM_ALERT_CP: i32 = 50;
 
 /// For single-threaded callers that have no search to coordinate with -- the
 /// command-line tools, which stop on node counts and nothing else. Never set.
@@ -2537,6 +2555,25 @@ impl<'a> Searcher<'a> {
         let mut last_depth = 0;
         let mut prev_score = 0;
         let mut stable_count: u32 = 0;
+        let mut prev_iter_score: Option<i32> = None;
+        let mut quiet_iters: u32 = 0;
+        // Are we still inside our own opening book? The book already holds a
+        // curated answer for this position, and until now it was used only to
+        // ORDER moves -- so the engine spent a full slice of clock rederiving
+        // a choice it had been handed. Measured from the starting position at
+        // 60+0, the first ten moves cost 24-30% of the clock, which is the
+        // part of the game where that time buys least.
+        //
+        // Not played instantly: a book this size (a few thousand positions)
+        // can end anywhere, and walking out of it without having searched is
+        // how an engine gets a lost position for free. It searches, at a
+        // fraction of the allowance, and the fraction stops applying the
+        // moment the position is no longer in the book.
+        let in_book = self
+            .style_book
+            .map(|b| !b.lookup(self.zob.hash(board)).is_empty())
+            .unwrap_or(false);
+        let opening_move = board.fullmove <= TM_OPENING_MOVES;
         self.killers = [[None; 2]; MAX_PLY];
         self.root_move_nodes.clear();
         self.root_scores.clear();
@@ -2658,7 +2695,55 @@ impl<'a> Searcher<'a> {
                             on_best as f64 / self.nodes.max(1) as f64
                         })
                         .unwrap_or(0.0);
-                    let scale = time_scale(effort_frac, stable_count);
+                    // Has the evaluation stopped moving? Both signals above
+                    // read "several moves are equally good" as "this position
+                    // is hard", because the root move swaps between equals
+                    // and the nodes spread across them. Traced from the
+                    // opening position: effort down at 0.08-0.13, settle
+                    // knocked back to 0 at half the depths, and the
+                    // multiplier pinned at its 2.20 ceiling -- the maximum
+                    // allowance, spent on the one position in chess that
+                    // needs it least. Measured cost in real games: 24% of the
+                    // clock gone in ten moves at 60+0, 31% at 180+0.
+                    //
+                    // The score is the signal neither of them is. When it
+                    // holds still across iterations the search is not
+                    // changing its mind, whichever of several equal moves it
+                    // happens to be naming this time -- and a value cannot be
+                    // an artefact of which thread arrived first, which is why
+                    // stability of the MOVE could never be trusted here.
+                    // Extensions stay available the moment the score does
+                    // move, which is when they are worth having.
+                    let score_delta = prev_iter_score.map(|p| (score - p).abs());
+                    let quiet = score_delta.map(|d| d <= TM_QUIET_CP).unwrap_or(false);
+                    quiet_iters = if quiet { quiet_iters + 1 } else { 0 };
+                    prev_iter_score = Some(score);
+                    // The opening ceiling below is there because the search's
+                    // signals are noise that early -- but a score that has
+                    // genuinely lurched is not noise, and refusing to think
+                    // about a real tactic because it happened on move eight
+                    // would be the same mistake in the other direction.
+                    let alarmed = score_delta.map(|d| d > TM_ALERT_CP).unwrap_or(false);
+                    let mut scale = time_scale(effort_frac, stable_count);
+                    if quiet_iters >= TM_QUIET_ITERS {
+                        scale = scale.min(1.0);
+                    }
+                    if in_book {
+                        scale = scale.min(TM_BOOK_SCALE);
+                    } else if opening_move && !alarmed {
+                        // Out of book but still in the opening. Neither signal
+                        // the multiplier is built on carries information here:
+                        // traced from the starting position, effort sits at
+                        // 0.08-0.13 and settle is knocked back to zero every
+                        // other depth, because a dozen moves are genuinely
+                        // near-equal and the root swaps between them. That
+                        // reads as "hard" and buys the ceiling, when what it
+                        // means is "it hardly matters which". A signal that
+                        // cannot inform should not be able to ask for more
+                        // time; the allowance still applies in full, it just
+                        // cannot be extended beyond it.
+                        scale = scale.min(TM_OPENING_SCALE);
+                    }
                     let allowed = budget.mul_f64(scale);
                     if std::env::var_os("KESTREL_TM_TRACE").is_some() {
                         eprintln!(

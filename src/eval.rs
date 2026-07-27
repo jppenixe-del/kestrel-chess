@@ -305,8 +305,30 @@ pub fn material_pst_features(board: &Board, feats: &mut [f32]) {
 }
 
 /// Zona do rei: a propria casa + as 8 vizinhas (igual ao king_attacks).
-fn king_zone(king_sq: Square) -> Bitboard {
-    atk().king[king_sq as usize] | bb(king_sq)
+/// The squares whose attackers count as aimed at this king.
+///
+/// The eight neighbours, PLUS the same eight pushed one rank towards the
+/// enemy, PLUS a sideways widening when the king sits on a rook file so that
+/// it still gets three files of cover.
+///
+/// The rank in front is the whole point, and leaving it out made the king
+/// safety term nearly inert. Traced on a real lost game: black had a knight
+/// hitting g3, a pawn arriving on f4, a queen and two bishops trained on the
+/// castled position, and our king term evaluated the whole thing at ZERO.
+/// Removing black's queen from the board moved it by nine centipawns.
+/// With the king on g1 the old zone was f1,g1,h1,f2,g2,h2 -- f3, g3 and h3
+/// were not in it, and an attack that builds on the third rank, which is how
+/// attacks on a castled king are built, was invisible.
+fn king_zone(king_sq: Square, color: Color) -> Bitboard {
+    let base = atk().king[king_sq as usize] | bb(king_sq);
+    let ahead = if color == Color::White { north(base) } else { south(base) };
+    let mut z = base | ahead;
+    match file_of(king_sq) {
+        0 => z |= east(z),
+        7 => z |= west(z),
+        _ => {}
+    }
+    z
 }
 
 // Pesos de eval -- valores proprios sensatos como ponto de partida,
@@ -1026,7 +1048,28 @@ impl Default for Weights {
 /// `to_vec`); material/PST (consts separadas) e king_danger_table
 /// (derivada) não fazem parte deste vector e ficam como estavam.
 #[rustfmt::skip]
-const TUNED_V46: [i32; 669] = [28,41,11,2,0,-4,21,14,15,-6,15,-5,-19,17,20,10,-40,-32,-20,-10,-4,-7,3,3,11,4,12,9,14,4,18,9,24,9,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,-36,-32,-20,-14,-4,-8,1,-6,9,0,5,4,11,5,12,6,10,8,12,9,26,19,28,17,32,24,34,24,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,-40,-31,-14,-19,-11,-10,-5,-4,-6,0,0,0,3,3,2,6,5,10,11,14,8,15,12,20,11,19,15,22,15,19,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,-25,-25,-22,-20,-14,-14,-3,-7,-1,-1,1,2,0,5,7,6,8,10,10,9,14,13,14,11,14,14,21,20,19,18,22,18,23,20,22,20,22,21,23,22,23,22,23,23,24,22,24,22,24,22,24,22,24,22,24,22,15,-2,13,-2,26,-4,48,-4,5,0,2,0,2,2,3,1,1,2,-5,-14,-19,-15,-25,-20,-40,-16,-34,2,-33,4,-19,-5,-2,-2,11,-7,50,50,86,54,86,54,95,55,84,41,0,0,8,3,32,15,30,15,30,20,26,10,0,0,10,20,0,-1,30,23,66,25,50,24,0,0,-13,10,-1,0,23,14,36,20,35,25,0,0,7,18,33,25,2,0,60,25,45,45,0,0,-1,0,19,8,-3,-1,34,25,38,49,0,0,1,25,29,28,28,28,1,0,54,24,0,0,-10,5,-8,6,7,4,-3,-1,41,55,0,0,13,15,20,18,21,20,15,10,-1,-1,0,0,-9,3,-10,0,-11,9,-13,1,0,-1,0,0,30,27,32,26,64,24,53,9,0,0,0,0,12,-2,22,8,7,-8,10,5,4,4,0,0,0,3,6,-2,18,6,33,29,65,99,110,175,0,0,0,0,0,0,1,0,3,-1,6,7,29,48,70,109,0,0,-1,-12,-24,-18,-11,-14,-20,-13,-10,-55,3,-43,-16,-27,-34,-6,-11,-7,-17,-4,0,0,0,0,0,0,-61,-34,-26,21,28,124,217,225,0,0,0,0,0,0,0,0,-43,-47,-11,-17,29,43,107,76,0,0,0,0,0,0,0,0,-50,-47,-19,-15,34,52,57,39,0,0,0,0,0,0,0,0,-49,-55,-15,-25,14,34,4,5,0,0,125,112,155,73,49,61,-16,50,-10,20,-5,6,17,-12,-2,9,-125,12,-3,-7,29,-11,20,8,11,42,12,59,30,68,34,66,0,0,0,0,0,0,15,-1,13,14,57,18,113,97,0,0,0,0,0,0,0,0,-52,-13,-48,-29,-54,-51,12,-99,0,0,7,2,0,0,-44,-12,-15,-14,-7,1,26,20,63,85,0,0,0,0,0,0,-17,-10,-20,-4,-11,15,1,25,73,103,0,0,0,0,12,-15,7,-6,0,3,-4,-9,-8,-6,-8,-10,-16,-15,-5,-3,0,2,3,2,-8,-2,0,-7,-26,-2,-8,6,64,96,106,96,8,8,82,76,-157];
+/// Weights in use. Same vector as before for everything except king
+/// safety, which was calibrated for the first time on 2026-07-27.
+///
+/// The regression tuner cannot reach those fields: shelter, storm, the
+/// weak-ring count, the flank counts and the attack units all feed one
+/// danger curve, so probing a field by one unit measures a slope on that
+/// curve rather than the field's contribution. They had therefore only
+/// ever been set by hand -- the one block of this evaluation never
+/// fitted to anything, and the largest measured weakness, which is
+/// unlikely to be a coincidence. `tuneking` optimises them through the
+/// real evaluation instead (coordinate descent, no linearisation), on
+/// 300k positions from this engine's own games.
+///
+/// Paired with the widened king zone: neither helps alone (37/60 and
+/// 36/60 on the blunder suite), together they beat both (39/60, and the
+/// cases outright FIXED go from 26 to 30). The zone was too small and
+/// the weights had been fitted around that, so only both at once moves.
+///
+/// Length grew from 669 to 675: `from_vec` tolerates a short vector by
+/// leaving later fields at their defaults, so the tunable terms added
+/// since the previous vector had silently never been tuned either.
+const TUNED_V46: [i32; 675] = [28,41,11,2,0,-4,21,14,15,-6,15,-5,-19,17,20,10,-40,-32,-20,-10,-4,-7,3,3,11,4,12,9,14,4,18,9,24,9,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,-36,-32,-20,-14,-4,-8,1,-6,9,0,5,4,11,5,12,6,10,8,12,9,26,19,28,17,32,24,34,24,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,-40,-31,-14,-19,-11,-10,-5,-4,-6,0,0,0,3,3,2,6,5,10,11,14,8,15,12,20,11,19,15,22,15,19,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,-25,-25,-22,-20,-14,-14,-3,-7,-1,-1,1,2,0,5,7,6,8,10,10,9,14,13,14,11,14,14,21,20,19,18,22,18,23,20,22,20,22,21,23,22,23,22,23,23,24,22,24,22,24,22,24,22,24,22,24,22,9,2,7,-6,20,6,-8,66,5,0,45,-8,36,28,53,11,35,15,-5,8,-15,-1,-33,2,-24,-7,-34,18,68,45,23,17,18,12,19,9,50,50,86,54,86,54,95,55,84,41,0,0,8,3,32,15,30,15,30,20,26,10,0,0,10,20,0,-1,30,23,66,25,50,24,0,0,-13,10,-1,0,23,14,36,20,35,25,0,0,7,18,33,25,2,0,60,25,45,45,0,0,-1,0,19,8,-3,-1,34,25,38,49,0,0,1,25,29,28,28,28,1,0,54,24,0,0,-10,5,-8,6,7,4,-3,-1,41,55,0,0,13,15,20,18,21,20,15,10,-1,-1,0,0,-9,3,-10,0,-11,9,-13,1,0,-1,0,0,30,27,32,26,64,24,53,9,0,0,0,0,12,-2,22,8,7,-8,10,5,4,4,0,0,0,3,6,-2,18,6,33,29,65,99,110,175,0,0,0,0,0,0,1,0,3,-1,6,7,29,48,70,109,0,0,-1,-12,-24,-18,-11,-14,-20,-13,-10,-55,3,-43,-16,-27,-34,-6,-11,-7,-17,-4,0,0,0,0,0,0,-61,-34,-26,21,28,124,217,225,0,0,0,0,0,0,0,0,-43,-47,-11,-17,29,43,107,76,0,0,0,0,0,0,0,0,-50,-47,-19,-15,34,52,57,39,0,0,0,0,0,0,0,0,-49,-55,-15,-25,14,34,4,5,0,0,125,112,155,73,49,61,-16,50,-10,20,-5,6,17,-12,-2,9,-125,12,-3,-7,29,-11,20,8,11,42,12,59,30,68,34,66,0,0,0,0,0,0,15,-1,13,14,57,18,113,97,0,0,0,0,0,0,0,0,-52,-13,-48,-29,-54,-51,12,-99,0,0,7,2,0,0,-44,-12,-15,-14,-7,1,26,20,63,85,0,0,0,0,0,0,-17,-10,-20,-4,-11,15,1,25,73,103,0,0,0,0,12,-15,7,-6,0,3,-4,-9,-8,-6,-8,-10,-16,-15,-5,3,0,2,-5,0,-4,0,0,-7,-26,-2,-8,6,64,96,106,96,8,8,82,76,-157,14,-6,22,10,-20,-12];
 
 static DEFAULT_WEIGHTS: OnceLock<Weights> = OnceLock::new();
 /// A/B testing hook for a tuning run's output, same reversible pattern
@@ -1472,8 +1515,8 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
         attacked_by_pt[c.idx()][PieceType::King.idx()] |= ka;
     }
 
-    let white_king_zone = king_zone(board.king_sq(Color::White));
-    let black_king_zone = king_zone(board.king_sq(Color::Black));
+    let white_king_zone = king_zone(board.king_sq(Color::White), Color::White);
+    let black_king_zone = king_zone(board.king_sq(Color::Black), Color::Black);
 
     // Indexed by the ATTACKING color (not the color whose king is in
     // danger) -- king_attack_units[White] is how much White's pieces
@@ -2342,6 +2385,30 @@ fn eval_mode_material_only() -> bool {
         std::env::var("KESTREL_EVAL_MODE").map(|v| v == "material").unwrap_or(false)
     })
 }
+/// `evaluate` with a caller-supplied weight set instead of the static one.
+///
+/// Exists so king safety can be calibrated at all. The regression tuner has
+/// to hold every king-safety field fixed -- shelter, storm, the weak-ring
+/// count, the flank counts and the attack units all feed one danger curve, so
+/// probing a field by one unit measures a slope on that curve rather than the
+/// field's contribution, and fitting them as if linear would be quietly
+/// wrong. The consequence is that king safety is the one block of this
+/// evaluation the tuner has never touched: it is entirely hand-set, which is
+/// a fair explanation for it being the largest measured weakness.
+///
+/// An optimiser that calls the real evaluation with candidate weights does
+/// not care whether the term is linear. This is that entry point.
+pub fn evaluate_with(board: &Board, w: &Weights) -> i32 {
+    let raw = if eval_mode_material_only() {
+        material_pst(board)
+    } else {
+        let p = positional_terms(board, w);
+        material_pst(board) + if board.side == Color::White { p } else { -p }
+    };
+    let raw = raw + complexity_adjustment(board, raw, w);
+    scale_endgame(board, raw, w)
+}
+
 pub fn evaluate(board: &Board) -> i32 {
     let raw = if eval_mode_material_only() {
         material_pst(board)
