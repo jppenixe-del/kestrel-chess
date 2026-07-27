@@ -127,6 +127,18 @@ pub struct SearchParams {
     pub hist_pruning_max_depth: i32,
     /// Extra slack below s_beta that turns a double extension into a triple.
     pub triple_ext_margin: i32,
+    /// How far below zero a move's history must sit to be skipped in quiescence.
+    pub qs_hist_prune_margin: i32,
+    pub hist_bonus_quad: i32,
+    pub hist_bonus_linear: i32,
+    pub hist_bonus_offset: i32,
+    pub hist_bonus_max: i32,
+    pub hist_malus_quad: i32,
+    pub hist_malus_linear: i32,
+    pub hist_malus_offset: i32,
+    pub hist_malus_max: i32,
+    /// Divides continuation history into the LMR reduction step.
+    pub lmr_hist_divisor: i32,
     pub rfp_improving: DepthMargin,
     pub rfp_not_improving: DepthMargin,
     pub razor_base: i32,
@@ -219,6 +231,16 @@ impl Default for SearchParams {
             hist_beta_margin: 37,
             hist_pruning_max_depth: 4,
             triple_ext_margin: 124,
+            qs_hist_prune_margin: 4096,
+            hist_bonus_quad: 439,
+            hist_bonus_linear: 196,
+            hist_bonus_offset: 100,
+            hist_bonus_max: 2121,
+            hist_malus_quad: 235,
+            hist_malus_linear: 277,
+            hist_malus_offset: -44,
+            hist_malus_max: 992,
+            lmr_hist_divisor: 24000,
             rfp_improving: DepthMargin { base: 0, slope: 26 },
             rfp_not_improving: DepthMargin { base: 0, slope: 80 },
             razor_base: 458,
@@ -300,6 +322,16 @@ impl SearchParams {
             self.hist_beta_margin,
             self.hist_pruning_max_depth,
             self.triple_ext_margin,
+            self.qs_hist_prune_margin,
+            self.hist_bonus_quad,
+            self.hist_bonus_linear,
+            self.hist_bonus_offset,
+            self.hist_bonus_max,
+            self.hist_malus_quad,
+            self.hist_malus_linear,
+            self.hist_malus_offset,
+            self.hist_malus_max,
+            self.lmr_hist_divisor,
         ]
     }
     pub fn from_vec(v: &[i32]) -> Self {
@@ -337,6 +369,16 @@ impl SearchParams {
             hist_beta_margin: v[36],
             hist_pruning_max_depth: v[37],
             triple_ext_margin: v[38],
+            qs_hist_prune_margin: v[39],
+            hist_bonus_quad: v[40],
+            hist_bonus_linear: v[41],
+            hist_bonus_offset: v[42],
+            hist_bonus_max: v[43],
+            hist_malus_quad: v[44],
+            hist_malus_linear: v[45],
+            hist_malus_offset: v[46],
+            hist_malus_max: v[47],
+            lmr_hist_divisor: v[48],
         }
     }
 }
@@ -349,7 +391,7 @@ impl SearchParams {
 /// Generated from `to_vec`, never hand-written. A list that drifts out of
 /// order does not fail: it quietly sets the wrong parameter, and the sweep
 /// reports whatever that other parameter happens to do.
-pub const PARAM_NAMES: [&str; 39] = [
+pub const PARAM_NAMES: [&str; 49] = [
     "rfp_improving_base",
     "rfp_improving_slope",
     "rfp_not_improving_base",
@@ -389,6 +431,16 @@ pub const PARAM_NAMES: [&str; 39] = [
     "hist_beta_margin",
     "hist_pruning_max_depth",
     "triple_ext_margin",
+    "qs_hist_prune_margin",
+    "hist_bonus_quad",
+    "hist_bonus_linear",
+    "hist_bonus_offset",
+    "hist_bonus_max",
+    "hist_malus_quad",
+    "hist_malus_linear",
+    "hist_malus_offset",
+    "hist_malus_max",
+    "lmr_hist_divisor",
 ];
 
 /// Overrides applied on top of the defaults, set over UCI before the first
@@ -810,6 +862,50 @@ const DOUBLE_EXT_MAX: i32 = 6;
 /// `cont_hist` do Searcher.
 pub const CONT_HIST_SIZE: usize = 6 * 64 * 6 * 64;
 const CONT_HIST_MAX: i32 = 16000;
+
+/// History update with gravity: the closer an entry already sits to the
+/// ceiling, the less a new observation moves it.
+///
+/// A plain clamped sum does not do this. An entry that reaches the ceiling
+/// stays pinned there, and every later cutoff for that move is discarded --
+/// so does every later failure, which is worse, because a move that stopped
+/// working keeps its maximum score until something drags it all the way back
+/// down one bonus at a time. Gravity makes the table saturate smoothly and
+/// stay responsive: near zero an update lands in full, near the ceiling it is
+/// almost entirely cancelled.
+#[inline]
+fn apply_gravity(value: i32, delta: i32, max: i32) -> i32 {
+    (value + delta - value * delta.abs() / max).clamp(-max, max)
+}
+
+/// Bonus for the move that caused a beta cutoff.
+///
+/// The old formula was `depth * depth`, which at depth 1 is 1 -- against a
+/// ceiling of 16000. Shallow nodes are the overwhelming majority of the tree,
+/// and there the table was effectively frozen: it took thousands of identical
+/// cutoffs to move an entry enough to change any ordering decision. The
+/// linear term is what makes a shallow cutoff worth recording at all; the
+/// quadratic term still makes a deep one worth more.
+fn history_bonus(depth: i32) -> i32 {
+    let sp = search_params();
+    let b = sp.hist_bonus_quad * depth * depth / 64 + sp.hist_bonus_linear * depth
+        - sp.hist_bonus_offset;
+    b.clamp(0, sp.hist_bonus_max)
+}
+
+/// Penalty for the quiet moves tried before the one that cut off.
+///
+/// Separate from the bonus, and deliberately so: "this move refuted the node"
+/// and "this move was tried first and did not" are not equally strong claims.
+/// The second is far weaker -- a move can fail simply for being ordered ahead
+/// of a better one -- so punishing it as hard as the cutoff is rewarded
+/// teaches the table noise. Using one number for both is the version we had.
+fn history_malus(depth: i32) -> i32 {
+    let sp = search_params();
+    let m = sp.hist_malus_quad * depth * depth / 64 + sp.hist_malus_linear * depth
+        - sp.hist_malus_offset;
+    m.clamp(0, sp.hist_malus_max)
+}
 
 #[inline(always)]
 fn cont_hist_idx(prev_pt: PieceType, prev_to: crate::types::Square, curr_pt: PieceType, curr_to: crate::types::Square) -> usize {
@@ -1310,7 +1406,7 @@ impl<'a> Searcher<'a> {
     /// qualidade real do lance do que um corte raso).
     fn update_history(&mut self, side: usize, mv: &Move, delta: i32) {
         let v = &mut self.history_scores[side][mv.from as usize][mv.to as usize];
-        *v = (*v + delta).clamp(-HISTORY_MAX, HISTORY_MAX);
+        *v = apply_gravity(*v, delta, HISTORY_MAX);
     }
 
     /// Same bonus/malus shape as update_history, for captures -- keyed
@@ -1319,7 +1415,7 @@ impl<'a> Searcher<'a> {
     /// which pieces are involved, not the exact squares.
     fn update_capture_history(&mut self, side: usize, moving: PieceType, captured: PieceType, delta: i32) {
         let v = &mut self.capture_history[side][moving.idx()][captured.idx()];
-        *v = (*v + delta).clamp(-HISTORY_MAX, HISTORY_MAX);
+        *v = apply_gravity(*v, delta, HISTORY_MAX);
     }
 
     /// Actualiza cont_hist para o par (prev_move, curr_move) -- +bonus
@@ -1330,7 +1426,7 @@ impl<'a> Searcher<'a> {
     fn update_cont_hist(&mut self, prev_pt: PieceType, prev_to: crate::types::Square, curr_pt: PieceType, curr_to: crate::types::Square, delta: i32) {
         let idx = cont_hist_idx(prev_pt, prev_to, curr_pt, curr_to);
         let v = &mut self.cont_hist[idx];
-        *v = (*v + delta).clamp(-CONT_HIST_MAX, CONT_HIST_MAX);
+        *v = apply_gravity(*v, delta, CONT_HIST_MAX);
     }
 
     /// Continuation-history score for moving `curr_pt` to `to` at `ply`:
@@ -1666,6 +1762,39 @@ impl<'a> Searcher<'a> {
             // (a fixed count isn't meaningful when the game is decided).
             if !in_check && tried >= search_params().qs_lmp_limit as usize && alpha.abs() < MATE_SCORE - MAX_PLY as i32 {
                 break;
+            }
+            // History pruning inside quiescence. The move list here is
+            // already filtered to captures that do not lose material, but
+            // "does not lose material on this square" and "is worth
+            // searching" are different questions, and the history tables
+            // have an answer to the second one that SEE cannot give. A move
+            // the tables have watched fail everywhere it has been tried is
+            // not made promising by winning an exchange.
+            //
+            // Not while in check, where every reply must be tried, and not
+            // once the score is already in mate territory, where a fixed
+            // history threshold means nothing.
+            if !in_check
+                && best > -MATE_SCORE + MAX_PLY as i32
+                && alpha.abs() < MATE_SCORE - MAX_PLY as i32
+            {
+                let h = if mv.is_capture() {
+                    match (board.piece_at(mv.from), board.piece_at(mv.to)) {
+                        (Some((moving, _)), Some((captured, _))) => {
+                            self.capture_history[board.side.idx()][moving.idx()][captured.idx()]
+                        }
+                        _ => 0,
+                    }
+                } else {
+                    let ch = match board.piece_at(mv.from) {
+                        Some((pt, _)) => self.cont_hist_score(pt, mv.to, ply),
+                        None => 0,
+                    };
+                    self.history_scores[board.side.idx()][mv.from as usize][mv.to as usize] + ch
+                };
+                if h < -search_params().qs_hist_prune_margin {
+                    continue;
+                }
             }
             tried += 1;
             let undo = board.make_move(&mv);
@@ -2531,7 +2660,9 @@ impl<'a> Searcher<'a> {
                     // every other adjustment's quantization. The piece
                     // already sits on `mv.to` at this point (post-make_move).
                     let cont_adj = match board.piece_at(mv.to) {
-                        Some((pt, _)) => -(self.cont_hist_score(pt, mv.to, ply) / 24000).clamp(-1, 1),
+                        Some((pt, _)) => {
+                            -(self.cont_hist_score(pt, mv.to, ply) / search_params().lmr_hist_divisor.max(1)).clamp(-1, 1)
+                        }
                         None => 0,
                     };
                     // Corrplexity: reduce ~one ply less when
@@ -2722,12 +2853,13 @@ impl<'a> Searcher<'a> {
                     // no' que NAO cortaram (quiets_tried inclui `mv` como
                     // ultimo elemento, ja' que foi empurrado logo acima --
                     // excluido do malus).
-                    let bonus = (hist_depth * hist_depth).min(HISTORY_MAX);
+                    let bonus = history_bonus(hist_depth);
+                    let malus = history_malus(hist_depth);
                     let side = board.side.idx();
                     self.update_history(side, &mv, bonus);
                     let n = quiets_tried.len().saturating_sub(1);
                     for qm in &quiets_tried[..n] {
-                        self.update_history(side, qm, -bonus);
+                        self.update_history(side, qm, -malus);
                     }
                     // Countermove heuristic (binario) mantido para
                     // compatibilidade; cont_hist e' o sinal principal.
@@ -2753,10 +2885,10 @@ impl<'a> Searcher<'a> {
                         for qm in &quiets_tried[..n] {
                             if let Some((q_pt, _)) = board.piece_at(qm.from) {
                                 if let Some((p1_pt, p1_to)) = prev1 {
-                                    self.update_cont_hist(p1_pt, p1_to, q_pt, qm.to, -bonus);
+                                    self.update_cont_hist(p1_pt, p1_to, q_pt, qm.to, -malus);
                                 }
                                 if let Some((p2_pt, p2_to)) = prev2 {
-                                    self.update_cont_hist(p2_pt, p2_to, q_pt, qm.to, -bonus);
+                                    self.update_cont_hist(p2_pt, p2_to, q_pt, qm.to, -malus);
                                 }
                             }
                         }
@@ -2767,14 +2899,15 @@ impl<'a> Searcher<'a> {
                     // captured) piece type instead of (from, to).
                     // Complements SEE in ordering (see MovePicker) --
                     // never touches SEE itself.
-                    let bonus = (hist_depth * hist_depth).min(HISTORY_MAX);
+                    let bonus = history_bonus(hist_depth);
+                    let malus = history_malus(hist_depth);
                     let side = board.side.idx();
                     let n = captures_tried.len().saturating_sub(1);
                     if let Some(&(_, moving_pt, captured_pt)) = captures_tried.last() {
                         self.update_capture_history(side, moving_pt, captured_pt, bonus);
                     }
                     for &(_, moving_pt, captured_pt) in &captures_tried[..n] {
-                        self.update_capture_history(side, moving_pt, captured_pt, -bonus);
+                        self.update_capture_history(side, moving_pt, captured_pt, -malus);
                     }
                 }
                 break;
@@ -3072,6 +3205,58 @@ impl<'a> Searcher<'a> {
                 "lmr-stats: reduzidos={} repesquisados={} ({:.1}%) reducao-media={:.2}",
                 self.lmr_tried, self.lmr_research, rr, avg
             );
+            // What the tables actually hold. Every consumer of history --
+            // history pruning, the LMR step, the RFP shift, the quiescence
+            // cut -- compares a raw table value against a constant, so those
+            // constants are only meaningful relative to the distribution
+            // here. Changing how the bonus is computed changes this
+            // distribution, and every one of those constants silently means
+            // something different afterwards. Printing it turns "pick a
+            // scaling factor" into a measurement.
+            {
+                let mut vals: Vec<i32> = self
+                    .history_scores
+                    .iter()
+                    .flat_map(|side| side.iter())
+                    .flat_map(|from| from.iter())
+                    .copied()
+                    .filter(|&v| v != 0)
+                    .collect();
+                if !vals.is_empty() {
+                    vals.sort_unstable();
+                    let at = |q: f64| vals[((vals.len() - 1) as f64 * q) as usize];
+                    eprintln!(
+                        "hist-dist: n={} p05={} p25={} mediana={} p75={} p95={} |max|={}",
+                        vals.len(),
+                        at(0.05),
+                        at(0.25),
+                        at(0.50),
+                        at(0.75),
+                        at(0.95),
+                        vals[0].abs().max(vals[vals.len() - 1].abs())
+                    );
+                }
+                let mut cv: Vec<i32> = self
+                    .cont_hist
+                    .iter()
+                    .copied()
+                    .filter(|&v| v != 0)
+                    .collect();
+                if !cv.is_empty() {
+                    cv.sort_unstable();
+                    let at = |q: f64| cv[((cv.len() - 1) as f64 * q) as usize];
+                    eprintln!(
+                        "cont-dist: n={} p05={} p25={} mediana={} p75={} p95={} |max|={}",
+                        cv.len(),
+                        at(0.05),
+                        at(0.25),
+                        at(0.50),
+                        at(0.75),
+                        at(0.95),
+                        cv[0].abs().max(cv[cv.len() - 1].abs())
+                    );
+                }
+            }
             let t = self.nmp_tried.max(1) as f64;
             eprintln!(
                 "nmp: tentado={} corte-cru={} ({:.0}%) aceite-sem-verificar={} verificado={} ok={} falhou={} fail-low={} ({:.0}%)",
