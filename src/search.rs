@@ -102,6 +102,13 @@ impl DepthMargin {
 
 #[derive(Clone, Copy)]
 pub struct SearchParams {
+    /// Extra margin per depth when the opponent has a capture that wins
+    /// material outright. See the note at the RFP block.
+    pub rfp_opp_easy_capture: i32,
+    /// Margin removed when the opponent's position is deteriorating.
+    pub rfp_opp_worsening: i32,
+    /// Divides the previous move's continuation-history score into the margin.
+    pub rfp_hist_divisor: i32,
     pub rfp_improving: DepthMargin,
     pub rfp_not_improving: DepthMargin,
     pub razor_base: i32,
@@ -185,6 +192,12 @@ impl Default for SearchParams {
         // discarded for lack of a positive delta ("os testes sao so'
         // para verificar, e' sempre para implementar").
         SearchParams {
+            // Starting points, not tuned values: this engine's tree is not
+            // the one these signals were measured on. They are exposed by
+            // name so they can be swept without a rebuild.
+            rfp_opp_easy_capture: 19,
+            rfp_opp_worsening: 14,
+            rfp_hist_divisor: 410,
             rfp_improving: DepthMargin { base: 0, slope: 26 },
             rfp_not_improving: DepthMargin { base: 0, slope: 80 },
             razor_base: 458,
@@ -256,6 +269,13 @@ impl SearchParams {
             self.do_deeper_margin_base,
             self.do_deeper_margin_depth,
             self.do_shallower_margin,
+            // Appended, never inserted: `from_vec` reads this vector by
+            // position, so putting a new parameter anywhere but the end
+            // silently shifts every one after it. It compiles, and every
+            // margin in the search quietly becomes a different margin.
+            self.rfp_opp_easy_capture,
+            self.rfp_opp_worsening,
+            self.rfp_hist_divisor,
         ]
     }
     pub fn from_vec(v: &[i32]) -> Self {
@@ -287,6 +307,9 @@ impl SearchParams {
             do_deeper_margin_base: v[30],
             do_deeper_margin_depth: v[31],
             do_shallower_margin: v[32],
+            rfp_opp_easy_capture: v[33],
+            rfp_opp_worsening: v[34],
+            rfp_hist_divisor: v[35],
         }
     }
 }
@@ -983,6 +1006,69 @@ impl<'a> Searcher<'a> {
     /// pecas). Ataques de peao usam a tabela do lado CONTRARIO (truque
     /// classico: "que casas atacaria um peao preto aqui" = "que peoes
     /// brancos atacam aqui", por simetria do padrao diagonal).
+    /// Does the opponent have a threat that wins material outright?
+    ///
+    /// Not "is anything attacked" -- specifically a piece of ours attacked by
+    /// a CHEAPER enemy piece, which wins material on any exchange and does not
+    /// need a search to confirm. Pure bitboard intersections against the
+    /// attack tables, no move generation: this runs before the move list
+    /// exists, and paying for the generator inside a test meant to avoid
+    /// searching would defeat the purpose.
+    ///
+    /// Used to make reverse futility pruning careful. A margin that says "we
+    /// are far enough ahead to skip this node" is a statement about the
+    /// evaluation, and the evaluation does not know that a rook is hanging to
+    /// a bishop. Where it is, the node deserves to be searched.
+    fn opponent_has_winning_threat(&self, board: &Board) -> bool {
+        let a = self.atk;
+        let us = board.side.idx();
+        let them = board.side.opp().idx();
+        let occ = board.occ_all;
+
+        let our_q = board.pieces[us][PieceType::Queen.idx()];
+        let our_r = board.pieces[us][PieceType::Rook.idx()];
+        let our_minor =
+            board.pieces[us][PieceType::Knight.idx()] | board.pieces[us][PieceType::Bishop.idx()];
+
+        // Pawns threaten anything above a pawn.
+        let mut pawns = board.pieces[them][PieceType::Pawn.idx()];
+        let valuable = our_q | our_r | our_minor;
+        while pawns != 0 {
+            let sq = pawns.trailing_zeros() as crate::types::Square;
+            pawns &= pawns - 1;
+            if a.pawn[them][sq as usize] & valuable != 0 {
+                return true;
+            }
+        }
+        // Minors threaten rooks and queens.
+        let mut knights = board.pieces[them][PieceType::Knight.idx()];
+        while knights != 0 {
+            let sq = knights.trailing_zeros() as crate::types::Square;
+            knights &= knights - 1;
+            if a.knight[sq as usize] & (our_q | our_r) != 0 {
+                return true;
+            }
+        }
+        let mut bishops = board.pieces[them][PieceType::Bishop.idx()];
+        while bishops != 0 {
+            let sq = bishops.trailing_zeros() as crate::types::Square;
+            bishops &= bishops - 1;
+            if crate::attacks::bishop_attacks(sq, occ) & (our_q | our_r) != 0 {
+                return true;
+            }
+        }
+        // Rooks threaten queens.
+        let mut rooks = board.pieces[them][PieceType::Rook.idx()];
+        while rooks != 0 {
+            let sq = rooks.trailing_zeros() as crate::types::Square;
+            rooks &= rooks - 1;
+            if crate::attacks::rook_attacks(sq, occ) & our_q != 0 {
+                return true;
+            }
+        }
+        false
+    }
+
     fn attackers_to(&self, board: &Board, s: crate::types::Square, occ: crate::bitboard::Bitboard) -> crate::bitboard::Bitboard {
         let a = self.atk;
         let mut att = 0u64;
@@ -1739,7 +1825,47 @@ impl<'a> Searcher<'a> {
             && beta.abs() < MATE_SCORE - MAX_PLY as i32
         {
             let sp = search_params();
-            let margin = if improving { sp.rfp_improving.at(depth) } else { sp.rfp_not_improving.at(depth) };
+            let mut margin = if improving { sp.rfp_improving.at(depth) } else { sp.rfp_not_improving.at(depth) };
+
+            // Three qualitative adjustments, replacing a flat margin.
+            //
+            // The margin answers "are we far enough ahead to skip this node
+            // without looking". A fixed number answers it from the evaluation
+            // alone, and the evaluation is exactly what does not know whether
+            // something is about to happen. Measured against a reference, its
+            // margins are modulated by all three of these and ours by none --
+            // and while every individual pruning mechanism here measured
+            // normal, the reference reaches two to three plies deeper on the
+            // same node budget. Depth like that does not come from one
+            // mechanism being broken; it comes from every decision being a
+            // little better informed.
+
+            // The opponent has a piece of ours attacked by a cheaper piece.
+            // Material is about to change hands and the static evaluation
+            // says nothing about it, so raise the bar for skipping.
+            if self.opponent_has_winning_threat(board) {
+                margin += sp.rfp_opp_easy_capture * depth;
+            }
+
+            // The opponent's position got worse over the last ply -- our
+            // evaluation now is better than the mirror of theirs a ply ago.
+            // Someone losing ground is less likely to have a refutation
+            // waiting, so lower the bar.
+            if ply > 0 && self.static_evals[ply - 1] != 0
+                && raw_static_eval > -self.static_evals[ply - 1] + 1
+            {
+                margin -= sp.rfp_opp_worsening;
+            }
+
+            // The move that led here had a good history score. A move this
+            // search has repeatedly found useful is more likely to be part of
+            // something real, so the node earns a look.
+            if let Some((pt, to)) = self.ply_last_move[ply] {
+                let prev_hist = self.cont_hist_score(pt, to, ply);
+                margin += prev_hist / sp.rfp_hist_divisor.max(1);
+            }
+
+            let margin = margin.max(20);
             if static_eval - margin >= beta {
                 self.cut_rfp += 1;
                 return static_eval - margin;
