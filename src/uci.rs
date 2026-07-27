@@ -814,6 +814,25 @@ impl Engine {
                         if let Ok(n) = tokens[4].parse::<usize>() {
                             self.threads = n.max(1);
                         }
+                    } else if tokens.len() >= 5 && tokens[1] == "name" && tokens[3] == "value" {
+                        // Search parameters by name. Sweeping a pruning margin
+                        // used to mean editing a constant and waiting for a
+                        // build; this makes it one line into a running engine,
+                        // which is the difference between trying three values
+                        // and trying thirty.
+                        //
+                        // An unknown name is reported, never ignored. A silent
+                        // typo looks exactly like "this parameter has no
+                        // effect", and a sweep that reads that way produces
+                        // five identical results and a confident conclusion
+                        // drawn from none of them.
+                        if let Ok(v) = tokens[4].parse::<i32>() {
+                            if !crate::search::set_param(tokens[2], v) {
+                                eprintln!("setoption: unknown parameter '{}'", tokens[2]);
+                            }
+                        } else {
+                            eprintln!("setoption: value for '{}' is not an integer", tokens[2]);
+                        }
                     }
                 }
                 "ucinewgame" => {

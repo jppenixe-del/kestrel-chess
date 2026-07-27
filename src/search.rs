@@ -31,7 +31,13 @@ static LMR_TABLE: OnceLock<[[i32; 64]; 64]> = OnceLock::new();
 /// the clock matters, not inside the first search.
 pub fn warmup() {
     let _ = lmr_table();
-    let _ = search_params();
+    // Deliberately NOT `search_params()`. It is a OnceLock, so the first read
+    // fixes it for the life of the process -- warming it here means every
+    // `setoption` that arrives afterwards is folded into a value nobody will
+    // ever read again. The engine accepts the option, reports nothing wrong,
+    // and searches with the old number: a sweep of five values returns five
+    // identical results and looks like a finding. Building it lazily costs one
+    // branch on the first node.
 }
 fn lmr_table() -> &'static [[i32; 64]; 64] {
     LMR_TABLE.get_or_init(|| {
@@ -111,6 +117,16 @@ pub struct SearchParams {
     pub rfp_hist_divisor: i32,
     /// Slack above beta that promotes a cutoff to a deeper history bonus.
     pub hist_beta_margin: i32,
+    /// Depth ceiling for history pruning. The reference this concept comes
+    /// from prunes up to 7 and then BREAKS out of the move loop; we cannot
+    /// break, because our ordering mixes countermove and book bonuses into
+    /// the quiet score and places losing captures AFTER quiets, so leaving
+    /// the loop on one bad quiet would also discard every sacrifice behind
+    /// it. Skipping one move at a time is the safe half of the mechanism;
+    /// this is the half that was left at 4 without ever being measured.
+    pub hist_pruning_max_depth: i32,
+    /// Extra slack below s_beta that turns a double extension into a triple.
+    pub triple_ext_margin: i32,
     pub rfp_improving: DepthMargin,
     pub rfp_not_improving: DepthMargin,
     pub razor_base: i32,
@@ -201,6 +217,8 @@ impl Default for SearchParams {
             rfp_opp_worsening: 14,
             rfp_hist_divisor: 410,
             hist_beta_margin: 37,
+            hist_pruning_max_depth: 4,
+            triple_ext_margin: 124,
             rfp_improving: DepthMargin { base: 0, slope: 26 },
             rfp_not_improving: DepthMargin { base: 0, slope: 80 },
             razor_base: 458,
@@ -280,6 +298,8 @@ impl SearchParams {
             self.rfp_opp_worsening,
             self.rfp_hist_divisor,
             self.hist_beta_margin,
+            self.hist_pruning_max_depth,
+            self.triple_ext_margin,
         ]
     }
     pub fn from_vec(v: &[i32]) -> Self {
@@ -315,13 +335,94 @@ impl SearchParams {
             rfp_opp_worsening: v[34],
             rfp_hist_divisor: v[35],
             hist_beta_margin: v[36],
+            hist_pruning_max_depth: v[37],
+            triple_ext_margin: v[38],
         }
+    }
+}
+
+/// Names of the search parameters, in the exact order `to_vec` emits them.
+/// Exposed so they can be set over UCI (`setoption name <n> value <v>`) and
+/// swept without a rebuild -- the difference between an experiment costing
+/// minutes and one costing a compile each.
+///
+/// Generated from `to_vec`, never hand-written. A list that drifts out of
+/// order does not fail: it quietly sets the wrong parameter, and the sweep
+/// reports whatever that other parameter happens to do.
+pub const PARAM_NAMES: [&str; 39] = [
+    "rfp_improving_base",
+    "rfp_improving_slope",
+    "rfp_not_improving_base",
+    "rfp_not_improving_slope",
+    "razor_base",
+    "razor_per_depth",
+    "futility_improving_base",
+    "futility_improving_slope",
+    "futility_not_improving_base",
+    "futility_not_improving_slope",
+    "cap_futility_improving_base",
+    "cap_futility_improving_slope",
+    "cap_futility_not_improving_base",
+    "cap_futility_not_improving_slope",
+    "delta_margin",
+    "qs_lmp_limit",
+    "tt_extended_cutoff_margin",
+    "history_prune_mult",
+    "nmp_min_depth",
+    "nmp_eval_margin",
+    "nmp_static_eval_base_margin",
+    "nmp_static_eval_depth_margin",
+    "nmp_base_reduction",
+    "nmp_depth_reduction_scale",
+    "nmp_eval_reduction_scale",
+    "nmp_max_eval_reduction",
+    "probcut_beta_margin",
+    "asp_init_delta",
+    "asp_widening_factor",
+    "min_asp_depth",
+    "do_deeper_margin_base",
+    "do_deeper_margin_depth",
+    "do_shallower_margin",
+    "rfp_opp_easy_capture",
+    "rfp_opp_worsening",
+    "rfp_hist_divisor",
+    "hist_beta_margin",
+    "hist_pruning_max_depth",
+    "triple_ext_margin",
+];
+
+/// Overrides applied on top of the defaults, set over UCI before the first
+/// search. `SEARCH_PARAMS` is a `OnceLock` and cannot be changed after it is
+/// read, so these are held separately and folded in when it is first built.
+pub static PARAM_OVERRIDES: std::sync::Mutex<Vec<(usize, i32)>> = std::sync::Mutex::new(Vec::new());
+
+/// Set one parameter by name. Returns false for an unknown name so the caller
+/// can say so out loud -- an ignored typo is indistinguishable from "this
+/// parameter has no effect", and that mistake costs a whole experiment.
+pub fn set_param(name: &str, value: i32) -> bool {
+    match PARAM_NAMES.iter().position(|&n| n == name) {
+        Some(i) => {
+            PARAM_OVERRIDES.lock().unwrap().push((i, value));
+            true
+        }
+        None => false,
     }
 }
 
 static SEARCH_PARAMS: OnceLock<SearchParams> = OnceLock::new();
 pub fn search_params() -> &'static SearchParams {
     SEARCH_PARAMS.get_or_init(|| {
+        let overrides = PARAM_OVERRIDES.lock().unwrap().clone();
+        if !overrides.is_empty() {
+            let mut v = SearchParams::default().to_vec();
+            for (i, val) in &overrides {
+                if *i < v.len() {
+                    v[*i] = *val;
+                }
+            }
+            eprintln!("setoption: {} search parameter(s) overridden", overrides.len());
+            return SearchParams::from_vec(&v);
+        }
         if let Ok(path) = std::env::var("KESTREL_SEARCH_PARAMS") {
             if let Ok(text) = std::fs::read_to_string(&path) {
                 let parsed: Vec<i32> = text.trim().split(',').filter_map(|s| s.parse().ok()).collect();
@@ -1891,12 +1992,9 @@ impl<'a> Searcher<'a> {
         // `depth>6?3:2` fixo que ignorava completamente a avaliacao
         // estatica -- mecanismo genuinamente mais informado (quanto
         // mais a posicao excede beta, mais funda a reducao), nao so'
-        // constantes recalibradas. `static_eval` (ja' corrigida por
-        // corr-hist -- e' o valor CORRIGIDO que alimenta AMBOS os
-        // gates; o `raw_static_eval` e' so' um intermediario, nunca
-        // usado aqui; confirmado por revisao 2026-07-23, o comentario
-        // anterior estava trocado e o segundo gate usava
-        // `raw_static_eval` por engano) usado nos DOIS gates.
+        // constantes recalibradas. A reducao usa `static_eval`, o valor
+        // corrigido; os dois gates usam valores diferentes, e a razao
+        // esta' explicada onde eles estao.
         // 2026-07-23: tentei uma busca de verificacao completa (R sem
         // cap + `nmp_min_ply` + re-busca real quando depth>15 e beta e'
         // quase decisivo) -- A/B isolado (300 jogos) deu 41.5%,
@@ -1924,8 +2022,18 @@ impl<'a> Searcher<'a> {
             && excluded.is_none()
             && beta.abs() < MATE_SCORE - MAX_PLY as i32
             && self.has_non_pawn_material(board)
+            // The two gates deliberately read different evaluations. The
+            // narrow one (margin ~29) is the fine judgement of whether this
+            // node is comfortably above beta, and it wants the CORRECTED
+            // eval, which is what the search actually believes. The wide one
+            // (margin ~193, relaxing with depth) is a floor: it exists to stop
+            // us handing away a move in a position that only looks good
+            // because correction history says so, and a floor built on the
+            // corrected value cannot do that job. A 2026-07-23 review saw the
+            // raw value here, read it as a copy-paste slip, and made both
+            // gates corrected. It was not a slip.
             && static_eval >= beta + sp_nmp.nmp_eval_margin
-            && static_eval
+            && raw_static_eval
                 >= beta + sp_nmp.nmp_static_eval_base_margin - sp_nmp.nmp_static_eval_depth_margin * depth
         {
             let r = ((sp_nmp.nmp_base_reduction + depth * sp_nmp.nmp_depth_reduction_scale) / 256
@@ -2133,7 +2241,20 @@ impl<'a> Searcher<'a> {
                     let parent_dext = self.dextensions[ply.saturating_sub(1)];
                     if s_score < s_beta - DOUBLE_EXT_MARGIN && !is_pv && parent_dext <= DOUBLE_EXT_MAX {
                         se_candidate = Some(tm);
-                        se_extension = 2;
+                        // Third ply for a QUIET move that is singular by an
+                        // even wider margin. The restriction to quiets is the
+                        // whole point: a capture can be singular simply
+                        // because it is the only way to recapture, which says
+                        // nothing about the line being forced. A quiet move
+                        // that no alternative comes close to matching is one
+                        // the position genuinely compels, and those are worth
+                        // following further than anything else on the board.
+                        se_extension =
+                            if !tm.is_capture() && s_score < s_beta - search_params().triple_ext_margin {
+                                3
+                            } else {
+                                2
+                            };
                         self.dextensions[ply] = parent_dext + 1;
                     } else if s_score < s_beta {
                         se_candidate = Some(tm);
@@ -2255,7 +2376,7 @@ impl<'a> Searcher<'a> {
             if i >= 3
                 && !is_pv
                 && !in_check
-                && depth <= 4
+                && depth <= search_params().hist_pruning_max_depth
                 && !mv.is_capture()
                 && mv.promotion.is_none()
                 && alpha.abs() < MATE_SCORE - MAX_PLY as i32
