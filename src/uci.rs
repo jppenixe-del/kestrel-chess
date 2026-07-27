@@ -478,7 +478,18 @@ impl Engine {
                 line_limits.soft_budget = limits.soft_budget.map(|b| b / divisor);
                 if let Some(end) = limits.deadline {
                     let total = end.saturating_duration_since(t0);
-                    line_limits.deadline = Some(Instant::now() + total / divisor);
+                    // Each line's deadline is measured from the START of the
+                    // whole search, not from now. Taking `now + share` per
+                    // line let every line's overrun carry into the next, so
+                    // the lines together ran well past the hard deadline that
+                    // was supposed to bound them -- a live game showed a move
+                    // costing 18.6s against a 13.5s ceiling, three lines
+                    // overshooting in sequence. Anchored to `t0`, the last
+                    // line ends where the ceiling says, whatever the earlier
+                    // ones did.
+                    let rest = if effective_multipv > 1 { effective_multipv as u32 - 1 } else { 1 };
+                    let used = total / 2 + (pv_index as u32 - 1) * (total / 2 / rest);
+                    line_limits.deadline = Some(t0 + used.min(total));
                 }
             }
             let (best, score, depth_reached, nodes_searched, pv_line) =
