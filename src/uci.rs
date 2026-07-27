@@ -827,7 +827,13 @@ impl Engine {
                         // five identical results and a confident conclusion
                         // drawn from none of them.
                         if let Ok(v) = tokens[4].parse::<i32>() {
-                            if !crate::search::set_param(tokens[2], v) {
+                            // Search parameters first, then material values
+                            // (mg_rook, eg_queen, ...). Both are just numbers
+                            // the engine compares things against, and both are
+                            // worth sweeping without a rebuild.
+                            if !crate::search::set_param(tokens[2], v)
+                                && !crate::eval::set_material(tokens[2], v)
+                            {
                                 eprintln!("setoption: unknown parameter '{}'", tokens[2]);
                             }
                         } else {
