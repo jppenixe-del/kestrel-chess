@@ -2745,19 +2745,66 @@ fn tune_king(dataset_path: &str, out_path: &str, max_positions: usize, threads: 
 /// sharp middlegame, quiet middlegame, and endgames with and without pawns.
 /// A benchmark drawn from one phase would miss a change that only affects
 /// another, which for a signature is worse than useless.
-const BENCH_FENS: [&str; 12] = [
-    "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
-    "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
-    "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
-    "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
-    "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8",
-    "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10",
-    "r1bq1rk1/pp2bppp/2n1pn2/2pp4/3P1B2/2PBPN2/PP1N1PPP/R2Q1RK1 w - - 0 9",
-    "8/8/4k3/8/8/3KBN2/8/8 w - - 0 1",
-    "2r3k1/2r2qp1/1p1p3p/p2Pppb1/P1P5/1PB3QP/4RPP1/3R2K1 w - - 2 26",
-    "6k1/5ppp/8/8/8/8/5PPP/6K1 w - - 0 40",
-    "r4rk1/1pp1qppp/p1np1n2/4p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 b - - 0 10",
-    "4rrk1/pp1n1pp1/3bp2p/q2p4/3P1P2/1PN1PQ2/P1B3PP/2R2RK1 w - - 0 18",
+/// Bench positions, drawn from the bot's own games by `build_bench_fens.py`
+/// and spread evenly across opening, middlegame and endgame by piece count.
+///
+/// Twelve positions were too few for either job the bench does. As a stability
+/// metric one unusual tree moved the total enough to read as a change; as a
+/// signature -- this binary visits exactly this many nodes -- a small set makes
+/// collisions between different builds likelier. Fifty-one, from real games,
+/// gives a number that moves when the search moves and not otherwise.
+const BENCH_FENS: [&str; 51] = [
+    "8/1p5p/2nk1B2/p1nr4/4r3/PP3R1P/1R2P1K1/8 b - - 3 36",
+    "r1bq1rk1/2p2ppp/2n1p3/P1bp4/4n3/4PN2/P2BNPPP/R2QKB1R w KQ - 6 12",
+    "8/1p2k1K1/p1p5/P3P3/1P1P4/4B3/b7/8 b - - 50 71",
+    "6k1/R7/2b5/7P/3B4/6P1/7q/4K3 w - - 2 47",
+    "Bn2r3/p2Q2pp/5p1k/8/2p4N/Bn4P1/4PP1P/R4RK1 b - - 0 15",
+    "r2q3r/pkpnb1p1/3pn1B1/1p2p1P1/QN2P3/2PPB3/PP4PP/R4RK1 w - - 2 19",
+    "r2q3r/ppp2k1p/2nbb1p1/8/2Q5/2NP4/PPP2PPP/R1B1KB1R w KQ - 5 12",
+    "r3rnk1/1b2qppp/p3p3/1p1pP3/2nP4/P1NB1NP1/1PQ2P1P/3RR1K1 w - - 1 19",
+    "rnbqkb1r/2p2ppp/4pn2/P1Pp4/8/4PN2/P4PPP/RNBQKB1R b KQkq - 0 8",
+    "rnb1qrk1/ppp1p1bn/3pP1p1/5p1p/3P3N/2PB3P/PP3PP1/RNBQR1K1 w - - 2 12",
+    "1r1r2k1/pb3p2/1pp3pp/8/3PP3/2R2N2/P4PPP/4R1K1 b - - 3 22",
+    "rnq1nrk1/1b2ppb1/p2p3B/1PpP2Q1/P3P1pp/2N2P2/1P3NPP/R3KB1R w KQ - 6 12",
+    "r1bq1rk1/ppp1ppb1/2np1np1/7p/3PP3/2PB1N1P/PP3PP1/RNBQR1K1 b - - 0 8",
+    "2r1r3/1pp2pkp/p2p2p1/3Pq3/nP1R3P/3Q2P1/P1P2PB1/1R4K1 b - - 2 22",
+    "8/8/p6P/P7/1k3p2/2r5/1q6/3K4 b - - 3 64",
+    "8/8/8/3pk3/8/3K1P2/8/8 b - - 1 64",
+    "8/8/7R/8/8/1P5P/Pk3PP1/6K1 w - - 1 40",
+    "5rk1/3b1ppp/2p1r3/1p1P4/1p6/5B2/1P1K1PPP/R6R b - - 0 22",
+    "4k3/8/5Q1p/8/4N3/1pP4P/1qbK1PP1/8 w - - 7 54",
+    "r1bq1rk1/pp2bppp/2p2n2/n2p4/3P4/P1N1PNB1/1PQ2PPP/R3KB1R w KQ - 0 12",
+    "8/4Q3/7P/6PK/4n3/4q3/1k6/8 w - - 13 89",
+    "rnb1kb1r/ppp1qppp/8/8/3pB3/8/PPP2PPP/RNBQR1K1 b kq - 1 8",
+    "r3kb1r/pp1npppp/2P1bn2/1B4B1/4p3/2N5/PPP2PPP/R2K2NR b kq - 0 8",
+    "6k1/1p4p1/8/2P2p2/1P3P2/2Q3K1/4p2P/3q4 b - - 1 36",
+    "6k1/1p2Bppp/4p3/1p2P3/6P1/P4b1P/4rP2/6K1 w - - 2 40",
+    "6n1/2p2k1p/pp3p2/3P2p1/2P5/2B1N3/PP3P2/7K b - - 3 22",
+    "6b1/4p3/8/6p1/K1k2P2/6p1/1q6/8 b - - 0 43",
+    "rnb1kb1r/2p1pppp/pq3n2/1p4N1/3P4/2N5/PPP1BPPP/R1BQ1RK1 b kq - 3 8",
+    "r1bq1rk1/pp2ppbp/2n2np1/1BPp4/5B2/2N1PN2/PPP2PPP/R2Q1RK1 b - - 4 8",
+    "r1b1r1k1/pp3pp1/2nb1q1p/8/3pn3/P4QP1/1PPP2KP/RNB2BNR b - - 3 15",
+    "rq3rk1/1p2b1p1/pNnpb2p/4pp2/2P1P3/1P2BN1P/P3QPP1/R2R2K1 w - - 0 12",
+    "6n1/5pk1/4p3/1b1pP1K1/3P2P1/7q/Q4P2/8 b - - 0 43",
+    "rnbqk2r/pp2ppbp/3p2p1/2p5/3P4/2PBPNP1/PP3PP1/RN1QK2R b KQkq - 0 8",
+    "8/8/4prp1/2Q4p/4RP2/3p3P/3k2PK/q7 w - - 4 54",
+    "8/p6k/1p4qp/3P4/2P1n2P/b7/4Q1P1/4B2K b - - 0 36",
+    "5rk1/p4ppp/3b4/8/Br2P3/4n3/P1P5/3R1R1K w - - 6 26",
+    "2r3k1/1Q3pp1/p6p/1p2p3/4p1b1/P1P1PqP1/5P1P/1R4K1 b - - 3 36",
+    "8/7p/5p1k/1N3P2/8/6PP/r6r/3RK3 w - - 11 47",
+    "2r5/4k1pp/pB2pp2/1p1P4/1P3nbR/2PB1q2/P2K1P1P/R7 w - - 1 26",
+    "3rn1k1/p3p1bp/P1R1p1p1/1P2p3/2P1P2P/3q1PP1/2Q2BK1/8 w - - 0 40",
+    "r4r1k/p2P2p1/2Q4p/1P2Q3/2B2p2/4R2P/5PP1/7K b - - 1 43",
+    "8/4K3/5pk1/5R2/6P1/5P2/8/8 w - - 9 82",
+    "r2k1n2/ppp2p1p/5bpB/3b4/3P1N2/P7/1P1K1PPP/4R3 w - - 0 12",
+    "8/4p2k/3p1p2/2pPP3/8/4n1PP/P2q4/6K1 b - - 0 36",
+    "8/2R5/p7/Pk5P/1p3p2/2p2K2/8/7r b - - 1 57",
+    "r1bqk2r/pppp1ppp/8/4p3/2PnP1Q1/P7/1P3PPP/RNB1KB1R b KQkq - 0 8",
+    "8/1p6/pB3k2/2P5/4ppp1/1p1r4/1R6/4K3 b - - 1 57",
+    "3r4/5k2/R4p2/1p6/2b1B1P1/1p2KP2/1P6/8 w - - 1 47",
+    "r3r1k1/1p1bppbn/1q1pP2p/1NpP2pB/1nP2P2/P1B4P/1Q1N2P1/R4RK1 b - - 0 15",
+    "2k4r/p4p2/3QpN2/3pP2p/1P1q4/8/P4PP1/2n2K2 w - - 4 40",
+    "r1b1k2r/ppp2pp1/2np1q1p/2bNp3/2B1P3/3P1N2/PPP2PPP/R2QK2R b KQkq - 1 8",
 ];
 
 fn bench(depth: i32) {
