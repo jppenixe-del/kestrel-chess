@@ -1117,6 +1117,121 @@ static DEFAULT_WEIGHTS: OnceLock<Weights> = OnceLock::new();
 /// position suite / a real game before ever touching the compiled-in
 /// consts -- nothing is "deployed" by running the tuner, only by a
 /// deliberate later commit copying values back into the consts.
+
+/// Per-family scaling of the evaluation weights.
+///
+/// A single global factor cannot answer the question that matters. It says
+/// "better or worse" and nothing else -- and when the parameter set is a
+/// mixture of inherited and locally tuned values, as ours is, it does not even
+/// say that reliably: scaling a value that was already on our scale is noise
+/// injected on purpose.
+///
+/// A factor per family asks a sharper question: not "does the engine play
+/// better" but "WHERE is it mispriced". If mobility wants +20% and king safety
+/// wants nothing, that is a finding about the evaluation, not a number to
+/// tune. Factors are in per-mille so they can arrive over UCI as integers:
+/// 1000 is unchanged, 1200 is +20%.
+static FAMILY_SCALE: [std::sync::atomic::AtomicI32; 6] = [
+    std::sync::atomic::AtomicI32::new(1000),
+    std::sync::atomic::AtomicI32::new(1000),
+    std::sync::atomic::AtomicI32::new(1000),
+    std::sync::atomic::AtomicI32::new(1000),
+    std::sync::atomic::AtomicI32::new(1000),
+    std::sync::atomic::AtomicI32::new(1000),
+];
+
+const FAMILIES: [&str; 6] = ["mobility", "king", "threats", "pawns", "pieces", "tempo"];
+
+/// Which family a weight field belongs to, or None if it is not scaled
+/// (scaling factors, complexity terms and anything else whose units are not
+/// centipawns).
+
+fn family_of(name: &str) -> &'static str {
+    field_family(name).unwrap_or("")
+}
+
+fn field_family(name: &str) -> Option<&'static str> {
+    match name {
+            "backward_exposed" => Some("pawns"),
+            "backward_pawn" => Some("pawns"),
+            "bishop_hit_queen" => Some("threats"),
+            "bishop_pair" => Some("pieces"),
+            "bishop_pawns" => Some("pawns"),
+            "candidate_passer" => Some("pawns"),
+            "defended_pawn" => Some("pawns"),
+            "doubled_pawn" => Some("pawns"),
+            "isolated_exposed" => Some("pawns"),
+            "isolated_pawn" => Some("pawns"),
+            "king_attacker_weight" => Some("king"),
+            "king_attacks" => Some("king"),
+            "king_flank_attacks" => Some("king"),
+            "king_flank_defenses" => Some("king"),
+            "knight_hit_queen" => Some("threats"),
+            "knight_outpost" => Some("pieces"),
+            "long_diag_bishop" => Some("pieces"),
+            "minor_behind_pawn" => Some("pieces"),
+            "mobility_bishop" => Some("mobility"),
+            "mobility_knight" => Some("mobility"),
+            "mobility_queen" => Some("mobility"),
+            "mobility_rook" => Some("mobility"),
+            "our_passer_proximity" => Some("pawns"),
+            "passed_pawn" => Some("pawns"),
+            "passer_defended_push" => Some("pawns"),
+            "passer_slider_behind" => Some("pawns"),
+            "pawn_phalanx" => Some("pawns"),
+            "pawn_shelter" => Some("king"),
+            "pawn_storm" => Some("king"),
+            "push_threat" => Some("threats"),
+            "restricted_squares" => Some("threats"),
+            "rook_hit_queen" => Some("threats"),
+            "rook_on_seventh" => Some("pieces"),
+            "rook_open" => Some("pieces"),
+            "safe_bishop_check" => Some("king"),
+            "safe_knight_check" => Some("king"),
+            "safe_queen_check" => Some("king"),
+            "safe_rook_check" => Some("king"),
+            "shelter_open" => Some("king"),
+            "tempo" => Some("tempo"),
+            "their_passer_proximity" => Some("pawns"),
+            "threat_by_bishop" => Some("threats"),
+            "threat_by_king" => Some("threats"),
+            "threat_by_knight" => Some("threats"),
+            "threat_by_pawn" => Some("threats"),
+            "threat_by_queen" => Some("threats"),
+            "threat_by_rook" => Some("threats"),
+            "uncastled_king_has_rights" => Some("king"),
+            "uncastled_king_no_rights" => Some("king"),
+            "weak_king_ring" => Some("king"),
+            _ => None,
+    }
+}
+
+/// Set one family's factor, in per-mille. Returns false for an unknown family.
+pub fn set_family_scale(name: &str, per_mille: i32) -> bool {
+    match FAMILIES.iter().position(|&f| f == name) {
+        Some(i) => {
+            FAMILY_SCALE[i].store(per_mille, std::sync::atomic::Ordering::Relaxed);
+            true
+        }
+        None => false,
+    }
+}
+
+/// True when any family has been rescaled, so the common path can skip the
+/// work entirely.
+pub fn family_scaling_active() -> bool {
+    FAMILY_SCALE
+        .iter()
+        .any(|a| a.load(std::sync::atomic::Ordering::Relaxed) != 1000)
+}
+
+fn family_factor(name: &str) -> i32 {
+    match field_family(name).and_then(|f| FAMILIES.iter().position(|&x| x == f)) {
+        Some(i) => FAMILY_SCALE[i].load(std::sync::atomic::Ordering::Relaxed),
+        None => 1000,
+    }
+}
+
 impl Weights {
     /// A copy with every king-safety input silenced -- the tunable block in
     /// `to_vec` AND the fields deliberately kept out of it.
@@ -1214,7 +1329,19 @@ static BUCKET_WEIGHTS: OnceLock<Vec<Weights>> = OnceLock::new();
 ///
 /// KESTREL_BUCKET_WEIGHTS points at a file of NUM_BUCKETS x to_vec() values,
 /// comma separated, which is what a bucketed tuner produces.
+/// Buckets with per-family factors applied. Built lazily and only when some
+/// factor was actually set, so `warmup()` -- which evaluates a position and
+/// would otherwise seal this before any setoption arrived -- never reaches it.
+static SCALED_BUCKETS: OnceLock<Vec<Weights>> = OnceLock::new();
+
 pub fn weights_for(board: &Board) -> &'static Weights {
+    if family_scaling_active() {
+        let scaled = SCALED_BUCKETS.get_or_init(|| {
+            let base = scaled_weights().clone();
+            vec![base; NUM_BUCKETS]
+        });
+        return &scaled[bucket_of(board)];
+    }
     let all = BUCKET_WEIGHTS.get_or_init(|| {
         let base = default_weights().clone();
         let dim = base.to_vec().len();
@@ -1236,6 +1363,53 @@ pub fn weights_for(board: &Board) -> &'static Weights {
         vec![base; NUM_BUCKETS]
     });
     &all[bucket_of(board)]
+}
+
+/// The weights with per-family factors applied.
+///
+/// A separate OnceLock from `default_weights()`, and deliberately not touched
+/// by `warmup()`. That function evaluates a real position to pay the
+/// first-call cost off the clock, which seals whatever it reads -- so anything
+/// configurable over UCI must be built lazily, on a lock the warm-up never
+/// looks at. The same mistake in search.rs silently invalidated a whole
+/// parameter sweep.
+static SCALED_WEIGHTS: OnceLock<Weights> = OnceLock::new();
+
+fn scaled_weights() -> &'static Weights {
+    SCALED_WEIGHTS.get_or_init(|| {
+        let base = default_weights();
+        let mut v = base.to_vec();
+        let fams = base.field_families();
+        let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for (i, fam) in fams.iter().enumerate() {
+            if i >= v.len() || fam.is_empty() {
+                continue;
+            }
+            let f = match FAMILIES.iter().position(|&x| x == *fam) {
+                Some(k) => FAMILY_SCALE[k].load(std::sync::atomic::Ordering::Relaxed),
+                None => 1000,
+            };
+            if f != 1000 {
+                v[i] = (v[i] as i64 * f as i64 / 1000) as i32;
+                *counts.entry(fam).or_insert(0) += 1;
+            }
+        }
+        for (fam, n) in &counts {
+            eprintln!("family scale: {} -> {} pesos alterados", fam, n);
+        }
+        base.from_vec(&v)
+    })
+}
+
+/// The weights the evaluation should use: scaled when any family factor was
+/// set, the plain defaults otherwise. One branch on a value that is almost
+/// always false.
+pub fn active_weights() -> &'static Weights {
+    if family_scaling_active() {
+        scaled_weights()
+    } else {
+        default_weights()
+    }
 }
 
 pub fn default_weights() -> &'static Weights {
@@ -1373,6 +1547,83 @@ impl Weights {
         pair!(self.stonewall_bad_bishop);
         v
     }
+    /// The family of every scalar `to_vec` emits, in the same order.
+    ///
+    /// Generated from the body of `to_vec` by substitution rather than written
+    /// out, so it cannot drift from the vector it describes -- a families list
+    /// that is one entry out of step does not fail, it scales the wrong terms
+    /// and reports whatever those happen to do.
+    pub fn field_families(&self) -> Vec<&'static str> {
+        let mut f: Vec<&'static str> = Vec::with_capacity(512);
+        // Macros, not closures: three closures capturing the same Vec mutably
+        // cannot coexist, and splitting them into separate scopes would make
+        // the generated body harder to keep in step with `to_vec`.
+        macro_rules! two { ($n:expr) => {{ let g = family_of($n); f.push(g); f.push(g); }} }
+        macro_rules! one { ($n:expr) => {{ f.push(family_of($n)); }} }
+        macro_rules! many {
+            ($n:expr, $len:expr) => {{
+                let g = family_of($n);
+                for _ in 0..$len { f.push(g); f.push(g); }
+            }}
+        }
+        two!("bishop_pair");
+        two!("long_diag_bishop");
+        two!("minor_behind_pawn");
+        two!("knight_outpost");
+        many!("rook_open", self.rook_open.len());
+        two!("rook_on_seventh");
+        two!("tempo");
+        many!("mobility_knight", self.mobility_knight.len());
+        many!("mobility_bishop", self.mobility_bishop.len());
+        many!("mobility_rook", self.mobility_rook.len());
+        many!("mobility_queen", self.mobility_queen.len());
+        many!("king_attacker_weight", self.king_attacker_weight.len());
+        two!("king_attacks");
+        two!("safe_knight_check");
+        two!("safe_bishop_check");
+        two!("safe_rook_check");
+        two!("safe_queen_check");
+        many!("pawn_shelter", self.pawn_shelter.len());
+        two!("shelter_open");
+        many!("pawn_storm", self.pawn_storm.len());
+        many!("threat_by_king", self.threat_by_king.len());
+        two!("knight_hit_queen");
+        two!("bishop_hit_queen");
+        two!("rook_hit_queen");
+        two!("push_threat");
+        two!("restricted_squares");
+        many!("pawn_phalanx", self.pawn_phalanx.len());
+        many!("defended_pawn", self.defended_pawn.len());
+        many!("isolated_pawn", self.isolated_pawn.len());
+        many!("doubled_pawn", self.doubled_pawn.len());
+        two!("isolated_exposed");
+        two!("backward_exposed");
+        many!("our_passer_proximity", self.our_passer_proximity.len());
+        many!("their_passer_proximity", self.their_passer_proximity.len());
+        many!("passer_defended_push", self.passer_defended_push.len());
+        many!("passer_slider_behind", self.passer_slider_behind.len());
+        two!("backward_pawn");
+        many!("bishop_pawns", self.bishop_pawns.len());
+        two!("weak_king_ring");
+        many!("king_flank_attacks", self.king_flank_attacks.len());
+        many!("king_flank_defenses", self.king_flank_defenses.len());
+        two!("uncastled_king_no_rights");
+        two!("uncastled_king_has_rights");
+        one!("scale_ocb_bishops_only");
+        one!("scale_ocb_one_rook");
+        one!("scale_ocb_one_knight");
+        one!("scale_fallback_base");
+        one!("scale_fallback_per_pawn");
+        one!("complexity_total_pawns");
+        one!("complexity_pawn_flanks");
+        one!("complexity_pawn_endgame");
+        one!("complexity_adjustment");
+        two!("stonewall");
+        two!("stonewall_outpost");
+        two!("stonewall_bad_bishop");
+        f
+    }
+
 
     /// Inverse of `to_vec()` -- rebuilds a full `Weights` from a flat
     /// vector in the exact same field order. `king_danger_table` is

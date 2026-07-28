@@ -831,8 +831,15 @@ impl Engine {
                             // (mg_rook, eg_queen, ...). Both are just numbers
                             // the engine compares things against, and both are
                             // worth sweeping without a rebuild.
+                            // Family factors arrive as `scale_<family>` in
+                            // per-mille, so a whole class of evaluation terms
+                            // can be moved at once and the question becomes
+                            // "where is the evaluation mispriced" rather than
+                            // "is this one number right".
+                            let fam = tokens[2].strip_prefix("scale_");
                             if !crate::search::set_param(tokens[2], v)
                                 && !crate::eval::set_material(tokens[2], v)
+                                && !fam.map_or(false, |f| crate::eval::set_family_scale(f, v))
                             {
                                 eprintln!("setoption: unknown parameter '{}'", tokens[2]);
                             }
