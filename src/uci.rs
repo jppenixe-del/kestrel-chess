@@ -52,7 +52,22 @@ const HARD_CAP_PERCENT: i64 = 45;
 /// The hard ceiling as a multiple of the base slice, in tenths. Sits just
 /// above the largest scaling the search can award itself, so a move that has
 /// earned every extension still gets cut before it can overshoot.
-const HARD_CAP_BUDGET_MULT: i64 = 25;
+///
+/// Raised from 25 (2.5x) once two real losses were traced to moves played
+/// fast with the clock full: mated on move 37 with 68.6s of 180 unspent, and
+/// on move 61 having spent 1.04s of an available 29.7s on the move that lost
+/// the game -- a move three seconds of thought does not play. A ceiling this
+/// close to the base allowance does not merely cut long searches, it stops
+/// the search from ever asking for time, because there is none to ask for.
+/// The percentage of the remaining clock below is what actually guards the
+/// game, and this now sits above the search's own ceiling rather than under
+/// it.
+const HARD_CAP_BUDGET_MULT: i64 = 40;
+/// Ceiling on how many ordinary moves a critical one may be worth, in tenths.
+/// Reached on a comfortable clock and given up as the clock runs down: the
+/// multiplier is the remaining clock in units of two seconds, floored at 1.0x
+/// so a short clock buys no long thinks at all.
+const EMERGENCY_MULT_MAX: i64 = 30;
 
 const OPENING_PLIES: i64 = 16;
 /// Ceiling on a single opening move once the book has no answer. Small on
@@ -76,6 +91,7 @@ fn compute_time_budget(
     opp_time: i64,
     movestogo: Option<i64>,
     last_score: Option<i32>,
+    pieces_left: i64,
 ) -> (i64, i64) {
     let safe_time = (my_time - MOVE_OVERHEAD_MS).max(1);
 
@@ -113,7 +129,32 @@ fn compute_time_budget(
     // much as every iteration before it put together. Without a ceiling close
     // enough to bite mid-search, the allowance is a suggestion the last
     // iteration is free to overshoot by half.
+    // How many of our moves the game still has in it, read off the material
+    // rather than the move number. A position with eight pieces left has few
+    // moves to go -- to mate, to a decided endgame, or to the point where the
+    // tablebases answer outright -- while a full board has the whole game
+    // ahead of it. The move number cannot tell those apart: move 40 of a
+    // queenless rook ending and move 40 of a full-board middlegame have very
+    // different amounts of chess remaining.
+    //
+    // This governs the EMERGENCY ceiling only. The base allowance keeps its
+    // constant fraction, which decays with the clock instead of accelerating
+    // against it -- an earlier attempt to drive the base allowance from an
+    // estimate of moves remaining had the engine spending 8% of its clock per
+    // move at move 34 and playing the last twenty at nothing. The ceiling is
+    // a different question: it is not what a move costs, it is what a move is
+    // ALLOWED to cost when the search says this one matters, and that should
+    // grow as the remaining game shrinks.
+    let horizon = (12 + (pieces_left - 2) * 7 / 5).clamp(12, 42);
+    // What a critical move is allowed to be worth, in ordinary moves, and that
+    // is a question about the clock as much as about the position. With a
+    // healthy clock a move that decides the game can be worth three; with the
+    // clock nearly out there is no such thing as an affordable long think, and
+    // the same reasoning that justifies spending would spend the game away.
+    // In tenths, so it moves continuously instead of in steps.
+    let emergency_mult = (safe_time / 2000).clamp(10, EMERGENCY_MULT_MAX);
     let mut hard_cap = (safe_time * HARD_CAP_PERCENT / 100)
+        .min((safe_time / horizon) * emergency_mult / 10)
         .min(soft * HARD_CAP_BUDGET_MULT / 10)
         .max(soft);
 
@@ -128,11 +169,22 @@ fn compute_time_budget(
     // que nos em breve. Confortavelmente atras (eles >=1.5x o nosso):
     // aperta -- preservar o proprio relogio pesa mais quando ja estamos
     // em desvantagem nele.
-    if opp_time > 0 {
-        if my_time >= opp_time * 3 / 2 {
-            hard_cap = hard_cap * 6 / 5;
-        } else if opp_time >= my_time * 3 / 2 {
-            hard_cap = hard_cap * 4 / 5;
+    // How far ahead or behind we are on the clock, not just how much clock we
+    // have. A raised ceiling is only safe if something watches the gap: the
+    // move that deserves six seconds deserves them when we are ahead on time
+    // and cannot afford them when the opponent has three times our clock and
+    // will simply outlast us. Continuous rather than two steps, because the
+    // step version treated 1.49x and 1.51x as different worlds.
+    if opp_time > 0 && my_time > 0 {
+        // ratio in tenths: 10 = level, 20 = double their clock, 5 = half.
+        let ratio = (my_time * 10 / opp_time).clamp(3, 25);
+        // Ahead: up to +50% of ceiling. Behind: down to -50%. Level: unchanged.
+        let adj = (10 + (ratio - 10) / 2).clamp(5, 15);
+        hard_cap = hard_cap * adj / 10;
+        // Being far behind on the clock also caps the base allowance, not just
+        // the emergency ceiling -- thinking well and flagging is still a loss.
+        if ratio <= 5 {
+            soft = soft * 3 / 4;
         }
     }
 
@@ -148,6 +200,26 @@ fn compute_time_budget(
         hard_cap = hard_cap.min(cut);
     }
 
+    // Nivel 2.5: under ten seconds, play like a machine gun.
+    //
+    // Below this the game is no longer decided by the quality of any single
+    // move -- it is decided by whether we still have a clock. Thinking is
+    // what loses here: a good move played in 400ms and a slightly better one
+    // played in 900ms are the same move if the second costs the game on time.
+    // So the allowance stops being a share of the clock scaled by difficulty
+    // and becomes a flat, small number of milliseconds, with the emergency
+    // ceiling switched off entirely -- there is no move important enough to
+    // be worth a long think when there is no long think left to have.
+    //
+    // Ten seconds buys about eighty moves at this rate, which is more chess
+    // than most positions have remaining. Kept clear of the panic tier below,
+    // which is a different thing: this is playing fast, that is surviving.
+    if safe_time < 10_000 {
+        let burst = (safe_time / 80).clamp(15, 150);
+        soft = soft.min(burst);
+        hard_cap = soft;
+    }
+
     // Nivel 3: modo panico (< 4s) -- corte agressivo independente de
     // vantagem, mas AINDA MAIS fundo se estivermos claramente a perder
     // (pedido explicito da sessao com o Pond: "em -5 pecas jogar a 0").
@@ -157,8 +229,13 @@ fn compute_time_budget(
         } else {
             (safe_time / 20).clamp(5, 150)
         };
-        soft = panic;
-        hard_cap = panic;
+        // Panic must never be SLOWER than the burst tier above it. It was:
+        // the clamp's floor of 150ms meant three seconds bought 142ms a move
+        // while five seconds bought 60ms, so the engine slowed down as the
+        // clock ran out. Taking the minimum keeps the whole ladder
+        // monotonic -- less clock is never more time per move.
+        soft = soft.min(panic);
+        hard_cap = soft;
     }
 
     // Nivel 4: zona da morte (< 1200ms) -- praticamente so' vive do
@@ -446,7 +523,15 @@ impl Engine {
             // time cutoff for that case.
             None
         } else {
-            let (mut soft, mut hard_cap) = compute_time_budget(my_time, my_inc, opp_time, movestogo, self.last_score);
+            let pieces_left = self
+                .board
+                .pieces
+                .iter()
+                .flat_map(|side| side.iter())
+                .map(|bb| bb.count_ones() as i64)
+                .sum::<i64>();
+            let (mut soft, mut hard_cap) =
+                compute_time_budget(my_time, my_inc, opp_time, movestogo, self.last_score, pieces_left);
             // The opening is played, not calculated -- including the parts of
             // it the book does not reach.
             //
@@ -473,6 +558,20 @@ impl Engine {
                 soft = soft.min(cap);
                 hard_cap = hard_cap.min(cap);
             }
+            // Publish the decision, not just its effect. The clock is the one
+            // part of the engine whose reasoning is invisible in the output --
+            // a move that took 1.04s tells you nothing about whether the
+            // engine considered spending more and declined, or was never
+            // allowed to. This line is what the heatmap reads.
+            println!(
+                "info string tm soft {} hard {} horizon {} pieces {} myclock {} oppclock {}",
+                soft,
+                hard_cap,
+                (12 + (pieces_left - 2) * 7 / 5).clamp(12, 42),
+                pieces_left,
+                my_time,
+                opp_time
+            );
             soft_budget_ms = Some(soft);
             // `hard_cap` is live again, and this time it is a ceiling rather
             // than a target. It was tried as the deadline once (2026-07-21)
