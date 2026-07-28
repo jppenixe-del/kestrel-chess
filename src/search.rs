@@ -660,7 +660,7 @@ pub struct SearchLimits {
 /// thread timing as position difficulty and burned 10-16s on ordinary moves.
 /// The lesson kept: stability may lengthen a search, never on its own, and
 /// never without the hard ceiling standing behind it.
-fn time_scale(effort_frac: f64, settle: u32, score_drop: i32) -> f64 {
+fn time_scale(effort_frac: f64, settle: u32, score_drop: i32, changes: u32) -> f64 {
     let effort = (TM_EFFORT_BASE - effort_frac) * TM_EFFORT_SCALE;
     let settle = (TM_SETTLE_BASE + TM_SETTLE_SCALE * (settle as f64 + TM_SETTLE_OFFSET).powf(TM_SETTLE_POWER))
         .max(TM_SETTLE_MIN);
@@ -678,7 +678,14 @@ fn time_scale(effort_frac: f64, settle: u32, score_drop: i32) -> f64 {
     } else {
         1.0
     };
-    (effort * settle * falling).clamp(TM_SCALE_MIN, TM_SCALE_MAX)
+    // A move the search keeps changing its mind about is worth paying for.
+    // This is the factor the engine did not have, and it is the one that
+    // separates a hard position from a slow one: effort and settle both read
+    // "several moves are equally good" as difficulty, so they fire on quiet
+    // positions with many reasonable moves. A best move that keeps being
+    // overturned means something concrete was found late, repeatedly.
+    let instability = (1.0 + changes as f64 * TM_INSTABILITY_SCALE).min(TM_INSTABILITY_MAX);
+    (effort * settle * falling * instability).clamp(TM_SCALE_MIN, TM_SCALE_MAX)
 }
 
 /// Extra time per centipawn lost since the previous iteration, and its cap.
@@ -714,7 +721,21 @@ const TM_SETTLE_MIN: f64 = 1.0;
 // The envelope, on top of which the hard deadline is a second and
 // independent bound.
 const TM_SCALE_MIN: f64 = 0.65;
-const TM_SCALE_MAX: f64 = 2.2;
+/// The most the search may award itself over the base allowance.
+///
+/// Was 2.2, which is what a healthy position needs and what a critical one
+/// cannot use. Two real losses were traced to it: a move that turned an equal
+/// game into mate, played in 1.04s with 29.7s on the clock, where three
+/// seconds of thought picks a different move. The ceiling was not reached in
+/// either case -- it was low enough that the signals never bothered to argue
+/// for more. The hard cap in the time budget bounds this from above, and a
+/// percentage of the remaining clock bounds THAT, so a raised ceiling here
+/// buys thinking time on contested moves without putting the game at risk.
+const TM_SCALE_MAX: f64 = 3.4;
+/// Growth per change of heart about the best move.
+const TM_INSTABILITY_SCALE: f64 = 0.22;
+/// ...and its ceiling, so a position that never settles cannot spend the game.
+const TM_INSTABILITY_MAX: f64 = 2.4;
 
 const TM_QUIET_CP: i32 = 10;
 const TM_QUIET_ITERS: u32 = 3;
@@ -3136,6 +3157,14 @@ impl<'a> Searcher<'a> {
         let mut last_depth = 0;
         let mut prev_score = 0;
         let mut stable_count: u32 = 0;
+        // How often the search has changed its mind about the best move.
+        // Stability says "nothing has moved lately"; this says "this position
+        // has been argued over", and the two are not the same signal -- a move
+        // that flipped four times and then held for two iterations reads as
+        // settled to one and as contested to the other. Measured on a real
+        // loss: the move that lost the game was played in 1.04s with 29.7s
+        // still on the clock, and 3s of thought finds a different move.
+        let mut move_changes: u32 = 0;
         // Score of the previous completed iteration, for the falling-eval
         // signal: a position whose score is dropping is one the search has not
         // finished solving.
@@ -3195,6 +3224,7 @@ impl<'a> Searcher<'a> {
                     stable_count += 1;
                 } else {
                     stable_count = 0;
+                    move_changes += 1;
                 }
                 best_move = Some(rb);
                 // The MOVE from an interrupted iteration is kept -- it was
@@ -3380,7 +3410,7 @@ impl<'a> Searcher<'a> {
                     // about a real tactic because it happened on move eight
                     // would be the same mistake in the other direction.
                     let alarmed = score_delta.map(|d| d > TM_ALERT_CP).unwrap_or(false);
-                    let mut scale = time_scale(effort_frac, stable_count, score_drop);
+                    let mut scale = time_scale(effort_frac, stable_count, score_drop, move_changes);
                     if quiet_iters >= TM_QUIET_ITERS {
                         scale = scale.min(1.0);
                     }
