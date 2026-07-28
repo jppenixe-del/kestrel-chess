@@ -54,6 +54,13 @@ const HARD_CAP_PERCENT: i64 = 45;
 /// earned every extension still gets cut before it can overshoot.
 const HARD_CAP_BUDGET_MULT: i64 = 25;
 
+const OPENING_PLIES: i64 = 16;
+/// Ceiling on a single opening move once the book has no answer. Small on
+/// purpose: the phase is theory, and the clock it saves is spent where the
+/// position is actually unique.
+const OPENING_MAX_MS: i64 = 70;
+
+
 /// Gestao de tempo em 4 niveis -- a mesma arquitetura em camadas que
 /// validamos esta sessao no Pond (jogos reais, derrotas por bandeira
 /// investigadas e corrigidas uma a uma): formula elastica normal, corte
@@ -165,6 +172,7 @@ fn compute_time_budget(
     (soft, hard_cap)
 }
 
+
 /// Caminho do livro relativo ao proprio executavel (nao fixo a esta
 /// maquina) -- pedido depois de mover o motor para o servidor remoto:
 /// "/mnt/d/..." nao existe la'. Espera polgar_book.bin ao lado do binario.
@@ -181,7 +189,18 @@ fn default_style_book_path() -> String {
     // reversible env-var pattern as every other opt-in hook in this
     // codebase) -- set it to `polgar_book.bin` to go back to the
     // original book, which is kept on disk, not deleted.
-    let filename = std::env::var("KESTREL_BOOK_FILE").unwrap_or_else(|_| "sf17_book.bin".to_string());
+    // The filename here was the one the book shipped with when it was built
+    // from another engine's analysis. Renaming the FILE to drop that reference
+    // without renaming it HERE meant the engine looked for something that no
+    // longer existed, found nothing, and quietly played every opening from
+    // scratch -- for days. It cost 2.16 seconds on move one of a 60-second
+    // bullet game and an improvised opening, in a game that ended 7
+    // inaccuracies and 2 mistakes.
+    //
+    // A missing book is silent by design: the engine is supposed to work
+    // without one. That is exactly what made this invisible.
+    let filename =
+        std::env::var("KESTREL_BOOK_FILE").unwrap_or_else(|_| "kestrel_book.bin".to_string());
     std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join(&filename)))
@@ -294,6 +313,36 @@ impl Engine {
         legal.into_iter().find(|m| m.to_uci() == uci)
     }
 
+    /// The book's answer for the position on the board, if it has one and it
+    /// is legal. Highest recorded count wins; ties keep the first, so the
+    /// choice is deterministic and a game can be reproduced from its moves.
+    ///
+    /// Legality is re-checked rather than trusted. A 64-bit position key can
+    /// collide, and a book built by another tool can disagree about castling
+    /// or en-passant rights in ways the key does not capture. Playing an
+    /// illegal move loses the game outright, which is far worse than the cost
+    /// of generating the move list once.
+    fn book_move(&self) -> Option<crate::moves::Move> {
+        let book = self.style_book.as_ref()?;
+        let entries = book.lookup(self.zob.hash(&self.board));
+        if entries.is_empty() {
+            return None;
+        }
+        let mut b = self.board.clone();
+        let legal = crate::movegen::generate_legal(&mut b, &self.atk);
+        entries
+            .iter()
+            .filter_map(|(m16, count)| {
+                let (from, to, promo) = crate::book::decode_move16(*m16);
+                legal
+                    .iter()
+                    .find(|l| l.from == from && l.to == to && l.promotion == promo)
+                    .map(|l| (*count, *l))
+            })
+            .max_by_key(|(count, _)| *count)
+            .map(|(_, mv)| mv)
+    }
+
     fn cmd_go(&mut self, tokens: &[&str], out: &mut impl Write) {
         let mut wtime = 0i64;
         let mut btime = 0i64;
@@ -341,6 +390,20 @@ impl Engine {
         let (my_time, my_inc) = if side_white { (wtime, winc) } else { (btime, binc) };
         let opp_time = if side_white { btime } else { wtime };
 
+        let instant_book_ok = restrict_root.is_empty()
+            && !infinite
+            && depth.is_none()
+            && nodes.is_none()
+            && std::env::var_os("KESTREL_NO_BOOK_INSTANT").is_none();
+        if instant_book_ok {
+            if let Some(mv) = self.book_move() {
+                let _ = writeln!(out, "info depth 0 multipv 1 score cp 0 nodes 0 nps 0 time 0 pv {}", mv.to_uci());
+                let _ = writeln!(out, "bestmove {}", mv.to_uci());
+                let _ = out.flush();
+                return;
+            }
+        }
+
         // `soft_budget_ms` tracks the real per-move time budget derived
         // from wtime/btime specifically (None for movetime/infinite/depth
         // requests, which aren't live-clock scenarios) -- used below as a
@@ -383,7 +446,33 @@ impl Engine {
             // time cutoff for that case.
             None
         } else {
-            let (soft, hard_cap) = compute_time_budget(my_time, my_inc, opp_time, movestogo, self.last_score);
+            let (mut soft, mut hard_cap) = compute_time_budget(my_time, my_inc, opp_time, movestogo, self.last_score);
+            // The opening is played, not calculated -- including the parts of
+            // it the book does not reach.
+            //
+            // Book positions already answer instantly. The moves in between
+            // did not: leaving book at ply 2 and searching it normally cost
+            // 1594ms, and out-of-book opening moves at 1.5s each are how a
+            // quarter of the clock disappears before the game starts. What
+            // makes that affordable in the middlegame -- the position is
+            // unique and the clock is there to be spent on it -- is exactly
+            // what is not true here.
+            //
+            // So the whole opening is capped, book or not. The engine still
+            // searches, and at this speed still reaches a sensible depth; it
+            // simply cannot spend middlegame money on a phase where the answer
+            // is either already known or is one of several equally playable
+            // moves. Tunable without a rebuild, because the right number
+            // depends on the book underneath it.
+            let game_ply = (self.board.fullmove as i64 - 1) * 2 + if side_white { 0 } else { 1 };
+            if game_ply < OPENING_PLIES {
+                let cap = std::env::var("KESTREL_OPENING_MS")
+                    .ok()
+                    .and_then(|v| v.parse::<i64>().ok())
+                    .unwrap_or(OPENING_MAX_MS);
+                soft = soft.min(cap);
+                hard_cap = hard_cap.min(cap);
+            }
             soft_budget_ms = Some(soft);
             // `hard_cap` is live again, and this time it is a ceiling rather
             // than a target. It was tried as the deadline once (2026-07-21)
