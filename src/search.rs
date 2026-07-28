@@ -2879,7 +2879,21 @@ impl<'a> Searcher<'a> {
                     }
                 };
                 self.root_scores[idx].2 = self.root_scores[idx].1;
-                self.root_scores[idx].1 = if i == 0 || score > alpha { score } else { NO_SCORE };
+                // A move whose own search was cut by the clock has no score to
+                // record. The return value of an aborted search is whatever
+                // the partial window held -- in practice 0 -- and because the
+                // first move is stored unconditionally, that 0 went in as if
+                // it were measured. It then became the reported evaluation:
+                // a position worth -12 published as 0.00, and 0.00 fed to the
+                // next move's aspiration window. Unmeasured is the truth here,
+                // and the previous iteration's value in .2 is what answers.
+                self.root_scores[idx].1 = if self.stop {
+                    NO_SCORE
+                } else if i == 0 || score > alpha {
+                    score
+                } else {
+                    NO_SCORE
+                };
             }
             if score > best_score {
                 best_score = score;
@@ -3183,9 +3197,65 @@ impl<'a> Searcher<'a> {
                     stable_count = 0;
                 }
                 best_move = Some(rb);
-                best_score = score;
+                // The MOVE from an interrupted iteration is kept -- it was
+                // computed and is often better than the previous depth's.
+                // The SCORE is not: an iteration cut mid-way returns whatever
+                // the partial window happened to hold, which in practice is
+                // frequently 0. Traced from a real bullet game: searches cut
+                // at 30ms and 250ms both reported score 0 on a position the
+                // full search values at -1225.
+                //
+                // Two things break when that score is kept. The engine reports
+                // a evaluation it does not believe, which is what the bridge
+                // logs and what anyone watching reads. And `prev_score` seeds
+                // the next move's aspiration window, so the following search
+                // starts centred on a number that came from nowhere -- and
+                // pays for it in fail-highs and fail-lows on a clock that, in
+                // bullet, it does not have.
+                // The score comes from the root move itself, not from the
+                // return value of an interrupted search.
+                //
+                // A search cut mid-iteration returns whatever its partial
+                // window held -- in practice often 0, which is how this engine
+                // reported "0.00" on a position it valued at -12. The root
+                // move carries a score that was actually computed for it, so
+                // it survives the interruption intact.
+                // .1 is this iteration's score, .2 the previous one's. An
+                // iteration cut before the move finished leaves .1 unmeasured,
+                // and the fallback then has to be the last depth that DID
+                // measure it -- otherwise the report falls back to the
+                // initial 0, which is exactly the "0.00" this is fixing.
+                let rb_score = self.root_scores.iter().find(|e| e.0 == rb).and_then(|e| {
+                    if e.1 != NO_SCORE {
+                        Some(e.1)
+                    } else if e.2 != NO_SCORE {
+                        Some(e.2)
+                    } else {
+                        None
+                    }
+                });
+                match rb_score {
+                    // A LOSING score from an interrupted iteration is not
+                    // trusted, and this is not caution for its own sake: with
+                    // the clock gone mid-search, the moves that would refute
+                    // the loss may simply not have been looked at yet. Keeping
+                    // it would announce a lost position that the next depth
+                    // routinely overturns, and would seed the following
+                    // aspiration window far below where the search actually
+                    // sits.
+                    Some(v) if self.stop && v < -MATE_SCORE + MAX_PLY as i32 => {}
+                    Some(v) => {
+                        best_score = v;
+                        prev_score = v;
+                    }
+                    None => {
+                        if !self.stop {
+                            best_score = score;
+                            prev_score = score;
+                        }
+                    }
+                }
                 last_depth = depth;
-                prev_score = score;
                 // An interrupted iteration is still reported when it
                 // changed the move.
                 //
@@ -3217,11 +3287,16 @@ impl<'a> Searcher<'a> {
                     let pv_str: Vec<String> = pv.iter().map(|m| m.to_uci()).collect();
                     let ms = search_start.elapsed().as_millis().max(1) as u64;
                     let nps = self.nodes.saturating_mul(1000) / ms;
-                    let score_str = if score.abs() >= MATE_THRESHOLD {
-                        let mate_in = (MATE_SCORE - score.abs() + 1) / 2;
-                        format!("mate {}", if score > 0 { mate_in } else { -mate_in })
+                    // Report best_score, not the raw return value: an
+                    // interrupted iteration returns whatever its partial
+                    // window held, and announcing that as the evaluation is
+                    // how a position worth -12 was published as 0.00.
+                    let rs = best_score;
+                    let score_str = if rs.abs() >= MATE_THRESHOLD {
+                        let mate_in = (MATE_SCORE - rs.abs() + 1) / 2;
+                        format!("mate {}", if rs > 0 { mate_in } else { -mate_in })
                     } else {
-                        format!("cp {}", score)
+                        format!("cp {}", rs)
                     };
                     println!(
                         "info depth {} multipv 1 score {} nodes {} nps {} time {} pv {}",
