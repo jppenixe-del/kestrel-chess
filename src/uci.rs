@@ -855,7 +855,17 @@ impl Engine {
             };
             let nodes_total: u64 = results.iter().map(|r| r.3).sum();
             let (best, score, depth_reached, _, winner) = results.remove(best_idx);
-            let pv_line = winner.extract_pv(board, depth_reached.max(1) as usize + 4);
+            // Anchored on the move actually returned. extract_pv rebuilds the
+            // line from the transposition table, whose root entry is
+            // always-replace and so need not be the move this search settled
+            // on: the engine printed "pv a2b4 ..." and then "bestmove h4f5".
+            // The decision was right and the announcement was wrong, which
+            // misleads anyone reading the output and corrupts any tool that
+            // walks the line -- the line analysed was not the line played.
+            let pv_line = match best {
+                Some(mv) => winner.extract_pv_from(board, mv, depth_reached.max(1) as usize + 4),
+                None => winner.extract_pv(board, depth_reached.max(1) as usize + 4),
+            };
             // Reclaim every thread's learned tables so the next move in
             // this game starts from what this search learned, instead of
             // from zero. The winner's set is kept first so thread 0 (the
