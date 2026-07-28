@@ -99,6 +99,131 @@ pub struct DepthMargin {
     pub base: i32,
     pub slope: i32,
 }
+
+/// Static Exchange Evaluation, as free functions.
+///
+/// Moved out of `Searcher` so the EVALUATION can use it too. The static
+/// evaluation had no way to price a piece that is about to be captured: a
+/// bishop left en prise scored a flat -58 penalty when the bishop is worth
+/// 355, so a position that was really -215 evaluated as -73. That 142-point
+/// error is larger than every pruning margin we have -- 35 per ply for RFP,
+/// 265 for null move -- which means whole-node pruning was deciding on a
+/// number that could be wrong by more than the margin it was compared against.
+///
+/// Nothing here needs searcher state; the only dependency was the attack
+/// tables, which are a global.
+pub mod see {
+    use crate::attacks::{bishop_attacks, rook_attacks, Attacks};
+    use crate::board::Board;
+    use crate::bitboard::*;
+    use crate::moves::{Move, MoveFlag};
+    use crate::types::{file_of, rank_of, sq, Color, PieceType, Square};
+
+    /// Static Exchange Evaluation: simula a sequencia completa de
+    /// capturas/recapturas na casa `mv.to`, sempre com o atacante menos
+    /// valioso de cada lado (a jogada optima para ambos), e devolve o
+    /// ganho material líquido assumindo optimo jogo de ambos os lados
+    /// (cada lado escolhe parar ou continuar a troca, o que for melhor
+    /// para si -- minimax classico sobre a "swap list"). Nao verifica
+    /// se a recaptura deixaria o proprio rei em xeque (limitacao
+    /// standard/aceite de SEE simples, presente em praticamente todos
+    /// os motores). So' chamar em lances de captura (incl. en passant).
+    pub fn see(a: &Attacks, board: &Board, mv: &Move) -> i32 {
+        let to = mv.to;
+        let Some((attacker_pt0, attacker_color0)) = board.piece_at(mv.from) else {
+            return 0;
+        };
+        let victim_val0 = if mv.flag == MoveFlag::EnPassant {
+            PieceType::Pawn.value()
+        } else {
+            match board.piece_at(to) {
+                Some((pt, _)) => pt.value(),
+                // Quiet move: nothing is captured, so the exchange starts
+                // at zero -- but the sequence below still runs, because the
+                // piece we just moved can be taken on `to`. That makes this
+                // a general "does this move lose material?" test rather
+                // than a capture-only one (it used to bail out with 0 here,
+                // which silently made any SEE-based test on a quiet move a
+                // no-op). Every existing caller guards on is_capture(), so
+                // their behaviour is unchanged.
+                None => 0,
+            }
+        };
+
+        let mut occ = board.occ_all;
+        occ &= !bb(mv.from);
+        if mv.flag == MoveFlag::EnPassant {
+            let ep_captured = sq(file_of(to), rank_of(mv.from));
+            occ &= !bb(ep_captured);
+        }
+
+        let mut gains: Vec<i32> = vec![victim_val0];
+        let mut attacker_val = attacker_pt0.value();
+        let mut side = attacker_color0.opp();
+
+        loop {
+            let attackers = attackers_to(a, board, to, occ);
+            let side_attackers = attackers & board.occ_color[side.idx()];
+            let Some((lva_sq, lva_pt)) = least_valuable_attacker(board, side_attackers, side) else {
+                break;
+            };
+            gains.push(attacker_val - *gains.last().unwrap());
+            attacker_val = lva_pt.value();
+            occ &= !bb(lva_sq);
+            side = side.opp();
+            if gains.len() > 32 {
+                break;
+            }
+        }
+
+        for i in (1..gains.len()).rev() {
+            gains[i - 1] = (-gains[i]).min(gains[i - 1]);
+        }
+        gains[0]
+    }
+    pub fn attackers_to(a: &Attacks, board: &Board, s: crate::types::Square, occ: crate::bitboard::Bitboard) -> crate::bitboard::Bitboard {
+        let a = a;
+        let mut att = 0u64;
+        att |= a.pawn[Color::Black.idx()][s as usize] & board.pieces[Color::White.idx()][PieceType::Pawn.idx()];
+        att |= a.pawn[Color::White.idx()][s as usize] & board.pieces[Color::Black.idx()][PieceType::Pawn.idx()];
+        att |= a.knight[s as usize]
+            & (board.pieces[Color::White.idx()][PieceType::Knight.idx()] | board.pieces[Color::Black.idx()][PieceType::Knight.idx()]);
+        att |= a.king[s as usize]
+            & (board.pieces[Color::White.idx()][PieceType::King.idx()] | board.pieces[Color::Black.idx()][PieceType::King.idx()]);
+        let diag = board.pieces[Color::White.idx()][PieceType::Bishop.idx()]
+            | board.pieces[Color::Black.idx()][PieceType::Bishop.idx()]
+            | board.pieces[Color::White.idx()][PieceType::Queen.idx()]
+            | board.pieces[Color::Black.idx()][PieceType::Queen.idx()];
+        att |= bishop_attacks(s, occ) & diag;
+        let orth = board.pieces[Color::White.idx()][PieceType::Rook.idx()]
+            | board.pieces[Color::Black.idx()][PieceType::Rook.idx()]
+            | board.pieces[Color::White.idx()][PieceType::Queen.idx()]
+            | board.pieces[Color::Black.idx()][PieceType::Queen.idx()];
+        att |= rook_attacks(s, occ) & orth;
+        att & occ
+    }
+    pub fn least_valuable_attacker(
+        board: &Board,
+        attackers: crate::bitboard::Bitboard,
+        side: Color,
+    ) -> Option<(crate::types::Square, PieceType)> {
+        for pt in [
+            PieceType::Pawn,
+            PieceType::Knight,
+            PieceType::Bishop,
+            PieceType::Rook,
+            PieceType::Queen,
+            PieceType::King,
+        ] {
+            let bbp = attackers & board.pieces[side.idx()][pt.idx()];
+            if bbp != 0 {
+                return Some((bbp.trailing_zeros() as crate::types::Square, pt));
+            }
+        }
+        None
+    }
+}
+
 impl DepthMargin {
     #[inline]
     fn at(&self, depth: i32) -> i32 {
@@ -241,15 +366,15 @@ impl Default for SearchParams {
             hist_malus_offset: -44,
             hist_malus_max: 992,
             lmr_hist_divisor: 36000,
-            rfp_improving: DepthMargin { base: 0, slope: 32 },
-            rfp_not_improving: DepthMargin { base: 0, slope: 100 },
-            razor_base: 572,
-            razor_per_depth: 572,
-            futility_improving: DepthMargin { base: 0, slope: 94 },
-            futility_not_improving: DepthMargin { base: 0, slope: 131 },
-            cap_futility_improving: DepthMargin { base: 2, slope: 144 },
-            cap_futility_not_improving: DepthMargin { base: 2, slope: 144 },
-            delta_margin: 250,
+            rfp_improving: DepthMargin { base: 0, slope: 35 },
+            rfp_not_improving: DepthMargin { base: 0, slope: 110 },
+            razor_base: 629,
+            razor_per_depth: 629,
+            futility_improving: DepthMargin { base: 0, slope: 103 },
+            futility_not_improving: DepthMargin { base: 0, slope: 144 },
+            cap_futility_improving: DepthMargin { base: 2, slope: 158 },
+            cap_futility_not_improving: DepthMargin { base: 2, slope: 158 },
+            delta_margin: 275,
             qs_lmp_limit: 8,
             tt_extended_cutoff_margin: 162,
             history_prune_mult: 2472,
@@ -258,14 +383,14 @@ impl Default for SearchParams {
             // depth>6?3:2 reduction, and there was no Kestrel-tuned
             // value to compare against for these fields at all.
             nmp_min_depth: 2,
-            nmp_eval_margin: 36,
-            nmp_static_eval_base_margin: 241,
+            nmp_eval_margin: 40,
+            nmp_static_eval_base_margin: 265,
             nmp_static_eval_depth_margin: 22,
             nmp_base_reduction: 1343,
             nmp_depth_reduction_scale: 78,
             nmp_eval_reduction_scale: 208,
             nmp_max_eval_reduction: 4,
-            probcut_beta_margin: 228,
+            probcut_beta_margin: 251,
             asp_init_delta: 12,
             asp_widening_factor: 46,
             min_asp_depth: 6,
@@ -535,12 +660,34 @@ pub struct SearchLimits {
 /// thread timing as position difficulty and burned 10-16s on ordinary moves.
 /// The lesson kept: stability may lengthen a search, never on its own, and
 /// never without the hard ceiling standing behind it.
-fn time_scale(effort_frac: f64, settle: u32) -> f64 {
+fn time_scale(effort_frac: f64, settle: u32, score_drop: i32) -> f64 {
     let effort = (TM_EFFORT_BASE - effort_frac) * TM_EFFORT_SCALE;
     let settle = (TM_SETTLE_BASE + TM_SETTLE_SCALE * (settle as f64 + TM_SETTLE_OFFSET).powf(TM_SETTLE_POWER))
         .max(TM_SETTLE_MIN);
-    (effort * settle).clamp(TM_SCALE_MIN, TM_SCALE_MAX)
+    // A score that is FALLING between iterations is the clearest sign that a
+    // position deserves more thought: the search is discovering a problem and
+    // has not yet found the way out. Neither of the other two signals sees
+    // this -- effort can stay high while the position collapses under it, and
+    // stability measures whether the MOVE changed, not whether it got worse.
+    //
+    // Only falls count. A score climbing means the news is good and there is
+    // nothing to solve, and paying extra for good news is how a clock is
+    // wasted on won positions.
+    let falling = if score_drop > 0 {
+        (1.0 + score_drop as f64 * TM_FALLING_SCALE).min(TM_FALLING_MAX)
+    } else {
+        1.0
+    };
+    (effort * settle * falling).clamp(TM_SCALE_MIN, TM_SCALE_MAX)
 }
+
+/// Extra time per centipawn lost since the previous iteration, and its cap.
+/// Small per unit and capped low: this multiplies two other factors that can
+/// each already stretch the budget, and the hard ceiling still stands behind
+/// all three. An earlier elastic-time attempt keyed on one signal alone burned
+/// 10-16 seconds on ordinary moves and had to be reverted the same day.
+const TM_FALLING_SCALE: f64 = 0.004;
+const TM_FALLING_MAX: f64 = 1.5;
 
 // Effort carries most of the decision. Measured across easy and hard
 // positions the fraction runs from about 0.13 (nothing decided yet) to about
@@ -1271,112 +1418,11 @@ impl<'a> Searcher<'a> {
         false
     }
 
-    fn attackers_to(&self, board: &Board, s: crate::types::Square, occ: crate::bitboard::Bitboard) -> crate::bitboard::Bitboard {
-        let a = self.atk;
-        let mut att = 0u64;
-        att |= a.pawn[Color::Black.idx()][s as usize] & board.pieces[Color::White.idx()][PieceType::Pawn.idx()];
-        att |= a.pawn[Color::White.idx()][s as usize] & board.pieces[Color::Black.idx()][PieceType::Pawn.idx()];
-        att |= a.knight[s as usize]
-            & (board.pieces[Color::White.idx()][PieceType::Knight.idx()] | board.pieces[Color::Black.idx()][PieceType::Knight.idx()]);
-        att |= a.king[s as usize]
-            & (board.pieces[Color::White.idx()][PieceType::King.idx()] | board.pieces[Color::Black.idx()][PieceType::King.idx()]);
-        let diag = board.pieces[Color::White.idx()][PieceType::Bishop.idx()]
-            | board.pieces[Color::Black.idx()][PieceType::Bishop.idx()]
-            | board.pieces[Color::White.idx()][PieceType::Queen.idx()]
-            | board.pieces[Color::Black.idx()][PieceType::Queen.idx()];
-        att |= bishop_attacks(s, occ) & diag;
-        let orth = board.pieces[Color::White.idx()][PieceType::Rook.idx()]
-            | board.pieces[Color::Black.idx()][PieceType::Rook.idx()]
-            | board.pieces[Color::White.idx()][PieceType::Queen.idx()]
-            | board.pieces[Color::Black.idx()][PieceType::Queen.idx()];
-        att |= rook_attacks(s, occ) & orth;
-        att & occ
-    }
 
-    fn least_valuable_attacker(
-        &self,
-        board: &Board,
-        attackers: crate::bitboard::Bitboard,
-        side: Color,
-    ) -> Option<(crate::types::Square, PieceType)> {
-        for pt in [
-            PieceType::Pawn,
-            PieceType::Knight,
-            PieceType::Bishop,
-            PieceType::Rook,
-            PieceType::Queen,
-            PieceType::King,
-        ] {
-            let bbp = attackers & board.pieces[side.idx()][pt.idx()];
-            if bbp != 0 {
-                return Some((bbp.trailing_zeros() as crate::types::Square, pt));
-            }
-        }
-        None
-    }
 
-    /// Static Exchange Evaluation: simula a sequencia completa de
-    /// capturas/recapturas na casa `mv.to`, sempre com o atacante menos
-    /// valioso de cada lado (a jogada optima para ambos), e devolve o
-    /// ganho material líquido assumindo optimo jogo de ambos os lados
-    /// (cada lado escolhe parar ou continuar a troca, o que for melhor
-    /// para si -- minimax classico sobre a "swap list"). Nao verifica
-    /// se a recaptura deixaria o proprio rei em xeque (limitacao
-    /// standard/aceite de SEE simples, presente em praticamente todos
-    /// os motores). So' chamar em lances de captura (incl. en passant).
-    fn see(&self, board: &Board, mv: &Move) -> i32 {
-        let to = mv.to;
-        let Some((attacker_pt0, attacker_color0)) = board.piece_at(mv.from) else {
-            return 0;
-        };
-        let victim_val0 = if mv.flag == MoveFlag::EnPassant {
-            PieceType::Pawn.value()
-        } else {
-            match board.piece_at(to) {
-                Some((pt, _)) => pt.value(),
-                // Quiet move: nothing is captured, so the exchange starts
-                // at zero -- but the sequence below still runs, because the
-                // piece we just moved can be taken on `to`. That makes this
-                // a general "does this move lose material?" test rather
-                // than a capture-only one (it used to bail out with 0 here,
-                // which silently made any SEE-based test on a quiet move a
-                // no-op). Every existing caller guards on is_capture(), so
-                // their behaviour is unchanged.
-                None => 0,
-            }
-        };
 
-        let mut occ = board.occ_all;
-        occ &= !bb(mv.from);
-        if mv.flag == MoveFlag::EnPassant {
-            let ep_captured = sq(file_of(to), rank_of(mv.from));
-            occ &= !bb(ep_captured);
-        }
 
-        let mut gains: Vec<i32> = vec![victim_val0];
-        let mut attacker_val = attacker_pt0.value();
-        let mut side = attacker_color0.opp();
 
-        loop {
-            let attackers = self.attackers_to(board, to, occ);
-            let side_attackers = attackers & board.occ_color[side.idx()];
-            let Some((lva_sq, lva_pt)) = self.least_valuable_attacker(board, side_attackers, side) else {
-                break;
-            };
-            gains.push(attacker_val - *gains.last().unwrap());
-            attacker_val = lva_pt.value();
-            occ &= !bb(lva_sq);
-            side = side.opp();
-            if gains.len() > 32 {
-                break;
-            }
-        }
-
-        for i in (1..gains.len()).rev() {
-            gains[i - 1] = (-gains[i]).min(gains[i - 1]);
-        }
-        gains[0]
-    }
 
     /// Bonus de ordenacao para lances que a Judit Polgar realmente jogou
     /// nesta posicao exata (1825 jogos reais, ver book.rs) -- cresce com
@@ -1554,7 +1600,7 @@ impl<'a> Searcher<'a> {
             .and_then(|x| *x)
             .and_then(|(pt, to)| self.countermoves[pt.idx()][to as usize]);
         // sort_by_cached_key (found in review, 2026-07-21), not
-        // sort_by_key: the key closure calls self.see() for every
+        // sort_by_key: the key closure calls see::see(self.atk, ) for every
         // capture, a full exchange simulation -- sort_by_key doesn't
         // guarantee calling the key function exactly once per element,
         // so that SEE could be recomputed more than once per move
@@ -1573,7 +1619,7 @@ impl<'a> Searcher<'a> {
                 // sink below quiet moves -- MVV-LVA couldn't tell "Bxf7"
                 // against a defended bishop (loses the piece) apart from
                 // a genuinely good capture.
-                let see = self.see(board, m);
+                let see = see::see(self.atk, board, m);
                 if see >= 0 {
                     -200_000 - see
                 } else {
@@ -1641,7 +1687,7 @@ impl<'a> Searcher<'a> {
             }
         } else {
             moves.retain(|m| m.is_capture() || m.promotion == Some(PieceType::Queen));
-            moves.retain(|m| !m.is_capture() || self.see(board, m) >= 0);
+            moves.retain(|m| !m.is_capture() || see::see(self.atk, board, m) >= 0);
             if alpha.abs() < MATE_SCORE - MAX_PLY as i32 {
                 let delta_margin = search_params().delta_margin;
                 moves.retain(|m| {
@@ -1734,7 +1780,7 @@ impl<'a> Searcher<'a> {
             // Promocoes de dama ficam sempre (mv.to nao e' captura nesse
             // caso, is_capture()==false, so' entram aqui por causa do
             // OR acima -- SEE nao se aplica, `is_capture()` protege isso).
-            moves.retain(|m| !m.is_capture() || self.see(board, m) >= 0);
+            moves.retain(|m| !m.is_capture() || see::see(self.atk, board, m) >= 0);
             // Delta pruning: a capture that CANNOT reach alpha even in
             // the best case (winning the captured piece outright, a
             // looser bound than the full SEE exchange) isn't worth
@@ -2310,7 +2356,7 @@ impl<'a> Searcher<'a> {
                     }
                     // SEE pre-filter: skip captures whose max plausible
                     // gain can't reach prob_beta from here anyway.
-                    if static_eval + self.see(board, mv) < prob_beta {
+                    if static_eval + see::see(self.atk, board, mv) < prob_beta {
                         continue;
                     }
                     let undo = board.make_move(mv);
@@ -2499,7 +2545,7 @@ impl<'a> Searcher<'a> {
                 let sp = search_params();
                 let margin = if improving { sp.cap_futility_improving.at(depth) } else { sp.cap_futility_not_improving.at(depth) };
                 let fe = *futility_eval.get_or_insert(static_eval);
-                let see_val = self.see(board, &mv);
+                let see_val = see::see(self.atk, board, &mv);
                 if fe + see_val + margin <= alpha {
                     i += 1;
                     continue;
@@ -2568,7 +2614,7 @@ impl<'a> Searcher<'a> {
                 } else {
                     -100 * depth
                 };
-                if self.see(board, &mv) < see_allowance {
+                if see::see(self.atk, board, &mv) < see_allowance {
                     i += 1;
                     continue;
                 }
@@ -3059,6 +3105,10 @@ impl<'a> Searcher<'a> {
         let mut last_depth = 0;
         let mut prev_score = 0;
         let mut stable_count: u32 = 0;
+        // Score of the previous completed iteration, for the falling-eval
+        // signal: a position whose score is dropping is one the search has not
+        // finished solving.
+        let mut prev_iter_score: Option<i32> = None;
         self.killers = [[None; 2]; MAX_PLY];
         self.root_move_nodes.clear();
         self.root_scores.clear();
@@ -3180,7 +3230,10 @@ impl<'a> Searcher<'a> {
                             on_best as f64 / self.nodes.max(1) as f64
                         })
                         .unwrap_or(0.0);
-                    let scale = time_scale(effort_frac, stable_count);
+                    let score_drop = prev_iter_score
+                        .map(|p: i32| (p - score).clamp(0, 400))
+                        .unwrap_or(0);
+                    let scale = time_scale(effort_frac, stable_count, score_drop);
                     let allowed = budget.mul_f64(scale);
                     if std::env::var_os("KESTREL_TM_TRACE").is_some() {
                         eprintln!(
@@ -3199,6 +3252,7 @@ impl<'a> Searcher<'a> {
                     }
                 }
             }
+            prev_iter_score = Some(score);
         }
         if std::env::var_os("KESTREL_CUT_STATS").is_some() && self.report {
             let pct = if self.cut_nodes > 0 {
@@ -3460,7 +3514,7 @@ impl MovePicker {
                             self.noisy[i].1 = i32::MIN; // marca para saltar depois
                             continue;
                         }
-                        self.noisy[i].1 = searcher.see(board, &m);
+                        self.noisy[i].1 = see::see(searcher.atk, board, &m);
                         // Capture history: tie-break only (see field doc
                         // on Searcher::capture_history) -- non-capture
                         // promotions have no "captured piece", left at 0.
