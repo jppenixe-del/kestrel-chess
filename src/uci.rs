@@ -213,6 +213,15 @@ impl Engine {
         let style_book = crate::book::Book::load(&default_style_book_path()).ok();
         // Build every lazily-initialised global now, while no clock is
         // running -- see eval::warmup().
+        // Profile before warm-up: warm-up evaluates a position, which seals
+        // the lazily-built tables, so anything the profile sets has to be in
+        // place first.
+        if let Ok(path) = std::env::var("KESTREL_PROFILE") {
+            match crate::eval::load_profile(&path) {
+                Ok(n) => eprintln!("perfil: {} valores carregados de {}", n, path),
+                Err(e) => eprintln!("perfil: nao consegui ler {} -- {}", path, e),
+            }
+        }
         crate::eval::warmup();
         crate::search::warmup();
         Engine {
@@ -702,53 +711,59 @@ impl Engine {
                     })
                 })
                 .collect();
-            let mut results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-            let mut best_idx = 0;
-            for i in 1..results.len() {
-                let better = results[i].2 > results[best_idx].2
-                    || (results[i].2 == results[best_idx].2 && results[i].1 > results[best_idx].1);
-                if better {
-                    best_idx = i;
-                }
+            // Weighted vote across threads, not a head count.
+            //
+            // Two designs exist in the wild. One has the main thread decide and
+            // helpers only fill the shared table; the other votes. Measured
+            // here, main-thread-decides lost at 40% over 50 games, because our
+            // helpers are near-copies of the main search and so contribute
+            // nothing but variance to whoever reads them.
+            //
+            // The vote is the right model, but counting heads is the wrong
+            // vote: it treats a thread that reached depth 8 with a score of
+            // -200 as equal to one that reached depth 14 at +50. Weight each
+            // thread by how much better its score is than the worst thread's,
+            // times the depth it actually completed. A thread that is both
+            // deep and convinced dominates; one that is shallow or pessimistic
+            // barely registers.
+            //
+            // The +14 offset keeps a thread that ties the minimum score from
+            // voting with zero weight -- it still saw something, and at equal
+            // scores depth should decide.
+            let mut results: Vec<_> = handles
+                .into_iter()
+                .filter_map(|h| h.join().ok())
+                .collect();
+            if results.is_empty() {
+                return ((None, 0, 0, 0, Vec::new()), Vec::new());
             }
-            // Consensus safeguard (2026-07-21): "deepest thread wins" is a
-            // lone-outlier risk -- traced a real bullet loss to exactly
-            // this: one thread's search settled on a move (hanging a
-            // rook) that no other thread agreed with, won the tie-break
-            // by reaching one ply deeper, and got played. 20 repeated
-            // trials of that exact position/clock never reproduced it
-            // again (17/20 gave the objectively good move, 3/20 a
-            // different-but-sound trade), confirming it was thread-
-            // selection variance, not a deterministic eval/search bug.
-            // If the naive winner's move is a lone outlier that most
-            // OTHER threads disagree with, prefer whichever move the
-            // plurality of threads actually settled on instead (using
-            // the deepest thread among those that agree with it) --
-            // costs nothing when threads agree (the common case), only
-            // overrides the rare case where the deepest thread is
-            // alone against the rest.
-            if results.len() > 2 {
-                let vote_count = |mv: Option<crate::moves::Move>| results.iter().filter(|r| r.0 == mv).count();
-                let winner_move = results[best_idx].0;
-                let winner_votes = vote_count(winner_move);
-                let mut plurality_move = winner_move;
-                let mut plurality_votes = winner_votes;
+            let best_idx = if results.len() < 2 {
+                0
+            } else {
+                let min_score = results.iter().map(|r| r.1).min().unwrap_or(0);
+                let weight = |r: &(Option<crate::moves::Move>, i32, i32, u64, Searcher)| {
+                    ((r.1 - min_score + 14) as i64) * (r.2.max(1) as i64)
+                };
+                let mut votes: Vec<(Option<crate::moves::Move>, i64)> = Vec::new();
                 for r in &results {
-                    let v = vote_count(r.0);
-                    if v > plurality_votes {
-                        plurality_votes = v;
-                        plurality_move = r.0;
+                    match votes.iter_mut().find(|(m, _)| *m == r.0) {
+                        Some((_, v)) => *v += weight(r),
+                        None => votes.push((r.0, weight(r))),
                     }
                 }
-                if plurality_votes > winner_votes && plurality_move != winner_move {
-                    if let Some(alt_idx) = (0..results.len())
-                        .filter(|&i| results[i].0 == plurality_move)
-                        .max_by_key(|&i| (results[i].2, results[i].1))
-                    {
-                        best_idx = alt_idx;
-                    }
-                }
-            }
+                let winner = votes
+                    .iter()
+                    .max_by_key(|(_, v)| *v)
+                    .map(|(m, _)| *m)
+                    .unwrap_or(results[0].0);
+                // Among the threads that agree on the winning move, take the
+                // one with the strongest individual claim: its PV is the one
+                // worth reporting.
+                (0..results.len())
+                    .filter(|&i| results[i].0 == winner)
+                    .max_by_key(|&i| weight(&results[i]))
+                    .unwrap_or(0)
+            };
             let nodes_total: u64 = results.iter().map(|r| r.3).sum();
             let (best, score, depth_reached, _, winner) = results.remove(best_idx);
             let pv_line = winner.extract_pv(board, depth_reached.max(1) as usize + 4);
@@ -840,6 +855,9 @@ impl Engine {
                             if !crate::search::set_param(tokens[2], v)
                                 && !crate::eval::set_material(tokens[2], v)
                                 && !fam.map_or(false, |f| crate::eval::set_family_scale(f, v))
+                                && !tokens[2]
+                                    .strip_prefix("psqt_")
+                                    .map_or(false, |p| crate::eval::set_psqt_scale(p, v))
                             {
                                 eprintln!("setoption: unknown parameter '{}'", tokens[2]);
                             }

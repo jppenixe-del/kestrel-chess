@@ -185,7 +185,7 @@ const EG_KING: [i32; 64] = [
 ///  - Rei 0: nao conta na soma material.
 /// Distintos de PieceType::value() (usado por SEE/MVV-LVA sem fase).
 const MG_VALUE: [i32; 6] = [125, 340, 355, 520, 990, 0];
-const EG_VALUE: [i32; 6] = [140, 300, 350, 570, 990, 0];
+const EG_VALUE: [i32; 6] = [140, 300, 350, 570, 1050, 0];
 
 /// Material values, overridable at runtime so they can be swept without a
 /// rebuild.
@@ -218,7 +218,7 @@ static EG_ATOMIC: [std::sync::atomic::AtomicI32; 6] = [
     std::sync::atomic::AtomicI32::new(300),
     std::sync::atomic::AtomicI32::new(350),
     std::sync::atomic::AtomicI32::new(570),
-    std::sync::atomic::AtomicI32::new(990),
+    std::sync::atomic::AtomicI32::new(1050),
     std::sync::atomic::AtomicI32::new(0),
 ];
 
@@ -258,6 +258,206 @@ pub fn set_material(name: &str, value: i32) -> bool {
 const PHASE_INC: [i32; 6] = [0, 1, 1, 2, 4, 0];
 const MAX_PHASE: i32 = 24;
 
+
+/// Per-piece scaling of the piece-square tables, in per-mille.
+///
+/// The PSQTs were adopted as "generic public educational tables: a starting
+/// point, not a finished state" and never calibrated against this engine. The
+/// amplitudes say as much. Compared with a strong reference, ours are roughly
+/// twice as loud for rooks and pawns in the middlegame -- and HALF as loud for
+/// the king, in both phases.
+///
+/// That last one matters most: the king's table is what says "shelter now,
+/// centralise later", and ours barely has an opinion. The error profile puts
+/// our exposed king at 1.19 times its expected share of mistakes, which is the
+/// same fact seen from the board.
+static PSQT_SCALE: [std::sync::atomic::AtomicI32; 6] = [
+    std::sync::atomic::AtomicI32::new(1000),
+    std::sync::atomic::AtomicI32::new(1000),
+    std::sync::atomic::AtomicI32::new(1000),
+    std::sync::atomic::AtomicI32::new(1000),
+    std::sync::atomic::AtomicI32::new(1000),
+    std::sync::atomic::AtomicI32::new(1350),
+];
+
+const PSQT_NAMES: [&str; 6] = ["pawn", "knight", "bishop", "rook", "queen", "king"];
+
+/// Set one piece's PSQT factor, e.g. `psqt_king`. False on an unknown name.
+pub fn set_psqt_scale(name: &str, per_mille: i32) -> bool {
+    match PSQT_NAMES.iter().position(|&p| p == name) {
+        Some(i) => {
+            PSQT_SCALE[i].store(per_mille, std::sync::atomic::Ordering::Relaxed);
+            true
+        }
+        None => false,
+    }
+}
+
+#[inline]
+fn psqt_factor(idx: usize) -> i32 {
+    PSQT_SCALE[idx].load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Piece-square tables loaded at runtime, replacing the compiled-in ones.
+///
+/// The tables in this file were adopted as generic public tables -- "a
+/// starting point, not a finished state" -- and never calibrated here.
+/// Measured against a strong reference, ours are about twice as loud for rooks
+/// and pawns in the middlegame and HALF as loud for the king in both phases,
+/// and the king's table is the one that says "shelter now, centralise later".
+///
+/// Replacing a whole table rather than scaling it, so generated tables can be
+/// tried against the real suite and real games. Format: one line per table,
+/// `MG_KING 12,-4,...` with 64 values, White's point of view, a1 first.
+///
+/// An env var rather than setoption, because 768 numbers do not belong on a
+/// UCI line. Read once at startup, before any search.
+static PSQT_OVERRIDE: OnceLock<Option<([Option<[i32; 64]>; 6], [Option<[i32; 64]>; 6])>> =
+    OnceLock::new();
+
+fn build_psqt_tables(
+    m: std::collections::HashMap<String, [i32; 64]>,
+) -> ([Option<[i32; 64]>; 6], [Option<[i32; 64]>; 6]) {
+    const NAMES: [&str; 6] = ["PAWN", "KNIGHT", "BISHOP", "ROOK", "QUEEN", "KING"];
+    let mut mg: [Option<[i32; 64]>; 6] = Default::default();
+    let mut eg: [Option<[i32; 64]>; 6] = Default::default();
+    for (i, n) in NAMES.iter().enumerate() {
+        mg[i] = m.get(&format!("MG_{}", n)).copied();
+        eg[i] = m.get(&format!("EG_{}", n)).copied();
+    }
+    (mg, eg)
+}
+
+fn psqt_override() -> &'static Option<([Option<[i32; 64]>; 6], [Option<[i32; 64]>; 6])> {
+    PSQT_OVERRIDE.get_or_init(|| {
+        let path = std::env::var("KESTREL_PSQT").ok()?;
+        let text = std::fs::read_to_string(&path).ok()?;
+        let mut m = std::collections::HashMap::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let (name, rest) = match line.split_once(char::is_whitespace) {
+                Some(x) => x,
+                None => continue,
+            };
+            let v: Vec<i32> = rest
+                .split(|c: char| c == ',' || c.is_whitespace())
+                .filter(|s| !s.is_empty())
+                .filter_map(|s| s.parse().ok())
+                .collect();
+            if v.len() == 64 {
+                let mut a = [0i32; 64];
+                a.copy_from_slice(&v);
+                m.insert(name.to_string(), a);
+            }
+        }
+        eprintln!("KESTREL_PSQT: {} tabelas carregadas de {}", m.len(), path);
+        PSQT_OVERRIDE_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+        Some(build_psqt_tables(m))
+    })
+}
+
+/// An overridden square, or None to use the compiled table.
+///
+/// Flat arrays indexed by piece, NOT a name lookup. The first version built a
+/// String with `format!` and hit a HashMap on every square of every
+/// evaluation -- the hottest path there is. Same tree, same node count, and
+/// the engine ran at 58% speed: 563k nps down to 325k, which cost about 180
+/// Elo and made every profile measured this afternoon look catastrophic when
+/// the values were fine. The bench never showed it, because a bench counts
+/// nodes and this only costs time.
+/// Set once, read on every square. Checking a relaxed bool is free; going
+/// through the OnceLock and an Option per square is not, and the normal case
+/// -- no override at all, which is how the bot runs -- must cost nothing.
+static PSQT_OVERRIDE_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[inline]
+fn psqt_from_override(kind: PieceType, idx: usize, eg: bool) -> Option<i32> {
+    if !PSQT_OVERRIDE_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    let tabs = psqt_override().as_ref()?;
+    let t = if eg { &tabs.1 } else { &tabs.0 };
+    t[kind.idx()].as_ref().map(|a| a[idx])
+}
+
+/// Load one file that holds every tunable number in the engine.
+///
+/// The motivation is coherence, not convenience. The values arrived from
+/// different places and were never designed together: piece-square tables
+/// adopted generic and never calibrated, search margins half inherited from
+/// another engine and half our own, material somewhere in between. Anyone
+/// designing a consistent set has to be able to see and set all of it at once,
+/// and the blocks are coupled -- pruning margins are compared against
+/// evaluation scores, the PSQT is a bonus added to material, and four
+/// constants read the history tables against their scale.
+///
+/// Format: `<section>.<name> <value(s)>`, lists comma-separated, `#` comments.
+/// Anything absent keeps its compiled-in value, so a profile can be partial.
+pub fn load_profile(path: &str) -> Result<usize, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let mut n = 0usize;
+    let mut psqt: std::collections::HashMap<String, [i32; 64]> = std::collections::HashMap::new();
+    for (lineno, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (key, rest) = match line.split_once(char::is_whitespace) {
+            Some(x) => x,
+            None => continue,
+        };
+        let rest = rest.trim();
+        let (section, name) = match key.split_once('.') {
+            Some(x) => x,
+            None => continue,
+        };
+        let one = || -> Option<i32> { rest.parse().ok() };
+        let ok = match section {
+            "material" => one().map(|v| set_material(name, v)).unwrap_or(false),
+            "scale" => one().map(|v| set_family_scale(name, v)).unwrap_or(false),
+            "psqt_scale" => one().map(|v| set_psqt_scale(name, v)).unwrap_or(false),
+            "search" => one()
+                .map(|v| crate::search::set_param(name, v))
+                .unwrap_or(false),
+            "psqt" => {
+                let v: Vec<i32> = rest
+                    .split(|c: char| c == ',' || c.is_whitespace())
+                    .filter(|s| !s.is_empty())
+                    .filter_map(|s| s.parse().ok())
+                    .collect();
+                if v.len() == 64 {
+                    let mut a = [0i32; 64];
+                    a.copy_from_slice(&v);
+                    psqt.insert(name.to_string(), a);
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        };
+        if ok {
+            n += 1;
+        } else {
+            // Loud, not silent. A profile that half-applies is worse than one
+            // that fails: the engine would run with a set nobody designed.
+            eprintln!("perfil: linha {} ignorada -- '{}'", lineno + 1, key);
+        }
+    }
+    if !psqt.is_empty() {
+        let count = psqt.len();
+        PSQT_OVERRIDE_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+        if PSQT_OVERRIDE.set(Some(build_psqt_tables(psqt))).is_err() {
+            eprintln!("perfil: tabelas ja fixadas, {} ignoradas", count);
+        }
+    }
+    Ok(n)
+}
+
 fn mirror_idx(color: Color, s: Square) -> usize {
     if color == Color::White {
         s as usize
@@ -270,6 +470,9 @@ fn mirror_idx(color: Color, s: Square) -> usize {
 
 fn pst_mg(kind: PieceType, color: Color, s: Square) -> i32 {
     let idx = mirror_idx(color, s);
+    if let Some(v) = psqt_from_override(kind, idx, false) {
+        return v;
+    }
     match kind {
         PieceType::Pawn => MG_PAWN[idx],
         PieceType::Knight => MG_KNIGHT[idx],
@@ -282,6 +485,9 @@ fn pst_mg(kind: PieceType, color: Color, s: Square) -> i32 {
 
 fn pst_eg(kind: PieceType, color: Color, s: Square) -> i32 {
     let idx = mirror_idx(color, s);
+    if let Some(v) = psqt_from_override(kind, idx, true) {
+        return v;
+    }
     match kind {
         PieceType::Pawn => EG_PAWN[idx],
         PieceType::Knight => EG_KNIGHT[idx],
@@ -301,8 +507,14 @@ fn pst_eg(kind: PieceType, color: Color, s: Square) -> i32 {
 /// tornar incremental).
 pub fn piece_contribution(kind: PieceType, color: Color, s: Square) -> (i32, i32, i32) {
     let sign = if color == Color::White { 1 } else { -1 };
-    let mg = sign * (mg_value(kind.idx()) + pst_mg(kind, color, s));
-    let eg = sign * (eg_value(kind.idx()) + pst_eg(kind, color, s));
+    let f = psqt_factor(kind.idx());
+    let (pmg, peg) = if f == 1000 {
+        (pst_mg(kind, color, s), pst_eg(kind, color, s))
+    } else {
+        (pst_mg(kind, color, s) * f / 1000, pst_eg(kind, color, s) * f / 1000)
+    };
+    let mg = sign * (mg_value(kind.idx()) + pmg);
+    let eg = sign * (eg_value(kind.idx()) + peg);
     (mg, eg, PHASE_INC[kind.idx()])
 }
 
@@ -570,6 +782,21 @@ const SAFETY_DISCOVERED: [[(i32, i32); 3]; 5] = [
 // The generic terms we already have -- knight outposts, bishop-blocked-by-
 // pawns -- catch fragments of this by accident. None of them can recognise
 // the structure as a thing with a plan attached.
+/// Starting points, not tuned values. Small on purpose: a new term that is
+/// wrong is worse than one that is absent, and these can be swept by profile
+/// (`scale.pawns` covers blocked_pawns, `scale.pieces` covers space).
+/// Peao, cavalo, bispo, torre, dama. Fraccao do valor da peca: nao o valor
+/// inteiro, porque nem toda a peca atacada se perde -- ha contra-jogo, xeques
+/// intermedios, e a busca resolve o resto. Ponto de partida conservador.
+const HANGING: [(i32, i32); 5] = [(-20, -25), (-55, -60), (-58, -62), (-90, -100), (-160, -180)];
+
+/// Cavalo, bispo, torre, dama -- por unidade de proximidade (7 - distancia).
+/// Ponto de partida pequeno: um termo novo errado e' pior que ausente.
+const KING_TROPISM: [(i32, i32); 4] = [(3, 1), (2, 1), (2, 0), (1, 0)];
+
+const SPACE: (i32, i32) = (3, 1);
+const BLOCKED_PAWNS: (i32, i32) = (-6, -3);
+
 const STONEWALL: (i32, i32) = (14, -6);
 const STONEWALL_OUTPOST: (i32, i32) = (22, 10);
 const STONEWALL_BAD_BISHOP: (i32, i32) = (-20, -12);
@@ -1010,6 +1237,61 @@ pub struct Weights {
     pub complexity_pawn_flanks: i32,
     pub complexity_pawn_endgame: i32,
     pub complexity_adjustment: i32,
+    /// Safe squares in our own half, behind our pawns, that the opponent does
+    /// not attack. Room to manoeuvre.
+    ///
+    /// This is the term that decides closed positions, and neither we nor the
+    /// reference had it. Measured on 214 real mistakes, we err TWICE as often
+    /// in locked structures as anywhere else -- and a locked board is exactly
+    /// where there is no tactic to find and the game is decided by who has
+    /// somewhere to put their pieces. Material and mobility have almost
+    /// nothing to say there: mobility counts squares a piece can reach NOW,
+    /// which in a blocked position is a small number for both sides and says
+    /// nothing about who is better placed to improve.
+    /// Per piece, scaled by how close it stands to the enemy king.
+    ///
+    /// Every other king term counts squares ATTACKED. None of them notices a
+    /// piece that is two squares from the enemy king and attacking nothing
+    /// yet -- which is exactly the piece about to decide the game. Mobility
+    /// makes this worse, not better: a rook with eighteen squares on a dead
+    /// flank outscores a rook with six pointed at the king.
+    ///
+    /// This is the term that says WHERE THE GAME IS. A hand-written
+    /// evaluation has to state that explicitly; it is one of the things a
+    /// neural network learns on its own, and one of the reasons this kind of
+    /// evaluation reads as "static" even when most of its terms are dynamic.
+    ///
+    /// Knights weigh most: they are short-range, so distance to the king is
+    /// nearly all of their attacking value. Queens weigh least per unit of
+    /// distance because they already reach far -- their closeness matters, but
+    /// the other king terms already price it.
+    /// Penalty for OUR pieces that are attacked and cannot be saved, when it
+    /// is the opponent's turn. Indexed by piece type.
+    ///
+    /// Every other threat term prices ATTACKING. None of them prices being
+    /// about to die. Found with the heatmap tool: dropping a bishop on d6 --
+    /// where an enemy bishop takes it next move -- scored +23 and came out as
+    /// the single BEST square on the board, because the bishop attacks a rook
+    /// and a bishop from there and nothing charges it for the fact that it
+    /// will not survive to collect.
+    ///
+    /// This matters far beyond one square. The static evaluation feeds every
+    /// whole-node pruning decision -- RFP, null move, razoring, futility --
+    /// and each of them asks "is my static score already good enough to cut
+    /// without searching?". An evaluation that is optimistic exactly when a
+    /// piece hangs makes those cuts on a lie, which is a candidate explanation
+    /// for null move firing 4.9x more often here than in a reference engine
+    /// and failing 64% of the time against its 28%.
+    pub hanging: [(i32, i32); 5],
+    pub king_tropism: [(i32, i32); 4],
+    pub space: (i32, i32),
+    /// Per own pawn standing directly in front of an enemy pawn.
+    ///
+    /// A board with six blocked pawns plays nothing like an open one, and
+    /// without this the evaluation cannot tell them apart. Counting them lets
+    /// the space bonus matter more precisely when the position is actually
+    /// closed.
+    pub blocked_pawns: (i32, i32),
     pub stonewall: (i32, i32),
     pub stonewall_outpost: (i32, i32),
     pub stonewall_bad_bishop: (i32, i32),
@@ -1086,6 +1368,10 @@ impl Default for Weights {
             complexity_pawn_flanks: COMPLEXITY_PAWN_FLANKS,
             complexity_pawn_endgame: COMPLEXITY_PAWN_ENDGAME,
             complexity_adjustment: COMPLEXITY_ADJUSTMENT,
+            hanging: HANGING,
+            king_tropism: KING_TROPISM,
+            space: SPACE,
+            blocked_pawns: BLOCKED_PAWNS,
             stonewall: STONEWALL,
             stonewall_outpost: STONEWALL_OUTPOST,
             stonewall_bad_bishop: STONEWALL_BAD_BISHOP,
@@ -1133,8 +1419,8 @@ static DEFAULT_WEIGHTS: OnceLock<Weights> = OnceLock::new();
 /// 1000 is unchanged, 1200 is +20%.
 static FAMILY_SCALE: [std::sync::atomic::AtomicI32; 6] = [
     std::sync::atomic::AtomicI32::new(1000),
-    std::sync::atomic::AtomicI32::new(1000),
-    std::sync::atomic::AtomicI32::new(1000),
+    std::sync::atomic::AtomicI32::new(1100),
+    std::sync::atomic::AtomicI32::new(1150),
     std::sync::atomic::AtomicI32::new(1000),
     std::sync::atomic::AtomicI32::new(1000),
     std::sync::atomic::AtomicI32::new(1000),
@@ -1219,6 +1505,10 @@ pub fn set_family_scale(name: &str, per_mille: i32) -> bool {
 
 /// True when any family has been rescaled, so the common path can skip the
 /// work entirely.
+/// Whether any family is scaled at all. Compared against 1000, not against
+/// the defaults: king and threats now ship at 1100 and 1150, so the scaled
+/// path IS the normal path. Building the scaled weights happens once behind a
+/// OnceLock; what this guards is only whether to take that path at all.
 pub fn family_scaling_active() -> bool {
     FAMILY_SCALE
         .iter()
@@ -1712,6 +2002,12 @@ impl Weights {
             // vector would change its length and invalidate the tuned weight
             // file already in production. They are reasoned constants for
             // now; they join the tuned vector once the shape is settled.
+            // Fora do vector pela mesma razao que os de baixo: mudar o
+            // comprimento invalidaria o ficheiro de pesos ja' em producao.
+            hanging: self.hanging,
+            king_tropism: self.king_tropism,
+            space: self.space,
+            blocked_pawns: self.blocked_pawns,
             unsafe_knight_check: self.unsafe_knight_check,
             unsafe_bishop_check: self.unsafe_bishop_check,
             unsafe_rook_check: self.unsafe_rook_check,
@@ -1831,6 +2127,54 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
         attacked[c.idx()] |= ka;
         attacked_by_pt[c.idx()][PieceType::King.idx()] |= ka;
     }
+
+    // === Tropismo: onde esta o jogo ===========================================
+    //
+    // Todos os outros termos de rei contam casas ATACADAS. Nenhum repara numa
+    // peca a duas casas do rei inimigo que ainda nao ataca nada -- que e'
+    // precisamente a peca prestes a decidir o jogo. A mobilidade ate agrava
+    // isto: uma torre com dezoito casas num flanco morto pontua melhor que uma
+    // com seis apontada ao rei.
+    //
+    // So' com dama no tabuleiro: sem ela nao ha ataque de mate a preparar e
+    // aproximar pecas do rei inimigo e' so' descentralizacao.
+    for c in [Color::White, Color::Black] {
+        let us = c.idx();
+        let them = c.opp().idx();
+        if board.pieces[us][PieceType::Queen.idx()] == 0 {
+            continue;
+        }
+        let sign = if c == Color::White { 1 } else { -1 };
+        let ksq = board.king_sq(c.opp());
+        let kf = (ksq as i32) & 7;
+        let kr = (ksq as i32) >> 3;
+        for (wi, pt) in [
+            PieceType::Knight,
+            PieceType::Bishop,
+            PieceType::Rook,
+            PieceType::Queen,
+        ]
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (i, *p))
+        {
+            let mut bb = board.pieces[us][pt.idx()];
+            while bb != 0 {
+                let sq = bb.trailing_zeros() as i32;
+                bb &= bb - 1;
+                let df = ((sq & 7) - kf).abs();
+                let dr = ((sq >> 3) - kr).abs();
+                // Distancia de rei (Chebyshev): 7 e' o canto oposto, 1 e'
+                // encostado. O bonus cresce com a proximidade.
+                let close = 7 - df.max(dr);
+                mg += sign * w.king_tropism[wi].0 * close;
+                eg += sign * w.king_tropism[wi].1 * close;
+            }
+        }
+        let _ = them;
+    }
+
+
 
     let white_king_zone = king_zone(board.king_sq(Color::White));
     let black_king_zone = king_zone(board.king_sq(Color::Black));
@@ -2304,6 +2648,134 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
         let their_pieces = board.occ_color[them];
         let their_queen = board.pieces[them][PieceType::Queen.idx()];
         let their_king = board.pieces[them][PieceType::King.idx()];
+
+    // === Pecas penduradas, avaliadas por SEE ==================================
+    //
+    // So' para o lado que NAO joga a seguir: quem tem o lance foge com a peca,
+    // quem nao tem vai perde-la.
+    //
+    // A primeira versao disto usava uma constante por tipo de peca: -58 para um
+    // bispo que vale 355. Numa posicao real (Bxf7+ na italiana) a avaliacao dava
+    // -73 quando a verdade, depois da recaptura, era -215. Um erro de 142
+    // centipeoes -- maior do que QUALQUER margem de poda que temos (35 por ply
+    // no RFP, 265 no null move). Toda a poda de no inteiro estava a decidir
+    // sobre um numero que podia estar errado por mais do que a margem contra a
+    // qual era comparado.
+    //
+    // SEE responde exactamente a pergunta certa: jogando a melhor captura sobre
+    // esta peca, e trocando de forma optima ate ao fim, quanto se perde? Uma
+    // peca defendida por igual da zero; uma pendurada da o seu valor inteiro.
+    //
+    // Uma rede neuronal aprende isto sozinha a partir de resultados; uma
+    // avaliacao escrita a mao tem de o dizer. E' a diferenca de metodo, nao de
+    // conhecimento.
+    {
+        let victim = board.side.opp();
+        let vi = victim.idx();
+        let ai = board.side.idx();
+        let sign = if victim == Color::White { 1 } else { -1 };
+        let mut worst = 0i32;
+        for pt in [
+            PieceType::Pawn,
+            PieceType::Knight,
+            PieceType::Bishop,
+            PieceType::Rook,
+            PieceType::Queen,
+        ] {
+            let mut bb = board.pieces[vi][pt.idx()] & attacked[ai];
+            while bb != 0 {
+                let sq = bb.trailing_zeros() as u8;
+                bb &= bb - 1;
+                // A captura mais barata sobre esta casa e' a que o adversario
+                // vai escolher, e e' a que SEE avalia a partir da lista de
+                // trocas completa.
+                let atk_bb = crate::search::see::attackers_to(a, board, sq, occ)
+                    & board.occ_color[ai];
+                if atk_bb == 0 {
+                    continue;
+                }
+                if let Some((from, _)) =
+                    crate::search::see::least_valuable_attacker(board, atk_bb, board.side)
+                {
+                    let mv = crate::moves::Move {
+                        from,
+                        to: sq,
+                        promotion: None,
+                        flag: crate::moves::MoveFlag::Capture,
+                    };
+                    let gain = crate::search::see::see(a, board, &mv);
+                    // So' a PIOR ameaca conta. Somar todas contaria varias
+                    // perdas que nunca acontecem juntas: so' se perde uma peca
+                    // por lance.
+                    if gain > worst {
+                        worst = gain;
+                    }
+                }
+            }
+        }
+        if worst > 0 && std::env::var_os("KESTREL_DEBUG_SEE").is_some() {
+            eprintln!("debug: worst SEE = {}, penalizacao = {}", worst, -(worst * 3 / 4));
+        }
+        if worst > 0 {
+            // Fraccao, nao o valor inteiro: ha xeques intermedios, contra-jogo
+            // e fugas que o SEE estatico nao ve. A busca resolve o resto -- isto
+            // so' tem de deixar a avaliacao estatica honesta o suficiente para
+            // as margens de poda fazerem sentido.
+            mg += sign * -(worst * 3 / 4);
+            eg += sign * -(worst * 3 / 4);
+        }
+    }
+
+    // === Espaco e peoes travados ===============================================
+    //
+    // O termo que decide posicoes fechadas, e que nenhum dos dois motores tinha.
+    // Medido nos 214 erros reais: erramos o DOBRO em estruturas travadas. Num
+    // tabuleiro fechado nao ha tactica para encontrar -- ganha quem tem onde por
+    // as pecas, e a mobilidade nao mede isso (conta casas alcancaveis AGORA, que
+    // num bloqueio sao poucas para ambos).
+    //
+    // Espaco = casas na nossa metade, nas colunas centrais, atras dos nossos
+    // peoes, que o adversario nao ataca. Vale mais quando ha muitas pecas para
+    // manobrar e quando o tabuleiro esta de facto travado, portanto o bonus e'
+    // multiplicado pelo numero de peoes bloqueados.
+    for c in [Color::White, Color::Black] {
+        let sign = if c == Color::White { 1 } else { -1 };
+        let us = c.idx();
+        let them = c.opp().idx();
+        let our_pawns = board.pieces[us][PieceType::Pawn.idx()];
+        let their_pawns = board.pieces[them][PieceType::Pawn.idx()];
+
+        // Peoes nossos travados de frente contra um peao deles.
+        let blocked = if c == Color::White {
+            our_pawns & (their_pawns >> 8)
+        } else {
+            our_pawns & (their_pawns << 8)
+        };
+        let n_blocked = blocked.count_ones() as i32;
+        mg += sign * w.blocked_pawns.0 * n_blocked;
+        eg += sign * w.blocked_pawns.1 * n_blocked;
+
+        // Colunas c a f, fileiras 2-4 do nosso lado: onde as pecas manobram.
+        const CENTRE_FILES: Bitboard = (FILE_A << 2) | (FILE_A << 3) | (FILE_A << 4) | (FILE_A << 5);
+        let home = if c == Color::White {
+            RANK_2 | RANK_3 | RANK_4
+        } else {
+            RANK_7 | RANK_6 | RANK_5
+        };
+        // Atras dos nossos peoes: a casa esta vazia e ha um peao nosso a
+        // frente dela na mesma coluna.
+        let behind = if c == Color::White {
+            (our_pawns >> 8) | (our_pawns >> 16)
+        } else {
+            (our_pawns << 8) | (our_pawns << 16)
+        };
+        let space = home & CENTRE_FILES & behind & !occ & !attacked[them];
+        // Escalado pelo bloqueio: espaco vale pouco num tabuleiro aberto, onde
+        // as pecas chegam a qualquer lado de qualquer maneira.
+        let weight = 1 + n_blocked;
+        mg += sign * w.space.0 * space.count_ones() as i32 * weight / 2;
+        eg += sign * w.space.1 * space.count_ones() as i32 * weight / 2;
+    }
 
         let defended_bb: Bitboard = attacked_by_2[them]
             | attacked_by_pt[them][PieceType::Pawn.idx()]
