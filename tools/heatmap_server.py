@@ -25,7 +25,9 @@ is then hanging or safe.
 import http.server, json, socketserver, subprocess, threading
 
 PORT = 8771
-ENGINE = "/root/kestrel_joao/kestrel_tm"
+# The binary the BOT plays with, deliberately -- a heatmap of a different
+# build answers a question nobody asked.
+ENGINE = "/root/kestrel_joao/kestrel_bot_bin"
 LOCK = threading.Lock()
 # Milissegundos de relogio, nao profundidade. O motor decide sozinho ate onde
 # ir: para quando a jogada estabiliza, o esforco se concentra e o score deixa
@@ -97,7 +99,7 @@ class Engine:
                 out.append(0)
         return out
 
-    def search(self, fen, ms, clock=None, inc=0):
+    def search(self, fen, ms, clock=None, inc=0, oppclock=None):
         """Search either for a fixed time, or with a real CLOCK.
 
         The clock is the interesting one: it lets the engine decide how long
@@ -112,16 +114,29 @@ class Engine:
         self._send("ucinewgame")
         self._send(f"position fen {fen}")
         if clock:
-            self._send(f"go wtime {clock} btime {clock} winc {inc} binc {inc}")
+            # The opponent's clock is part of the decision, not decoration:
+            # the same position deserves a different amount of thought when
+            # we are ahead on time and when we are about to be outlasted.
+            opp = oppclock or clock
+            self._send(f"go wtime {clock} btime {opp} winc {inc} binc {inc}")
         else:
             self._send(f"go movetime {max(50, ms)}")
         score = None
         depth = 0
         spent = 0
+        tm = None
         for _ in range(400000):
             line = self.p.stdout.readline()
             if not line:
                 break
+            if line.startswith("info string tm "):
+                # What the engine allowed itself, and why -- the one part of
+                # its reasoning that never shows up in the moves.
+                t = line.split()
+                try:
+                    tm = {t[i]: int(t[i + 1]) for i in range(3, len(t) - 1, 2)}
+                except (ValueError, IndexError):
+                    tm = None
             if line.startswith("info depth"):
                 t = line.split()
                 try:
@@ -137,8 +152,8 @@ class Engine:
                 mv = line.split()[1]
                 # Leave the pipe clean for whoever comes next.
                 self.sync()
-                return mv, score, depth, spent
-        return None, None, 0, 0
+                return mv, score, depth, spent, tm
+        return None, None, 0, 0, None
 
 
 ENG = Engine()
@@ -217,7 +232,7 @@ def heatmap(fen, square, depth=SEARCH_MS, clock=None, inc=0):
     # avaliacao sozinha erraria e a procura corrige -- e onde nao corrige.
     best_uci = best_san = None
     if depth > 0 or clock:
-        best_uci, _, _, _ = ENG.search(fen, depth, clock or None, inc)
+        best_uci, _, _, _, _ = ENG.search(fen, depth, clock or None, inc)
         if best_uci:
             try:
                 m = chess.Move.from_uci(best_uci)
@@ -236,7 +251,7 @@ def heatmap(fen, square, depth=SEARCH_MS, clock=None, inc=0):
             "best_from": bf, "best_to": bt, "best_san": best_san}
 
 
-def best_move(fen, ms, clock=None, inc=0):
+def best_move(fen, ms, clock=None, inc=0, oppclock=None):
     """The move the search plays. Its own endpoint so the board can show it the
     moment a position is loaded, without waiting for a 60-variant heatmap."""
     try:
@@ -244,7 +259,7 @@ def best_move(fen, ms, clock=None, inc=0):
         b = chess.Board(fen)
     except (ImportError, ValueError):
         return {}
-    uci, score, d, spent = ENG.search(fen, ms if not clock else 0, clock, inc)
+    uci, score, d, spent, tm = ENG.search(fen, ms if not clock else 0, clock, inc, oppclock)
     if not uci:
         return {}
     try:
@@ -255,7 +270,7 @@ def best_move(fen, ms, clock=None, inc=0):
         return {}
     return {"best_from": m.from_square, "best_to": m.to_square,
             "best_san": b.san(m), "score": score, "depth": d, "spent": spent,
-            "clock": clock}
+            "clock": clock, "tm": tm}
 
 
 PAGE_TEMPLATE = r"""<!doctype html><meta charset=utf-8>
@@ -298,9 +313,12 @@ PAGE_TEMPLATE = r"""<!doctype html><meta charset=utf-8>
  <input type=text id=fen value="r1bq1rk1/pp2bppp/2n1pn2/2pp4/3P1B2/2PBPN2/PP1N1PPP/R2Q1RK1 w - - 0 9">
  <button onclick="load()">Carregar</button>
 </div>
+<div id=tmpanel style="margin:8px 0;padding:9px 11px;border:1px solid #2a2f38;border-radius:7px;
+  background:#1b1e24;font:12px ui-monospace,monospace;color:#9aa4b0;display:none"></div>
 <div class=row>
  <label>busca <input type=text id=depth value="400" style="width:56px"> ms</label>
  <label>ou RELOGIO <input type=text id=clock value="" placeholder="60000" style="width:76px"> ms</label>
+ <label>adversario <input type=text id=oppclock value="" placeholder="igual" style="width:70px"> ms</label>
  <label>incremento <input type=text id=inc value="0" style="width:52px"> ms</label>
  <button onclick="showBest()">so a melhor jogada</button>
 </div>
@@ -328,6 +346,7 @@ function opts(){
   return {fen:g('fen').value,
           depth:(g('depth').value===''?400:+g('depth').value),
           clock:+g('clock').value||0,
+          oppclock:+g('oppclock').value||0,
           inc:+g('inc').value||0};
 }
 function load(){
@@ -340,7 +359,8 @@ async function showBest(){
   try{
     const o=opts();
     const r=await fetch('/heat',{method:'POST',body:JSON.stringify(
-      {fen:o.fen,square:0,only_best:true,depth:o.depth,clock:o.clock,inc:o.inc})});
+      {fen:o.fen,square:0,only_best:true,depth:o.depth,clock:o.clock,
+       oppclock:o.oppclock,inc:o.inc})});
     const j=await r.json();
     if(j.best_to===undefined||j.best_to===null){ leg.textContent=j.error||'sem lance'; return; }
     best={from:j.best_from,to:j.best_to,san:j.best_san}; draw();
@@ -350,6 +370,25 @@ async function showBest(){
                        (100*j.spent/j.clock).toFixed(1)+'%) ate a profundidade '+j.depth; }
     else if(j.depth){ extra=' | profundidade '+j.depth; }
     leg.textContent='a busca joga '+j.best_san+' ('+sc+')'+extra;
+    // What the clock decided, and on what grounds. A move played in 1s tells
+    // you nothing about whether the engine weighed spending more; this does.
+    const tp=document.getElementById('tmpanel');
+    if(j.tm){
+      const t=j.tm, used=j.spent, pct=(100*used/t.soft).toFixed(0);
+      const gap=t.oppclock? (t.myclock/t.oppclock) : 1;
+      const gapTxt = gap>1.2 ? 'a frente no relogio (+'+((gap-1)*100).toFixed(0)+'%), tecto alargado'
+                   : gap<0.83 ? 'atras no relogio (-'+((1-gap)*100).toFixed(0)+'%), tecto cortado'
+                   : 'relogios equilibrados';
+      const mode = t.hard===t.soft ? '<b style="color:#f0883e">metralhadora</b> (sem tecto: pouco relogio)'
+                                   : 'normal (pode esticar ate '+(t.hard/t.soft).toFixed(1)+'x)';
+      tp.style.display='block';
+      tp.innerHTML='<b style="color:#d8dde3">gestao de tempo</b> &nbsp; modo '+mode+
+        '<br>orcamento <b style="color:#6db3f2">'+t.soft+'ms</b>'+
+        ' &nbsp; tecto <b style="color:#6db3f2">'+t.hard+'ms</b>'+
+        ' &nbsp; gastou <b style="color:'+(used>t.hard?'#f0883e':'#7ee787')+'">'+used+'ms</b> ('+pct+'% do orcamento)'+
+        '<br>faltam ~<b>'+t.horizon+'</b> lances (estimado por '+t.pieces+' pecas no tabuleiro)'+
+        ' &nbsp;|&nbsp; '+gapTxt;
+    } else { tp.style.display='none'; }
   }catch(e){ leg.textContent='erro: '+e; }
 }
 function draw(){
@@ -443,7 +482,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if req.get("only_best"):
                     out = best_move(req["fen"], int(req.get("depth", SEARCH_MS)),
                                     int(req.get("clock") or 0) or None,
-                                    int(req.get("inc") or 0))
+                                    int(req.get("inc") or 0),
+                                    int(req.get("oppclock") or 0) or None)
                 else:
                     out = heatmap(req["fen"], int(req["square"]),
                                   int(req.get("depth", SEARCH_MS)),
