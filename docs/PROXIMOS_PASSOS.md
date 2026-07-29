@@ -41,61 +41,50 @@ the part that made per-bucket tuning not worth starting.
   still falling -- with 20k positions against 5824 parameters that is the fit
   memorising, not learning. Use the full dataset, hold out a validation split,
   and stop on validation loss rather than epochs.
-* **The extractor disagrees with the evaluation by 15cp**, where 3cp is the
-  limit integer truncation allows, and this must be settled before any tuning
-  run is trusted. A tuner fed features that do not add up will produce weights
-  happily, and they will be wrong.
+* **The extractor now agrees with the evaluation.** It did not, by 15cp against
+  a 3cp bar, and it turned out to be two independent faults rather than the
+  non-linearity it was reported as:
 
-  What is established, so nobody repeats it:
+  1. `material_pst_current_vec` returned the raw piece-square tables while the
+     evaluation applies `psqt_factor` to them -- and the king's factor is 1350,
+     not 1000. Five centipawns a position, in the material half, reported as a
+     positional non-linearity.
+  2. The probe multiplier defaulted to `10 * MAX_PHASE`, and MAX_PHASE is 24,
+     so it probed at 240. At 240 the residual is 14.5cp; at 1024 it drops to
+     3.2 and stays there through 240000. Every value tried by hand happened to
+     be above the knee, so the residual looked scale-independent -- which is
+     precisely the signature of "not rounding" -- and was read that way for a
+     day.
 
-  - It is not rounding. The residual does not move when KESTREL_PROBE_MULT is
-    raised a hundredfold, which is the test the code itself prescribes.
-  - It appeared in commit 8fdf335 (28/07). Binaries built before it report
-    2.6cp; every one after reports 14.8-15.7cp.
-  - **It is not the terms that commit added.** Each of the four (hanging via
-    SEE, king tropism, blocked pawns, space) was disabled in turn and then all
-    together; with all of them off the positional evaluation returns to
-    exactly the pre-commit value (-78 on the worst position, matching the old
-    binary to the unit) and the residual STILL reads 15.0.
-  - Material and piece-square features are fine: `checkmatpst` passes within
-    1.5cp.
-  - `to_vec`/`from_vec` round-trip cleanly over all 705 scalars.
+  Residual now: 2.4cp on the quiet dataset, 3.2 on our own games, 2.4 on the
+  combined one. The bar is 3.5, set just above the measured floor rather than
+  just below it.
 
-  So the disagreement is in the extraction path, not in the evaluation. The
-  same commit also introduced runtime PSQT scaling (`psqt_factor`,
-  `set_psqt_scale`, `psqt_override`) and `load_profile`; those are what is
-  left unexamined, and the self-check's own reconstruction is the other half
-  worth reading closely.
+  **The test that matters is invariance, not the number.** A residual that
+  shrinks as the probe grows is rounding; one that does not is the model
+  failing to be the function. Sweep KESTREL_PROBE_MULT before concluding
+  anything.
 
-  Already fixed along the way (29/07): the six weights added on 28-29/07
-  (hanging, king_tropism, space, blocked_pawns, king_aim, king_battery) were
-  evaluated but never emitted by `to_vec`, so no tuner could see or move them
-  -- they are appended now, and older weight files stay valid by being
-  shorter. `hanging` applied a hardcoded 3/4 instead of its own weight; it now
-  uses it, in thousandths, with defaults that reproduce the old behaviour to
-  the unit. And an `env::var_os` sat in the evaluation's hottest loop; it is
-  read once now.
+* **Extractor and engine now partition alike.** `gpuextract` bucketed by phase
+  while `eval::bucket_of` buckets by pawn count. A run would have trained each
+  set on one population and the engine applied it to another. They call the
+  same function now.
 
-**Why it is worth it.** Slope of our evaluation against a strong reference on
-220 quiet positions (1.00 = same scale):
+* **Overfitting.** Loss fell from 0.223 to 0.0119 over 5000 epochs on 20k
+  positions against 5824 parameters and was still falling -- that is
+  memorisation. Use the full data, hold out a validation split, stop on
+  validation loss.
 
-| pieces | 29-32 | 25-28 | 21-24 | 17-20 | 13-16 | 9-12 | 5-8 |
-|---|---|---|---|---|---|---|---|
-| slope | 0.78 | 0.97 | 1.05 | 1.52 | 1.50 | 1.57 | 1.37 |
+* **How much data there is: 12.5 million positions**, not the 250k an earlier
+  note in this file claimed. `dataset_own.epd` alone holds 2.65M from our own
+  games. That changes what is affordable: at 4 buckets the smallest bucket
+  gets ~3400 positions per weight, at 8 buckets ~1357. Eight buckets fit the
+  data comfortably; the earlier worry that they would not was based on the
+  wrong figure.
 
-We are quiet where there is most material and shrill where there is least. Two
-phases blended linearly cannot express that, and no single global factor fixes
-it because the error changes sign in the middle.
-
-2026-07-29 corrected the LOUDNESS only, with eight scale factors by piece count
-(`material_bucket_scale`): suite 74/214 -> 78/214 at a fixed 400k nodes. Weight
-buckets correct something else -- what the terms BELIEVE in each phase, not just
-how loudly they say it. The two are complementary.
-
-**When measuring:** use fixed nodes and one thread. The same binary scored 73
-then 69 on the suite at 300ms, and 73-75 at four threads. And note that the
-`eval` command now reports what SEARCH sees; before it reported the sum of the
-component blocks and disagreed with the engine it exists to explain.
+  Boundaries the distribution asks for, measured on our own games: 4 buckets
+  at [5, 9, 12] pawns -- which is exactly what `bucket_of` already uses, an
+  independent confirmation -- and 8 buckets at [3, 6, 8, 9, 11, 12, 13].
 
 ## 2. A network, and where the GPU actually helps
 
