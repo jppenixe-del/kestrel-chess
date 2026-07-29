@@ -370,6 +370,31 @@ PONDER_MIN_CLOCK_MS = 30000  # only ponder with a comfortable clock
 # The ponder engine runs alongside the real one. Four plus four on six cores
 # starved the bridge's own socket reader (see the Threads note in Engine).
 PONDER_THREADS = 1
+
+# --- Decidir o RESULTADO, nao so o lance -------------------------------------
+#
+# The bridge used to ignore draw offers entirely: it never accepted one and
+# never made one. In a game that ran to 149 moves and was lost on time in a
+# dead-equal position, an offer either way would have saved the half point --
+# and at 3+0 with no increment, a long equal game is exactly where the clock
+# decides a game the pieces do not.
+#
+# The engine's own evaluation is the input. It is not a strong engine's
+# evaluation, so the thresholds are wide and the memory is long: a single
+# iteration saying 0.00 means little, six in a row mean the position is not
+# going anywhere.
+DRAW_EQUAL_CP = 35        # |score| under this counts as "level"
+DRAW_MEMORY = 8           # how many of our own moves we look back over
+DRAW_OFFER_AFTER = 8      # level for this many moves before we offer
+DRAW_ACCEPT_CP = 60       # accept if we are not better than this
+# Offer only once the clock is a real risk. With time in hand there is no
+# reason to stop playing -- we win most games we play out.
+DRAW_OFFER_CLOCK_FRAC = 0.35
+# Resign only when it is beyond doubt and has been for a while. This does not
+# change the result -- a lost game is lost -- it buys the time back for the
+# next game, which at an 80% score is worth more than the moves it skips.
+RESIGN_CP = -1200
+RESIGN_MOVES = 10
 # Entries kept in weblog/eval.jsonl (see _append_eval_log).
 EVAL_LOG_LINES = 400
 # Plies the engine treats as the opening (mirrors OPENING_PLIES in uci.rs).
@@ -436,7 +461,50 @@ def _consume_ponder(ponder_state, moves):
         return ponder_state.get("result")
 
 
-def handle_state(engine, game_id, state, my_color, seen_moves, speed, opp_rating=None, ponder_state=None):
+def decide_result(game_id, state, my_color, scores, initial_clock, my_clock):
+    """Accept, offer or resign -- before spending a move on the position.
+
+    `scores` is our own evaluation after each of our moves, in centipawns from
+    our side. Returns True if the game is now over as far as we are concerned.
+    """
+    # Did the opponent offer? Lichess reports the offer under the OFFERING
+    # side's colour, so ours is the other one.
+    opp_offering = state.get("bdraw" if my_color == "white" else "wdraw", False)
+    recent = scores[-DRAW_MEMORY:]
+    if opp_offering:
+        # Accept unless we are clearly better. A draw offered in a position we
+        # are losing or holding is a result, not a concession -- and the games
+        # this bot loses on time are precisely the ones it was not losing.
+        latest = recent[-1] if recent else 0
+        if latest <= DRAW_ACCEPT_CP:
+            api_post(f"/api/bot/game/{game_id}/draw/yes", timeout=5, attempts=2)
+            print(f"[{game_id}] empate aceite (a nossa aval: {latest}cp)")
+            return True
+        api_post(f"/api/bot/game/{game_id}/draw/no", timeout=5, attempts=2)
+        print(f"[{game_id}] empate recusado (estamos melhores: {latest}cp)")
+        return False
+
+    # Nothing to decide until the position has been level for a while AND the
+    # clock has become the thing most likely to decide the game.
+    if len(recent) >= DRAW_OFFER_AFTER and initial_clock:
+        level = all(abs(sc) <= DRAW_EQUAL_CP for sc in recent[-DRAW_OFFER_AFTER:])
+        low = my_clock < initial_clock * DRAW_OFFER_CLOCK_FRAC
+        if level and low:
+            api_post(f"/api/bot/game/{game_id}/draw/yes", timeout=5, attempts=2)
+            print(f"[{game_id}] empate proposto -- {DRAW_OFFER_AFTER} lances nivelados "
+                  f"e {my_clock/1000:.0f}s de relogio")
+            # An offer is not an ending: we keep playing until it is taken.
+            return False
+
+    if len(scores) >= RESIGN_MOVES and all(sc <= RESIGN_CP for sc in scores[-RESIGN_MOVES:]):
+        api_post(f"/api/bot/game/{game_id}/resign", timeout=5, attempts=2)
+        print(f"[{game_id}] desistencia -- {RESIGN_MOVES} lances abaixo de "
+              f"{RESIGN_CP}cp (ultimo: {scores[-1]}cp)")
+        return True
+    return False
+
+
+def handle_state(engine, game_id, state, my_color, seen_moves, speed, opp_rating=None, ponder_state=None, scores=None):
     status = state.get("status")
     if status not in ("started", "created"):
         return False
@@ -452,6 +520,23 @@ def handle_state(engine, game_id, state, my_color, seen_moves, speed, opp_rating
     btime = state.get("btime", 60000)
     winc = state.get("winc", 0)
     binc = state.get("binc", 0)
+    # Decide the RESULT before deciding the move. A draw taken here costs
+    # nothing; the same draw refused costs the whole game when the clock runs
+    # out twenty moves later in a position that never changed.
+    if scores is not None:
+        # The reference clock is the first one we ever saw on this game, in the
+        # same unit as every later reading. Taking it from the game's `clock`
+        # field instead mixed seconds with milliseconds and the low-clock test
+        # never fired -- caught by a unit test, not by a game.
+        if scores.get("initial") is None:
+            scores["initial"] = wtime if my_color == "white" else btime
+        try:
+            if decide_result(game_id, state, my_color,
+                             scores["cp"], scores.get("initial"),
+                             wtime if my_color == "white" else btime):
+                return False
+        except Exception as e:
+            print(f"[{game_id}] decisao de resultado falhou: {e}", file=sys.stderr)
     bm = None
     top_score = None  # score cp do PONTO DE VISTA DO LADO A JOGAR
     reason = "plain engine (bullet-speed safety gate)"
@@ -542,6 +627,10 @@ def handle_state(engine, game_id, state, my_color, seen_moves, speed, opp_rating
         # is merely slow, and cap the damage at 9s when it is genuinely down.
         api_post(f"/api/bot/game/{game_id}/move/{bm}", timeout=3, attempts=3)
         ph["post"] = time.time() - t_post
+        # Our own reading of the position after each of our moves. This is the
+        # only memory the draw and resign decisions have.
+        if scores is not None and top_score is not None:
+            scores["cp"].append(top_score)
         print(f"[{game_id}] {time.strftime('%H:%M:%S')} {bm} clock={my_clock/1000:.1f}s "
               f"think={ph['think']:.2f}s post={ph['post']:.2f}s -- {reason} "
               f"(speed={speed}{opp_str})")
@@ -658,6 +747,8 @@ def play_game(game_id, my_id):
     speed = None
     opp_rating = None
     seen_moves = [-1]
+    # Per-game memory for the draw/resign decisions.
+    scores = {"cp": [], "initial": None}
     ponder_state = new_ponder_state()
     game_over = False
     attempts = 0
@@ -708,13 +799,13 @@ def play_game(game_id, my_id):
                         opp = black if my_color == "white" else white
                         opp_rating = opp.get("rating")
                         speed = ev.get("speed")
-                        if not handle_state(engine, game_id, ev.get("state", {}), my_color, seen_moves, speed, opp_rating, ponder_state):
+                        if not handle_state(engine, game_id, ev.get("state", {}), my_color, seen_moves, speed, opp_rating, ponder_state, scores):
                             game_over = True
                             break
                     elif t == "gameState":
                         if my_color is None:
                             continue
-                        if not handle_state(engine, game_id, ev, my_color, seen_moves, speed, opp_rating, ponder_state):
+                        if not handle_state(engine, game_id, ev, my_color, seen_moves, speed, opp_rating, ponder_state, scores):
                             game_over = True
                             break
             except Exception as e:
