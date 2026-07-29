@@ -94,14 +94,33 @@ def main():
     print(f"{n_pos} positions, {n_par} parameters, {len(vals)} non-zeros "
           f"({len(vals) / max(1, n_pos):.0f} per position), read in {time.time() - t0:.1f}s")
 
-    X = torch.sparse_coo_tensor(
-        torch.from_numpy(np.stack([rows, cols])),
-        torch.from_numpy(vals), (n_pos, n_par), device=dev).coalesce()
-    y = torch.from_numpy(results).to(dev)
+    # A validation split, held out and never trained on.
+    #
+    # Without it there is no way to tell fitting from memorising, and the
+    # difference is not academic: 5000 epochs on 20k positions against 5824
+    # parameters drove the loss from 0.223 to 0.0119 and it was still falling.
+    # That is not a model of chess, it is a lookup table for those positions.
+    # Split by POSITION INDEX rather than at random per non-zero, so a
+    # position's features never straddle the two sets.
+    n_val = max(1, n_pos // 10)
+    val_rows = set(range(n_pos - n_val, n_pos))
+    is_val = np.isin(rows, np.fromiter(val_rows, dtype=np.int64))
+
+    def build(mask, offset, height):
+        return torch.sparse_coo_tensor(
+            torch.from_numpy(np.stack([rows[mask] - offset, cols[mask]])),
+            torch.from_numpy(vals[mask]), (height, n_par), device=dev).coalesce()
+
+    X = build(~is_val, 0, n_pos - n_val)
+    Xv = build(is_val, n_pos - n_val, n_val)
+    y = torch.from_numpy(results[: n_pos - n_val]).to(dev)
+    yv = torch.from_numpy(results[n_pos - n_val :]).to(dev)
+    print(f"treino {n_pos - n_val}, validacao {n_val} (nunca treinada)")
     w = torch.zeros(n_par, device=dev, requires_grad=True)
 
     opt = torch.optim.Adam([w], lr=lr)
     t0 = time.time()
+    best_val, best_w, best_epoch, since = float("inf"), None, 0, 0
     for e in range(epochs):
         opt.zero_grad()
         # Evaluation of every position at once. The sigmoid turns it into the
@@ -113,10 +132,31 @@ def main():
             loss = loss + l2 * torch.mean(w ** 2)
         loss.backward()
         opt.step()
-        if e % max(1, epochs // 10) == 0 or e == epochs - 1:
-            print(f"  epoch {e:5}  loss {loss.item():.6f}  "
-                  f"({(time.time() - t0) / (e + 1) * 1000:.1f}ms/epoch)")
+        # Validation decides when to stop, not the epoch count. Training loss
+        # only ever falls; the held-out set is what says whether anything was
+        # learned.
+        if e % 25 == 0 or e == epochs - 1:
+            with torch.no_grad():
+                pv = torch.sigmoid(torch.sparse.mm(Xv, w.unsqueeze(1)).squeeze(1) * K)
+                vloss = torch.mean((pv - yv) ** 2).item()
+            if vloss < best_val - 1e-7:
+                best_val, best_w, best_epoch, since = vloss, w.detach().clone(), e, 0
+            else:
+                since += 25
+            if e % max(25, (epochs // 10 // 25) * 25) == 0 or e == epochs - 1:
+                print(f"  epoch {e:5}  treino {loss.item():.6f}  validacao {vloss:.6f}"
+                      f"{'  <- melhor' if vloss <= best_val else ''}")
+            # Stop when the held-out loss has not improved for a while: past
+            # that point every further epoch is fitting noise in the training
+            # half, and the weights get worse while the number on screen
+            # keeps looking better.
+            if since >= max(200, epochs // 10):
+                print(f"  paragem antecipada na epoca {e}: validacao sem melhorar ha {since} epocas")
+                break
 
+    if best_w is not None:
+        print(f"  melhor validacao {best_val:.6f} na epoca {best_epoch} -- sao esses os pesos guardados")
+        w = best_w
     out = w.detach().cpu().numpy()
     # Rounded to integers because that is what the engine's weights are. Doing
     # it here rather than letting the engine truncate keeps the file honest
