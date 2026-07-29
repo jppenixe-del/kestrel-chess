@@ -543,11 +543,19 @@ pub fn material_pst_current_vec() -> Vec<i32> {
     let tables_mg = [&MG_PAWN, &MG_KNIGHT, &MG_BISHOP, &MG_ROOK, &MG_QUEEN, &MG_KING];
     let tables_eg = [&EG_PAWN, &EG_KNIGHT, &EG_BISHOP, &EG_ROOK, &EG_QUEEN, &EG_KING];
     // Through the same scale the evaluation applies. `piece_contribution`
-    // multiplies each table by `psqt_factor`, and the king's is 1350 rather
-    // than 1000, so returning the raw tables described a set of weights the
-    // engine does not use. It cost 5cp per position in the feature
-    // extractor's self-check -- reported as a positional non-linearity, and
-    // hunted as one, when it was material all along and entirely linear.
+    // multiplies each table by `psqt_factor`, so returning the raw tables
+    // described a set of weights the engine does not use. It cost 5cp per
+    // position in the feature extractor's self-check -- reported as a
+    // positional non-linearity, and hunted as one, when it was material all
+    // along and entirely linear.
+    //
+    // The king's factor is 1350, and that is deliberate, not an artefact:
+    // measured in the project's own PSQT simulator, our king table has half
+    // the amplitude of a strong reference's, and 1350 was chosen there as the
+    // compromise between a fixed-time reading (115) and one blind to castling
+    // (122). It is recorded in perfil_v3.txt with that reasoning. Nobody
+    // should "restore" it to 1000 on the assumption that a round number was
+    // meant -- if it changes, it changes because the simulator says so.
     for (i, t) in tables_mg.iter().enumerate() {
         let f = psqt_factor(i);
         for &x in t.iter() { v.push(if f == 1000 { x } else { x * f / 1000 }); }

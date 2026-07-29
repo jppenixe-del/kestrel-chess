@@ -46,9 +46,21 @@ the part that made per-bucket tuning not worth starting.
   non-linearity it was reported as:
 
   1. `material_pst_current_vec` returned the raw piece-square tables while the
-     evaluation applies `psqt_factor` to them -- and the king's factor is 1350,
-     not 1000. Five centipawns a position, in the material half, reported as a
-     positional non-linearity.
+     evaluation applies `psqt_factor` to them. Five centipawns a position, in
+     the material half, reported as a positional non-linearity.
+
+     The king's factor being 1350 is deliberate and came from the project's
+     own PSQT simulator, not from any tuning run: our king table has half the
+     amplitude of a strong reference's, and 1350 is the recorded compromise
+     between a fixed-time reading and one blind to castling. See
+     perfil_v3.txt. It is a decision, not a number to be tidied away.
+
+     **This matters for tuning.** If a run fits the piece-square tables
+     themselves, the fitted values already contain whatever the factor was
+     doing, and leaving `psqt_scale.king` at 1350 would apply it twice. Either
+     tune with the factors at 1000, or divide them out of the result -- and
+     that is a decision for whoever owns the profile, not a detail to settle
+     in passing.
   2. The probe multiplier defaulted to `10 * MAX_PHASE`, and MAX_PHASE is 24,
      so it probed at 240. At 240 the residual is 14.5cp; at 1024 it drops to
      3.2 and stays there through 240000. Every value tried by hand happened to
