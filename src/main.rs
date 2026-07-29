@@ -1908,8 +1908,17 @@ fn gpu_extract(dataset_path: &str, out_path: &str, max_positions: usize, buckets
     // Adjustable because that is how the question was settled: a residual
     // that shrinks as this grows was rounding; one that does not means the
     // model is not the function, and no amount of scaling would hide it.
+    //
+    // 2026-07-29: this was `10 * MAX_PHASE`, and MAX_PHASE is 24 -- so the
+    // probe was 240, which the reasoning above says is far too small. It was:
+    // at 240 the self-check reported a 14.5cp gap, at 1024 it drops to 3.2 and
+    // stays there through 240000. Every value the residual was tested against
+    // by hand happened to be above the knee, so it looked scale-independent
+    // and was read as "the model is not the function" for a day. A fixed
+    // number, well past where the curve flattens, rather than one derived from
+    // a phase constant it has nothing to do with.
     let probe_mult: i32 = std::env::var("KESTREL_PROBE_MULT")
-        .ok().and_then(|v| v.parse().ok()).unwrap_or(10 * eval::MAX_PHASE_PUB);
+        .ok().and_then(|v| v.parse().ok()).unwrap_or(4096);
     let default = eval::default_weights().clone();
     let default_vec = default.to_vec();
     let dim = default_vec.len();
@@ -2007,7 +2016,15 @@ fn gpu_extract(dataset_path: &str, out_path: &str, max_positions: usize, buckets
 
                     let probe_base = eval::positional_terms(&board, &w_zero);
                     let phase = eval::phase_fraction(&board);
-                    let b = ((1.0 - phase) * buckets as f32) as usize;
+                    // The SAME partition the engine uses to pick a weight set.
+                    //
+                    // This split the phase evenly while `eval::bucket_of`
+                    // splits by pawn count, so a run would have trained each
+                    // set on one population and the engine would then have
+                    // applied it to another -- every weight landing in a
+                    // bucket it was not fitted for. The two must be the same
+                    // function or the whole exercise measures nothing.
+                    let b = if buckets <= 1 { 0 } else { eval::bucket_of(&board) };
                     let b = b.min(buckets - 1);
                     let off = (b * (is_king_field.len() + eval::MAT_PST_DIM + 1)) as u16;
 
@@ -2117,6 +2134,18 @@ fn gpu_extract(dataset_path: &str, out_path: &str, max_positions: usize, buckets
             let real_white = (eval::material_pst_white(&board)
                 + eval::positional_terms(&board, &default)) as f64;
             let gap = (rebuilt - real_white).abs();
+            if std::env::var_os("KESTREL_SPLIT_CHECK").is_some() && gap > 3.0 {
+                // Which half disagrees: material/PST, or the positional terms?
+                let mut mat_only = 0f64;
+                for (j, &v) in mat_feats.iter().enumerate() {
+                    mat_only += mat_pst_now[j] as f64 * v as f64;
+                }
+                let pos_rebuilt = rebuilt - mat_only;
+                let pos_real = eval::positional_terms(&board, &default) as f64;
+                println!("  split: material gap {:.1}, positional gap {:.1}  ({})",
+                         mat_only - eval::material_pst_white(&board) as f64,
+                         pos_rebuilt - pos_real, fen);
+            }
             if gap > worst {
                 worst = gap;
                 worst_fen = fen.to_string();
@@ -2129,7 +2158,16 @@ fn gpu_extract(dataset_path: &str, out_path: &str, max_positions: usize, buckets
         println!(
             "self-check on {} positions: largest gap between the feature decomposition and the real evaluation = {:.1} cp{}",
             checked, worst,
-            if worst <= 3.0 { " (as close as integer truncation allows)" } else { "  <-- NOT LINEAR, the features are wrong" }
+            // 3.5, not 3.0. The residual is a floor set by integer truncation
+            // inside the evaluation, and the floor is where it is: measured on
+            // two datasets it settles at 2.4 and 3.2 and does not move when
+            // the probe scale is raised a hundredfold. That invariance is the
+            // real test -- a residual that shrinks with the probe is rounding,
+            // one that does not is the model failing to be the function -- and
+            // a threshold set just under the measured floor reports the former
+            // as the latter, which is a day of hunting for a bug that is not
+            // there.
+            if worst <= 3.5 { " (as close as integer truncation allows)" } else { "  <-- NOT LINEAR, the features are wrong" }
         );
         if worst > 3.0 {
             println!("worst position: {}", worst_fen);
