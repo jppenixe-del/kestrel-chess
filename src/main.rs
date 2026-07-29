@@ -75,6 +75,26 @@ fn main() {
         lookup_book(&args[2], &args[3..].join(" "));
         return;
     }
+    if args.len() >= 2 && args[1] == "defaults" {
+        // What is already in the binary before any profile is read. Printed
+        // rather than documented by hand, because a hand-written list of
+        // compiled-in values is a list that goes stale silently -- and the
+        // whole point is that nobody should have to guess what the baseline
+        // is.
+        println!("# Valores JA COMPILADOS no binario (o baseline chama-se V3).");
+        println!("# Omitir uma chave preserva estes valores. Declarar 1000 APAGA-OS.");
+        println!("#");
+        for (i, f) in ["mobility", "king", "threats", "pawns", "pieces", "tempo"].iter().enumerate() {
+            println!("scale.{} {}", f, eval::FAMILY_DEFAULTS[i]);
+        }
+        for (i, p) in ["pawn", "knight", "bishop", "rook", "queen", "king"].iter().enumerate() {
+            println!("psqt_scale.{} {}", p, eval::PSQT_DEFAULTS[i]);
+        }
+        println!("#");
+        println!("# As tabelas PSQT tambem sao as do V3 -- ver `dumpmatpst`.");
+        println!("# Buckets: {} (por contagem de peoes)", eval::NUM_BUCKETS);
+        return;
+    }
     if args.len() >= 2 && args[1] == "checkweights" {
         check_weights_roundtrip();
         return;

@@ -516,6 +516,29 @@ fn psqt_from_override(kind: PieceType, idx: usize, eg: bool) -> Option<i32> {
 ///
 /// Format: `<section>.<name> <value(s)>`, lists comma-separated, `#` comments.
 /// Anything absent keeps its compiled-in value, so a profile can be partial.
+/// Say so when a profile writes 1000 over a value that was not 1000.
+///
+/// In a system of multipliers 1000 reads as the identity, and it is not one
+/// here: the loader SETS, it does not multiply. A profile that writes
+/// `scale.king 1000` is not leaving the king alone, it is discarding the
+/// 1100 the V3 profile measured. Omitting the key is what leaves it alone.
+/// This has already cost one afternoon -- a V4 draft rescaled the king from
+/// 1100 to a slope-flattening curve and erased a tuned setting while
+/// appearing only to rescale.
+fn warn_if_undoing_v3(section: &str, name: &str, default: Option<i32>, rest: &str) {
+    let Some(d) = default else { return };
+    if d == 1000 {
+        return;
+    }
+    if rest.trim().split_whitespace().next().and_then(|v| v.parse::<i32>().ok()) == Some(1000) {
+        eprintln!(
+            "perfil: AVISO -- {}.{} = 1000 sobrepoe o default {} (afinado, vem do V3). \
+Omitir a chave preserva-o; declarar 1000 apaga-o.",
+            section, name, d
+        );
+    }
+}
+
 /// `king` -> ("king", None); `king.3` -> ("king", Some(3)).
 fn split_bucket(name: &str) -> (&str, Option<usize>) {
     match name.rsplit_once('.') {
@@ -556,10 +579,12 @@ pub fn load_profile(path: &str) -> Result<usize, String> {
             }
             "scale" => {
                 let (fam, bucket) = split_bucket(name);
+                warn_if_undoing_v3("scale", fam, family_scale_default(fam), &rest);
                 one().map(|v| set_family_scale(fam, bucket, v)).unwrap_or(false)
             }
             "psqt_scale" => {
                 let (piece, bucket) = split_bucket(name);
+                warn_if_undoing_v3("psqt_scale", piece, psqt_scale_default(piece), &rest);
                 one().map(|v| set_psqt_scale(piece, bucket, v)).unwrap_or(false)
             }
             "search" => one()
@@ -1696,6 +1721,28 @@ fn field_family(name: &str) -> Option<&'static str> {
 }
 
 /// Set one family's factor, in per-mille. Returns false for an unknown family.
+/// What a family scale is BEFORE any profile touches it.
+///
+/// Not 1000. The V3 profile is compiled into these defaults, so writing 1000
+/// into a profile does not neutralise a family -- it overwrites a calibrated
+/// value with a generic one. Omitting the key is what preserves V3.
+pub fn family_scale_default(name: &str) -> Option<i32> {
+    // Index 0..6 is bucket 0, which every bucket starts equal to.
+    FAMILIES.iter().position(|&f| f == name).map(|i| FAMILY_DEFAULTS[i])
+}
+
+/// The compiled-in family scales, in FAMILIES order. Kept as plain data so
+/// tooling can print them without reading the atomics, which a profile may
+/// already have changed.
+pub const FAMILY_DEFAULTS: [i32; 6] = [1000, 1100, 1150, 1000, 1000, 1000];
+
+/// Same, for PSQT amplitudes, in PSQT_NAMES order.
+pub const PSQT_DEFAULTS: [i32; 6] = [1000, 1000, 1000, 1000, 1000, 1350];
+
+pub fn psqt_scale_default(name: &str) -> Option<i32> {
+    PSQT_NAMES.iter().position(|&p| p == name).map(|i| PSQT_DEFAULTS[i])
+}
+
 pub fn set_family_scale(name: &str, bucket: Option<usize>, per_mille: i32) -> bool {
     let i = match FAMILIES.iter().position(|&f| f == name) {
         Some(i) => i,
