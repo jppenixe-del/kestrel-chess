@@ -20,12 +20,12 @@ much it actually costs.
 
 Usage: endgame_agreement.py <engine[:opt=val,...]> [positions] [nodes]
 """
-import subprocess, sys, chess, chess.pgn
+import os, subprocess, sys, chess, chess.pgn
 
 ENGINE = sys.argv[1]
 WANT = int(sys.argv[2]) if len(sys.argv) > 2 else 120
 NODES = int(sys.argv[3]) if len(sys.argv) > 3 else 400_000
-REF = "/usr/local/bin/stockfish"
+REF = os.environ.get("KESTREL_REF_ENGINE", "/usr/local/bin/ref-engine")
 REF_DEPTH = 18
 MAX_PIECES = 12
 

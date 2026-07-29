@@ -21,12 +21,14 @@ played, so the question is never abstract. Two references answer alongside us,
 because they disagree with each other often enough that agreeing with only one
 proves nothing.
 """
-import http.server, json, socketserver, subprocess, threading
+import http.server, json, os, socketserver, subprocess, threading
 
 PORT = 8769
 ENGINE = "/root/kestrel_joao/kestrel_psqt"
-REFS = [("stockfish", "/usr/local/bin/stockfish"),
-        ("sirius", "/root/hce_8buckets_experiment/sirius")]
+# Paths only, named by role. Which engines these are is a local matter and
+# does not belong in the repository.
+REFS = [(f"ref{i}", p) for i, p in enumerate(
+    os.environ.get("KESTREL_REF_ENGINES", "/usr/local/bin/ref-engine").split(":")) if p]
 SUITE = "/root/kestrel_joao/blunders_big.epd"
 FAMILIES = ["mobility", "king", "threats", "pawns", "pieces", "tempo"]
 PIECES = ["pawn", "knight", "bishop", "rook", "queen", "king"]

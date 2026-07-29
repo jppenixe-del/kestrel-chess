@@ -1,4 +1,4 @@
-"""Texel tuning on the GPU.
+"""Fitting the evaluation weights to game results, on the GPU.
 
 The engine already writes the hard part: `kestrel gpuextract <dataset> <out.bin>
 <max> <buckets> <threads>` decomposes each position into the linear
@@ -24,12 +24,18 @@ exactly like a single-bucket one -- the buckets never interact and the same
 matrix multiply handles all of them.
 
 Usage:
-    python3 gpu_tune.py feats.bin out.txt [epochs] [K] [lr] [l2]
+    python3 gpu_tune.py feats.bin out.txt [epochs] [K] [lr] [l2] [minutes]
 
 `out.txt` is the comma-separated vector the engine reads back through
-KESTREL_BUCKET_WEIGHTS.
+KESTREL_BUCKET_WEIGHTS. It is written EVERY time the held-out loss improves,
+not once at the end: a run that is interrupted -- and this one runs on a
+machine that gets switched off -- must leave behind the best weights it had
+rather than nothing at all. A first run wrote nothing for two hours and would
+have lost all of it.
+
+`minutes` is a wall-clock budget. The run stops cleanly when it expires.
 """
-import struct
+import os
 import sys
 import time
 
@@ -37,62 +43,126 @@ import numpy as np
 import torch
 
 
-def load(path):
-    """Read the whole file into COO arrays.
+def parse(path):
+    """Read the whole file into per-record arrays, and cache the result.
 
-    Parsed with numpy rather than a Python loop: at a quarter million positions
-    and several hundred features each, the loop is the slowest part of the job
-    by a wide margin -- minutes against seconds, to prepare work the GPU then
-    does in milliseconds.
+    Two passes. The first walks the records to collect their offsets and
+    lengths -- no numpy per position -- and the second lifts the feature bytes
+    out in one go. The obvious version, which builds a small array per
+    position, makes three numpy calls per record: eight million of them on
+    this dataset, and it spent ten minutes without finishing.
+
+    The second pass masks the bytes it does NOT want rather than listing the
+    ones it does. Listing them means an index per byte, and there are 1.2
+    billion feature bytes here: 9.6GB of 64-bit indices to extract 1.2GB of
+    data, which took the machine to zero free memory and had to be killed. The
+    headers and tails being masked out number 26 million, and a boolean mask
+    over the buffer costs one byte each.
+
+    Even done well this costs minutes, which is paid again on every restart.
+    The result is cached beside the input, and the cache is what makes it
+    affordable to stop a run and start another with different settings.
     """
+    cache = path + ".npz"
+    if os.path.exists(cache) and os.path.getmtime(cache) > os.path.getmtime(path):
+        z = np.load(cache)
+        print(f"  cache: {cache}", flush=True)
+        return z["counts"], z["cols"], z["vals"], z["results"]
+
     raw = np.fromfile(path, dtype=np.uint8)
-    rows, cols, vals, results = [], [], [], []
-    off = 0
     total = raw.size
-    row = 0
-    # One position at a time, but each position parsed in one numpy call.
-    while off < total:
-        n = int(struct.unpack_from("<H", raw, off)[0])
+
+    counts, starts, tails = [], [], []
+    off = 0
+    while off + 2 <= total:
+        n = int.from_bytes(raw[off:off + 2].tobytes(), "little")
         off += 2
-        block = raw[off:off + n * 6]
-        if block.size < n * 6:
+        end = off + n * 6
+        if end + 8 > total:
             break
-        idx = np.frombuffer(block.tobytes(), dtype=np.dtype([("i", "<u2"), ("v", "<f4")]))
-        off += n * 6
-        _phase = struct.unpack_from("<f", raw, off)[0]
-        off += 4
-        res = struct.unpack_from("<f", raw, off)[0]
-        off += 4
-        rows.append(np.full(n, row, dtype=np.int64))
-        cols.append(idx["i"].astype(np.int64))
-        vals.append(idx["v"].astype(np.float32))
-        results.append(res)
-        row += 1
-    return (np.concatenate(rows), np.concatenate(cols), np.concatenate(vals),
-            np.array(results, dtype=np.float32), row)
+        counts.append(n)
+        starts.append(off)
+        tails.append(end)
+        off = end + 8
+    n_pos = len(counts)
+    counts = np.asarray(counts, dtype=np.int64)
+    print(f"  {n_pos} posicoes lidas, a montar as matrizes...", flush=True)
+
+    starts = np.asarray(starts, dtype=np.int64)
+    tails = np.asarray(tails, dtype=np.int64)
+
+    res_idx = (tails[:, None] + 4 + np.arange(4)).ravel()
+    results = np.frombuffer(raw[res_idx].tobytes(), dtype="<f4").astype(np.float32)
+
+    keep = np.ones(total, dtype=bool)
+    keep[(starts[:, None] - 2 + np.arange(2)).ravel()] = False
+    keep[(tails[:, None] + np.arange(8)).ravel()] = False
+    keep[max(0, off - 2):] = False
+    pairs = raw[keep].view(np.dtype([("i", "<u2"), ("v", "<f4")]))
+    cols = pairs["i"].copy()
+    vals = pairs["v"].astype(np.float32)
+
+    del raw, keep, pairs
+    np.savez(cache, counts=counts, cols=cols, vals=vals, results=results)
+    return counts, cols, vals, results
+
+
+def csr(crow, col, val, height, width, dev):
+    """Build a CSR matrix, with both index arrays in the SAME dtype.
+
+    They must match, and nothing says so out loud: a matrix built with 64-bit
+    row pointers and 32-bit column indices constructs without complaint, and
+    then the first product on the GPU dies with an illegal memory access. int32
+    is the right width here -- the largest index is 200 million -- and it also
+    halves what the indices cost in GPU memory.
+    """
+    idx = torch.int32
+    m = torch.sparse_csr_tensor(
+        torch.from_numpy(crow).to(idx).to(dev), torch.from_numpy(col).to(idx).to(dev),
+        torch.from_numpy(val).to(dev), (height, width))
+    assert m.crow_indices().dtype == m.col_indices().dtype
+    return m
 
 
 def main():
     if len(sys.argv) < 3:
         print(__doc__)
         return
-    feats_path, out_path = sys.argv[1], sys.argv[2]
-    epochs = int(sys.argv[3]) if len(sys.argv) > 3 else 400
+    argv = sys.argv[:]
+
+    def flag(name, default=None):
+        if name in argv:
+            i = argv.index(name)
+            v = argv[i + 1]
+            del argv[i:i + 2]
+            return v
+        return default
+
+    init_path = flag("--init")
+    stride = int(flag("--stride", 0))
+    free = int(flag("--free", 0))
+
+    sys.argv = argv
+    feats_path, out_path = argv[1], argv[2]
+    epochs = int(argv[3]) if len(argv) > 3 else 4000
     # Scaling constant of the logistic. 1/400 is the usual starting point; it
     # is not a free parameter to taste, it sets what "one pawn" means in the
     # probability the fit is matching, so changing it changes every weight.
-    K = float(sys.argv[4]) if len(sys.argv) > 4 else 1.0 / 400.0
-    lr = float(sys.argv[5]) if len(sys.argv) > 5 else 1.0
-    l2 = float(sys.argv[6]) if len(sys.argv) > 6 else 0.0
+    K = float(argv[4]) if len(argv) > 4 else 1.0 / 400.0
+    lr = float(argv[5]) if len(argv) > 5 else 1.0
+    l2 = float(argv[6]) if len(argv) > 6 else 0.0
+    budget = float(argv[7]) * 60 if len(argv) > 7 else float("inf")
 
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"device: {dev}" + (f" ({torch.cuda.get_device_name(0)})" if dev == "cuda" else ""))
 
     t0 = time.time()
-    rows, cols, vals, results, n_pos = load(feats_path)
+    counts, cols, vals, results = parse(feats_path)
+    n_pos = len(counts)
     n_par = int(cols.max()) + 1
-    print(f"{n_pos} positions, {n_par} parameters, {len(vals)} non-zeros "
-          f"({len(vals) / max(1, n_pos):.0f} per position), read in {time.time() - t0:.1f}s")
+    nnz = len(vals)
+    print(f"{n_pos} positions, {n_par} parameters, {nnz} non-zeros "
+          f"({nnz / max(1, n_pos):.0f} per position), read in {time.time() - t0:.1f}s")
 
     # A validation split, held out and never trained on.
     #
@@ -103,68 +173,162 @@ def main():
     # Split by POSITION INDEX rather than at random per non-zero, so a
     # position's features never straddle the two sets.
     n_val = max(1, n_pos // 10)
-    val_rows = set(range(n_pos - n_val, n_pos))
-    is_val = np.isin(rows, np.fromiter(val_rows, dtype=np.int64))
+    n_tr = n_pos - n_val
+    crow = np.zeros(n_pos + 1, dtype=np.int64)
+    np.cumsum(counts, out=crow[1:])
+    cut = int(crow[n_tr])
 
-    def build(mask, offset, height):
-        return torch.sparse_coo_tensor(
-            torch.from_numpy(np.stack([rows[mask] - offset, cols[mask]])),
-            torch.from_numpy(vals[mask]), (height, n_par), device=dev).coalesce()
+    # CSR, not COO, and the transpose built by hand.
+    #
+    # COO costs a sort on every product and carries 64-bit indices for both
+    # coordinates: the first version of this ran at 15 seconds an epoch, which
+    # is sixteen hours for the run it was asked to do. The records already
+    # arrive grouped by position, so the row pointers are just a running total
+    # of the feature counts -- no sort, no coalesce.
+    #
+    # The gradient needs X transposed. Autograd would transpose it on every
+    # backward pass; there are only 11888 columns, so a counting sort builds it
+    # once and it is reused for every epoch after.
+    Xcrow, Xcol, Xval = crow[: n_tr + 1], cols[:cut], vals[:cut]
+    Vcrow = (crow[n_tr:] - crow[n_tr]).copy()
+    X = csr(Xcrow.astype(np.int64), Xcol.astype(np.int32), Xval, n_tr, n_par, dev)
+    Xv = csr(Vcrow, cols[cut:].astype(np.int32), vals[cut:], n_val, n_par, dev)
 
-    X = build(~is_val, 0, n_pos - n_val)
-    Xv = build(is_val, n_pos - n_val, n_val)
-    y = torch.from_numpy(results[: n_pos - n_val]).to(dev)
-    yv = torch.from_numpy(results[n_pos - n_val :]).to(dev)
-    print(f"treino {n_pos - n_val}, validacao {n_val} (nunca treinada)")
-    w = torch.zeros(n_par, device=dev, requires_grad=True)
+    order = np.argsort(Xcol, kind="stable")
+    Tcrow = np.zeros(n_par + 1, dtype=np.int64)
+    np.cumsum(np.bincount(Xcol.astype(np.int64), minlength=n_par), out=Tcrow[1:])
+    rows = np.repeat(np.arange(n_tr, dtype=np.int32), counts[:n_tr])
+    Xt = csr(Tcrow, rows[order].astype(np.int32), Xval[order], n_par, n_tr, dev)
+    del order, rows
+
+    # Check both matrices before spending hours on them. A malformed sparse
+    # tensor does not raise: it either dies with an illegal memory access
+    # partway through -- which is how the index dtype above was found -- or,
+    # worse, returns numbers. Ten random positions, evaluated against a random
+    # weight vector, compared with the same sum done in numpy from the raw
+    # arrays.
+    probe = np.random.default_rng(0).standard_normal(n_par).astype(np.float32)
+    pw = torch.from_numpy(probe).to(dev)
+    for name, M, base, off in (("X", X, 0, 0), ("Xv", Xv, n_tr, cut)):
+        got = torch.mv(M, pw).cpu().numpy()
+        for r in np.random.default_rng(1).integers(0, M.shape[0], 10):
+            s = int(crow[base + r]) - off
+            e = s + int(counts[base + r])
+            want = float(np.dot(vals[off + s:off + e].astype(np.float64),
+                                probe[cols[off + s:off + e].astype(np.int64)]))
+            assert abs(want - got[r]) < 1e-2 * max(1.0, abs(want)), \
+                f"{name} linha {r}: {got[r]} != {want}"
+    # The transpose has to agree with X, not merely be well formed: x.Xt(d)
+    # is the gradient, and a wrong one trains happily to the wrong answer.
+    d = torch.from_numpy(np.random.default_rng(2).standard_normal(n_tr).astype(np.float32)).to(dev)
+    lhs = torch.dot(torch.mv(X, pw), d).item()
+    rhs = torch.dot(pw, torch.mv(Xt, d)).item()
+    assert abs(lhs - rhs) < 1e-3 * max(1.0, abs(lhs)), f"Xt nao e' a transposta: {lhs} != {rhs}"
+    print(f"  matrizes verificadas (X, Xv, e Xt contra X)", flush=True)
+
+    y = torch.from_numpy(results[:n_tr]).to(dev)
+    yv = torch.from_numpy(results[n_tr:]).to(dev)
+    print(f"treino {n_tr}, validacao {n_val} (nunca treinada)", flush=True)
+
+    # Where the fit starts, and what it is allowed to move.
+    #
+    # Starting from zeros makes the fit rediscover chess from scratch, and it
+    # does so badly where two feature families explain the same thing: the
+    # first run put a pawn at 330 in the opening and 69 in the endgame, which
+    # is Material and PSQT collinear, splitting their shared explanation
+    # wherever the optimiser happened to land. Measured on the blunder suite
+    # against the weights it replaced: 78 positions fixed became 62.
+    #
+    # Started from `kestrel tunestart`, epoch zero IS the current engine. A fit
+    # that finds nothing changes nothing, and everything it does change, it
+    # changed for a reason in the data.
+    #
+    # `--free N` trains only the first N of every `--stride` parameters. The
+    # material and piece-square block cannot be installed per bucket anyway --
+    # the incremental accumulator has one set of tables and knows nothing about
+    # the pawn count -- so letting the fit move it produces weights balanced
+    # against material the engine will not be using. Frozen, the positional
+    # weights are fitted in the presence of the real thing.
+    if init_path:
+        init = np.asarray([int(x) for x in open(init_path).read().strip().split(",")],
+                          dtype=np.float32)
+        assert len(init) == n_par, f"--init tem {len(init)} valores, esperava {n_par}"
+        w = torch.from_numpy(init.copy()).to(dev)
+        print(f"  arranque em {init_path}", flush=True)
+    else:
+        w = torch.zeros(n_par, device=dev)
+
+    trainable = None
+    if stride and free:
+        m = (np.arange(n_par) % stride) < free
+        trainable = torch.from_numpy(m.astype(np.float32)).to(dev)
+        print(f"  a treinar {int(m.sum())} de {n_par} pesos "
+              f"(os primeiros {free} de cada {stride}); os restantes ficam como estao",
+              flush=True)
 
     opt = torch.optim.Adam([w], lr=lr)
+    w.grad = torch.zeros_like(w)
+
+    def forward(M, weights):
+        return torch.sigmoid(torch.mv(M, weights) * K)
+
+    def save(weights):
+        text = ",".join(str(int(round(float(v)))) for v in weights.cpu().numpy())
+        tmp = out_path + ".part"
+        with open(tmp, "w") as fh:
+            fh.write(text)
+        os.replace(tmp, out_path)
+
     t0 = time.time()
-    best_val, best_w, best_epoch, since = float("inf"), None, 0, 0
+    best_val, best_epoch, since, stop = float("inf"), 0, 0, ""
     for e in range(epochs):
-        opt.zero_grad()
-        # Evaluation of every position at once. The sigmoid turns it into the
-        # probability White wins, and the loss is against the game's actual
-        # result -- the whole of Texel tuning is this line and the next.
-        pred = torch.sigmoid(torch.sparse.mm(X, w.unsqueeze(1)).squeeze(1) * K)
-        loss = torch.mean((pred - y) ** 2)
+        # The whole of Texel tuning is these four lines. The sigmoid turns the
+        # evaluation into the probability White wins; the loss is against the
+        # game's actual result. The gradient is written out rather than left to
+        # autograd only so the transpose above can be reused.
+        pred = forward(X, w)
+        d = (pred - y) * (pred * (1.0 - pred))
+        w.grad.copy_(torch.mv(Xt, d) * (2.0 * K / n_tr))
         if l2:
-            loss = loss + l2 * torch.mean(w ** 2)
-        loss.backward()
+            w.grad.add_(w, alpha=2.0 * l2 / n_par)
+        if trainable is not None:
+            # Zeroing the gradient is not enough on its own with Adam, which
+            # carries momentum: a weight frozen after some steps would keep
+            # drifting on what it had accumulated. Zeroed before the step, it
+            # never accumulates any.
+            w.grad.mul_(trainable)
         opt.step()
+
         # Validation decides when to stop, not the epoch count. Training loss
         # only ever falls; the held-out set is what says whether anything was
         # learned.
         if e % 25 == 0 or e == epochs - 1:
             with torch.no_grad():
-                pv = torch.sigmoid(torch.sparse.mm(Xv, w.unsqueeze(1)).squeeze(1) * K)
-                vloss = torch.mean((pv - yv) ** 2).item()
-            if vloss < best_val - 1e-7:
-                best_val, best_w, best_epoch, since = vloss, w.detach().clone(), e, 0
+                tloss = torch.mean((pred - y) ** 2).item()
+                vloss = torch.mean((forward(Xv, w) - yv) ** 2).item()
+            better = vloss < best_val - 1e-7
+            if better:
+                best_val, best_epoch, since = vloss, e, 0
+                save(w)
             else:
                 since += 25
-            if e % max(25, (epochs // 10 // 25) * 25) == 0 or e == epochs - 1:
-                print(f"  epoch {e:5}  treino {loss.item():.6f}  validacao {vloss:.6f}"
-                      f"{'  <- melhor' if vloss <= best_val else ''}")
+            print(f"  epoch {e:5}  treino {tloss:.6f}  validacao {vloss:.6f}"
+                  f"{'  <- melhor, guardado' if better else ''}"
+                  f"  [{time.time() - t0:.0f}s]", flush=True)
             # Stop when the held-out loss has not improved for a while: past
             # that point every further epoch is fitting noise in the training
-            # half, and the weights get worse while the number on screen
-            # keeps looking better.
+            # half, and the weights get worse while the number on screen keeps
+            # looking better.
             if since >= max(200, epochs // 10):
-                print(f"  paragem antecipada na epoca {e}: validacao sem melhorar ha {since} epocas")
+                stop = f"validacao sem melhorar ha {since} epocas"
+            if time.time() - t0 > budget:
+                stop = "orcamento de tempo esgotado"
+            if stop:
+                print(f"  paragem na epoca {e}: {stop}", flush=True)
                 break
 
-    if best_w is not None:
-        print(f"  melhor validacao {best_val:.6f} na epoca {best_epoch} -- sao esses os pesos guardados")
-        w = best_w
-    out = w.detach().cpu().numpy()
-    # Rounded to integers because that is what the engine's weights are. Doing
-    # it here rather than letting the engine truncate keeps the file honest
-    # about what will actually be used.
-    text = ",".join(str(int(round(float(v)))) for v in out)
-    with open(out_path, "w") as fh:
-        fh.write(text)
-    print(f"wrote {n_par} weights to {out_path} in {time.time() - t0:.1f}s")
+    print(f"  melhor validacao {best_val:.6f} na epoca {best_epoch} "
+          f"-- e' esse o ficheiro em {out_path}", flush=True)
 
 
 main()

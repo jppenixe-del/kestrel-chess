@@ -22,14 +22,14 @@ so the same harness reads it.
 
 Usage: build_endgame_suite.py [pgn] [out] [max_games] [threshold] [max_pieces]
 """
-import subprocess, sys, chess, chess.pgn
+import os, subprocess, sys, chess, chess.pgn
 
 PGN = sys.argv[1] if len(sys.argv) > 1 else "kestrel_games.pgn"
 OUT = sys.argv[2] if len(sys.argv) > 2 else "endgames.epd"
 MAX_GAMES = int(sys.argv[3]) if len(sys.argv) > 3 else 300
 THRESHOLD = int(sys.argv[4]) if len(sys.argv) > 4 else 120
 ENDGAME_PIECES = int(sys.argv[5]) if len(sys.argv) > 5 else 14
-REF = "/usr/local/bin/stockfish"
+REF = os.environ.get("KESTREL_REF_ENGINE", "/usr/local/bin/ref-engine")
 REF_DEPTH = 16
 US = "kestrelstrike"
 DECIDED = 800          # already won or lost: nothing to learn from the move
