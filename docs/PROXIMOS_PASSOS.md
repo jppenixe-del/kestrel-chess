@@ -23,8 +23,35 @@ It is inactive on purpose: every bucket starts as a copy of the single set, so
 nothing moves until trained weights exist. A structural change and a strength
 change should never arrive together, or there is no telling which did what.
 
-**Missing:** the tuner (`kestrel tune`, `tunestream`) has no notion of buckets.
-It needs to extract features per bucket and train the four sets separately.
+**Not missing after all, and this corrects an earlier note in this file:**
+`kestrel gpuextract <dataset> <out.bin> <max> <buckets> <threads>` already
+decomposes each position into per-weight linear contributions AND already takes
+a bucket count -- feature indices carry the bucket offset, so the buckets never
+interact. The CPU tuners (`tune`, `tunestream`) are the ones that know nothing
+about buckets, and they no longer need to.
+
+`tools/gpu_tune.py` fits those features: sparse logistic regression in PyTorch.
+Measured on the second machine's RTX 5060 Ti, 20k positions and 4 buckets
+(5824 parameters): 5.4ms per epoch, 5000 epochs in 27 seconds. On a CPU this is
+the part that made per-bucket tuning not worth starting.
+
+**Two things to settle before trusting a run:**
+
+* **Overfitting.** Loss fell from 0.223 to 0.0119 over 5000 epochs and was
+  still falling -- with 20k positions against 5824 parameters that is the fit
+  memorising, not learning. Use the full dataset, hold out a validation split,
+  and stop on validation loss rather than epochs.
+* **The extractor is out of date with the evaluation.** Its own self-check
+  reports a 14.8cp gap between the feature decomposition and the real
+  evaluation, where 3cp is the limit integer truncation allows. It is not
+  rounding: the residual does not shrink when KESTREL_PROBE_MULT is raised a
+  hundredfold, which is the test the code itself prescribes. It predates
+  29/07 -- the same gap appears in every binary tried -- and the likely cause
+  is the terms added on 28/07 (hanging pieces via SEE, tropism, space) that
+  contribute through hardcoded constants instead of through their own weight
+  fields, so probing a weight does not move them and the fit cannot see them.
+  Fix that first: a tuner fed features that do not add up to the evaluation
+  will happily produce weights, and they will be wrong.
 
 **Why it is worth it.** Slope of our evaluation against a strong reference on
 220 quiet positions (1.00 = same scale):
