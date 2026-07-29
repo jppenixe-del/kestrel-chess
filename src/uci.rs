@@ -941,28 +941,64 @@ impl Engine {
             let best_idx = if results.len() < 2 {
                 0
             } else {
+                // The score votes, but only when it can be trusted.
+                //
+                // First attempt at fixing this removed the score from the
+                // weight entirely, on the theory that picking the maximum of
+                // N noisy samples is biased upward and the bias grows with N.
+                // The theory is right and the fix was wrong: a strong
+                // reference uses score * depth exactly as this did, and
+                // guards the bias at its source instead. What it refuses are
+                // scores that are not measurements -- a thread whose search
+                // was cut, and a thread whose principal variation is too
+                // short to be a line at all. Those are where an inflated
+                // number comes from, and the difference between four threads
+                // and ten is how often one of them shows up.
+                //
+                // Traced from a real loss: 22.Nxb5 cost 244cp, and the
+                // engine's own evaluation ranks it DEAD LAST of seven
+                // candidates -- -285 against -31 for the move it plays at one
+                // thread. Search did not fail to see it. A thread came back
+                // convinced, and being convinced was the whole of the weight.
                 let min_score = results.iter().map(|r| r.1).min().unwrap_or(0);
-                let weight = |r: &(Option<crate::moves::Move>, i32, i32, u64, Searcher)| {
-                    ((r.1 - min_score + 14) as i64) * (r.2.max(1) as i64)
+                let pv_len: Vec<usize> = results
+                    .iter()
+                    .map(|r| r.4.extract_pv(board, 4).len())
+                    .collect();
+                let weight = |i: usize, r: &(Option<crate::moves::Move>, i32, i32, u64, Searcher)| {
+                    // A line of two moves is not a line. Such a thread still
+                    // plays -- it simply does not get to outvote one that
+                    // searched something through to an end.
+                    let trusted = if pv_len[i] > 2 { 1i64 } else { 0i64 };
+                    ((r.1 - min_score + 14) as i64) * (r.2.max(1) as i64) * trusted
                 };
                 let mut votes: Vec<(Option<crate::moves::Move>, i64)> = Vec::new();
-                for r in &results {
+                for (i, r) in results.iter().enumerate() {
                     match votes.iter_mut().find(|(m, _)| *m == r.0) {
-                        Some((_, v)) => *v += weight(r),
-                        None => votes.push((r.0, weight(r))),
+                        Some((_, v)) => *v += weight(i, r),
+                        None => votes.push((r.0, weight(i, r))),
                     }
                 }
-                let winner = votes
-                    .iter()
-                    .max_by_key(|(_, v)| *v)
-                    .map(|(m, _)| *m)
-                    .unwrap_or(results[0].0);
+                // Ties go to thread 0. It is the one that reports during the
+                // search and the one whose clock decisions end it, so when the
+                // pool is genuinely split, the move already being announced is
+                // the one to play.
+                let top = votes.iter().map(|(_, v)| *v).max().unwrap_or(0);
+                let winner = if votes.iter().any(|(m, v)| *v == top && *m == results[0].0) {
+                    results[0].0
+                } else {
+                    votes
+                        .iter()
+                        .max_by_key(|(_, v)| *v)
+                        .map(|(m, _)| *m)
+                        .unwrap_or(results[0].0)
+                };
                 // Among the threads that agree on the winning move, take the
                 // one with the strongest individual claim: its PV is the one
                 // worth reporting.
                 (0..results.len())
                     .filter(|&i| results[i].0 == winner)
-                    .max_by_key(|&i| weight(&results[i]))
+                    .max_by_key(|&i| weight(i, &results[i]))
                     .unwrap_or(0)
             };
             let nodes_total: u64 = results.iter().map(|r| r.3).sum();
