@@ -162,7 +162,14 @@ fn compute_time_budget(
     // alternatives still roughly equal. The permission to think long belongs
     // later, when the position is genuinely unique.
     let by_clock = (safe_time / 2000).clamp(10, EMERGENCY_MULT_MAX);
-    let by_phase = (12 + game_ply / 2).clamp(12, EMERGENCY_MULT_MAX);
+    // Grows slowly on purpose. At ply/2 this reached 2.5 of a possible 3.0 by
+    // move 13, which is not "later in the game" by any reading -- a real 3+0
+    // loss spent 72% of its clock on the first 40 moves, twelve of them at 4s
+    // or more and two above 10s, and then had 51 seconds left for 109 moves.
+    // A game that runs long is not rare and cannot be predicted, so the
+    // permission to think long has to arrive late enough that a long game can
+    // still afford it.
+    let by_phase = (10 + game_ply / 4).clamp(10, EMERGENCY_MULT_MAX);
     let emergency_mult = by_clock.min(by_phase);
     let mut hard_cap = (safe_time * HARD_CAP_PERCENT / 100)
         .min((safe_time / horizon) * emergency_mult / 10)
