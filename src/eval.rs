@@ -795,6 +795,17 @@ const HANGING: [(i32, i32); 5] = [(-20, -25), (-55, -60), (-58, -62), (-90, -100
 const KING_TROPISM: [(i32, i32); 4] = [(3, 1), (2, 1), (2, 0), (1, 0)];
 
 const SPACE: (i32, i32) = (3, 1);
+/// A slider aimed at the enemy king through [1, 2, 3+] blockers.
+///
+/// Steep on purpose. One piece from opening the line is a live threat the
+/// defender must keep answering; three is a shape that may never come to
+/// anything. Middlegame only in any real sense -- with the queens off, a
+/// bishop pointing at a king is just a bishop, which is what the endgame
+/// values say.
+const KING_AIM: [(i32, i32); 3] = [(14, 4), (7, 2), (3, 1)];
+/// A second slider on the same line. The pattern is worth more than its
+/// parts: one blocker removed exposes the king to both at once.
+const KING_BATTERY: (i32, i32) = (12, 3);
 const BLOCKED_PAWNS: (i32, i32) = (-6, -3);
 
 const STONEWALL: (i32, i32) = (14, -6);
@@ -1285,6 +1296,12 @@ pub struct Weights {
     pub hanging: [(i32, i32); 5],
     pub king_tropism: [(i32, i32); 4],
     pub space: (i32, i32),
+    /// A slider sharing a line with the enemy king, by how many blockers still
+    /// stand in the way: [1, 2, 3+]. One square from opening is a threat.
+    pub king_aim: [(i32, i32); 3],
+    /// A second slider on the same line -- the battery, worth more than the
+    /// two pieces counted apart.
+    pub king_battery: (i32, i32),
     /// Per own pawn standing directly in front of an enemy pawn.
     ///
     /// A board with six blocked pawns plays nothing like an open one, and
@@ -1371,6 +1388,8 @@ impl Default for Weights {
             hanging: HANGING,
             king_tropism: KING_TROPISM,
             space: SPACE,
+            king_aim: KING_AIM,
+            king_battery: KING_BATTERY,
             blocked_pawns: BLOCKED_PAWNS,
             stonewall: STONEWALL,
             stonewall_outpost: STONEWALL_OUTPOST,
@@ -2007,6 +2026,8 @@ impl Weights {
             hanging: self.hanging,
             king_tropism: self.king_tropism,
             space: self.space,
+            king_aim: self.king_aim,
+            king_battery: self.king_battery,
             blocked_pawns: self.blocked_pawns,
             unsafe_knight_check: self.unsafe_knight_check,
             unsafe_bishop_check: self.unsafe_bishop_check,
@@ -2648,6 +2669,96 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
         let their_pieces = board.occ_color[them];
         let their_queen = board.pieces[them][PieceType::Queen.idx()];
         let their_king = board.pieces[them][PieceType::King.idx()];
+
+    // === Miras: pecas de longo alcance apontadas ao rei ATRAVES de bloqueios ==
+    //
+    // What a game is lost to is rarely a move; it is a plan, played one move at
+    // a time while nothing looks wrong. Traced from a real loss: over sixteen
+    // moves the opponent played Qc2, Qb3, Qa7, b5, Qa5, Bc6, Bb7, Qa8, lining
+    // a queen and a bishop up on the long diagonal against our king, and then
+    // Bxd5+ turned +1.6 into a lost position. The evaluation never saw any of
+    // it coming. A bishop on b7 whose diagonal is blocked at d5 does not
+    // attack the king zone, so it counted as nothing at all, and the queen
+    // waiting behind it counted as nothing twice.
+    //
+    // The aiming is the fact worth pricing, not the arrival. A slider that
+    // shares a line with the enemy king is committed to that king: every
+    // blocker on the line is a piece that can be traded, deflected, or
+    // captured with check, and the defender has to keep answering that
+    // question for the rest of the game. So the score is by how much still
+    // stands in the way, and the last blocker is worth far more than the
+    // first -- one square from opening is a threat, three is a shape.
+    //
+    // A second slider on the SAME line is the pattern itself: a battery is
+    // worth more than the two pieces apart, because removing one blocker
+    // exposes the king to both.
+    for c in [Color::White, Color::Black] {
+        let sign = if c == Color::White { 1 } else { -1 };
+        let us = c.idx();
+        let them = c.opp().idx();
+        let their_king_bb = board.pieces[them][PieceType::King.idx()];
+        if their_king_bb == 0 {
+            continue;
+        }
+        let ksq = their_king_bb.trailing_zeros() as u8;
+        let occ_all = board.occ_color[0] | board.occ_color[1];
+        // Lines already counted once, so a battery is scored as a battery
+        // rather than as two independent sliders aiming at the same king.
+        let mut seen_lines: u64 = 0;
+        for pt in [PieceType::Bishop, PieceType::Rook, PieceType::Queen] {
+            let mut bb = board.pieces[us][pt.idx()];
+            while bb != 0 {
+                let sq = bb.trailing_zeros() as u8;
+                bb &= bb - 1;
+                // Does this piece's MOVEMENT share a line with the king --
+                // ignoring everything in between? That is the question the
+                // direct-attack terms cannot ask.
+                //
+                // Asked with arithmetic, not with magic lookups. The first
+                // version generated each slider's attacks on an empty board
+                // and intersected with the king; correct, and it cost 6% of
+                // the engine's speed for a question that is two comparisons.
+                // `between` is empty for squares that do not share a line, so
+                // it doubles as the alignment test.
+                let line = a.between[sq as usize][ksq as usize];
+                if line == 0 {
+                    continue;
+                }
+                let (sf, sr) = (file_of(sq) as i32, rank_of(sq) as i32);
+                let (kf, kr) = (file_of(ksq) as i32, rank_of(ksq) as i32);
+                let diagonal = (sf - kf).abs() == (sr - kr).abs();
+                let straight = sf == kf || sr == kr;
+                let can_travel = match pt {
+                    PieceType::Bishop => diagonal,
+                    PieceType::Rook => straight,
+                    _ => diagonal || straight,
+                };
+                if !can_travel {
+                    continue;
+                }
+                let blockers = (line & occ_all).count_ones() as usize;
+                if blockers == 0 {
+                    // Already a check or a direct attack: the existing king
+                    // safety terms own this case, and paying twice for it
+                    // would double-count the one thing we do see.
+                    continue;
+                }
+                let idx = (blockers - 1).min(2);
+                let (mut m, mut e) = w.king_aim[idx];
+                // A line a second slider already claims. Scored once more, as
+                // the battery it is.
+                let line_key = line | (1u64 << ksq);
+                if seen_lines & line_key == line_key && line != 0 {
+                    let (bm, be) = w.king_battery;
+                    m += bm;
+                    e += be;
+                }
+                seen_lines |= line_key;
+                mg += sign * m;
+                eg += sign * e;
+            }
+        }
+    }
 
     // === Pecas penduradas, avaliadas por SEE ==================================
     //
