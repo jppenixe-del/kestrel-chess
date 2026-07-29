@@ -2,6 +2,84 @@
 
 Written 2026-07-29. Ordered by value over cost, not by appeal.
 
+## 0. The blunder suite was wrong, and every number below it moved
+
+Read this before trusting any measurement in this file or in the commit log.
+
+The suite is the arbiter of nearly every decision this project has made. It was
+built at depth 16 and recorded exactly ONE correct move per position. Rebuilt at
+depth 22, recording every move within 20cp of the best:
+
+* **83 of 214 best moves changed** (39%).
+* **103 of 214 positions have at least one equally good alternative**, which the
+  old suite counted as a failure.
+
+What that did to the numbers, same binary, 400k nodes, one thread:
+
+| | old suite | recalibrated |
+|---|---|---|
+| V3, the engine as it plays | 78 fixed / 131 avoided | **110 fixed / 144 avoided** |
+| a fit from zeros | 62 fixed | 104 fixed |
+
+The engine was being charged with a blunder in 32 positions where it played a
+correct move -- just not the one move the suite happened to hold.
+
+**And the old suite did not merely understate; it exaggerated differences.** The
+gap between V3 and the fit was 16 positions and is 6. When two in five right
+answers are arbitrary, a build is penalised for a coin toss, and that noise
+appears as a difference between versions. Any past verdict decided by a margin
+of a few positions -- the V4 profiles, the hand-chosen buckets, the queen sweep
+in section 1b -- was decided partly by that coin.
+
+`blunders_big_v2.epd` is the recalibrated suite; `recalibrar_suite.py` rebuilds
+it. `blunder_test.py` reads `also` and counts any of them as fixed.
+
+## 0b. Fitting the weights: what it measured (2026-07-29)
+
+The fitter works, the plumbing that carried its output did not, and the result
+is that a fit still does not beat what it would replace.
+
+**`KESTREL_BUCKET_WEIGHTS` had never been read by any binary that ran.**
+`weights_for` tested the family factors first and returned there; V3 is compiled
+into the defaults, so that branch is always taken. Every per-bucket fit ever
+produced could only be measured by an engine ignoring it. Fixed in ec57874 --
+and it is the same shape as the advisor forcing multipv 3: a setting that never
+reached the code it configured. When a change measures as doing nothing, check
+that it arrived before concluding it does nothing.
+
+**Measured on the recalibrated suite, 400k nodes, one thread:**
+
+| | validation loss | avoided | fixed |
+|---|---|---|---|
+| V3 (what plays) | 0.0972 | **144/214** | **110** |
+| fit from V3, material frozen | 0.0785 | 140/214 | 106 |
+| fit from zeros, everything free | **0.0780** | 135/214 | 104 |
+
+**The lowest held-out loss belongs to the worst engine.** The held-out split is
+real -- 265k positions never trained on -- and it still ranks the three exactly
+backwards. It is a diagnostic of the fit, not an arbiter of strength. Nothing
+in this file should be decided by it.
+
+Fitted from zeros, the run put a pawn at 330 in the opening and 69 in the
+endgame: chess upside down, the signature of Material and PSQT being collinear
+and the optimiser splitting their shared explanation wherever it landed. Since
+per-bucket material cannot be installed anyway -- the incremental accumulator
+holds one set of tables and knows nothing about the pawn count -- `kestrel
+tunestart` now writes the engine's own weights in the fitter's layout, and
+`--free` freezes the material block. Verified: installing the starting file
+reproduces the unconfigured binary to the centipawn on sixty positions, so
+epoch zero IS the current engine.
+
+That recovers 5 of the 9 positions the free fit lost, in the predicted
+direction, and still does not reach V3.
+
+**What has NOT been tried, and is the obvious next thing:** all of the above was
+fitted on `dataset_own.epd` -- 2.65M positions from our own games, labelled by
+the result of a game between two ~2200 players. That is the weakest label
+available. There are 10M and 5M position datasets sitting unused in the
+repository directory. Refit there before concluding anything about whether a fit
+can beat V3.
+
 ## 1. Per-phase weight buckets
 
 Everything is built except one piece.
