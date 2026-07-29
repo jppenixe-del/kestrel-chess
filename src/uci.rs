@@ -1108,10 +1108,10 @@ impl Engine {
                             let fam = tokens[2].strip_prefix("scale_");
                             if !crate::search::set_param(tokens[2], v)
                                 && !crate::eval::set_material(tokens[2], v)
-                                && !fam.map_or(false, |f| crate::eval::set_family_scale(f, v))
+                                && !fam.map_or(false, |f| crate::eval::set_family_scale(f, None, v))
                                 && !tokens[2]
                                     .strip_prefix("psqt_")
-                                    .map_or(false, |p| crate::eval::set_psqt_scale(p, v))
+                                    .map_or(false, |p| crate::eval::set_psqt_scale(p, None, v))
                             {
                                 eprintln!("setoption: unknown parameter '{}'", tokens[2]);
                             }

@@ -271,31 +271,150 @@ const MAX_PHASE: i32 = 24;
 /// centralise later", and ours barely has an opinion. The error profile puts
 /// our exposed king at 1.19 times its expected share of mistakes, which is the
 /// same fact seen from the board.
-static PSQT_SCALE: [std::sync::atomic::AtomicI32; 6] = [
-    std::sync::atomic::AtomicI32::new(1000),
-    std::sync::atomic::AtomicI32::new(1000),
-    std::sync::atomic::AtomicI32::new(1000),
-    std::sync::atomic::AtomicI32::new(1000),
-    std::sync::atomic::AtomicI32::new(1000),
-    std::sync::atomic::AtomicI32::new(1350),
-];
+/// PSQT amplitude, per phase bucket: `[bucket * 6 + piece]`.
+///
+/// The incremental accumulator in `Board` is built with the LAST bucket's
+/// factors -- it has no board to ask, and rebuilding it whenever a pawn leaves
+/// the board would cost more than the term is worth. Everything else is
+/// corrected in the evaluation, and only for pieces whose factor actually
+/// differs between buckets, which in the V4 profile is the queen alone.
+static PSQT_SCALE: [std::sync::atomic::AtomicI32; 6 * NUM_BUCKETS] = {
+    use std::sync::atomic::AtomicI32;
+    [
+        AtomicI32::new(1000), AtomicI32::new(1000), AtomicI32::new(1000),
+        AtomicI32::new(1000), AtomicI32::new(1000), AtomicI32::new(1350),
+        AtomicI32::new(1000), AtomicI32::new(1000), AtomicI32::new(1000),
+        AtomicI32::new(1000), AtomicI32::new(1000), AtomicI32::new(1350),
+        AtomicI32::new(1000), AtomicI32::new(1000), AtomicI32::new(1000),
+        AtomicI32::new(1000), AtomicI32::new(1000), AtomicI32::new(1350),
+        AtomicI32::new(1000), AtomicI32::new(1000), AtomicI32::new(1000),
+        AtomicI32::new(1000), AtomicI32::new(1000), AtomicI32::new(1350),
+        AtomicI32::new(1000), AtomicI32::new(1000), AtomicI32::new(1000),
+        AtomicI32::new(1000), AtomicI32::new(1000), AtomicI32::new(1350),
+        AtomicI32::new(1000), AtomicI32::new(1000), AtomicI32::new(1000),
+        AtomicI32::new(1000), AtomicI32::new(1000), AtomicI32::new(1350),
+        AtomicI32::new(1000), AtomicI32::new(1000), AtomicI32::new(1000),
+        AtomicI32::new(1000), AtomicI32::new(1000), AtomicI32::new(1350),
+        AtomicI32::new(1000), AtomicI32::new(1000), AtomicI32::new(1000),
+        AtomicI32::new(1000), AtomicI32::new(1000), AtomicI32::new(1350),
+    ]
+};
+
+/// The bucket whose factors the incremental accumulator is built with.
+const PSQT_BASE_BUCKET: usize = NUM_BUCKETS - 1;
 
 const PSQT_NAMES: [&str; 6] = ["pawn", "knight", "bishop", "rook", "queen", "king"];
 
 /// Set one piece's PSQT factor, e.g. `psqt_king`. False on an unknown name.
-pub fn set_psqt_scale(name: &str, per_mille: i32) -> bool {
-    match PSQT_NAMES.iter().position(|&p| p == name) {
-        Some(i) => {
-            PSQT_SCALE[i].store(per_mille, std::sync::atomic::Ordering::Relaxed);
-            true
+pub fn set_psqt_scale(name: &str, bucket: Option<usize>, per_mille: i32) -> bool {
+    let i = match PSQT_NAMES.iter().position(|&p| p == name) {
+        Some(i) => i,
+        None => return false,
+    };
+    match bucket {
+        None => {
+            for b in 0..NUM_BUCKETS {
+                PSQT_SCALE[b * 6 + i].store(per_mille, std::sync::atomic::Ordering::Relaxed);
+            }
         }
-        None => false,
+        Some(b) if b < NUM_BUCKETS => {
+            PSQT_SCALE[b * 6 + i].store(per_mille, std::sync::atomic::Ordering::Relaxed);
+        }
+        Some(_) => return false,
     }
+    PSQT_BUCKETS_DIFFER.store(
+        (0..NUM_BUCKETS).any(|b| {
+            (0..6).any(|k| {
+                PSQT_SCALE[b * 6 + k].load(std::sync::atomic::Ordering::Relaxed)
+                    != PSQT_SCALE[PSQT_BASE_BUCKET * 6 + k].load(std::sync::atomic::Ordering::Relaxed)
+            })
+        }),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    true
+}
+
+/// Whether any bucket wants different PSQT amplitudes from the base one. When
+/// false -- the common case -- the correction below is skipped entirely.
+static PSQT_BUCKETS_DIFFER: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the family scales differ BETWEEN buckets -- that is, whether a
+/// per-phase profile is driving them.
+///
+/// Deliberately not the same question as `family_scaling_active`, which has
+/// been true since the V3 profile set king to 1100 and threats to 1150 for the
+/// whole game. Asking that one instead silently disabled the material-bucket
+/// correction with no per-bucket profile loaded at all, and cost 4 positions
+/// on the suite before a single number had been changed -- a measurement of
+/// nothing, presented as a measurement of the profile.
+static FAMILY_BUCKETS_DIFFER: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn family_buckets_differ() -> bool {
+    FAMILY_BUCKETS_DIFFER.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether the per-piece-count volume correction still applies.
+///
+/// It was switched off automatically whenever any bucket differed, on the
+/// assumption that a bucket profile would always be flattening the same slope
+/// and the two would multiply. That assumption is wrong for a profile that
+/// uses buckets surgically -- moving weight from mobility to pawn structure in
+/// locked positions, say -- while leaving the overall scale alone. Such a
+/// profile replaces nothing, and turning this off costs the 4 suite positions
+/// it is worth for no reason at all.
+///
+/// So it is explicit: `scale.material_buckets 0` in a profile turns it off,
+/// and a profile that flattens the slope itself should say so.
+static MATERIAL_BUCKETS_ON: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+pub fn set_material_buckets(on: bool) {
+    MATERIAL_BUCKETS_ON.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// What the accumulator got wrong for this position's bucket.
+///
+/// `Board` keeps material and piece-square scores incrementally, built with
+/// PSQT_BASE_BUCKET's factors because a piece knows nothing about how many
+/// pawns are on the board. Where a bucket asks for a different amplitude, the
+/// difference is added here -- over the pieces that differ, which is normally
+/// just the queens.
+fn psqt_bucket_correction(board: &Board) -> i32 {
+    if !PSQT_BUCKETS_DIFFER.load(std::sync::atomic::Ordering::Relaxed) {
+        return 0;
+    }
+    let b = bucket_of(board);
+    if b == PSQT_BASE_BUCKET {
+        return 0;
+    }
+    let (mut mg, mut eg) = (0i32, 0i32);
+    for pt in ALL_PIECES {
+        let i = pt.idx();
+        let f = PSQT_SCALE[b * 6 + i].load(std::sync::atomic::Ordering::Relaxed);
+        let base = PSQT_SCALE[PSQT_BASE_BUCKET * 6 + i].load(std::sync::atomic::Ordering::Relaxed);
+        if f == base {
+            continue;
+        }
+        for c in [Color::White, Color::Black] {
+            let sign = if c == Color::White { 1 } else { -1 };
+            let mut bb = board.pieces[c.idx()][i];
+            while bb != 0 {
+                let sq = bb.trailing_zeros() as Square;
+                bb &= bb - 1;
+                mg += sign * (pst_mg(pt, c, sq) * f / 1000 - pst_mg(pt, c, sq) * base / 1000);
+                eg += sign * (pst_eg(pt, c, sq) * f / 1000 - pst_eg(pt, c, sq) * base / 1000);
+            }
+        }
+    }
+    let phase = board.phase.min(MAX_PHASE);
+    (mg * phase + eg * (MAX_PHASE - phase)) / MAX_PHASE
 }
 
 #[inline]
 fn psqt_factor(idx: usize) -> i32 {
-    PSQT_SCALE[idx].load(std::sync::atomic::Ordering::Relaxed)
+    PSQT_SCALE[PSQT_BASE_BUCKET * 6 + idx].load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Piece-square tables loaded at runtime, replacing the compiled-in ones.
@@ -397,6 +516,17 @@ fn psqt_from_override(kind: PieceType, idx: usize, eg: bool) -> Option<i32> {
 ///
 /// Format: `<section>.<name> <value(s)>`, lists comma-separated, `#` comments.
 /// Anything absent keeps its compiled-in value, so a profile can be partial.
+/// `king` -> ("king", None); `king.3` -> ("king", Some(3)).
+fn split_bucket(name: &str) -> (&str, Option<usize>) {
+    match name.rsplit_once('.') {
+        Some((head, tail)) => match tail.parse::<usize>() {
+            Ok(b) => (head, Some(b)),
+            Err(_) => (name, None),
+        },
+        None => (name, None),
+    }
+}
+
 pub fn load_profile(path: &str) -> Result<usize, String> {
     let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
     let mut n = 0usize;
@@ -418,8 +548,20 @@ pub fn load_profile(path: &str) -> Result<usize, String> {
         let one = || -> Option<i32> { rest.parse().ok() };
         let ok = match section {
             "material" => one().map(|v| set_material(name, v)).unwrap_or(false),
-            "scale" => one().map(|v| set_family_scale(name, v)).unwrap_or(false),
-            "psqt_scale" => one().map(|v| set_psqt_scale(name, v)).unwrap_or(false),
+            // `<family>` means the whole game; `<family>.<bucket>` means one
+            // phase. Both forms are accepted so a profile written before
+            // buckets existed still loads and still means what it meant.
+            "scale" if name == "material_buckets" => {
+                one().map(|v| { set_material_buckets(v != 0); true }).unwrap_or(false)
+            }
+            "scale" => {
+                let (fam, bucket) = split_bucket(name);
+                one().map(|v| set_family_scale(fam, bucket, v)).unwrap_or(false)
+            }
+            "psqt_scale" => {
+                let (piece, bucket) = split_bucket(name);
+                one().map(|v| set_psqt_scale(piece, bucket, v)).unwrap_or(false)
+            }
             "search" => one()
                 .map(|v| crate::search::set_param(name, v))
                 .unwrap_or(false),
@@ -1463,14 +1605,29 @@ static DEFAULT_WEIGHTS: OnceLock<Weights> = OnceLock::new();
 /// wants nothing, that is a finding about the evaluation, not a number to
 /// tune. Factors are in per-mille so they can arrive over UCI as integers:
 /// 1000 is unchanged, 1200 is +20%.
-static FAMILY_SCALE: [std::sync::atomic::AtomicI32; 6] = [
-    std::sync::atomic::AtomicI32::new(1000),
-    std::sync::atomic::AtomicI32::new(1100),
-    std::sync::atomic::AtomicI32::new(1150),
-    std::sync::atomic::AtomicI32::new(1000),
-    std::sync::atomic::AtomicI32::new(1000),
-    std::sync::atomic::AtomicI32::new(1000),
-];
+/// Family scale, per phase bucket: `[bucket * 6 + family]`.
+///
+/// One row per bucket because the correction the profile asks for is not a
+/// single number -- our evaluation runs at 0.78 of a strong reference's with a
+/// full board and 1.57 of it once the pieces are gone, so the error changes
+/// SIGN in the middle and no global factor can flatten it.
+///
+/// Every bucket starts at the values that were in force before buckets
+/// existed (king 1100, threats 1150 from the V3 profile, the rest neutral), so
+/// turning the mechanism on changes nothing until a profile says otherwise.
+static FAMILY_SCALE: [std::sync::atomic::AtomicI32; 6 * NUM_BUCKETS] = {
+    use std::sync::atomic::AtomicI32;
+    [
+        AtomicI32::new(1000), AtomicI32::new(1100), AtomicI32::new(1150), AtomicI32::new(1000), AtomicI32::new(1000), AtomicI32::new(1000),
+        AtomicI32::new(1000), AtomicI32::new(1100), AtomicI32::new(1150), AtomicI32::new(1000), AtomicI32::new(1000), AtomicI32::new(1000),
+        AtomicI32::new(1000), AtomicI32::new(1100), AtomicI32::new(1150), AtomicI32::new(1000), AtomicI32::new(1000), AtomicI32::new(1000),
+        AtomicI32::new(1000), AtomicI32::new(1100), AtomicI32::new(1150), AtomicI32::new(1000), AtomicI32::new(1000), AtomicI32::new(1000),
+        AtomicI32::new(1000), AtomicI32::new(1100), AtomicI32::new(1150), AtomicI32::new(1000), AtomicI32::new(1000), AtomicI32::new(1000),
+        AtomicI32::new(1000), AtomicI32::new(1100), AtomicI32::new(1150), AtomicI32::new(1000), AtomicI32::new(1000), AtomicI32::new(1000),
+        AtomicI32::new(1000), AtomicI32::new(1100), AtomicI32::new(1150), AtomicI32::new(1000), AtomicI32::new(1000), AtomicI32::new(1000),
+        AtomicI32::new(1000), AtomicI32::new(1100), AtomicI32::new(1150), AtomicI32::new(1000), AtomicI32::new(1000), AtomicI32::new(1000),
+    ]
+};
 
 const FAMILIES: [&str; 6] = ["mobility", "king", "threats", "pawns", "pieces", "tempo"];
 
@@ -1539,14 +1696,33 @@ fn field_family(name: &str) -> Option<&'static str> {
 }
 
 /// Set one family's factor, in per-mille. Returns false for an unknown family.
-pub fn set_family_scale(name: &str, per_mille: i32) -> bool {
-    match FAMILIES.iter().position(|&f| f == name) {
-        Some(i) => {
-            FAMILY_SCALE[i].store(per_mille, std::sync::atomic::Ordering::Relaxed);
-            true
+pub fn set_family_scale(name: &str, bucket: Option<usize>, per_mille: i32) -> bool {
+    let i = match FAMILIES.iter().position(|&f| f == name) {
+        Some(i) => i,
+        None => return false,
+    };
+    match bucket {
+        // A profile written before buckets existed means the whole game.
+        None => {
+            for b in 0..NUM_BUCKETS {
+                FAMILY_SCALE[b * 6 + i].store(per_mille, std::sync::atomic::Ordering::Relaxed);
+            }
         }
-        None => false,
+        Some(b) if b < NUM_BUCKETS => {
+            FAMILY_SCALE[b * 6 + i].store(per_mille, std::sync::atomic::Ordering::Relaxed);
+        }
+        Some(_) => return false,
     }
+    FAMILY_BUCKETS_DIFFER.store(
+        (0..NUM_BUCKETS).any(|b| {
+            (0..6).any(|k| {
+                FAMILY_SCALE[b * 6 + k].load(std::sync::atomic::Ordering::Relaxed)
+                    != FAMILY_SCALE[k].load(std::sync::atomic::Ordering::Relaxed)
+            })
+        }),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    true
 }
 
 /// True when any family has been rescaled, so the common path can skip the
@@ -1561,9 +1737,9 @@ pub fn family_scaling_active() -> bool {
         .any(|a| a.load(std::sync::atomic::Ordering::Relaxed) != 1000)
 }
 
-fn family_factor(name: &str) -> i32 {
+fn family_factor(name: &str, bucket: usize) -> i32 {
     match field_family(name).and_then(|f| FAMILIES.iter().position(|&x| x == f)) {
-        Some(i) => FAMILY_SCALE[i].load(std::sync::atomic::Ordering::Relaxed),
+        Some(i) => FAMILY_SCALE[bucket * 6 + i].load(std::sync::atomic::Ordering::Relaxed),
         None => 1000,
     }
 }
@@ -1638,18 +1814,27 @@ impl Weights {
 /// calibration but noise-fitting, and a search this wide finds and exploits
 /// exactly that kind of mirage. These boundaries are set so each bucket holds
 /// a comparable share: 23% / 28% / 29% / 19%.
-pub const NUM_BUCKETS: usize = 4;
+pub const NUM_BUCKETS: usize = 8;
 
 pub fn bucket_of(board: &Board) -> usize {
     let pawns = crate::bitboard::count(
         board.pieces[Color::White.idx()][PieceType::Pawn.idx()]
             | board.pieces[Color::Black.idx()][PieceType::Pawn.idx()],
     );
+    // Eight buckets, boundaries from the V4 profile. Measured on the pawn
+    // distribution of our own games so no bucket is left fitting noise: the
+    // slices come out 14/16/14/8/19/10/8/12%, uneven because pawn count is
+    // discrete, and with 12.5M positions available the smallest still holds
+    // over a thousand positions per weight.
     match pawns {
-        0..=5 => 0,
-        6..=9 => 1,
-        10..=12 => 2,
-        _ => 3,
+        0..=3 => 0,
+        4..=6 => 1,
+        7..=8 => 2,
+        9 => 3,
+        10..=11 => 4,
+        12 => 5,
+        13 => 6,
+        _ => 7,
     }
 }
 
@@ -1672,10 +1857,12 @@ static SCALED_BUCKETS: OnceLock<Vec<Weights>> = OnceLock::new();
 
 pub fn weights_for(board: &Board) -> &'static Weights {
     if family_scaling_active() {
-        let scaled = SCALED_BUCKETS.get_or_init(|| {
-            let base = scaled_weights().clone();
-            vec![base; NUM_BUCKETS]
-        });
+        // One set per bucket, each built with ITS OWN family factors. This
+        // used to clone a single scaled set into every bucket, which made the
+        // mechanism structurally present and practically inert: whatever the
+        // profile said about bucket 7 was applied to bucket 0 as well.
+        let scaled = SCALED_BUCKETS
+            .get_or_init(|| (0..NUM_BUCKETS).map(scaled_weights_for).collect());
         return &scaled[bucket_of(board)];
     }
     let all = BUCKET_WEIGHTS.get_or_init(|| {
@@ -1711,8 +1898,8 @@ pub fn weights_for(board: &Board) -> &'static Weights {
 /// parameter sweep.
 static SCALED_WEIGHTS: OnceLock<Weights> = OnceLock::new();
 
-fn scaled_weights() -> &'static Weights {
-    SCALED_WEIGHTS.get_or_init(|| {
+fn scaled_weights_for(bucket: usize) -> Weights {
+    {
         let base = default_weights();
         let mut v = base.to_vec();
         let fams = base.field_families();
@@ -1722,7 +1909,7 @@ fn scaled_weights() -> &'static Weights {
                 continue;
             }
             let f = match FAMILIES.iter().position(|&x| x == *fam) {
-                Some(k) => FAMILY_SCALE[k].load(std::sync::atomic::Ordering::Relaxed),
+                Some(k) => FAMILY_SCALE[bucket * 6 + k].load(std::sync::atomic::Ordering::Relaxed),
                 None => 1000,
             };
             if f != 1000 {
@@ -1730,11 +1917,13 @@ fn scaled_weights() -> &'static Weights {
                 *counts.entry(fam).or_insert(0) += 1;
             }
         }
-        for (fam, n) in &counts {
-            eprintln!("family scale: {} -> {} pesos alterados", fam, n);
+        if bucket == 0 {
+            for (fam, n) in &counts {
+                eprintln!("family scale: {} -> {} pesos alterados (por bucket)", fam, n);
+            }
         }
         base.from_vec(&v)
-    })
+    }
 }
 
 /// The weights the evaluation should use: scaled when any family factor was
@@ -1742,7 +1931,12 @@ fn scaled_weights() -> &'static Weights {
 /// always false.
 pub fn active_weights() -> &'static Weights {
     if family_scaling_active() {
-        scaled_weights()
+        // No board here, so the fullest bucket: this is used by tooling that
+        // wants "the weights", not by the search, which always has a position.
+        SCALED_BUCKETS
+            .get_or_init(|| (0..NUM_BUCKETS).map(scaled_weights_for).collect())
+            .last()
+            .unwrap()
     } else {
         default_weights()
     }
@@ -3382,7 +3576,17 @@ pub fn evaluate(board: &Board) -> i32 {
     };
     let w = weights_for(board);
     let raw = raw + complexity_adjustment(board, raw, w);
-    material_bucket_scale(board, scale_endgame(board, raw, w))
+    // The per-bucket family scales in `weights_for` correct the same slope
+    // this did, and they do it where it was measured -- the positional terms,
+    // which carry 83-100% of the evaluation in balanced positions. Applying
+    // both multiplied the correction: 0.65 x 0.82 is half the evaluation.
+    // Kept, and inert, while the profile drives the buckets.
+    let v = scale_endgame(board, raw, w) + psqt_bucket_correction(board);
+    if MATERIAL_BUCKETS_ON.load(std::sync::atomic::Ordering::Relaxed) {
+        material_bucket_scale(board, v)
+    } else {
+        v
+    }
 }
 
 /// How loud this evaluation is, measured against a strong reference and
@@ -3592,7 +3796,14 @@ fn endgame_scale_factor(board: &Board, raw: i32, weights: &Weights) -> i32 {
 /// decente. Reduz bastante o custo por no sem perder a personalidade nas
 /// decisoes que realmente importam.
 pub fn evaluate_fast(board: &Board) -> i32 {
-    material_pst(board)
+    // The bucket correction belongs here too. Without it the quiescence search
+    // and the pruning margins read the accumulator raw -- the queen at the
+    // base bucket's amplitude in every position -- while the real evaluation
+    // corrected it. Search and evaluation disagreeing about the same position
+    // is worth more than the term itself: measured, it cost 12 suite positions
+    // out of 214, and it looked exactly like the profile being wrong.
+    let c = psqt_bucket_correction(board);
+    material_pst(board) + if board.side == Color::White { c } else { -c }
 }
 
 /// Le' os acumuladores incrementais mantidos por add_piece()/remove_piece()
