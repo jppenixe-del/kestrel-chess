@@ -736,6 +736,9 @@ const TM_SCALE_MAX: f64 = 3.4;
 const TM_INSTABILITY_SCALE: f64 = 0.22;
 /// ...and its ceiling, so a position that never settles cannot spend the game.
 const TM_INSTABILITY_MAX: f64 = 2.4;
+/// How much the evaluation must move for a change of best move to count as
+/// the search finding something, rather than picking between equals.
+const TM_INSTABILITY_MIN_CP: i32 = 20;
 
 const TM_QUIET_CP: i32 = 10;
 const TM_QUIET_ITERS: u32 = 3;
@@ -3224,7 +3227,23 @@ impl<'a> Searcher<'a> {
                     stable_count += 1;
                 } else {
                     stable_count = 0;
-                    move_changes += 1;
+                    // Only a change that MOVED THE EVALUATION counts.
+                    //
+                    // A root move that swaps between alternatives worth the
+                    // same is not a hard position, it is a position with
+                    // several playable moves -- the opening, most of the
+                    // time. Counting those cost a real game: 73 seconds went
+                    // on moves 9 to 20, one of them 12s, and the phase that
+                    // decided the game was played at under 3s a move. This is
+                    // the exact trap `effort` and `settle` were already
+                    // documented as falling into, and the first version of
+                    // this counter walked straight into it.
+                    let real = prev_iter_score
+                        .map(|p: i32| (p - score).abs() >= TM_INSTABILITY_MIN_CP)
+                        .unwrap_or(false);
+                    if real {
+                        move_changes += 1;
+                    }
                 }
                 best_move = Some(rb);
                 // The MOVE from an interrupted iteration is kept -- it was

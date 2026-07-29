@@ -92,6 +92,7 @@ fn compute_time_budget(
     movestogo: Option<i64>,
     last_score: Option<i32>,
     pieces_left: i64,
+    game_ply: i64,
 ) -> (i64, i64) {
     let safe_time = (my_time - MOVE_OVERHEAD_MS).max(1);
 
@@ -152,7 +153,17 @@ fn compute_time_budget(
     // clock nearly out there is no such thing as an affordable long think, and
     // the same reasoning that justifies spending would spend the game away.
     // In tenths, so it moves continuously instead of in steps.
-    let emergency_mult = (safe_time / 2000).clamp(10, EMERGENCY_MULT_MAX);
+    // ...and about WHEN in the game it is being asked. A first real loss with
+    // the raised ceiling was spent at the wrong end of the game: 73 seconds
+    // went on moves 9 to 20, one of them 12s, and the phase that actually
+    // decided the game -- moves 32 to 48, where an advantage of +1.6 eroded
+    // into a lost position -- was played at 1.4 to 3s a move. Nothing had gone
+    // wrong yet on move 11; the position was still theory-adjacent and the
+    // alternatives still roughly equal. The permission to think long belongs
+    // later, when the position is genuinely unique.
+    let by_clock = (safe_time / 2000).clamp(10, EMERGENCY_MULT_MAX);
+    let by_phase = (12 + game_ply / 2).clamp(12, EMERGENCY_MULT_MAX);
+    let emergency_mult = by_clock.min(by_phase);
     let mut hard_cap = (safe_time * HARD_CAP_PERCENT / 100)
         .min((safe_time / horizon) * emergency_mult / 10)
         .min(soft * HARD_CAP_BUDGET_MULT / 10)
@@ -531,7 +542,9 @@ impl Engine {
                 .map(|bb| bb.count_ones() as i64)
                 .sum::<i64>();
             let (mut soft, mut hard_cap) =
-                compute_time_budget(my_time, my_inc, opp_time, movestogo, self.last_score, pieces_left);
+                compute_time_budget(my_time, my_inc, opp_time, movestogo, self.last_score,
+                                    pieces_left, (self.board.fullmove as i64 - 1) * 2
+                                        + if side_white { 0 } else { 1 });
             // The opening is played, not calculated -- including the parts of
             // it the book does not reach.
             //
