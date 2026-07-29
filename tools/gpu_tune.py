@@ -282,7 +282,7 @@ def main():
     t0 = time.time()
     best_val, best_epoch, since, stop = float("inf"), 0, 0, ""
     for e in range(epochs):
-        # The whole of Texel tuning is these four lines. The sigmoid turns the
+        # The whole of the method is these four lines. The sigmoid turns the
         # evaluation into the probability White wins; the loss is against the
         # game's actual result. The gradient is written out rather than left to
         # autograd only so the transpose above can be reused.
