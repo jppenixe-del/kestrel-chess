@@ -28,7 +28,9 @@ case "${1:-status}" in
       echo "ja esta a correr. usa ./bot.sh status"; exit 1
     fi
     # Duas maquinas com o mesmo token disputam os mesmos jogos.
-    if ssh -o ConnectTimeout=5 napoleon 'pgrep -f "python3 -u lichess_bridge.py" >/dev/null' 2>/dev/null; then
+    # ps + grep, nao pgrep -f: o padrao esta na linha de comando do proprio ssh,
+    # por isso o pgrep apanha-se a si mesmo e da sempre positivo.
+    if [ -n "$(ssh -o ConnectTimeout=5 napoleon 'ps -eo cmd --no-headers | grep -F "lichess_bridge.py" | grep -v grep | grep -v "ps -eo"' 2>/dev/null)" ]; then
       echo "ERRO: o bridge esta a correr no napoleao. Para la primeiro."; exit 1
     fi
     rm -f $PAUSE
@@ -75,7 +77,9 @@ case "${1:-status}" in
     [ -n "$l" ] && tr '\0' '\n' < /proc/${l%% *}/environ 2>/dev/null | grep CASUAL | sed 's/^/  /'
     [ -f $PAUSE ] && echo "PAUSADO (nao aceita desafios novos)"
     echo "jogos a decorrer: $(playing)"
-    ssh -o ConnectTimeout=5 napoleon 'pgrep -f "python3 -u lichess_bridge.py" >/dev/null && echo "AVISO: bridge tambem a correr no napoleao (conflito)"' 2>/dev/null
+    [ -n "$(ssh -o ConnectTimeout=5 napoleon 'ps -eo cmd --no-headers | grep -F "lichess_bridge.py" | grep -v grep | grep -v "ps -eo"' 2>/dev/null)" ] &&
+      echo "AVISO: bridge tambem a correr no napoleao (conflito)"
+    true
     curl -s "https://lichess.org/api/user/KestrelStrike" 2>/dev/null | python3 -c "
 import json,sys; p=json.load(sys.stdin)['perfs']
 print(f\"rating: bullet {p['bullet']['rating']} | blitz {p['blitz']['rating']}\")" 2>/dev/null
