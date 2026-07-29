@@ -89,6 +89,25 @@ const OPENING_MAX_MS: i64 = 70;
 /// `KESTREL_HEATMAP_ONLY=1` or `setoption name HeatmapOnly value true`.
 static HEATMAP_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// What a position with no legal moves is worth, from the side to move.
+///
+/// The evaluation cannot answer this and does not try: it counts material, and
+/// a stalemated position is usually one where we have plenty. Two of the first
+/// seven games played from the evaluation alone ended in stalemate with a won
+/// position, because every move was scored by material and the one that ended
+/// the game scored best of all. Mate and stalemate are facts about the move
+/// list, not about the pieces, and they have to be checked where the move list
+/// is generated.
+fn terminal_value(board: &Board, atk: &crate::attacks::Attacks) -> i32 {
+    if board.in_check(board.side, atk) {
+        // Mated: the worst thing that can happen to the side to move.
+        -30000
+    } else {
+        // Stalemate is a draw however much material is on the board.
+        0
+    }
+}
+
 fn heatmap_only() -> bool {
     HEATMAP_ONLY.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -598,7 +617,7 @@ impl Engine {
             // -- taking the attacker, moving the target away -- get a third
             // ply, and the rest do not. Depth where it is earned, on a budget
             // of one extra square's worth of work.
-            let threat: Option<crate::moves::Move> = if plies >= 3 {
+            let threat: Option<(crate::moves::Move, i32)> = if plies >= 3 {
                 let u = self.board.make_null_move();
                 let his = crate::movegen::generate_legal(&mut self.board, &self.atk);
                 let mut best_r: Option<(crate::moves::Move, i32)> = None;
@@ -611,12 +630,15 @@ impl Engine {
                     }
                 }
                 self.board.unmake_null_move(&u);
-                best_r.map(|(m, _)| m)
+                best_r
             } else {
                 None
             };
-            if let Some(t) = threat {
-                let _ = writeln!(out, "info string ameaca {}", t.to_uci());
+            // What the position is worth if we do nothing: the baseline the
+            // threat is measured against.
+            let idle = threat.map(|(_, v)| -v);
+            if let Some((t, v)) = threat {
+                let _ = writeln!(out, "info string ameaca {} vale {}", t.to_uci(), -v);
             }
             let mut best: Option<(crate::moves::Move, i32)> = None;
             for mv in &legal {
@@ -629,36 +651,51 @@ impl Engine {
                 // A move that answers the threat is looked at one ply deeper:
                 // it either takes the piece that was going to move, or gets
                 // the target out of the way.
-                let answers_threat = std::env::var_os("KESTREL_HEATMAP_ALL3").is_some()
-                    || threat.map_or(false, |t| mv.to == t.to || mv.from == t.to);
-                let after = if plies <= 1 {
-                    -crate::eval::evaluate(&self.board)
+                // Does his threat survive our move?
+                //
+                // No extra ply for this: the question is answered by looking,
+                // not by searching. If the piece he was going to take is still
+                // there, and the piece that was going to take it is still
+                // there, the threat stands and the move has not addressed it.
+                // Costs two board reads, and the point of this mode is to see
+                // what the evaluation sees rather than to out-search it.
+                let threat_survives = threat.map_or(false, |(t, _)| {
+                    self.board.piece_at(t.from).is_some() && self.board.piece_at(t.to).is_some()
+                });
+                let after = if plies >= 3 {
+                    // Threat-aware, at one ply of cost. The static value of
+                    // our move, minus what he still threatens if we did not
+                    // deal with it.
+                    let base = -crate::eval::evaluate(&self.board);
+                    if threat_survives {
+                        base.saturating_sub(idle.map_or(0, |i| (base - i).max(0)))
+                    } else {
+                        base
+                    }
+                } else if plies <= 1 {
+                    let his = crate::movegen::generate_legal(&mut self.board, &self.atk);
+                    if his.is_empty() {
+                        // He has no move: mate in our favour, or a stalemate
+                        // that throws the whole game away.
+                        -terminal_value(&self.board, &self.atk)
+                    } else {
+                        -crate::eval::evaluate(&self.board)
+                    }
                 } else {
                     let replies = crate::movegen::generate_legal(&mut self.board, &self.atk);
                     if replies.is_empty() {
-                        // Mate or stalemate for him: evaluate as it stands.
-                        -crate::eval::evaluate(&self.board)
+                        // Mate for him is the best move on the board; stalemate
+                        // is a draw and must never look like the material says.
+                        -terminal_value(&self.board, &self.atk)
                     } else {
                         let mut his_best = i32::MIN;
                         for r in &replies {
                             let u2 = self.board.make_move(r);
-                            let v = if plies >= 3 && answers_threat {
-                                // One more ply, only here: our best follow-up.
-                                let ours = crate::movegen::generate_legal(&mut self.board, &self.atk);
-                                if ours.is_empty() {
-                                    -crate::eval::evaluate(&self.board)
-                                } else {
-                                    let mut mine = i32::MIN;
-                                    for m2 in &ours {
-                                        let u3 = self.board.make_move(m2);
-                                        let vv = crate::eval::evaluate(&self.board);
-                                        self.board.unmake_move(m2, &u3);
-                                        if vv > mine {
-                                            mine = vv;
-                                        }
-                                    }
-                                    -mine
-                                }
+                            let ours = crate::movegen::generate_legal(&mut self.board, &self.atk);
+                            let v = if ours.is_empty() {
+                                // Now WE have no move: his reply mates us, or
+                                // stalemates us out of a won game.
+                                -terminal_value(&self.board, &self.atk)
                             } else {
                                 -crate::eval::evaluate(&self.board)
                             };
