@@ -159,6 +159,51 @@ correction, so the search saw the queen at one amplitude while the evaluation
 saw it at another. 13 suite positions, and it looked exactly like the profile
 being wrong.
 
+## 1c. A Rust Lichess client, with our options and our machines
+
+The Python bridge has grown everything the engine needs and nothing it needs to
+be reliable. Rewrite it in Rust, using BotLi (github.com/Torom/BotLi, cloned
+and configured at /root/kestrel_joao/BotLi, NOT running) as a reference for
+features -- not as a base to copy, since the engine is original work.
+
+**Machine orchestration is a first-class requirement, not a convenience.**
+There are two machines -- the server (6 cores, shared with tests) and the
+second box (ssh napoleon, 6c/12t, RTX 5060 Ti) -- and today the choice of where
+the bot plays is made by hand, with scp and manual restarts. The client should
+own it:
+
+* machines declared in config, with core counts and which one plays;
+* choice by time control -- the second box is 25% faster per thread (620k vs
+  495k nps), so bullet belongs there while the other runs suites;
+* threads per machine and per speed, not one global constant;
+* verify the binary is identical on both (md5) before playing, and refuse to
+  play one older than the repository -- we have played old versions without
+  noticing;
+* switch machines WITHOUT killing games: pause, wait for the board to empty,
+  start on the other side;
+* never two clients on the same token at once -- they fight over the same
+  games;
+* assume the machine it is NOT playing on may be running heavy tests, and do
+  not treat its CPU as free.
+
+**What has to come with us** (all in lichess_bridge.py, all of it measured):
+time management left to the engine via wtime/btime with no imposed movetime;
+the draw and resignation logic; the instant opening book; the pause-by-file
+that refuses new challenges without killing live games (restarts cost hours of
+429); per-move telemetry, which produced every diagnosis we have; and the short
+retried move POST, since that request runs on OUR clock.
+
+**What BotLi does better and is worth taking**: matchmaking -- but following
+each challenge to its outcome, not just its creation, since most bots decline
+with declineReasonKey "nobot"; online tablebases; and stream reconnection that
+does not drop ~46 times a day.
+
+**Traps already paid for**: ponder OFF, because a second engine process starves
+the first and once cost a live game; heavy tests on the playing machine cost a
+loss on time (44s on one move with 44s on the clock -- not time management,
+missing CPU); and clock.initial is in seconds while wtime/btime are in
+milliseconds.
+
 ## 2. A network, and where the GPU actually helps
 
 **Training on the GPU: yes.** That is what it is for.
