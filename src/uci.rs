@@ -93,8 +93,10 @@ fn heatmap_only() -> bool {
     HEATMAP_ONLY.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// 1 = only our move; 2 = his best reply counted too. Nothing above 2, because
-/// past that it stops being a heatmap and starts being a search.
+/// 1 = only our move; 2 = his best reply too.
+///
+/// 3 exists and is MEASURABLY TERRIBLE -- kept only because the measurement is
+/// worth more than the mode. See the note on threats below.
 static HEATMAP_PLIES: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
 
 fn heatmap_plies() -> i32 {
@@ -349,7 +351,7 @@ impl Engine {
         if std::env::var("KESTREL_HEATMAP_ONLY").map(|v| v == "1").unwrap_or(false) {
             HEATMAP_ONLY.store(true, std::sync::atomic::Ordering::Relaxed);
             let n: i32 = std::env::var("KESTREL_HEATMAP_PLIES").ok()
-                .and_then(|v| v.parse().ok()).unwrap_or(1).clamp(1, 2);
+                .and_then(|v| v.parse().ok()).unwrap_or(1).clamp(1, 3);
             HEATMAP_PLIES.store(n, std::sync::atomic::Ordering::Relaxed);
             eprintln!("modo heatmap: sem busca, {} ply(s) de avaliacao estatica", n);
         }
@@ -563,6 +565,59 @@ impl Engine {
         if heatmap_only() {
             let plies = heatmap_plies();
             let legal = crate::movegen::generate_legal(&mut self.board, &self.atk);
+
+            // The threat: what he would play if we passed.
+            //
+            // MEASURED, and the result is a lesson rather than a feature.
+            // Naming the threat works perfectly -- on a knight attacked twice
+            // it reports the capture outright -- but spending the extra ply on
+            // the moves that answer it takes the suite from 42/214 to 23, and
+            // giving every move that third ply takes it to 5.
+            //
+            // The cause is not the mixture of depths, which was the obvious
+            // suspect. It is parity. An odd depth ends on OUR move, so the
+            // evaluation sees the piece we just took and not the recapture --
+            // the horizon effect in its purest form. At two plies he has the
+            // last word and the recapture shows up. Without a quiescence
+            // search, only even depths mean anything, and this is why the
+            // engine's own `go depth 1` holds up at 41/214: it HAS one.
+            //
+            // The null move stays because naming the threat is worth having on
+            // its own, as an `info string`. What it must not do is buy depth.
+            //
+            // A null move answers a question nothing else here can. Two plies
+            // show one reply to each of OUR moves, but never what he was
+            // trying to do beforehand -- so they cannot tell "this move is
+            // good" from "this move saves me". Passing the turn and reading
+            // his heatmap names the threat outright.
+            //
+            // Note what this is NOT for. The threat's value is the same for
+            // every move we might play, so it cannot reorder anything by
+            // itself; adding a constant changes no ranking. What it buys is
+            // knowing WHERE to look further: the moves that answer the threat
+            // -- taking the attacker, moving the target away -- get a third
+            // ply, and the rest do not. Depth where it is earned, on a budget
+            // of one extra square's worth of work.
+            let threat: Option<crate::moves::Move> = if plies >= 3 {
+                let u = self.board.make_null_move();
+                let his = crate::movegen::generate_legal(&mut self.board, &self.atk);
+                let mut best_r: Option<(crate::moves::Move, i32)> = None;
+                for r in &his {
+                    let u2 = self.board.make_move(r);
+                    let v = -crate::eval::evaluate(&self.board);
+                    self.board.unmake_move(r, &u2);
+                    if best_r.map_or(true, |(_, b)| v > b) {
+                        best_r = Some((*r, v));
+                    }
+                }
+                self.board.unmake_null_move(&u);
+                best_r.map(|(m, _)| m)
+            } else {
+                None
+            };
+            if let Some(t) = threat {
+                let _ = writeln!(out, "info string ameaca {}", t.to_uci());
+            }
             let mut best: Option<(crate::moves::Move, i32)> = None;
             for mv in &legal {
                 let undo = self.board.make_move(mv);
@@ -571,6 +626,11 @@ impl Engine {
                 // from his side, and he plays its best square. The difference
                 // between the two is how much of our error is blindness to the
                 // reply rather than a wrong reading of the position.
+                // A move that answers the threat is looked at one ply deeper:
+                // it either takes the piece that was going to move, or gets
+                // the target out of the way.
+                let answers_threat = std::env::var_os("KESTREL_HEATMAP_ALL3").is_some()
+                    || threat.map_or(false, |t| mv.to == t.to || mv.from == t.to);
                 let after = if plies <= 1 {
                     -crate::eval::evaluate(&self.board)
                 } else {
@@ -582,7 +642,26 @@ impl Engine {
                         let mut his_best = i32::MIN;
                         for r in &replies {
                             let u2 = self.board.make_move(r);
-                            let v = -crate::eval::evaluate(&self.board);
+                            let v = if plies >= 3 && answers_threat {
+                                // One more ply, only here: our best follow-up.
+                                let ours = crate::movegen::generate_legal(&mut self.board, &self.atk);
+                                if ours.is_empty() {
+                                    -crate::eval::evaluate(&self.board)
+                                } else {
+                                    let mut mine = i32::MIN;
+                                    for m2 in &ours {
+                                        let u3 = self.board.make_move(m2);
+                                        let vv = crate::eval::evaluate(&self.board);
+                                        self.board.unmake_move(m2, &u3);
+                                        if vv > mine {
+                                            mine = vv;
+                                        }
+                                    }
+                                    -mine
+                                }
+                            } else {
+                                -crate::eval::evaluate(&self.board)
+                            };
                             self.board.unmake_move(r, &u2);
                             if v > his_best {
                                 his_best = v;
@@ -1166,7 +1245,7 @@ impl Engine {
                 "setoption" => {
                     if tokens.len() >= 5 && tokens[1] == "name" && tokens[2] == "HeatmapPlies" && tokens[3] == "value" {
                         let n: i32 = tokens[4].parse().unwrap_or(1);
-                        HEATMAP_PLIES.store(n.clamp(1, 2), std::sync::atomic::Ordering::Relaxed);
+                        HEATMAP_PLIES.store(n.clamp(1, 3), std::sync::atomic::Ordering::Relaxed);
                     } else if tokens.len() >= 5 && tokens[1] == "name" && tokens[2] == "HeatmapOnly" && tokens[3] == "value" {
                         let on = tokens[4].eq_ignore_ascii_case("true") || tokens[4] == "1";
                         HEATMAP_ONLY.store(on, std::sync::atomic::Ordering::Relaxed);

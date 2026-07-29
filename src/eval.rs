@@ -3071,9 +3071,20 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
     // avaliacao escrita a mao tem de o dizer. E' a diferenca de metodo, nao de
     // conhecimento.
     {
-        let victim = board.side.opp();
+        // Both sides, when asked for.
+        //
+        // The reasoning for one side only -- "whoever has the move runs away
+        // with the piece" -- is search reasoning: it assumes something will
+        // look one ply ahead and see the escape. With no search there is
+        // nothing to see it, and the evaluation goes blind to half the board.
+        // The side to move still counts for less, because it CAN run: a piece
+        // it can save is not a piece it has lost.
+        for (victim, share) in see_both_sides(board.side) {
+            if share == 0 {
+                continue;
+            }
         let vi = victim.idx();
-        let ai = board.side.idx();
+        let ai = victim.opp().idx();
         let sign = if victim == Color::White { 1 } else { -1 };
         let mut worst = 0i32;
         let mut worst_pt = PieceType::Pawn;
@@ -3130,8 +3141,9 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
             // anything. In thousandths, so 750 is exactly what the constant
             // was: the defaults reproduce the old behaviour to the unit.
             let (hm, he) = w.hanging[worst_pt.idx().min(4)];
-            mg += sign * -(worst * hm / 1000);
-            eg += sign * -(worst * he / 1000);
+            mg += sign * -(worst * hm / 1000) * share / 1000;
+            eg += sign * -(worst * he / 1000) * share / 1000;
+        }
         }
     }
 
@@ -3585,6 +3597,31 @@ static EVAL_MODE_MATERIAL_ONLY: OnceLock<bool> = OnceLock::new();
 /// Read once. `env::var_os` on every evaluation that finds a hanging piece is
 /// a syscall-shaped cost in the hottest loop the engine has.
 static DEBUG_SEE: OnceLock<bool> = OnceLock::new();
+/// Which sides the hanging-piece term looks at, and how much each counts.
+///
+/// By default only the side that does NOT have the move, at full weight --
+/// what the search wants, since it will see the escape itself. With
+/// `KESTREL_SEE_BOTH=1` the side to move is priced too, at a fraction, for
+/// running without a search at all (see HeatmapOnly).
+static SEE_BOTH: OnceLock<bool> = OnceLock::new();
+const SEE_TO_MOVE_SHARE: i32 = 350;
+
+fn see_both_sides(to_move: Color) -> [(Color, i32); 2] {
+    let both = *SEE_BOTH.get_or_init(|| {
+        std::env::var("KESTREL_SEE_BOTH").map(|v| v == "1").unwrap_or(false)
+    });
+    // The side without the move always counts in full. The side to move counts
+    // at a fraction when asked, and at zero otherwise -- a zero share skips the
+    // work, so the default path costs exactly what it did before.
+    if debug_see() {
+        eprintln!("debug: see_both={} to_move={:?}", both, to_move);
+    }
+    [
+        (to_move.opp(), 1000),
+        (to_move, if both { SEE_TO_MOVE_SHARE } else { 0 }),
+    ]
+}
+
 fn debug_see() -> bool {
     *DEBUG_SEE.get_or_init(|| std::env::var_os("KESTREL_DEBUG_SEE").is_some())
 }
