@@ -51,15 +51,28 @@ component blocks and disagreed with the engine it exists to explain.
 
 **Training on the GPU: yes.** That is what it is for.
 
-**Evaluating on the GPU during a game: no**, and it is arithmetic rather than
+A network in an alpha-beta search is a solved problem -- the strongest engines
+in the world are alpha-beta with a neural evaluation. The open question is not
+whether a network fits, it is WHERE it runs.
+
+**On the CPU: yes**, and the reason is worth stating exactly, because it
+decides the whole design. The first layer -- by far the largest -- is never
+recomputed per node. An accumulator is kept and, when a move shifts a piece,
+the weight columns for the origin square are subtracted and those for the
+destination added: a few hundred integer adds instead of a matrix multiply.
+The remaining layers are tiny and run in SIMD over 8/16-bit integers. What
+makes a network affordable is not that it is small; it is that it is barely
+recomputed. Two accumulators, one per side, because each side reads the board
+from its own perspective.
+
+**On the GPU during a game: no**, and this is arithmetic rather than
 preference. The search performs ~500,000 evaluations per second, one at a time,
 each deciding whether to keep searching -- sequentially dependent, not a batch.
-That is ~2 microseconds per evaluation, against 50-200 microseconds of latency
-for a single GPU call. It would be 25-100x slower per evaluation. GPUs pay off
-on batches of hundreds, and alpha-beta does not produce them: engines that pair
-a network with alpha-beta run it on the CPU (small, quantised, updated
-incrementally per move), and the ones that use a GPU use MCTS, which batches
-naturally by expanding many leaves at once.
+That is ~2 microseconds per evaluation against 50-200 microseconds of latency
+for a single GPU call, and nothing incremental survives a trip across the bus.
+GPUs pay off on batches of hundreds; alpha-beta does not produce them. Engines
+that do use a GPU pair it with MCTS, which batches naturally by expanding many
+leaves at once.
 
 So: train on the GPU, infer on the CPU with incremental updates, and keep the
 hand-crafted evaluation as the safety net (known endgames, tablebases) and as
