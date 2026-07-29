@@ -85,6 +85,22 @@ const OPENING_MAX_MS: i64 = 70;
 /// panico), sem distinguir "estamos a perder" de "estamos a ganhar" --
 /// o bug exato que causou uma derrota real por bandeira no Pond antes de
 /// ser corrigido (relaxava o corte tambem quando estavamos a perder).
+/// Play straight from the evaluation, no search at all. Set with
+/// `KESTREL_HEATMAP_ONLY=1` or `setoption name HeatmapOnly value true`.
+static HEATMAP_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn heatmap_only() -> bool {
+    HEATMAP_ONLY.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 1 = only our move; 2 = his best reply counted too. Nothing above 2, because
+/// past that it stops being a heatmap and starts being a search.
+static HEATMAP_PLIES: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
+
+fn heatmap_plies() -> i32 {
+    HEATMAP_PLIES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn compute_time_budget(
     my_time: i64,
     my_inc: i64,
@@ -330,6 +346,13 @@ impl Engine {
         // Profile before warm-up: warm-up evaluates a position, which seals
         // the lazily-built tables, so anything the profile sets has to be in
         // place first.
+        if std::env::var("KESTREL_HEATMAP_ONLY").map(|v| v == "1").unwrap_or(false) {
+            HEATMAP_ONLY.store(true, std::sync::atomic::Ordering::Relaxed);
+            let n: i32 = std::env::var("KESTREL_HEATMAP_PLIES").ok()
+                .and_then(|v| v.parse().ok()).unwrap_or(1).clamp(1, 2);
+            HEATMAP_PLIES.store(n, std::sync::atomic::Ordering::Relaxed);
+            eprintln!("modo heatmap: sem busca, {} ply(s) de avaliacao estatica", n);
+        }
         if let Ok(path) = std::env::var("KESTREL_PROFILE") {
             match crate::eval::load_profile(&path) {
                 Ok(n) => eprintln!("perfil: {} valores carregados de {}", n, path),
@@ -525,6 +548,72 @@ impl Engine {
         // search.rs). Only set on the real-clock branch -- `movetime`,
         // `infinite` and fixed-depth searches mean exactly what they say and
         // must not be second-guessed by time management.
+        // Heatmap mode: play what the evaluation alone says, with no search.
+        //
+        // Every legal move is played, the resulting position evaluated once,
+        // and the best one returned -- which is exactly what the heatmap page
+        // paints. It is not a way to play well; it is a way to see the
+        // evaluation with nothing in front of it. Anything the search normally
+        // hides -- a term with the wrong sign, an amplitude that swamps the
+        // rest -- shows up in the move immediately.
+        //
+        // Note the sign: `evaluate` answers from the side to move's point of
+        // view, and after our move that is the opponent. The best move for us
+        // is the one that leaves THEM the worst position.
+        if heatmap_only() {
+            let plies = heatmap_plies();
+            let legal = crate::movegen::generate_legal(&mut self.board, &self.atk);
+            let mut best: Option<(crate::moves::Move, i32)> = None;
+            for mv in &legal {
+                let undo = self.board.make_move(mv);
+                // One ply asks what the evaluation thinks of OUR move. Two
+                // plies asks whether it saw what he answers -- his own heatmap,
+                // from his side, and he plays its best square. The difference
+                // between the two is how much of our error is blindness to the
+                // reply rather than a wrong reading of the position.
+                let after = if plies <= 1 {
+                    -crate::eval::evaluate(&self.board)
+                } else {
+                    let replies = crate::movegen::generate_legal(&mut self.board, &self.atk);
+                    if replies.is_empty() {
+                        // Mate or stalemate for him: evaluate as it stands.
+                        -crate::eval::evaluate(&self.board)
+                    } else {
+                        let mut his_best = i32::MIN;
+                        for r in &replies {
+                            let u2 = self.board.make_move(r);
+                            let v = -crate::eval::evaluate(&self.board);
+                            self.board.unmake_move(r, &u2);
+                            if v > his_best {
+                                his_best = v;
+                            }
+                        }
+                        // His best is our worst.
+                        -his_best
+                    }
+                };
+                self.board.unmake_move(mv, &undo);
+                if best.map_or(true, |(_, b)| after > b) {
+                    best = Some((*mv, after));
+                }
+            }
+            match best {
+                Some((mv, sc)) => {
+                    let _ = writeln!(
+                        out,
+                        "info depth {} multipv 1 score cp {} nodes {} nps 0 time 0 pv {}",
+                        plies, sc, legal.len(), mv.to_uci()
+                    );
+                    let _ = writeln!(out, "bestmove {}", mv.to_uci());
+                }
+                None => {
+                    let _ = writeln!(out, "bestmove 0000");
+                }
+            }
+            let _ = out.flush();
+            return;
+        }
+
         let mut soft_budget: Option<Duration> = None;
         let deadline: Option<Instant> = if let Some(mt) = movetime {
             Some(Instant::now() + Duration::from_millis(mt.max(1) as u64))
@@ -1075,7 +1164,13 @@ impl Engine {
                     let _ = out.flush();
                 }
                 "setoption" => {
-                    if tokens.len() >= 5 && tokens[1] == "name" && tokens[2] == "Hash" && tokens[3] == "value" {
+                    if tokens.len() >= 5 && tokens[1] == "name" && tokens[2] == "HeatmapPlies" && tokens[3] == "value" {
+                        let n: i32 = tokens[4].parse().unwrap_or(1);
+                        HEATMAP_PLIES.store(n.clamp(1, 2), std::sync::atomic::Ordering::Relaxed);
+                    } else if tokens.len() >= 5 && tokens[1] == "name" && tokens[2] == "HeatmapOnly" && tokens[3] == "value" {
+                        let on = tokens[4].eq_ignore_ascii_case("true") || tokens[4] == "1";
+                        HEATMAP_ONLY.store(on, std::sync::atomic::Ordering::Relaxed);
+                    } else if tokens.len() >= 5 && tokens[1] == "name" && tokens[2] == "Hash" && tokens[3] == "value" {
                         if let Ok(mb) = tokens[4].parse::<usize>() {
                             self.tt = TranspositionTable::new(mb.max(1));
                         }
