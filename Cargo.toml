@@ -4,11 +4,14 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-# The fitted weight set, compiled in instead of the hand-calibrated one.
+# The fitted weight set is the engine now: +152.7 Elo +/- 33.4 over the
+# hand-calibrated one, SPRT H1 accepted at 496 games, 347-142-7.
 #
 # A feature rather than a file so that comparing the two compares two binaries
 # and nothing else -- no environment variable, no parsing, no path that exists
-# on one side and not the other.
+# on one side and not the other. Build with --no-default-features to get the
+# hand-calibrated set back for a comparison.
+default = ["fitted"]
 fitted = []
 
 [dependencies]
