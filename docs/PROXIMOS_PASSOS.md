@@ -41,17 +41,40 @@ the part that made per-bucket tuning not worth starting.
   still falling -- with 20k positions against 5824 parameters that is the fit
   memorising, not learning. Use the full dataset, hold out a validation split,
   and stop on validation loss rather than epochs.
-* **The extractor is out of date with the evaluation.** Its own self-check
-  reports a 14.8cp gap between the feature decomposition and the real
-  evaluation, where 3cp is the limit integer truncation allows. It is not
-  rounding: the residual does not shrink when KESTREL_PROBE_MULT is raised a
-  hundredfold, which is the test the code itself prescribes. It predates
-  29/07 -- the same gap appears in every binary tried -- and the likely cause
-  is the terms added on 28/07 (hanging pieces via SEE, tropism, space) that
-  contribute through hardcoded constants instead of through their own weight
-  fields, so probing a weight does not move them and the fit cannot see them.
-  Fix that first: a tuner fed features that do not add up to the evaluation
-  will happily produce weights, and they will be wrong.
+* **The extractor disagrees with the evaluation by 15cp**, where 3cp is the
+  limit integer truncation allows, and this must be settled before any tuning
+  run is trusted. A tuner fed features that do not add up will produce weights
+  happily, and they will be wrong.
+
+  What is established, so nobody repeats it:
+
+  - It is not rounding. The residual does not move when KESTREL_PROBE_MULT is
+    raised a hundredfold, which is the test the code itself prescribes.
+  - It appeared in commit 8fdf335 (28/07). Binaries built before it report
+    2.6cp; every one after reports 14.8-15.7cp.
+  - **It is not the terms that commit added.** Each of the four (hanging via
+    SEE, king tropism, blocked pawns, space) was disabled in turn and then all
+    together; with all of them off the positional evaluation returns to
+    exactly the pre-commit value (-78 on the worst position, matching the old
+    binary to the unit) and the residual STILL reads 15.0.
+  - Material and piece-square features are fine: `checkmatpst` passes within
+    1.5cp.
+  - `to_vec`/`from_vec` round-trip cleanly over all 705 scalars.
+
+  So the disagreement is in the extraction path, not in the evaluation. The
+  same commit also introduced runtime PSQT scaling (`psqt_factor`,
+  `set_psqt_scale`, `psqt_override`) and `load_profile`; those are what is
+  left unexamined, and the self-check's own reconstruction is the other half
+  worth reading closely.
+
+  Already fixed along the way (29/07): the six weights added on 28-29/07
+  (hanging, king_tropism, space, blocked_pawns, king_aim, king_battery) were
+  evaluated but never emitted by `to_vec`, so no tuner could see or move them
+  -- they are appended now, and older weight files stay valid by being
+  shorter. `hanging` applied a hardcoded 3/4 instead of its own weight; it now
+  uses it, in thousandths, with defaults that reproduce the old behaviour to
+  the unit. And an `env::var_os` sat in the evaluation's hottest loop; it is
+  read once now.
 
 **Why it is worth it.** Slope of our evaluation against a strong reference on
 220 quiet positions (1.00 = same scale):

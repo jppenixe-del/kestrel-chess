@@ -788,7 +788,14 @@ const SAFETY_DISCOVERED: [[(i32, i32); 3]; 5] = [
 /// Peao, cavalo, bispo, torre, dama. Fraccao do valor da peca: nao o valor
 /// inteiro, porque nem toda a peca atacada se perde -- ha contra-jogo, xeques
 /// intermedios, e a busca resolve o resto. Ponto de partida conservador.
-const HANGING: [(i32, i32); 5] = [(-20, -25), (-55, -60), (-58, -62), (-90, -100), (-160, -180)];
+/// What a hanging piece costs, as a fraction of what SEE says the exchange
+/// wins, in thousandths and per piece type.
+///
+/// Was a flat 3/4 written into the code, which is what these defaults are: the
+/// change is that the number can now be seen by the tuner and can differ by
+/// piece. The old values here were absolute centipawn penalties from the
+/// version before SEE priced this term, and were dead.
+const HANGING: [(i32, i32); 5] = [(750, 750), (750, 750), (750, 750), (750, 750), (750, 750)];
 
 /// Cavalo, bispo, torre, dama -- por unidade de proximidade (7 - distancia).
 /// Ponto de partida pequeno: um termo novo errado e' pior que ausente.
@@ -1854,6 +1861,20 @@ impl Weights {
         pair!(self.stonewall);
         pair!(self.stonewall_outpost);
         pair!(self.stonewall_bad_bishop);
+        // Added 2026-07-29. These terms were being evaluated but not emitted,
+        // so the feature extractor could not see them: probing a weight did
+        // not move them, and its self-check reported a 14.8cp gap between the
+        // decomposition and the real evaluation -- a gap that did not shrink
+        // when the probe scale was raised a hundredfold, which is the test
+        // that separates rounding from "the model is not the function". A
+        // tuner fed features that do not add up produces weights happily, and
+        // they are wrong.
+        pairs!(self.hanging);
+        pairs!(self.king_tropism);
+        pair!(self.space);
+        pair!(self.blocked_pawns);
+        pairs!(self.king_aim);
+        pair!(self.king_battery);
         v
     }
     /// The family of every scalar `to_vec` emits, in the same order.
@@ -2010,6 +2031,14 @@ impl Weights {
         let stonewall = pair!();
         let stonewall_outpost = pair!();
         let stonewall_bad_bishop = pair!();
+        // Same order as `to_vec`. Files written before these existed are
+        // shorter and simply keep the defaults -- see the note on `next!`.
+        let hanging_v = pairs!(5);
+        let king_tropism_v = pairs!(4);
+        let space_v = pair!();
+        let blocked_pawns_v = pair!();
+        let king_aim_v = pairs!(3);
+        let king_battery_v = pair!();
         debug_assert!(i >= v.len(), "from_vec: read fewer values than supplied");
         Weights {
             bishop_pair, long_diag_bishop, minor_behind_pawn, knight_outpost, rook_open, rook_on_seventh, tempo,
@@ -2023,12 +2052,12 @@ impl Weights {
             // now; they join the tuned vector once the shape is settled.
             // Fora do vector pela mesma razao que os de baixo: mudar o
             // comprimento invalidaria o ficheiro de pesos ja' em producao.
-            hanging: self.hanging,
-            king_tropism: self.king_tropism,
-            space: self.space,
-            king_aim: self.king_aim,
-            king_battery: self.king_battery,
-            blocked_pawns: self.blocked_pawns,
+            hanging: hanging_v,
+            king_tropism: king_tropism_v,
+            space: space_v,
+            king_aim: king_aim_v,
+            king_battery: king_battery_v,
+            blocked_pawns: blocked_pawns_v,
             unsafe_knight_check: self.unsafe_knight_check,
             unsafe_bishop_check: self.unsafe_bishop_check,
             unsafe_rook_check: self.unsafe_rook_check,
@@ -2786,6 +2815,7 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
         let ai = board.side.idx();
         let sign = if victim == Color::White { 1 } else { -1 };
         let mut worst = 0i32;
+        let mut worst_pt = PieceType::Pawn;
         for pt in [
             PieceType::Pawn,
             PieceType::Knight,
@@ -2820,20 +2850,27 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
                     // por lance.
                     if gain > worst {
                         worst = gain;
+                        worst_pt = pt;
                     }
                 }
             }
         }
-        if worst > 0 && std::env::var_os("KESTREL_DEBUG_SEE").is_some() {
-            eprintln!("debug: worst SEE = {}, penalizacao = {}", worst, -(worst * 3 / 4));
+        if worst > 0 && debug_see() {
+            eprintln!("debug: worst SEE = {worst}");
         }
         if worst > 0 {
             // Fraccao, nao o valor inteiro: ha xeques intermedios, contra-jogo
             // e fugas que o SEE estatico nao ve. A busca resolve o resto -- isto
             // so' tem de deixar a avaliacao estatica honesta o suficiente para
             // as margens de poda fazerem sentido.
-            mg += sign * -(worst * 3 / 4);
-            eg += sign * -(worst * 3 / 4);
+            // Through the weight, not through a constant. The fraction was
+            // hardcoded at 3/4, which made this term invisible to the feature
+            // extractor -- probing a weight did not move it -- and untunable by
+            // anything. In thousandths, so 750 is exactly what the constant
+            // was: the defaults reproduce the old behaviour to the unit.
+            let (hm, he) = w.hanging[worst_pt.idx().min(4)];
+            mg += sign * -(worst * hm / 1000);
+            eg += sign * -(worst * he / 1000);
         }
     }
 
@@ -3284,6 +3321,13 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
 /// motor "normal" que a arena ja usa. Ler o env UMA vez (OnceLock),
 /// nao a cada chamada de evaluate() (custaria NPS real).
 static EVAL_MODE_MATERIAL_ONLY: OnceLock<bool> = OnceLock::new();
+/// Read once. `env::var_os` on every evaluation that finds a hanging piece is
+/// a syscall-shaped cost in the hottest loop the engine has.
+static DEBUG_SEE: OnceLock<bool> = OnceLock::new();
+fn debug_see() -> bool {
+    *DEBUG_SEE.get_or_init(|| std::env::var_os("KESTREL_DEBUG_SEE").is_some())
+}
+
 fn eval_mode_material_only() -> bool {
     *EVAL_MODE_MATERIAL_ONLY.get_or_init(|| {
         std::env::var("KESTREL_EVAL_MODE").map(|v| v == "material").unwrap_or(false)
