@@ -73,12 +73,63 @@ epoch zero IS the current engine.
 That recovers 5 of the 9 positions the free fit lost, in the predicted
 direction, and still does not reach V3.
 
-**What has NOT been tried, and is the obvious next thing:** all of the above was
-fitted on `dataset_own.epd` -- 2.65M positions from our own games, labelled by
-the result of a game between two ~2200 players. That is the weakest label
-available. There are 10M and 5M position datasets sitting unused in the
-repository directory. Refit there before concluding anything about whether a fit
-can beat V3.
+## 0c. The suite cannot resolve differences this small -- and never could
+
+Before reading "144 versus 140" as the fit losing, count the positions where
+the two actually disagree. They differ in **50 of 214**, and of those V3 is
+right 26 times and the fit 24. That is **p = 0.89**. The suite does not
+distinguish them at all.
+
+The same count on the fit trained on strong games: they differ in **84**
+positions, 43 to 41, **p = 0.91**.
+
+What a margin has to be, on this suite, before it means anything:
+
+| positions where two builds disagree | margin needed for p < 0.05 |
+|---|---|
+| 50 | 14 |
+| 100 | 20 |
+| 200 | 28 |
+
+**Almost no verdict this project has recorded had that margin.** The V4 profile
+table in section 1b (78 / 73 / 71 / 75 / 60) and the queen sweep (69 / 67 / 78 /
+60) were read as results; several of those gaps are inside the noise, and they
+were measured on the OLD suite, which exaggerated differences on top of it. This
+does not make those conclusions wrong. It makes them undemonstrated, which is a
+different thing and has to be said plainly.
+
+**Use the disagreement count, not the totals.** Two builds sharing 164 identical
+answers tell you nothing about each other; only the positions where they differ
+carry information, and there are far fewer of those than the headline suggests.
+For anything under a 14-position margin, the arbiter is games.
+
+## 0d. Data quality was the whole difference (2026-07-29)
+
+Same fitter, same constraints, same starting point -- only the dataset changes:
+
+| fit | avoided | fixed |
+|---|---|---|
+| our own games, free from zeros | 135 | 104 |
+| our own games, material frozen | 140 | 106 |
+| **strong games, material frozen** | **143** | **110** |
+| V3, hand-calibrated over days | 144 | 110 |
+
+Monotone, and the last one is a dead heat -- the same 110 fixed, disagreeing in
+84 positions at 43-41.
+
+The reason shows up in the loss before the suite does. Starting from V3, the fit
+moves the held-out loss by **0.0187** on our own games and by only **0.0046** on
+strong games. V3's weights already explain strong play; what they fail to
+explain is our own games. Fitting there was teaching the engine to predict its
+own mistakes.
+
+Note the losses are NOT comparable across datasets -- the strong set is 55%
+draws and ours is 13% -- so only the movement from a common starting point, and
+the suite, mean anything.
+
+**A fit made entirely of data, with no value chosen by hand, now equals a
+hand-calibrated V3 on the suite.** Whether it is actually stronger is a question
+for games, which is running.
 
 ## 1. Per-phase weight buckets
 
