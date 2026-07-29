@@ -5,6 +5,8 @@ mod board;
 mod book;
 mod endgame;
 mod eval;
+#[cfg(feature = "fitted")]
+pub mod fitted;
 mod magic;
 mod movegen;
 mod moves;

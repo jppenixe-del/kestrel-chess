@@ -3,6 +3,14 @@ name = "kestrel"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# The fitted weight set, compiled in instead of the hand-calibrated one.
+#
+# A feature rather than a file so that comparing the two compares two binaries
+# and nothing else -- no environment variable, no parsing, no path that exists
+# on one side and not the other.
+fitted = []
+
 [dependencies]
 
 [profile.release]
