@@ -24,6 +24,10 @@ import json, sys, time, urllib.request, urllib.parse, urllib.error
 BASE = "https://lichess.org"
 TOKEN_PATH = "/root/kestrel_joao/secrets/lichess_token.txt"
 MAX_CONCURRENT = 1
+# Bots that have accepted our challenges before. Rebuilt from real game
+# history at startup, so it follows who actually plays us rather than a list
+# someone has to remember to edit.
+PROVEN = set()
 TIME_CONTROLS = [180, 60]  # try 3+0 blitz first (accepted), then 1+0 bullet
 POLL_SECONDS = 20
 
@@ -48,6 +52,12 @@ def api_get_stream(path):
             yield json.loads(line)
 
 def challenge(username, base, inc=0, rated=True):
+    # KESTREL_CASUAL=1 forces friendly games. Used when the engine is running
+    # in a mode that is not meant to be measured -- heatmap play, experiments --
+    # where a rated result would cost the account something the test does not
+    # pay back.
+    if os.environ.get("KESTREL_CASUAL") == "1":
+        rated = False
     body = urllib.parse.urlencode({
         "rated": "true" if rated else "false", "clock.limit": base, "clock.increment": inc,
         "color": "random", "variant": "standard",
@@ -96,9 +106,32 @@ def n_playing():
     except Exception:
         return 0
 
+def load_proven():
+    """Who has actually played us. A challenge to one of these has a real
+    chance of becoming a game; a challenge to a stranger usually does not."""
+    try:
+        req = urllib.request.Request(
+            f"{BASE}/api/games/user/kestrelstrike?max=100",
+            headers={**_headers(), "Accept": "application/x-ndjson"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            for line in resp.read().decode().splitlines():
+                if not line.strip():
+                    continue
+                g = json.loads(line)
+                for side in ("white", "black"):
+                    uid = g.get("players", {}).get(side, {}).get("user", {}).get("id")
+                    if uid and uid != "kestrelstrike":
+                        PROVEN.add(uid)
+    except Exception as e:
+        print(f"loop: nao consegui ler o historico ({e})", flush=True)
+
+
 def main():
     rl_backoff = 120
     me = api_get("/api/account")
+    load_proven()
+    print(f"loop: {len(PROVEN)} adversarios ja jogaram connosco: "
+          f"{', '.join(sorted(PROVEN))}", flush=True)
     my_id = me.get("id")
     my_r = me.get("perfs", {}).get("blitz", {}).get("rating", 1500)
     base_below = int(os.environ.get("KESTREL_ELO_BELOW", "300"))
@@ -116,7 +149,11 @@ def main():
         if n_playing() >= MAX_CONCURRENT:
             time.sleep(POLL_SECONDS); continue
         try:
-            bots = list(api_get_stream("/api/bot/online?nb=40"))
+            # Forty was a window, not a list: the bots that actually play us --
+            # halcyonbot, openingsbot -- sat past position forty and were never
+            # even considered, while the loop reported "nobody in the band"
+            # with them online the whole time.
+            bots = list(api_get_stream("/api/bot/online?nb=150"))
         except Exception as e:
             print(f"loop: erro a listar bots: {e}", flush=True)
             time.sleep(POLL_SECONDS); continue
@@ -168,7 +205,11 @@ def main():
                 and skip.get(b["id"], 0) < now
                 and not is_odds(b)
                 and -below <= (blitz(b) - my_r) <= above]
-        cand.sort(key=lambda b: abs(blitz(b) - my_r))
+        # Opponents who have played us before come first. Most bots decline
+        # bot challenges outright, so a proven acceptance is worth more than a
+        # closer rating: the nearest-rated stranger is usually a refusal, and
+        # a refusal teaches nothing at all.
+        cand.sort(key=lambda b: (b["id"] not in PROVEN, abs(blitz(b) - my_r)))
         if not cand:
             if widen < max_widen:
                 widen += 50
@@ -223,7 +264,16 @@ def main():
             time.sleep(rl_backoff)
             rl_backoff = min(rl_backoff * 2, 900)
         elif "played 100 games" in msg:
-            skip[uid] = now + 3600  # daily cap: skip 1h
+            # Lichess says exactly when the cap lifts. Guessing an hour meant
+            # re-challenging a bot seven times before it could possibly say
+            # yes, and each attempt costs a cycle someone else could have had.
+            wait = 3600
+            try:
+                wait = int(json.loads(msg).get("ratelimit", {}).get("seconds", 3600))
+            except Exception:
+                pass
+            skip[uid] = now + max(60, wait)
+            print(f"loop: {uid} no limite diario -- volta em {wait // 60}min", flush=True)
             time.sleep(3)
         else:
             skip[uid] = now + 600  # declined/other: skip 10 min
