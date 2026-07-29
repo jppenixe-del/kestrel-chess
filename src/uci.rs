@@ -1167,7 +1167,18 @@ impl Engine {
                     // as a remainder so the four numbers always add up to
                     // `positional`, however the blocks are computed.
                     let rest = pos - pieces - mobility - king;
-                    let _ = writeln!(out, "eval(white) total={}  material_pst={}  positional={}", mat + pos, mat, pos);
+                    // The number the SEARCH sees, not the one the parts add
+                    // up to. `evaluate` applies the endgame scale and the
+                    // material-bucket correction on top of these components,
+                    // and reporting the sum without them made this command
+                    // disagree with the engine it is supposed to explain --
+                    // a diagnostic that lies is worse than no diagnostic.
+                    let seen = {
+                        let v = crate::eval::evaluate(b);
+                        if b.side == crate::types::Color::White { v } else { -v }
+                    };
+                    let _ = writeln!(out, "eval(white) total={}  bruto={}  material_pst={}  positional={}",
+                                     seen, mat + pos, mat, pos);
                     let _ = writeln!(out, "  pieces={} mobility={} king={} threats+pawns={}", pieces, mobility, king, rest);
                     let _ = out.flush();
                 }
