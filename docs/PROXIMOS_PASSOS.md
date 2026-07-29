@@ -98,6 +98,67 @@ the part that made per-bucket tuning not worth starting.
   at [5, 9, 12] pawns -- which is exactly what `bucket_of` already uses, an
   independent confirmation -- and 8 buckets at [3, 6, 8, 9, 11, 12, 13].
 
+## 1b. What hand-tuned buckets taught us (2026-07-29)
+
+Eight buckets are in the engine, partitioned by pawn count, driven from a
+profile. The mechanism works. Every set of hand-chosen values for it lost.
+
+**Terminology first, because it misled the measurements for an afternoon.**
+There is no "no profile" baseline. The V3 profile is compiled into the
+defaults -- king scale 1100, threats 1150, psqt_scale.king 1350, and the
+piece-square tables themselves, verified value by value against
+perfil_v3_completo.txt. Running with no profile file IS running V3. A V4 entry
+setting a family to 1000 therefore does not leave it neutral: it UNDOES V3.
+The first V4 draft flattened `scale.king` from 1100 to 800-1280 and silently
+erased a tuned setting while appearing to only rescale.
+
+**Measured, blunder suite at a fixed 400k nodes, one thread:**
+
+| profile | suite |
+|---|---|
+| V3 (the defaults) | **78/214** |
+| V4, linear slope flattening | 73 |
+| V4, surgical (locked positions + queen) | 71 |
+| V4, locked positions only | 75 |
+| V4, queen only at 1250 | 60 |
+
+And the queen swept in both directions, which is the result that settles it:
+
+| queen scale, buckets 5-7 | 800 | 900 | 1000 | 1250 |
+|---|---|---|---|---|
+| suite | 69 | 67 | **78** | 60 |
+
+Symmetric. Both hypotheses -- "amplify to restrain the queen" and "reduce to
+flatten the incentive" -- predicted one side would help. Neither did.
+
+**Two things this proves, and one it does not.**
+
+Proven: 1000 is not a neutral origin for these tables, it is where V3 left
+them after its own calibration. Moving away from a calibrated point in either
+direction loses, whichever direction that is.
+
+Proven: nobody can predict the interaction between evaluation scale and search
+margins by hand. The margins (`rfp`, `nmp`, `razoring`, `futility`) are fixed
+centipawn quantities tuned against the scale the evaluation actually produces.
+Change that scale for a subset of features and the margins mean something
+different, in a way no amount of reasoning about chess anticipates.
+
+NOT proven: that the buckets are wrong. What is wrong is choosing their values
+by hand. A fit over 12.5M positions learns the interaction instead of guessing
+it, which is the whole argument for the tuner.
+
+**A measurement trap worth remembering.** One hypothesis along the way was
+that per-bucket PSQT creates a discontinuity -- trade a pawn, cross a boundary,
+the evaluation jumps. Tested directly on identical positions either side of a
+boundary: the jump is 115cp without any profile and 113cp with one. It is the
+pawn, not the bucket. A plausible mechanism, measured, and false.
+
+**And a real bug the exercise found**: `evaluate_fast` -- used by quiescence
+and the pruning margins -- read the incremental accumulator without the bucket
+correction, so the search saw the queen at one amplitude while the evaluation
+saw it at another. 13 suite positions, and it looked exactly like the profile
+being wrong.
+
 ## 2. A network, and where the GPU actually helps
 
 **Training on the GPU: yes.** That is what it is for.
