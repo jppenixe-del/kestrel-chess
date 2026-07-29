@@ -1903,6 +1903,80 @@ static BUCKET_WEIGHTS: OnceLock<Vec<Weights>> = OnceLock::new();
 static SCALED_BUCKETS: OnceLock<Vec<Weights>> = OnceLock::new();
 
 pub fn weights_for(board: &Board) -> &'static Weights {
+    // A fitted file wins outright, and is checked BEFORE the family factors.
+    //
+    // It used to be checked after, which made it dead code: the V3 profile is
+    // compiled into the defaults, so `family_scaling_active()` is true in
+    // every build that has ever run, and the function returned before it ever
+    // looked at the file. A tuning run could be measured only by a binary that
+    // ignored its output.
+    //
+    // Winning outright is also the right meaning, not just the convenient one.
+    // The file holds a complete set of weights, fitted against features that
+    // already contain whatever the factors were doing -- scaling them again
+    // would apply the same correction twice, exactly the trap `psqt_scale`
+    // sets for anyone who tunes the tables themselves.
+    let all = BUCKET_WEIGHTS.get_or_init(|| {
+        let base = default_weights().clone();
+        let dim = base.to_vec().len();
+        if let Ok(path) = std::env::var("KESTREL_BUCKET_WEIGHTS") {
+            match std::fs::read_to_string(&path) {
+                Ok(text) => {
+                    let v: Vec<i32> = text.trim().split(',').filter_map(|s| s.trim().parse().ok()).collect();
+                    // Two accepted widths, because the fitter emits more per
+                    // bucket than this can install.
+                    //
+                    // `gpuextract` lays each bucket out as dim positional
+                    // weights, then MAT_PST_DIM material and piece-square
+                    // values, then one bias. Only the positional block has a
+                    // from_vec to be loaded through: the piece-square tables
+                    // feed the incremental accumulator, which knows nothing
+                    // about how many pawns are on the board and cannot hold a
+                    // set per bucket.
+                    //
+                    // So a full-width file is read for its positional block
+                    // and the rest is dropped, out loud. Dropping it is not a
+                    // detail: the positional weights were fitted against the
+                    // material values in the same vector, and those come out
+                    // of the fit disagreeing sharply with the engine's --
+                    // Material and PSQT are collinear and the fit splits their
+                    // shared explanation wherever it likes. Adopting a fitted
+                    // material block whole has already failed twice, measured.
+                    let wide = dim + MAT_PST_DIM + 1;
+                    let stride = if v.len() == dim * NUM_BUCKETS {
+                        dim
+                    } else if v.len() == wide * NUM_BUCKETS {
+                        eprintln!(
+                            "KESTREL_BUCKET_WEIGHTS: full-width file -- using the {} positional \
+                             weights per bucket, IGNORING {} material/PST values and the bias",
+                            dim, MAT_PST_DIM + 1
+                        );
+                        wide
+                    } else {
+                        eprintln!(
+                            "KESTREL_BUCKET_WEIGHTS: expected {} or {} values ({} buckets x {} or x {}), \
+                             found {} -- ignoring",
+                            dim * NUM_BUCKETS, wide * NUM_BUCKETS, NUM_BUCKETS, dim, wide, v.len()
+                        );
+                        return Vec::new();
+                    };
+                    eprintln!(
+                        "KESTREL_BUCKET_WEIGHTS: {} buckets x {} weights from {} \
+                         (family scaling not applied on top)",
+                        NUM_BUCKETS, dim, path
+                    );
+                    return (0..NUM_BUCKETS)
+                        .map(|b| base.from_vec(&v[b * stride..b * stride + dim]))
+                        .collect();
+                }
+                Err(e) => eprintln!("KESTREL_BUCKET_WEIGHTS: cannot read {}: {} -- ignoring", path, e),
+            }
+        }
+        Vec::new()
+    });
+    if !all.is_empty() {
+        return &all[bucket_of(board)];
+    }
     if family_scaling_active() {
         // One set per bucket, each built with ITS OWN family factors. This
         // used to clone a single scaled set into every bucket, which made the
@@ -1912,27 +1986,8 @@ pub fn weights_for(board: &Board) -> &'static Weights {
             .get_or_init(|| (0..NUM_BUCKETS).map(scaled_weights_for).collect());
         return &scaled[bucket_of(board)];
     }
-    let all = BUCKET_WEIGHTS.get_or_init(|| {
-        let base = default_weights().clone();
-        let dim = base.to_vec().len();
-        if let Ok(path) = std::env::var("KESTREL_BUCKET_WEIGHTS") {
-            if let Ok(text) = std::fs::read_to_string(&path) {
-                let v: Vec<i32> = text.trim().split(',').filter_map(|s| s.trim().parse().ok()).collect();
-                if v.len() == dim * NUM_BUCKETS {
-                    eprintln!("KESTREL_BUCKET_WEIGHTS: {} buckets x {} weights from {}", NUM_BUCKETS, dim, path);
-                    return (0..NUM_BUCKETS)
-                        .map(|b| base.from_vec(&v[b * dim..(b + 1) * dim]))
-                        .collect();
-                }
-                eprintln!(
-                    "KESTREL_BUCKET_WEIGHTS: expected {} values ({} buckets x {}), found {} -- ignoring",
-                    dim * NUM_BUCKETS, NUM_BUCKETS, dim, v.len()
-                );
-            }
-        }
-        vec![base; NUM_BUCKETS]
-    });
-    &all[bucket_of(board)]
+    static PLAIN: OnceLock<Vec<Weights>> = OnceLock::new();
+    &PLAIN.get_or_init(|| vec![default_weights().clone(); NUM_BUCKETS])[bucket_of(board)]
 }
 
 /// The weights with per-family factors applied.
@@ -1944,6 +1999,21 @@ pub fn weights_for(board: &Board) -> &'static Weights {
 /// looks at. The same mistake in search.rs silently invalidated a whole
 /// parameter sweep.
 static SCALED_WEIGHTS: OnceLock<Weights> = OnceLock::new();
+
+/// The weights this bucket evaluates with right now, family factors included.
+///
+/// This is the starting point a fit has to be given, and it is not
+/// `default_weights()`: with a profile in force -- and V3 is compiled in, so
+/// one always is -- the engine evaluates with the scaled set. A fit started
+/// from the unscaled one begins by rediscovering the profile, and a fit
+/// started from zero begins by rediscovering chess.
+pub fn effective_weights_for_bucket(bucket: usize) -> Weights {
+    if family_scaling_active() {
+        scaled_weights_for(bucket)
+    } else {
+        default_weights().clone()
+    }
+}
 
 fn scaled_weights_for(bucket: usize) -> Weights {
     {

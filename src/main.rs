@@ -155,6 +155,36 @@ fn main() {
         println!("wrote {} values ({} buckets x {}) to {}", out.len(), eval::NUM_BUCKETS, base.len(), args[2]);
         return;
     }
+    if args.len() >= 3 && args[1] == "tunestart" {
+        // The engine's own weights, laid out exactly as `gpuextract` lays out
+        // its features: per bucket, the positional block, then material and
+        // piece-square, then the bias.
+        //
+        // A fit needs this as its starting point, and the first one did not
+        // have it: started from zeros, it produced a pawn worth 330 in the
+        // opening and 69 in the endgame -- chess upside down, and the known
+        // signature of Material and PSQT being collinear. On the blunder suite
+        // the result cost sixteen positions against the weights it replaced.
+        //
+        // Started from here instead, epoch zero IS the current engine, so a
+        // fit that finds nothing changes nothing, and every move away from it
+        // is a move the data paid for.
+        let dim = eval::default_weights().to_vec().len();
+        let mat = eval::material_pst_current_vec();
+        let mut out: Vec<i32> = Vec::with_capacity((dim + mat.len() + 1) * eval::NUM_BUCKETS);
+        for b in 0..eval::NUM_BUCKETS {
+            out.extend(eval::effective_weights_for_bucket(b).to_vec());
+            out.extend(mat.iter().copied());
+            out.push(1); // the bias feature is the term itself, at weight one
+        }
+        let text: Vec<String> = out.iter().map(|x| x.to_string()).collect();
+        std::fs::write(&args[2], text.join(",")).expect("nao consegui escrever");
+        println!(
+            "wrote {} values ({} buckets x {} = {} positional + {} material/PST + 1 bias) to {}",
+            out.len(), eval::NUM_BUCKETS, dim + mat.len() + 1, dim, mat.len(), args[2]
+        );
+        return;
+    }
     if args.len() >= 3 && args[1] == "evaltrace" {
         // Which evaluation terms fired in this position, and by how much.
         //
