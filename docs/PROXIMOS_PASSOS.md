@@ -204,6 +204,48 @@ loss on time (44s on one move with 44s on the clock -- not time management,
 missing CPU); and clock.initial is in seconds while wtime/btime are in
 milliseconds.
 
+## 1d. Playing with no search at all, and what it measured (2026-07-29)
+
+`HeatmapOnly` plays straight from the evaluation: every legal move played, the
+resulting position evaluated once, the best returned. `HeatmapPlies 2` counts
+his best reply too. It exists to see the evaluation with nothing in front of
+it -- a term with the wrong sign or an amplitude that swamps the rest shows up
+directly in the move.
+
+What it measured, blunder suite, 214 positions:
+
+| mode | suite |
+|---|---|
+| 1 ply, evaluation alone, zero nodes | 37 |
+| 2 plies, with his reply | **42** |
+| `go depth 1` (quiescence, ordering, TT) | 41 |
+| `go depth 2` | 48 |
+| full search, 400k nodes | 78 |
+
+**The evaluation alone finds 47% of what the full search finds.** Seeing the
+immediate reply is worth five positions; the rest of the gap is depth.
+
+**Two plies of static evaluation equals a real search at depth 1.** That is not
+a compliment to the evaluation, it is a question about the quiescence search:
+with ordering, a transposition table and quiescence, depth 1 should beat a
+static reading of the reply comfortably. It does not. Worth investigating on
+its own.
+
+**Threat detection by null move works, and buying depth with it does not.**
+Passing the turn and reading his heatmap names the threat exactly -- on a
+knight attacked twice it reports the capture. But spending an extra ply on the
+moves that answer the threat takes the suite from 42 to 23, and giving every
+move that third ply takes it to 5.
+
+The cause is parity, not the mixture of depths. An odd depth ends on OUR move,
+so the evaluation sees the piece we just took and never the recapture: the
+horizon effect, undiluted. At two plies he has the last word. **Without a
+quiescence search, only even depths mean anything** -- and that is precisely
+why the engine's own depth 1 holds up at 41, since it has one.
+
+The null move stays, reporting the threat as an `info string`. It must not buy
+depth.
+
 ## 2. A network, and where the GPU actually helps
 
 **Training on the GPU: yes.** That is what it is for.
