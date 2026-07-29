@@ -1977,6 +1977,31 @@ pub fn weights_for(board: &Board) -> &'static Weights {
     if !all.is_empty() {
         return &all[bucket_of(board)];
     }
+    // The fitted set, compiled in.
+    //
+    // Same precedence and same rule as a file: it is a complete set of
+    // weights, so the family factors are NOT applied on top -- they are
+    // already inside these numbers, having been in force when the features
+    // were extracted, and applying them again would apply them twice.
+    #[cfg(feature = "fitted")]
+    {
+        static FIT: OnceLock<Vec<Weights>> = OnceLock::new();
+        return &FIT.get_or_init(|| {
+            let base = default_weights().clone();
+            let dim = base.to_vec().len();
+            assert_eq!(
+                crate::fitted::FITTED.len(),
+                dim * NUM_BUCKETS,
+                "fitted table is {} values, evaluation wants {} ({} buckets x {})",
+                crate::fitted::FITTED.len(), dim * NUM_BUCKETS, NUM_BUCKETS, dim
+            );
+            (0..NUM_BUCKETS)
+                .map(|b| base.from_vec(&crate::fitted::FITTED[b * dim..(b + 1) * dim]))
+                .collect()
+        })[bucket_of(board)];
+    }
+    #[cfg(not(feature = "fitted"))]
+    {
     if family_scaling_active() {
         // One set per bucket, each built with ITS OWN family factors. This
         // used to clone a single scaled set into every bucket, which made the
@@ -1988,6 +2013,7 @@ pub fn weights_for(board: &Board) -> &'static Weights {
     }
     static PLAIN: OnceLock<Vec<Weights>> = OnceLock::new();
     &PLAIN.get_or_init(|| vec![default_weights().clone(); NUM_BUCKETS])[bucket_of(board)]
+    }
 }
 
 /// The weights with per-family factors applied.
