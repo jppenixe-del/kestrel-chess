@@ -770,7 +770,50 @@ pub fn material_pst_features(board: &Board, feats: &mut [f32]) {
 
 /// Zona do rei: a propria casa + as 8 vizinhas (igual ao king_attacks).
 fn king_zone(king_sq: Square) -> Bitboard {
-    atk().king[king_sq as usize] | bb(king_sq)
+    let near = atk().king[king_sq as usize] | bb(king_sq);
+    #[cfg(not(feature = "widekingzone"))]
+    {
+        near
+    }
+    // The eight neighbours plus the rank in front of them, and a file wider
+    // when the king sits on a rook file.
+    //
+    // The narrow zone was measured blind, not merely miscalibrated. After
+    // 18.g3 f4 in a real loss, with a knight on h5, a knight on g6, a bishop
+    // on d6 and the queen on e7 all pointed at our king, our king-safety term
+    // read ZERO where a strong reference read -65. Removing each attacker in
+    // turn and re-reading the term: no knight, 0; no other knight, 1; no
+    // BISHOP, 0; no QUEEN, 9. Taking the queen out of a mating attack moved
+    // king safety by nine centipawns. That is not a weight that needs
+    // adjusting, it is a term that cannot see.
+    //
+    // The cause: with the king on g1 the zone was f1,g1,h1,f2,g2,h2. An attack
+    // on a castled king is built on the third rank -- f3, g3, h3 -- and none of
+    // them were in it. A knight landing on g3 and a pawn arriving on f4 were
+    // invisible.
+    //
+    // Widening was tried on 27/07 and scored 35 of 59 against 37, so it was
+    // shelved. That margin is two positions, and this project has since
+    // measured what two positions are worth: a four-position gap came out of
+    // fifty disagreements at 26-24, p = 0.89. Two is noise, and a mechanism
+    // this clearly demonstrated should not have been dismissed by it.
+    //
+    // Behind a feature because it changes what the extractor sees, so the
+    // king-safety weights have to be refitted with it before it means
+    // anything -- which is exactly what the 27/07 note said to do and what
+    // there was no working tuner to do with.
+    #[cfg(feature = "widekingzone")]
+    {
+        let forward = if rank_of(king_sq) < 4 { north(near) } else { south(near) };
+        let sideways = if (bb(king_sq) & FILE_A) != 0 {
+            east(near)
+        } else if (bb(king_sq) & FILE_H) != 0 {
+            west(near)
+        } else {
+            0
+        };
+        near | forward | sideways
+    }
 }
 
 // Pesos de eval -- valores proprios sensatos como ponto de partida,
