@@ -260,8 +260,17 @@ pub fn conversion_drive(board: &Board, eg_material_white: i32) -> i32 {
     if n(board, weak, PieceType::Queen) > 0 {
         return 0;
     }
-    let v = 6 * push_close(board.king_sq(strong), board.king_sq(weak))
-        + 4 * push_to_edge(board.king_sq(weak));
+    // 2026-07-30: was 6 and 4, which spans about a fifth of a pawn across the
+    // whole term. Measured over 1281 games played to the finish: median moves
+    // to win 79 against the champion's 78, and 598 wins against 603. It did
+    // nothing at all -- in a position won by eight pawns the candidate moves
+    // differ by more than the tie-break was worth, so it was swallowed before
+    // it could break anything.
+    //
+    // Four times bigger, still under a pawn across the term, which is what a
+    // tie-break can be in a position nobody is going to lose.
+    let v = 24 * push_close(board.king_sq(strong), board.king_sq(weak))
+        + 16 * push_to_edge(board.king_sq(weak));
     if strong == Color::White { v } else { -v }
 }
 
