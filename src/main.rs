@@ -5,7 +5,10 @@ mod board;
 mod book;
 mod endgame;
 mod eval;
-#[cfg(feature = "fitted")]
+#[cfg(all(feature = "fitted", not(feature = "widekingzone")))]
+pub mod fitted;
+#[cfg(all(feature = "fitted", feature = "widekingzone"))]
+#[path = "fitted_wkz.rs"]
 pub mod fitted;
 mod magic;
 mod movegen;
