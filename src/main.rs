@@ -157,6 +157,38 @@ fn main() {
         println!("wrote {} values ({} buckets x {}) to {}", out.len(), eval::NUM_BUCKETS, base.len(), args[2]);
         return;
     }
+    if args.len() >= 2 && args[1] == "searchparams" {
+        // Name and value of every search parameter, in the order to_vec writes
+        // them. Without this a sweep has to count offsets by hand against the
+        // Default impl, which is how a whole afternoon of parameter work was
+        // silently applied to the wrong fields once already.
+        //
+        // With an argument, multiplies the parameters carried in EVALUATION
+        // units by that factor, in per mille, and prints the vector ready for
+        // KESTREL_SEARCH_PARAMS. Those margins are compared against scores, so
+        // when the evaluation's scale changes they stop meaning what they were
+        // calibrated to mean -- and the fitted weight set evaluates 1.45x
+        // louder than the set it replaced.
+        let v = search::SearchParams::default().to_vec();
+        let scale: i32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1000);
+        if scale == 1000 {
+            for (n, x) in search::PARAM_NAMES.iter().zip(v.iter()) {
+                let unit = if search::param_in_eval_units(n) { "  [eval units]" } else { "" };
+                println!("{:34} {}{}", n, x, unit);
+            }
+            return;
+        }
+        let out: Vec<String> = search::PARAM_NAMES
+            .iter()
+            .zip(v.iter())
+            .map(|(n, x)| {
+                if search::param_in_eval_units(n) { (*x as i64 * scale as i64 / 1000).to_string() }
+                else { x.to_string() }
+            })
+            .collect();
+        println!("{}", out.join(","));
+        return;
+    }
     if args.len() >= 3 && args[1] == "tunestart" {
         // The engine's own weights, laid out exactly as `gpuextract` lays out
         // its features: per bucket, the positional block, then material and
