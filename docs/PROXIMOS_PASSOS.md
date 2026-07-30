@@ -131,6 +131,47 @@ the suite, mean anything.
 hand-calibrated V3 on the suite.** Whether it is actually stronger is a question
 for games, which is running.
 
+## 0e. The margins did NOT need rescaling with the evaluation (2026-07-30)
+
+The fitted weight set evaluates 1.45x louder than the one it replaced, and every
+pruning margin is a fixed quantity in centipawns compared against a score. The
+obvious conclusion is that they all became 0.69x as aggressive as they were
+calibrated to be and want scaling back. Nine candidates, 1000 games each,
+against the champion:
+
+| candidate | Elo | LOS |
+|---|---|---|
+| rfp only | +12.2 +/- 20.8 | 87.4% |
+| aspiration window only | +5.9 | 71.1% |
+| delta/probcut/TT/hist-beta | +5.6 | 69.9% |
+| futility only | +2.4 | 59.1% |
+| razoring only | -0.7 | 47.4% |
+| everything x1.25 | -1.0 | 46.1% |
+| doDeeper family only | -2.8 | 39.7% |
+| null-move only | -4.9 | 32.3% |
+| **everything x1.45** | **-19.1** | 3.7% |
+
+The global correction, which was the whole hypothesis, is the WORST of the nine.
+Nothing reaches significance. This confirms the note already in search.rs -- that
+a blanket rescale of all eval-unit margins scored worse than leaving them alone,
+and that calibration is per-parameter -- against a change in the evaluation's
+scale large enough that it should have broken it if anything would.
+
+Worth understanding rather than just recording: it means the fitted set's extra
+loudness is not a uniform multiplier. It grew where something is happening and
+not in the quiet positions where pruning margins do their work. A single ratio
+measured over 105 mixed positions described the evaluation's output and not the
+quantity the margins actually see.
+
+**How big a match has to be, which this campaign got wrong.** After 1000 games
+the best candidate's LLR was 0.429 against a 2.94 bound -- 15% of a decision.
+The 500-round cap could never have produced a formal verdict on an effect this
+size. Separating 12 Elo from zero at 95% needs ~2,800 games; 5 Elo needs
+~16,400. What the campaign does give is a bound: all nine are within +/-21 Elo,
+and the only one approaching an effect is negative.
+
+The rfp candidate is the one worth resolving and is running at 4000 games.
+
 ## 1. Per-phase weight buckets
 
 Everything is built except one piece.
