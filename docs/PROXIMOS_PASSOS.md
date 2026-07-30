@@ -194,6 +194,37 @@ Kept behind the `widekingzone` feature with its own fitted table, off, because
 the measurement is worth more than the code: anyone who has this idea again can
 read the number instead of spending a day on it.
 
+## 0g. Adjudication was selecting for the wrong half of the game (2026-07-30)
+
+Every match this project has run used `-resign movecount=3 score=400`. Measured
+over 1383 games: 97% ended by adjudication, at a median of 592cp, after a median
+of 38 moves.
+
+So the criterion rewarded reaching an advantage and never once asked whether the
+engine could finish. An engine that wins material quickly and then shuffles
+scores exactly the same as one that mates in ten. Over many decisions that is a
+direction, not a detail: it selects for grabbing and never for closing.
+
+It also made the GoldenEye test meaningless as designed. That term wakes at 800cp
+of material and only 30.7% of games ever reached it -- and reached it on the move
+they were cut short. The test was measuring a conversion feature in a harness
+that removes conversion.
+
+**New default: no resign, no draw adjudication.** Games run to mate, threefold
+or the fifty-move rule. On the rerun, 223 of the first 236 games ended in mate
+against 97% adjudicated before. It is slower, and it is the only way to measure
+the second half of a game.
+
+**What this does NOT overturn.** The +152.7 Elo fit and the frfp margins were
+won under the old protocol, and what was won was won -- a gain measured on the
+first half of the game is still a gain. What is missing is any measurement at
+all of the second half, for any change ever adopted here.
+
+**What it does put back in question:** every candidate REJECTED on a margin
+smaller than its plausible endgame effect. The wider king zone lost 10.3 Elo
+under adjudication; nothing in that test could have credited it for anything
+after move 38.
+
 ## 1. Per-phase weight buckets
 
 Everything is built except one piece.
