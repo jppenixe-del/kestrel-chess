@@ -19,6 +19,11 @@ fitted = []
 # feature extractor sees. See the note at king_zone in eval.rs.
 widekingzone = []
 
+# GoldenEye: when the game is already won, see the way to finish it -- a
+# tie-break among moves that all win, preferring the one that ends it soonest.
+# See conversion_drive in endgame.rs.
+goldeneye = []
+
 [dependencies]
 
 [profile.release]

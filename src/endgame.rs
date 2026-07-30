@@ -225,6 +225,46 @@ fn file_bb(f: u8) -> Bitboard {
     crate::bitboard::FILE_A << f
 }
 
+/// Push the losing king to the edge and bring ours up, whenever the material
+/// is decisive -- not only when the loser is stripped bare.
+///
+/// The knowledge below only fires when the weak side has NOTHING: no pawn, no
+/// piece. Leave it a bishop and two pawns and the engine plays a won endgame
+/// with no idea that the point is to trap the king. Measured over four real
+/// bullet wins: in balanced positions it did not drop 150cp once in 101 moves,
+/// and in positions already won by more than fifteen pawns it dropped 150cp in
+/// FOUR MOVES OUT OF FIVE, average 259. It converts, but it strolls -- and
+/// those games ran to 227, 185 and 147 moves on a sixty-second clock, which is
+/// how a won game becomes a race.
+///
+/// Deliberately small. This is a tie-break among moves that are all winning,
+/// not a claim about who stands better: at 6 and 4 per unit of distance the
+/// whole term spans about a fifth of a pawn, so it can reorder equal moves and
+/// cannot outvote a real one. Returns zero unless the advantage is past a
+/// rook and a minor, where "which move wins" has stopped being the question
+/// and "which move wins soonest" has started.
+pub fn conversion_drive(board: &Board, eg_material_white: i32) -> i32 {
+    const DECISIVE: i32 = 800;
+    let (strong, adv) = if eg_material_white >= 0 {
+        (Color::White, eg_material_white)
+    } else {
+        (Color::Black, -eg_material_white)
+    };
+    if adv < DECISIVE {
+        return 0;
+    }
+    // A king with a queen still on the board is not being mated in a corner;
+    // it is being checkmated wherever it stands. The drive is for the endings
+    // where the loser runs.
+    let weak = strong.opp();
+    if n(board, weak, PieceType::Queen) > 0 {
+        return 0;
+    }
+    let v = 6 * push_close(board.king_sq(strong), board.king_sq(weak))
+        + 4 * push_to_edge(board.king_sq(weak));
+    if strong == Color::White { v } else { -v }
+}
+
 /// Which side, if either, is the one with the material -- and what is known
 /// about the resulting endgame.
 ///
