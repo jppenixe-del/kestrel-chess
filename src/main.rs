@@ -5,7 +5,10 @@ mod board;
 mod book;
 mod endgame;
 mod eval;
-#[cfg(all(feature = "fitted", not(feature = "widekingzone")))]
+#[cfg(all(feature = "fitted", not(feature = "widekingzone"), not(feature = "fittedquiet")))]
+pub mod fitted;
+#[cfg(all(feature = "fitted", feature = "fittedquiet"))]
+#[path = "fitted_quiet.rs"]
 pub mod fitted;
 #[cfg(all(feature = "fitted", feature = "widekingzone"))]
 #[path = "fitted_wkz.rs"]
@@ -611,6 +614,7 @@ fn play_one_selfplay_game(
         }
 
         let mut searcher = Searcher {
+            root_side: board.side,
             stop_flag: &crate::search::NO_STOP,
             cut_nodes: 0,
             cut_first: 0,
@@ -871,6 +875,7 @@ fn play_one_selfplay_game_tc(
         let move_t0 = Instant::now();
 
         let mut searcher = Searcher {
+            root_side: board.side,
             stop_flag: &crate::search::NO_STOP,
             cut_nodes: 0,
             cut_first: 0,
@@ -2568,6 +2573,7 @@ fn resolve_quiet_dataset(in_path: &str, out_path: &str) {
         let mut board = Board::from_fen(fen);
 
         let mut searcher = Searcher {
+            root_side: board.side,
             stop_flag: &crate::search::NO_STOP,
             cut_nodes: 0,
             cut_first: 0,
@@ -2976,6 +2982,7 @@ fn bench(depth: i32) {
         tt.clear();
         let stop = std::sync::atomic::AtomicBool::new(false);
         let mut searcher = search::Searcher {
+            root_side: board.side,
             stop_flag: &stop,
             cut_nodes: 0,
             cut_first: 0,
