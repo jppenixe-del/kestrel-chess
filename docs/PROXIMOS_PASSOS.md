@@ -172,6 +172,28 @@ and the only one approaching an effect is negative.
 
 The rfp candidate is the one worth resolving and is running at 4000 games.
 
+## 0f. The wider king zone loses, and the term really was blind (2026-07-30)
+
+Rejected formally: SPRT H0 accepted over 3928 games, **-10.3 Elo +/- 10.5**,
+LOS 2.8%. It does not merely fail to gain; it fails the non-regression bar too.
+
+The conclusion has to be stated precisely, because the obvious short version is
+wrong. The term WAS blind -- measured in July, with a queen, two knights and a
+bishop aimed at our king and king safety reading zero, and removing the queen
+moving it by nine centipawns. Refitting its weights with the wider zone, which
+was the step the July note said was missing and which there was no working
+tuner for, does not rescue it either: the fit moved the held-out loss by
+0.000022 over eight thousand epochs.
+
+What the games say is that seeing it costs more than it pays. A wider zone is
+more squares walked in EVERY evaluation, and that is paid in nodes in every
+position, to be repaid only in the few where an attack is actually being built.
+A correct feature that does not earn its keep.
+
+Kept behind the `widekingzone` feature with its own fitted table, off, because
+the measurement is worth more than the code: anyone who has this idea again can
+read the number instead of spending a day on it.
+
 ## 1. Per-phase weight buckets
 
 Everything is built except one piece.
