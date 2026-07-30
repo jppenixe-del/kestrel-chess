@@ -5,7 +5,10 @@ mod board;
 mod book;
 mod endgame;
 mod eval;
-#[cfg(all(feature = "fitted", not(feature = "widekingzone"), not(feature = "fittedquiet"), not(feature = "fittedsf80")))]
+#[cfg(all(feature = "fitted", not(feature = "widekingzone"), not(feature = "fittedquiet"), not(feature = "fittedsf80"), not(feature = "fittedciclo")))]
+pub mod fitted;
+#[cfg(all(feature = "fitted", feature = "fittedciclo"))]
+#[path = "fitted_ciclo.rs"]
 pub mod fitted;
 #[cfg(all(feature = "fitted", feature = "fittedsf80"))]
 #[path = "fitted_sf80.rs"]

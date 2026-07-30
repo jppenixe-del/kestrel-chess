@@ -30,6 +30,9 @@ fittedquiet = []
 # O mesmo ajuste sobre o binpack publico (test80-2024-06). Ver fitted_sf80.rs.
 fittedsf80 = []
 
+# Ajustado nas posicoes dos nossos proprios jogos. Ver fitted_ciclo.rs.
+fittedciclo = []
+
 [dependencies]
 
 [profile.release]

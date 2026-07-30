@@ -374,6 +374,13 @@ fn compute_time_budget(
 /// Caminho do livro relativo ao proprio executavel (nao fixo a esta
 /// maquina) -- pedido depois de mover o motor para o servidor remoto:
 /// "/mnt/d/..." nao existe la'. Espera polgar_book.bin ao lado do binario.
+/// Quantas vezes um lance tem de aparecer no livro para ser jogado sem busca.
+/// Medido neste livro: 23% das posicoes tem o seu melhor lance com contagem 1
+/// e 43% com 2 ou menos. Abaixo deste numero o livro cala-se e a posicao vai a
+/// busca. Valor a medir em A/B -- por isso e' uma constante e nao um palpite
+/// espalhado pelo codigo.
+const BOOK_MIN_COUNT: u32 = 1;   // inerte por agora: uma medicao de cada vez. Subir para 3 quando for a vez dele.
+
 fn default_style_book_path() -> String {
     // 2026-07-22: the Judit Polgar signature book was the user's
     // original IDEA for the project's personality, not a fixed
@@ -565,6 +572,17 @@ impl Engine {
                 !self.history.contains(&self.zob.hash(&ap))
             })
             .max_by_key(|(count, _)| *count)
+            // Um lance visto num unico jogo nao e' teoria, e' a escolha de
+            // alguem naquele dia. Contado no proprio livro: em 23% das
+            // posicoes o lance MAIS jogado aparece uma unica vez, e em 43%
+            // duas ou menos. Nessas, jogar de livro e' jogar as cegas com
+            // zero nos de busca -- e a busca, com dois segundos, quase de
+            // certeza sabe mais do que uma amostra de um.
+            //
+            // As linhas principais nao sao afectadas: a contagem maxima do
+            // livro e' 17445, e sao essas as posicoes que aparecem quase
+            // sempre. O que se recusa e' a cauda rara e profunda.
+            .filter(|(count, _)| *count >= BOOK_MIN_COUNT)
             .map(|(_, mv)| mv)
     }
 

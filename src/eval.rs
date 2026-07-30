@@ -4091,7 +4091,24 @@ fn endgame_scale_factor(board: &Board, raw: i32, weights: &Weights) -> i32 {
     // about convertibility. No queens is a cheap, real proxy for "this
     // is actually an endgame" that keeps the approximation safe.
     if n_wq == 0 && n_bq == 0 {
-        let strong_pawns = if raw > 0 { n_wp } else { n_bp };
+        // `raw` vem na perspectiva de QUEM JOGA, nao das brancas -- e' o que
+        // diz o comentario de scale_endgame logo acima, e e' o que
+        // material_pst/positional_terms_signed fazem. Portanto "raw > 0" quer
+        // dizer "quem joga esta melhor", NAO "as brancas estao melhor".
+        //
+        // Com as pretas a jogar e melhores, a versao anterior contava os peoes
+        // das BRANCAS como sendo do lado forte, e a escala saia diferente da
+        // mesma posicao vista do outro lado.
+        //
+        // Medido, espelhando 900 posicoes (trocar as cores e virar o tabuleiro
+        // tem de dar exactamente a mesma avaliacao): 30% assimetricas com 3-6
+        // pecas, 33% com 7-10, 0% com o tabuleiro cheio -- ate 324cp de
+        // diferenca. Um peao a mais bastava; um cavalo, bispo ou torre a mais
+        // nao, porque so' os peoes entram nesta conta. Com material simetrico
+        // dava zero, que e' o disfarce: escolher o lado errado nao custa nada
+        // quando os dois lados tem os mesmos peoes.
+        let brancas_fortes = if board.side == Color::White { raw > 0 } else { raw < 0 };
+        let strong_pawns = if brancas_fortes { n_wp } else { n_bp };
         return (weights.scale_fallback_base + weights.scale_fallback_per_pawn * strong_pawns).min(SCALE_NORMAL);
     }
     SCALE_NORMAL
