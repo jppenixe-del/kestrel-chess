@@ -29,7 +29,7 @@ MAX_CONCURRENT = 1
 # someone has to remember to edit.
 PROVEN = set()
 TIME_CONTROLS = [180, 60]  # try 3+0 blitz first (accepted), then 1+0 bullet
-POLL_SECONDS = 20
+POLL_SECONDS = 30  # menos ciclos, menos pedidos: ver challenge_outcome
 
 def token():
     with open(TOKEN_PATH) as f:
@@ -38,14 +38,45 @@ def token():
 def _headers():
     return {"Authorization": f"Bearer {token()}"}
 
+# Um 429 e' para esperar, nao para morrer.
+#
+# O gerador rebentava com HTTPError e o processo acabava -- o bot ficava sem
+# procurar adversarios ate' alguem reparar, e "alguem reparar" pode ser horas.
+# Um limite de pedidos e' temporario por definicao; a resposta certa e' parar
+# de pedir durante uns minutos, nao desistir.
+_travao = [0.0]
+
+
+def _espera_travao():
+    while time.time() < _travao[0]:
+        time.sleep(5)
+
+
+def _429(segundos=180):
+    _travao[0] = max(_travao[0], time.time() + segundos)
+    print(f"loop: 429 -- a conta esta no limite, calado {segundos}s", flush=True)
+
+
 def api_get(path):
+    _espera_travao()
     req = urllib.request.Request(BASE + path, headers=_headers())
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        return json.loads(resp.read())
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            _429()
+        raise
 
 def api_get_stream(path):
+    _espera_travao()
     req = urllib.request.Request(BASE + path, headers=_headers())
-    resp = urllib.request.urlopen(req, timeout=30)
+    try:
+        resp = urllib.request.urlopen(req, timeout=30)
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            _429()
+        raise
     for line in resp:
         line = line.strip()
         if line:
@@ -84,10 +115,19 @@ def challenge_outcome(cid, seconds=25):
 
     Returns (state, reason): "accepted", "declined", or "pending".
     """
-    for _ in range(max(1, seconds // 5)):
-        time.sleep(5)
-        if n_playing() >= MAX_CONCURRENT:
-            return "accepted", ""
+    # De 9 em 9 segundos, e um pedido de cada vez.
+    #
+    # Eram dois de 5 em 5 -- dez pedidos por desafio enviado -- e um deles era
+    # redundante: o proprio desafio ja diz se foi aceite, nao e' preciso
+    # perguntar tambem a conta se esta a jogar. Somado ao resto, a conta
+    # ultrapassava o limite da Lichess, e quando isso acontece os streams caem:
+    # o POST de um lance esgota o tempo limite e a ligacao do jogo morre ao
+    # mesmo tempo. Cinco vezes num dia, duas delas a custar o jogo por bandeira.
+    #
+    # Medido: a latencia esta perfeita, mediana 49ms em 90 pedidos. Nao era a
+    # rede. Eram pedidos a mais.
+    for _ in range(max(1, seconds // 9)):
+        time.sleep(9)
         try:
             d = api_get(f"/api/challenge/{cid}/show")
         except Exception:
@@ -185,7 +225,19 @@ class Skips:
 
 def main():
     rl_backoff = 120
-    me = api_get("/api/account")
+    # O arranque tambem tem de sobreviver a um 429.
+    #
+    # Se a conta esta no limite quando este processo comeca, ele rebentava aqui
+    # e ficava morto -- e a maneira mais provavel de a conta estar no limite e'
+    # ter acabado de o atingir, ou seja precisamente o momento em que isto e'
+    # relancado.
+    me = None
+    while me is None:
+        try:
+            me = api_get("/api/account")
+        except Exception as e:
+            print(f"loop: nao consegui arrancar ({e}), tento daqui a 60s", flush=True)
+            time.sleep(60)
     load_proven()
     print(f"loop: {len(PROVEN)} adversarios ja jogaram connosco: "
           f"{', '.join(sorted(PROVEN))}", flush=True)

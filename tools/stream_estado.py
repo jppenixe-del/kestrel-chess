@@ -21,7 +21,20 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 TOKEN = open(os.path.join(BASE, "secrets", "lichess_token.txt")).read().strip()
 SAIDA = os.path.join(BASE, "weblog", "bot.json")
 HIST = os.path.join(BASE, "weblog", "rating_hist.json")
-INTERVALO = 30
+# Trinta segundos era demais, e nao por elegancia.
+#
+# Este processo faz DOIS pedidos por ciclo, em cima do que a ponte e o gerador
+# de desafios ja fazem, e a conta anda perto do limite da Lichess. Quando o
+# limite e' atingido os streams caem: o POST de um lance esgota os 3 segundos e
+# a ligacao do jogo morre ao mesmo tempo -- cinco vezes num dia, duas delas a
+# custar o jogo por bandeira.
+#
+# Confirmado ao medir: a latencia esta perfeita, mediana 49ms e maximo 290ms em
+# 90 pedidos. Nao ha problema de rede. Ha pedidos a mais, e uma parte deles era
+# minha.
+#
+# O rating muda de jogo em jogo, nao de meio em meio minuto.
+INTERVALO = 180
 
 
 def api(path):
@@ -48,10 +61,20 @@ def grava(caminho, d):
 
 def main():
     hist = carrega_hist()
+    cache_me = [None]
+    ultimo_me = [0.0]
+    ultimo_n = [-1]
     while True:
         try:
-            me = api("/api/account")
+            # Um pedido, nao dois: /api/account/playing ja diz se ha jogo, e
+            # o rating so' e' preciso quando um jogo acaba.
             jogando = api("/api/account/playing").get("nowPlaying", [])
+            if len(jogando) != ultimo_n[0] or time.time() - ultimo_me[0] > 900:
+                me = api("/api/account")
+                cache_me[0] = me
+                ultimo_me[0] = time.time()
+            ultimo_n[0] = len(jogando)
+            me = cache_me[0] or {}
             agora = time.time()
             ratings = {}
             for k in ("bullet", "blitz"):
