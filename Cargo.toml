@@ -14,6 +14,11 @@ edition = "2021"
 default = ["fitted"]
 fitted = []
 
+# The king-safety zone widened to the rank in front of the king's neighbours.
+# Needs its weights refitted with it to mean anything -- it changes what the
+# feature extractor sees. See the note at king_zone in eval.rs.
+widekingzone = []
+
 [dependencies]
 
 [profile.release]
