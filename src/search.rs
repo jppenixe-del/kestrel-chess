@@ -576,6 +576,56 @@ pub static PARAM_OVERRIDES: std::sync::Mutex<Vec<(usize, i32)>> = std::sync::Mut
 /// Set one parameter by name. Returns false for an unknown name so the caller
 /// can say so out loud -- an ignored typo is indistinguishable from "this
 /// parameter has no effect", and that mistake costs a whole experiment.
+/// Whether a parameter is a quantity in EVALUATION units, i.e. compared
+/// against a score rather than counting plies, moves or history points.
+///
+/// It matters because those are the only ones that stop meaning what they were
+/// calibrated to mean when the evaluation's scale changes -- and it changed by
+/// 1.45x when the fitted weight set arrived. A margin of 629 against an
+/// evaluation that got half again as loud is a margin of 434 in the old money.
+///
+/// Classified by reading each use, not by the name: `nmp_eval_reduction_scale`
+/// divides `static_eval - beta`, so it is an eval quantity even though it
+/// yields plies; `qs_hist_prune_margin`, `rfp_hist_divisor` and the whole
+/// `hist_*` family are history points and are NOT, however much the word
+/// "margin" suggests otherwise. Guessing this from the names is exactly the
+/// mistake that once applied an afternoon of parameter work to the wrong
+/// fields.
+pub fn param_in_eval_units(name: &str) -> bool {
+    matches!(
+        name,
+        "rfp_improving_base"
+            | "rfp_improving_slope"
+            | "rfp_not_improving_base"
+            | "rfp_not_improving_slope"
+            | "razor_base"
+            | "razor_per_depth"
+            | "futility_improving_base"
+            | "futility_improving_slope"
+            | "futility_not_improving_base"
+            | "futility_not_improving_slope"
+            | "cap_futility_improving_base"
+            | "cap_futility_improving_slope"
+            | "cap_futility_not_improving_base"
+            | "cap_futility_not_improving_slope"
+            | "delta_margin"
+            | "tt_extended_cutoff_margin"
+            | "nmp_eval_margin"
+            | "nmp_static_eval_base_margin"
+            | "nmp_static_eval_depth_margin"
+            | "nmp_eval_reduction_scale"
+            | "probcut_beta_margin"
+            | "asp_init_delta"
+            | "do_deeper_margin_base"
+            | "do_deeper_margin_depth"
+            | "do_shallower_margin"
+            | "rfp_opp_easy_capture"
+            | "rfp_opp_worsening"
+            | "hist_beta_margin"
+            | "triple_ext_margin"
+    )
+}
+
 pub fn set_param(name: &str, value: i32) -> bool {
     match PARAM_NAMES.iter().position(|&n| n == name) {
         Some(i) => {

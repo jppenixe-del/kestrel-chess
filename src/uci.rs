@@ -23,7 +23,33 @@ use std::time::{Duration, Instant};
 // 150 covers that ~3x over the median with margin for jitter, without the
 // strength cost of an over-large reserve (250 measurably lost pure,
 // non-flag games in self-play by thinking too little per move).
-const MOVE_OVERHEAD_MS: i64 = 150;
+const MOVE_OVERHEAD_DEFAULT_MS: i64 = 150;
+
+/// What to hold back for everything that is not thinking, in milliseconds.
+///
+/// Settable, because 150 is right for one opponent and wrong for another and
+/// there is no single value that is right for both. Against people and bots the
+/// move POST costs ~50ms here and 150 covers it three times over. Against the
+/// server's own engine the same POST is measured at **560ms** -- not our
+/// network, which does a full TLS handshake and GET to the site in 46ms, but
+/// the path on the far side. At 150 the engine believes it has half a second
+/// per move that it does not have, and a bullet game is thirty of those: it
+/// flags with the clock reading positive and the search never at fault.
+///
+/// The note this replaces recorded that a move-overhead change had been tried
+/// and had not fixed the flags, "validated against an unrealistic 300ms
+/// latency". The latency is 560ms. The premise was wrong, not the idea.
+///
+/// A larger reserve is not free -- 250 measurably lost non-flag games in
+/// self-play by thinking too little -- so the client measures its own POSTs and
+/// sets this, rather than anyone picking a number that covers the worst case
+/// for every opponent.
+static MOVE_OVERHEAD: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(MOVE_OVERHEAD_DEFAULT_MS);
+
+fn move_overhead_ms() -> i64 {
+    MOVE_OVERHEAD.load(std::sync::atomic::Ordering::Relaxed)
+}
 /// Sudden-death base slice: this many moves' worth of the remaining clock.
 /// The search scales that allowance by how hard the position is turning out
 /// to be (see `time_scale` in search.rs), so this is a pivot, not the amount
@@ -131,7 +157,7 @@ fn compute_time_budget(
     pieces_left: i64,
     game_ply: i64,
 ) -> (i64, i64) {
-    let safe_time = (my_time - MOVE_OVERHEAD_MS).max(1);
+    let safe_time = (my_time - move_overhead_ms()).max(1);
 
     // Nivel 1: a base allowance. The increment still counts as income spread
     // over the moves ahead rather than raw clock, which is why it is added
@@ -822,11 +848,11 @@ impl Engine {
             // formula is self-correcting, so this rare case doesn't compound.
             let think_floor = soft.min(80);
             let search_ms = if advisor_enabled {
-                (soft - ADVISOR_RESERVE_MS - MOVE_OVERHEAD_MS).max(think_floor)
+                (soft - ADVISOR_RESERVE_MS - move_overhead_ms()).max(think_floor)
             } else {
-                (soft - MOVE_OVERHEAD_MS).max(think_floor)
+                (soft - move_overhead_ms()).max(think_floor)
             };
-            let hard_ms = (hard_cap - MOVE_OVERHEAD_MS).max(search_ms);
+            let hard_ms = (hard_cap - move_overhead_ms()).max(search_ms);
             soft_budget = Some(Duration::from_millis(search_ms.max(1) as u64));
             Some(Instant::now() + Duration::from_millis(hard_ms.max(1) as u64))
         };
@@ -1272,6 +1298,7 @@ impl Engine {
                     let _ = writeln!(out, "id author claude (fable5), projeto proprio");
                     let _ = writeln!(out, "option name Hash type spin default 64 min 1 max 4096");
                     let _ = writeln!(out, "option name Threads type spin default 1 min 1 max 64");
+                    let _ = writeln!(out, "option name Move Overhead type spin default {} min 0 max 5000", MOVE_OVERHEAD_DEFAULT_MS);
                     let _ = writeln!(out, "uciok");
                     let _ = out.flush();
                 }
@@ -1289,6 +1316,11 @@ impl Engine {
                     } else if tokens.len() >= 5 && tokens[1] == "name" && tokens[2] == "Hash" && tokens[3] == "value" {
                         if let Ok(mb) = tokens[4].parse::<usize>() {
                             self.tt = TranspositionTable::new(mb.max(1));
+                        }
+                    } else if tokens.len() >= 6 && tokens[1] == "name" && tokens[2] == "Move"
+                        && tokens[3] == "Overhead" && tokens[4] == "value" {
+                        if let Ok(ms) = tokens[5].parse::<i64>() {
+                            MOVE_OVERHEAD.store(ms.clamp(0, 5000), std::sync::atomic::Ordering::Relaxed);
                         }
                     } else if tokens.len() >= 5 && tokens[1] == "name" && tokens[2] == "Threads" && tokens[3] == "value" {
                         if let Ok(n) = tokens[4].parse::<usize>() {
