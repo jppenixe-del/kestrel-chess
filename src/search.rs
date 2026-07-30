@@ -350,8 +350,8 @@ impl Default for SearchParams {
             // Starting points, not tuned values: this engine's tree is not
             // the one these signals were measured on. They are exposed by
             // name so they can be swept without a rebuild.
-            rfp_opp_easy_capture: 24,
-            rfp_opp_worsening: 18,
+            rfp_opp_easy_capture: 34,
+            rfp_opp_worsening: 26,
             rfp_hist_divisor: 615,
             hist_beta_margin: 46,
             hist_pruning_max_depth: 4,
@@ -366,8 +366,8 @@ impl Default for SearchParams {
             hist_malus_offset: -44,
             hist_malus_max: 992,
             lmr_hist_divisor: 36000,
-            rfp_improving: DepthMargin { base: 0, slope: 35 },
-            rfp_not_improving: DepthMargin { base: 0, slope: 110 },
+            rfp_improving: DepthMargin { base: 0, slope: 50 },
+            rfp_not_improving: DepthMargin { base: 0, slope: 159 },
             razor_base: 629,
             razor_per_depth: 629,
             futility_improving: DepthMargin { base: 0, slope: 103 },
