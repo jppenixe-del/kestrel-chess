@@ -16,6 +16,7 @@ mod moves;
 mod perft;
 mod search;
 mod syzygy;
+mod tablebase;
 mod tt;
 mod types;
 mod uci;

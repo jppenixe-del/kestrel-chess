@@ -600,6 +600,37 @@ impl Engine {
             && depth.is_none()
             && nodes.is_none()
             && std::env::var_os("KESTREL_NO_BOOK_INSTANT").is_none();
+        // Solved before it is searched.
+        //
+        // Same place as the book and for the same reason: if the answer already
+        // exists there is nothing to decide, and thinking about it only spends
+        // clock. Reported with time 0 and no nodes, because that is the truth --
+        // the engine did not search, it asked.
+        if instant_book_ok && crate::tablebase::enabled() {
+            if let Some(hit) = crate::tablebase::probe(&self.board) {
+                if let Some(mv) = self.find_move(&hit.best) {
+                    let sc = match hit.wdl {
+                        1 => 10_000 - hit.dtz.abs(),
+                        -1 => -10_000 + hit.dtz.abs(),
+                        _ => 0,
+                    };
+                    let (w, d, l) = match hit.wdl {
+                        1 => (1000, 0, 0),
+                        -1 => (0, 0, 1000),
+                        _ => (0, 1000, 0),
+                    };
+                    let _ = writeln!(
+                        out,
+                        "info depth 0 multipv 1 score cp {} wdl {} {} {} nodes 0 nps 0 time 0 pv {}",
+                        sc, w, d, l, mv.to_uci()
+                    );
+                    let _ = writeln!(out, "info string tablebase: dtz {}", hit.dtz);
+                    let _ = writeln!(out, "bestmove {}", mv.to_uci());
+                    let _ = out.flush();
+                    return;
+                }
+            }
+        }
         if instant_book_ok {
             if let Some(mv) = self.book_move() {
                 let _ = writeln!(out, "info depth 0 multipv 1 score cp 0 nodes 0 nps 0 time 0 pv {}", mv.to_uci());
@@ -1339,6 +1370,7 @@ impl Engine {
                     let _ = writeln!(out, "option name Hash type spin default 64 min 1 max 4096");
                     let _ = writeln!(out, "option name Threads type spin default 1 min 1 max 64");
                     let _ = writeln!(out, "option name Move Overhead type spin default {} min 0 max 5000", MOVE_OVERHEAD_DEFAULT_MS);
+                    let _ = writeln!(out, "option name OnlineTablebase type check default false");
                     let _ = writeln!(out, "uciok");
                     let _ = out.flush();
                 }
@@ -1357,6 +1389,10 @@ impl Engine {
                         if let Ok(mb) = tokens[4].parse::<usize>() {
                             self.tt = TranspositionTable::new(mb.max(1));
                         }
+                    } else if tokens.len() >= 5 && tokens[1] == "name" && tokens[2] == "OnlineTablebase"
+                        && tokens[3] == "value" {
+                        let on = tokens[4].eq_ignore_ascii_case("true") || tokens[4] == "1";
+                        crate::tablebase::set_enabled(on);
                     } else if tokens.len() >= 6 && tokens[1] == "name" && tokens[2] == "Move"
                         && tokens[3] == "Overhead" && tokens[4] == "value" {
                         if let Ok(ms) = tokens[5].parse::<i64>() {
