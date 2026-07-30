@@ -3397,9 +3397,19 @@ impl<'a> Searcher<'a> {
                     } else {
                         format!("cp {}", rs)
                     };
+                    // The same number as chances of winning, drawing, losing.
+                    //
+                    // A centipawn is not a stable unit across the game -- fitted
+                    // on 220k real results, the scale that turns evaluation into
+                    // a score runs from 433 with three pawns on the board to
+                    // 1564 with a full one. So "+2.10" means a 77% score in one
+                    // ending and 60% in an opening, and a client deciding
+                    // whether to offer a draw on centipawns is reading a ruler
+                    // whose marks move. This is what it should read instead.
+                    let (w, d, l) = crate::eval::win_draw_loss(board, rs);
                     println!(
-                        "info depth {} multipv 1 score {} nodes {} nps {} time {} pv {}",
-                        depth, score_str, self.nodes, nps, ms, pv_str.join(" ")
+                        "info depth {} multipv 1 score {} wdl {} {} {} nodes {} nps {} time {} pv {}",
+                        depth, score_str, w, d, l, self.nodes, nps, ms, pv_str.join(" ")
                     );
                     use std::io::Write;
                     let _ = std::io::stdout().flush();

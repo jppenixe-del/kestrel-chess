@@ -160,6 +160,31 @@ fn main() {
         println!("wrote {} values ({} buckets x {}) to {}", out.len(), eval::NUM_BUCKETS, base.len(), args[2]);
         return;
     }
+    if args.len() >= 3 && args[1] == "wdl" {
+        // wdl "<fen>" [eval_cp ...] -- the win/draw/loss curve for a position.
+        //
+        // A diagnostic for the unit itself, not for a position. The evaluation's
+        // centipawn is not a fixed quantity: the scale that turns it into a
+        // score runs from 433 with three pawns on the board to 1564 with a full
+        // one, fitted on 220,000 real results. Printing the curve is how anyone
+        // checks that claim without taking it on trust.
+        let fen = args[2].clone();
+        let board = Board::from_fen(&fen);
+        let evals: Vec<i32> = if args.len() > 3 {
+            args[3..].iter().filter_map(|a| a.parse().ok()).collect()
+        } else {
+            vec![-1600, -800, -400, -200, -100, -50, 0, 50, 100, 200, 400, 800, 1600]
+        };
+        println!("bucket {} ({} peoes)", eval::bucket_of(&board),
+                 (board.pieces[0][0] | board.pieces[1][0]).count_ones());
+        println!("{:>8}  {:>6} {:>6} {:>6}   {:>7}", "eval", "vit", "emp", "der", "score");
+        for e in evals {
+            let (w, d, l) = eval::win_draw_loss(&board, e);
+            println!("{:>8}  {:>6} {:>6} {:>6}   {:>6.1}%", e, w, d, l,
+                     (w as f64 + d as f64 / 2.0) / 10.0);
+        }
+        return;
+    }
     if args.len() >= 2 && args[1] == "searchparams" {
         // Name and value of every search parameter, in the order to_vec writes
         // them. Without this a sweep has to count offsets by hand against the

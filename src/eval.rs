@@ -3873,6 +3873,47 @@ pub fn evaluate(board: &Board) -> i32 {
 /// believe -- the ordering of moves within a bucket is untouched. What changes
 /// is that a pawn's worth of advantage now means the same thing to the pruning
 /// margins in an endgame as it does in a middlegame, which it did not before.
+/// The chance of winning, drawing and losing this position, in per mille.
+///
+/// The search needs one number and gets one; this is for everything that has to
+/// DECIDE something -- offer a draw, accept one, resign, spend clock -- and
+/// those decisions are about outcomes, not centipawns.
+///
+/// It exists because centipawns are not a stable unit here and that is measured,
+/// not suspected. Fitting `1/(1+10^(-eval/D))` to the actual results of 220,000
+/// positions, the D the data asks for is not 400 and is not one number:
+///
+///   pawns   0-3   4-6   7-8    9   10-11   12    13   14+
+///   D       433   548   631   694   782   987  1042  1564
+///
+/// Three and a half times, end to end. A centipawn in the opening is worth
+/// under a third of a centipawn in an endgame in actual winning chances, and
+/// the evaluation reports them as the same quantity. At the single 400 the
+/// engine assumed, a position it calls +210 was being read as a 77% score where
+/// the truth is 64%.
+///
+/// Buckets by PAWN count, the same partition `bucket_of` uses. Measuring on one
+/// partition and applying on another is a mistake this project has already made
+/// once, in the feature extractor.
+pub fn win_draw_loss(board: &Board, eval_cp: i32) -> (i32, i32, i32) {
+    const DIVISOR: [i32; NUM_BUCKETS] = [433, 548, 631, 694, 782, 987, 1042, 1564];
+    // Draw rate at level, per bucket, falling as the position leaves level.
+    // Endgames with few pawns draw far more often than a full board does, which
+    // no single number can express either.
+    const DRAW_AT_LEVEL: [i32; NUM_BUCKETS] = [620, 480, 430, 400, 370, 330, 310, 250];
+    let b = bucket_of(board);
+    let d = DIVISOR[b] as f64;
+    let x = eval_cp as f64 / d;
+    let score = 1.0 / (1.0 + 10f64.powf(-x));
+    // The draw share shrinks as the evaluation leaves zero, on the same scale
+    // the score is measured in, so both curves stretch together per bucket.
+    let draw = DRAW_AT_LEVEL[b] as f64 / 1000.0 / (1.0 + x * x);
+    let draw = draw.min(2.0 * score.min(1.0 - score));
+    let w = ((score - draw / 2.0) * 1000.0).round() as i32;
+    let dr = (draw * 1000.0).round() as i32;
+    (w.clamp(0, 1000), dr.clamp(0, 1000), (1000 - w - dr).clamp(0, 1000))
+}
+
 fn material_bucket_scale(board: &Board, v: i32) -> i32 {
     // Per mille, indexed by (piece count - 1) / 4, so bucket 7 is a full board.
     // Derived from measured slope: factor = 1 / slope, softened toward 1.0
