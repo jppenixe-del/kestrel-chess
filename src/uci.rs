@@ -148,6 +148,31 @@ fn heatmap_plies() -> i32 {
     HEATMAP_PLIES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// What the increment pays for, which is time that costs nothing to spend.
+///
+/// The increment is income: whatever is spent up to it comes back, so the clock
+/// ends the move where it started. But it does not all come back, because the
+/// move has to REACH the server -- and that leg is billed to us. Measured from
+/// here: ~50ms against people and bots, and 560ms against the server's own
+/// engine, which is why the reserve is the measured one and not a guess.
+///
+/// Subtracting it first is what makes this safe for SMALL increments. Four
+/// fifths of a 100ms increment is 80ms, and 80 spent plus 40 of lag against 100
+/// received is a clock that drains a move at a time while the arithmetic looks
+/// like it balances. With the reserve taken off the top first, a increment too
+/// small to fund a think funds nothing and the burst tier takes over, which is
+/// the right answer.
+///
+/// Capped at a third of what is on the clock as well: the increment arrives
+/// AFTER the move, so spending it beforehand is spending money not yet paid.
+fn increment_funded(my_inc: i64, safe_time: i64) -> i64 {
+    if my_inc <= 0 {
+        return 0;
+    }
+    let net = (my_inc - move_overhead_ms()).max(0);
+    (net * 4 / 5).min(safe_time / 3).max(0)
+}
+
 fn compute_time_budget(
     my_time: i64,
     my_inc: i64,
@@ -298,6 +323,15 @@ fn compute_time_budget(
     if safe_time < 10_000 {
         let burst = (safe_time / 80).clamp(15, 150);
         soft = soft.min(burst);
+        // An increment is income, not savings. Whatever is spent up to it comes
+        // back, so the clock ends the move where it started -- and playing
+        // 112ms a move on a five-second increment gives away 4.9 seconds of
+        // free thinking, every move, to arrive at exactly the same clock.
+        //
+        // Capped at a third of what is left as well, because the increment
+        // only arrives AFTER the move: spending it before it lands is spending
+        // money that has not been paid.
+        soft = soft.max(increment_funded(my_inc, safe_time));
         hard_cap = soft;
     }
 
@@ -316,13 +350,19 @@ fn compute_time_budget(
         // clock ran out. Taking the minimum keeps the whole ladder
         // monotonic -- less clock is never more time per move.
         soft = soft.min(panic);
+        soft = soft.max(increment_funded(my_inc, safe_time));
         hard_cap = soft;
     }
 
     // Nivel 4: zona da morte (< 1200ms) -- praticamente so' vive do
     // incremento, chao absoluto independente de tudo o resto.
     if safe_time < 1200 {
-        let floor = (my_inc * 4 / 5).clamp(2, 40);
+        // The 40ms ceiling here was written for sudden death, where there is
+        // no income and every millisecond spent is gone. With an increment it
+        // is the wrong instrument: it caps a five-second allowance at forty
+        // milliseconds and plays the rest of the game blind while the clock
+        // climbs.
+        let floor = increment_funded(my_inc, safe_time).max((my_inc * 4 / 5).clamp(2, 40));
         soft = floor;
         hard_cap = floor;
     }
