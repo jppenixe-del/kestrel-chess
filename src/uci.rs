@@ -544,6 +544,26 @@ impl Engine {
                     .find(|l| l.from == from && l.to == to && l.promotion == promo)
                     .map(|l| (*count, *l))
             })
+            // O livro nao pode repetir uma posicao que ja' aconteceu no jogo.
+            //
+            // A consulta e' por posicao e nao sabe nada do que ja' se jogou,
+            // portanto duas posicoes que se respondem uma a' outra mandam o
+            // motor de uma para a outra para sempre. Jogo gevDcupD: 6...Nh5
+            // 7.Bd2 Nhf6 8.Bf4 Nh5 9.Bd2 Nhf6 10.Bf4 -- empate ao lance 9,
+            // todos os lances a 0.00s e o relogio parado nos 59.9s. O motor
+            // nunca pensou; o livro repetiu-se ate' a' triplice.
+            //
+            // Nao chega o desprezo pelo empate na busca: quando o livro
+            // responde, busca nenhuma corre.
+            //
+            // Se todos os lances de livro repetirem, devolve-se None e a
+            // posicao vai a busca -- que ja' sabe pontuar um empate com
+            // desprezo e escolhe outra coisa se houver melhor.
+            .filter(|(_, mv)| {
+                let mut ap = self.board.clone();
+                ap.make_move(mv);
+                !self.history.contains(&self.zob.hash(&ap))
+            })
             .max_by_key(|(count, _)| *count)
             .map(|(_, mv)| mv)
     }
