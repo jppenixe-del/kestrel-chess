@@ -126,6 +126,63 @@ def load_proven():
         print(f"loop: nao consegui ler o historico ({e})", flush=True)
 
 
+SKIP_FILE = "/root/kestrel_joao/challenge_skips.json"
+
+
+class Skips:
+    """Quem nao vale a pena desafiar agora, e ate quando -- gravado em disco.
+
+    Estava so' em memoria, e por isso durava ate ao reinicio seguinte. Foi assim
+    que uma noite inteira se gastou a mandar 65 desafios a cinco bots que
+    recusam bots por principio: o castigo de doze horas apagava-se sempre que a
+    ponte reiniciava, e ela reinicia varias vezes por dia.
+
+    O castigo dobra a cada recusa seguida do mesmo adversario, e volta a zero
+    quando ele finalmente joga. Um bot que recusa duas vezes provavelmente vai
+    recusar sempre, e insistir com ele nao custa so' tempo -- custa o limite de
+    pedidos, que e' partilhado com os desafios que valiam a pena.
+    """
+
+    def __init__(self, path=SKIP_FILE):
+        self.path = path
+        self.ate = {}     # uid -> epoch
+        self.vezes = {}   # uid -> recusas seguidas
+        try:
+            d = json.load(open(path))
+            self.ate = {k: float(v) for k, v in d.get("ate", {}).items()}
+            self.vezes = {k: int(v) for k, v in d.get("vezes", {}).items()}
+            vivos = sum(1 for t in self.ate.values() if t > time.time())
+            print(f"loop: {vivos} adversarios ainda de castigo (lido de {path})", flush=True)
+        except Exception:
+            pass
+
+    def bloqueado(self, uid):
+        return self.ate.get(uid, 0) > time.time()
+
+    def castiga(self, uid, segundos, agrava=False):
+        if agrava:
+            n = self.vezes.get(uid, 0) + 1
+            self.vezes[uid] = n
+            segundos *= 2 ** min(n - 1, 5)   # tecto: 32x, para nao ser eterno
+        self.ate[uid] = max(self.ate.get(uid, 0), time.time() + segundos)
+        self._grava()
+
+    def jogou(self, uid):
+        self.vezes.pop(uid, None)
+        self._grava()
+
+    def _grava(self):
+        agora = time.time()
+        self.ate = {k: v for k, v in self.ate.items() if v > agora}
+        self.vezes = {k: v for k, v in self.vezes.items() if k in self.ate}
+        try:
+            tmp = self.path + ".tmp"
+            json.dump({"ate": self.ate, "vezes": self.vezes}, open(tmp, "w"))
+            os.replace(tmp, self.path)
+        except Exception as e:
+            print(f"loop: nao consegui gravar os castigos: {e}", flush=True)
+
+
 def main():
     rl_backoff = 120
     me = api_get("/api/account")
@@ -144,7 +201,7 @@ def main():
     # send AT MOST one challenge per cycle, skip a bot for a while after
     # challenging it (declined ones especially), and back off hard on 429.
     # The old version fired up to ~50 challenges/cycle and got us 429'd.
-    skip = {}  # uid -> epoch until which to skip this bot
+    skip = Skips()
     while True:
         if n_playing() >= MAX_CONCURRENT:
             time.sleep(POLL_SECONDS); continue
@@ -202,7 +259,7 @@ def main():
             n = (b.get("id") or "").lower()
             return "odds" in n or "forknight" in n or "handicap" in n
         cand = [b for b in bots if b.get("id") != my_id and blitz(b) is not None
-                and skip.get(b["id"], 0) < now
+                and not skip.bloqueado(b["id"])
                 and not is_odds(b)
                 and -below <= (blitz(b) - my_r) <= above]
         # Opponents who have played us before come first. Most bots decline
@@ -228,7 +285,7 @@ def main():
                 cid = json.loads(msg).get("id") or json.loads(msg).get("challenge", {}).get("id")
             except Exception:
                 cid = None
-            skip[uid] = now + 1800  # vary opponents even when it works
+            skip.jogou(uid); skip.castiga(uid, 1800)  # variar adversarios mesmo quando corre bem
             state, why = challenge_outcome(cid) if cid else ("pending", "")
             # "casual" means the bot plays, just not for rating. A game we
             # learn from is worth more than a refusal we can log, so take it:
@@ -248,7 +305,7 @@ def main():
                 # too, and the one after that. Parking it for half a day is
                 # what turns this loop from cycling five refusals all night
                 # into working down the list until it finds someone who plays.
-                skip[uid] = now + (43200 if why == "nobot" else 3600)
+                skip.castiga(uid, 43200 if why == "nobot" else 3600, agrava=True)
                 print(f"loop: {uid} recusou ({why}) -- fora por "
                       f"{'12h' if why == 'nobot' else '1h'}", flush=True)
             else:
@@ -272,11 +329,11 @@ def main():
                 wait = int(json.loads(msg).get("ratelimit", {}).get("seconds", 3600))
             except Exception:
                 pass
-            skip[uid] = now + max(60, wait)
+            skip.castiga(uid, max(60, wait))
             print(f"loop: {uid} no limite diario -- volta em {wait // 60}min", flush=True)
             time.sleep(3)
         else:
-            skip[uid] = now + 600  # declined/other: skip 10 min
+            skip.castiga(uid, 600, agrava=True)  # recusou: 10 min, a dobrar se insistir
             print(f"loop: {uid} recusou/erro ({msg[:50]}) -- skip 10min", flush=True)
             time.sleep(5)
 

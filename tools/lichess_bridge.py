@@ -9,6 +9,7 @@ pedido explicitamente; esta ponte propria evita o problema por completo).
 """
 import json
 import os
+import statistics
 import subprocess
 import sys
 import threading
@@ -116,6 +117,16 @@ def api_post(path, data=None, timeout=15, attempts=1):
     return None
 
 
+# As tablebases vivem NO MOTOR, como opcao UCI, e nao aqui.
+#
+# Estiveram aqui durante uma hora e sairam antes de jogarem um lance. Duas
+# implementacoes da mesma coisa e' o modo de falha que este projecto ja teve
+# tres vezes num dia: um segundo caminho que DESCREVE o que o primeiro faz em
+# vez de o chamar, e que deixa de bater certo sem ninguem dar por isso. No
+# motor tambem serve qualquer outro cliente, e o motor pode reportar o lance
+# como seu -- com tempo zero, porque nao pensou, perguntou.
+
+
 def api_post_form(path, form_data):
     """POST com application/x-www-form-urlencoded (Lichess bot chat API
     aceita este formato, nao JSON puro)."""
@@ -205,8 +216,19 @@ class Engine:
         # mid-play. The ponder is a guess about the next move; it does not get
         # the same budget as the search that has to produce this one.
         self._send(f"setoption name Threads value {threads}")
+        # Ate' sete pecas o resultado ja esta calculado; perguntar custa 149ms e
+        # responde com a verdade em vez de uma avaliacao. 22% dos nossos jogos
+        # chegam la. O motor cai para a busca normal em qualquer falha.
+        self._send("setoption name OnlineTablebase value true")
         self._send("isready")
         self._read_until("readyok")
+
+    def set_move_overhead(self, ms):
+        """Tell the engine what to hold back for everything that is not
+        thinking. Sent between searches, which UCI allows, because the value is
+        not knowable when the engine starts -- it is measured from our own
+        moves."""
+        self._send(f"setoption name Move Overhead value {int(ms)}")
 
     def _send(self, cmd):
         self.proc.stdin.write(cmd + "\n")
@@ -365,6 +387,23 @@ MULTIPV_UNSAFE_SPEEDS = {"bullet", "ultraBullet"}
 # clock is low, where a spike is fatal (a spike with a comfortable clock is
 # harmless). This is what actually fixed the flags, not the move-overhead
 # change (which was validated against an unrealistic 300ms latency).
+# What the engine holds back per move, measured rather than assumed.
+#
+# The engine's own default is 150ms, right for the ~50ms POST we see against
+# people and bots. Against the server's own engine the same POST is measured at
+# 560ms -- not our network, which reaches the site in 46ms, but the path on the
+# far side. At 150 the engine believes it has half a second per move it does not
+# have, and a bullet game is thirty of those: it flags with the search never at
+# fault and the clock reading positive.
+#
+# So it is measured per game. A bigger reserve costs strength when it is not
+# needed (250 measurably lost non-flag games in self-play), which is exactly why
+# it must not be raised globally to cover the worst opponent.
+MOVE_OVERHEAD_FLOOR_MS = 150    # never below the engine's own default
+MOVE_OVERHEAD_SAFETY = 1.5      # cover jitter above the median we measured
+MOVE_OVERHEAD_MIN_SAMPLES = 3   # two POSTs is not a measurement
+MOVE_OVERHEAD_STEP_MS = 100     # only resend when it moved by this much
+
 PONDER_MOVETIME_MS = 2000
 PONDER_MIN_CLOCK_MS = 30000  # only ponder with a comfortable clock
 # The ponder engine runs alongside the real one. Four plus four on six cores
@@ -383,17 +422,31 @@ PONDER_THREADS = 1
 # evaluation, so the thresholds are wide and the memory is long: a single
 # iteration saying 0.00 means little, six in a row mean the position is not
 # going anywhere.
-DRAW_EQUAL_CP = 35        # |score| under this counts as "level"
+# Every threshold below is in the ENGINE'S centipawns, and that unit moved.
+#
+# The fitted weight set evaluates 1.45x louder than the hand-calibrated one it
+# replaced -- measured at fixed nodes over 105 positions, median ratio 1.449.
+# These numbers were chosen against the old scale, so read literally they now
+# fire at different positions than they were meant to: resigning at -1200 with
+# the new engine happens where the old one said -828, which is a savable game
+# thrown away.
+#
+# Divided through by the measured factor rather than re-picked by hand, so they
+# keep meaning the position they were calibrated to mean. If the evaluation
+# scale is ever refitted again, this factor is what has to move with it.
+EVAL_SCALE = 1.45         # new engine's centipawns per old engine's
+
+DRAW_EQUAL_CP = int(35 * EVAL_SCALE)    # |score| under this counts as "level"
 DRAW_MEMORY = 8           # how many of our own moves we look back over
 DRAW_OFFER_AFTER = 8      # level for this many moves before we offer
-DRAW_ACCEPT_CP = 60       # accept if we are not better than this
+DRAW_ACCEPT_CP = int(60 * EVAL_SCALE)   # accept if we are not better than this
 # Offer only once the clock is a real risk. With time in hand there is no
 # reason to stop playing -- we win most games we play out.
 DRAW_OFFER_CLOCK_FRAC = 0.35
 # Resign only when it is beyond doubt and has been for a while. This does not
 # change the result -- a lost game is lost -- it buys the time back for the
 # next game, which at an 80% score is worth more than the moves it skips.
-RESIGN_CP = -1200
+RESIGN_CP = int(-1200 * EVAL_SCALE)
 RESIGN_MOVES = 10
 # Entries kept in weblog/eval.jsonl (see _append_eval_log).
 EVAL_LOG_LINES = 400
@@ -504,7 +557,7 @@ def decide_result(game_id, state, my_color, scores, initial_clock, my_clock):
     return False
 
 
-def handle_state(engine, game_id, state, my_color, seen_moves, speed, opp_rating=None, ponder_state=None, scores=None):
+def handle_state(engine, game_id, state, my_color, seen_moves, speed, opp_rating=None, ponder_state=None, scores=None, overhead=None):
     status = state.get("status")
     if status not in ("started", "created"):
         return False
@@ -627,6 +680,23 @@ def handle_state(engine, game_id, state, my_color, seen_moves, speed, opp_rating
         # is merely slow, and cap the damage at 9s when it is genuinely down.
         api_post(f"/api/bot/game/{game_id}/move/{bm}", timeout=3, attempts=3)
         ph["post"] = time.time() - t_post
+        # Learn this opponent's latency from our own moves, and tell the engine.
+        # Adaptive rather than a bigger constant: the cost differs by a factor of
+        # ten between opponents, and a reserve large enough for the worst one
+        # throws away thinking time against every other.
+        if overhead is not None:
+            overhead["samples"].append(ph["post"] * 1000.0)
+            if len(overhead["samples"]) >= MOVE_OVERHEAD_MIN_SAMPLES:
+                med = statistics.median(overhead["samples"][-12:])
+                want = max(MOVE_OVERHEAD_FLOOR_MS, int(med * MOVE_OVERHEAD_SAFETY))
+                if abs(want - overhead["sent"]) >= MOVE_OVERHEAD_STEP_MS:
+                    try:
+                        engine.set_move_overhead(want)
+                        print(f"[{game_id}] move overhead {overhead['sent']} -> {want}ms "
+                              f"(POST mediano {med:.0f}ms em {len(overhead['samples'])} lances)")
+                        overhead["sent"] = want
+                    except Exception as e:
+                        print(f"[{game_id}] nao consegui ajustar o overhead: {e}", file=sys.stderr)
         # Our own reading of the position after each of our moves. This is the
         # only memory the draw and resign decisions have.
         if scores is not None and top_score is not None:
@@ -693,6 +763,44 @@ def _append_eval_log(game_id, score_cp, my_color, ply, mv):
         pass  # log-only, nao afecta o jogo
 
 
+def adopt_orphans(active_games, my_id):
+    """Start playing games the server says are ours and nobody is playing.
+
+    The event stream is the only thing that tells us a game has begun, and it
+    drops -- 46 times in one day, measured. A `gameStart` that arrives during a
+    reconnect is simply never seen, and the game then sits there with our clock
+    running and nobody to move: the exact signature of the losses on time where
+    one move ate forty seconds. Reconnecting does not fix it, because the
+    stream only replays events from the moment it opens.
+
+    So the board itself is the authority, not the events. Anything live that
+    has no thread gets one.
+    """
+    try:
+        data = api_get("/api/account/playing")
+    except Exception:
+        return
+    for g in data.get("nowPlaying", []):
+        gid = g.get("gameId")
+        if not gid:
+            continue
+        if gid not in active_games:
+            print(f"[{gid}] jogo orfao adoptado (o evento perdeu-se numa queda do stream)")
+            active_games.add(gid)
+            threading.Thread(target=play_game, args=(gid, my_id), name=f"game-{gid}", daemon=True).start()
+            continue
+        # Ours, tracked -- and still waiting. A thread that died, or a game
+        # stream that went quiet, leaves the clock running with nobody to move.
+        # Being tracked is not the same as being played.
+        if g.get("isMyTurn") and (g.get("secondsLeft") or 999) < 30:
+            live = any(t.name == f"game-{gid}" and t.is_alive() for t in threading.enumerate())
+            if not live:
+                print(f"[{gid}] a nossa vez, {g.get('secondsLeft')}s no relogio e ninguem a jogar "
+                      f"-- a retomar", file=sys.stderr)
+                threading.Thread(target=play_game, args=(gid, my_id),
+                                 name=f"game-{gid}", daemon=True).start()
+
+
 def prune_finished(active_games):
     """Drop games from `active_games` that the server says are over, and
     return what is genuinely still running.
@@ -749,6 +857,11 @@ def play_game(game_id, my_id):
     seen_moves = [-1]
     # Per-game memory for the draw/resign decisions.
     scores = {"cp": [], "initial": None}
+    # Per-game memory of how long our own move POSTs take, which is what the
+    # engine has to hold back. Per game and not global: it is a property of the
+    # opponent's side of the connection, and it differs by a factor of ten
+    # between a bot and the server's own engine.
+    overhead = {"samples": [], "sent": MOVE_OVERHEAD_FLOOR_MS}
     ponder_state = new_ponder_state()
     game_over = False
     attempts = 0
@@ -799,13 +912,13 @@ def play_game(game_id, my_id):
                         opp = black if my_color == "white" else white
                         opp_rating = opp.get("rating")
                         speed = ev.get("speed")
-                        if not handle_state(engine, game_id, ev.get("state", {}), my_color, seen_moves, speed, opp_rating, ponder_state, scores):
+                        if not handle_state(engine, game_id, ev.get("state", {}), my_color, seen_moves, speed, opp_rating, ponder_state, scores, overhead):
                             game_over = True
                             break
                     elif t == "gameState":
                         if my_color is None:
                             continue
-                        if not handle_state(engine, game_id, ev, my_color, seen_moves, speed, opp_rating, ponder_state, scores):
+                        if not handle_state(engine, game_id, ev, my_color, seen_moves, speed, opp_rating, ponder_state, scores, overhead):
                             game_over = True
                             break
             except Exception as e:
@@ -883,12 +996,34 @@ def main():
     acct = api_get("/api/account")
     my_id = acct.get("id")
     print(f"ligado como {acct.get('username')} (id={my_id}), title={acct.get('title')}")
+    # Is the engine we are about to play with the one that was built?
+    #
+    # Games have been played with a binary older than the repository more than
+    # once, and nothing in the output said so -- the engine answers perfectly
+    # well, it is just not the engine anyone thinks it is.
+    try:
+        built = os.path.join(_HERE, "Kestrel", "target", "release", "kestrel")
+        if os.path.exists(built) and os.path.getmtime(built) > os.path.getmtime(ENGINE_CMD[0]) + 5:
+            age = (os.path.getmtime(built) - os.path.getmtime(ENGINE_CMD[0])) / 60
+            print(f"AVISO: ha um binario compilado {age:.0f} min mais recente que o do bot. "
+                  f"Correr ./bot.sh install para o usar.", file=sys.stderr)
+    except Exception:
+        pass
     active_games = set()
     backoff = 5
     while True:
         try:
+            # Every reconnect, before reading a single event: whatever we
+            # missed while disconnected is on the board, not in the stream.
+            adopt_orphans(active_games, my_id)
+            last_sweep = time.time()
             for ev in api_stream("/api/stream/event"):
                 backoff = 5  # connected: forget any previous rate-limit wait
+                # And periodically while connected, because a dropped event
+                # on a live connection leaves no trace at all.
+                if time.time() - last_sweep > 90:
+                    last_sweep = time.time()
+                    adopt_orphans(active_games, my_id)
                 t = ev.get("type")
                 if t == "challenge":
                     ch = ev["challenge"]
@@ -960,10 +1095,10 @@ def main():
                         except Exception as e:
                             print(f"[{gid}] abort falhou ({e}) -- jogar na mesma")
                             active_games.add(gid)
-                            threading.Thread(target=play_game, args=(gid, my_id), daemon=True).start()
+                            threading.Thread(target=play_game, args=(gid, my_id), name=f"game-{gid}", daemon=True).start()
                     else:
                         active_games.add(gid)
-                        th = threading.Thread(target=play_game, args=(gid, my_id), daemon=True)
+                        th = threading.Thread(target=play_game, args=(gid, my_id), name=f"game-{gid}", daemon=True)
                         th.start()
                 elif t == "gameFinish":
                     gid = ev["game"]["id"]
@@ -979,6 +1114,12 @@ def main():
             is_rate_limit = "429" in str(e)
             if is_rate_limit:
                 backoff = min(backoff * 2 if backoff >= 60 else 60, 600)
+            elif "timed out" in str(e):
+                # The commonest failure by far -- 46 in one day -- and the
+                # least serious: a long-lived HTTP stream that went quiet.
+                # Five seconds of waiting buys nothing and is five seconds in
+                # which a challenge goes unanswered.
+                backoff = 1
             else:
                 backoff = 5
             print(f"[main] stream caiu, a reconectar em {backoff}s: {e}", file=sys.stderr)
