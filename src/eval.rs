@@ -3833,9 +3833,27 @@ pub fn evaluate(board: &Board) -> i32 {
     // both multiplied the correction: 0.65 x 0.82 is half the evaluation.
     // Kept, and inert, while the profile drives the buckets.
     let v = scale_endgame(board, raw, w) + psqt_bucket_correction(board);
-    if MATERIAL_BUCKETS_ON.load(std::sync::atomic::Ordering::Relaxed) {
+    let v = if MATERIAL_BUCKETS_ON.load(std::sync::atomic::Ordering::Relaxed) {
         material_bucket_scale(board, v)
     } else {
+        v
+    };
+    // Added last, so the scaling that corrects how loud the evaluation is does
+    // not also scale a tie-break that is not part of the position's worth --
+    // and turned to the side to move first, which is what `evaluate` returns
+    // and what everything above it already is.
+    //
+    // Getting that backwards is not a small error: a drive term with the wrong
+    // sign tells the winning side to walk AWAY from the king it is trying to
+    // trap. It showed up as the evaluation dropping 14cp in a position White
+    // was winning, which is the opposite of what the term exists to do.
+    #[cfg(feature = "goldeneye")]
+    {
+        let drive = crate::endgame::conversion_drive(board, eg_material_white(board));
+        v + if board.side == Color::White { drive } else { -drive }
+    }
+    #[cfg(not(feature = "goldeneye"))]
+    {
         v
     }
 }
