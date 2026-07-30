@@ -9,6 +9,8 @@ pedido explicitamente; esta ponte propria evita o problema por completo).
 """
 import json
 import os
+
+import chess
 import statistics
 import subprocess
 import sys
@@ -223,6 +225,12 @@ class Engine:
         self._send("isready")
         self._read_until("readyok")
 
+    def set_threads(self, n):
+        if getattr(self, "_threads_actual", None) == n:
+            return
+        self._send(f"setoption name Threads value {n}")
+        self._threads_actual = n
+
     def set_move_overhead(self, ms):
         """Tell the engine what to hold back for everything that is not
         thinking. Sent between searches, which UCI allows, because the value is
@@ -261,6 +269,12 @@ class Engine:
             f"winc {int(winc_ms)} binc {int(binc_ms)}"
         )
         raw = self._read_until("bestmove", timeout=180)
+        # As linhas `info string` do motor eram lidas e deitadas fora, e por
+        # isso uma funcionalidade a trabalhar era indistinguivel de uma
+        # desligada: as tablebases responderam vinte e duas vezes num jogo e o
+        # log nao tinha uma unica mencao delas. O que nao se ve nao se pode
+        # dizer que funciona.
+        self.ultimo_info = [l.strip() for l in raw if l.startswith("info string")]
         return self._parse_bestmove(raw), self._parse_last_score(raw)
 
     @staticmethod
@@ -667,6 +681,9 @@ def handle_state(engine, game_id, state, my_color, seen_moves, speed, opp_rating
             bm = None
     if bm is None:
         bm, top_score = engine.bestmove(moves, wtime, btime, winc, binc)
+        for linha in getattr(engine, "ultimo_info", []):
+            if "tablebase" in linha:
+                reason = "tablebase: " + linha.split("tablebase:")[-1].strip()
     ph["think"] = time.time() - t_arrive
     if bm:
         opp_str = f", opp elo {opp_rating}" if opp_rating is not None else ""
@@ -721,7 +738,82 @@ def handle_state(engine, game_id, state, my_color, seen_moves, speed, opp_rating
         # Log estruturado do eval para o web viewer local consumir --
         # ver weblog/index.html + tampermonkey script na raiz do repo.
         _append_eval_log(game_id, top_score, my_color, len(moves) + 1, bm)
+        _write_live(game_id, state, moves + [bm], my_color, top_score, opp_rating, speed, ph)
+    else:
+        # Tambem quando NAO jogamos: senao a janela congela no nosso ultimo
+        # lance enquanto o adversario pensa, e o relogio dele nunca se mexe.
+        _write_live(game_id, state, moves, my_color, None, opp_rating, speed, ph)
     return True
+
+
+_live_hist = {}
+
+
+def _marca_fim(game_id, resultado="acabou"):
+    """Dizer que acabou.
+
+    A janela ficava a descontar o relogio a partir do ultimo lance que
+    escrevemos, com o jogo ja terminado no servidor -- xeque-mate no Lichess e
+    os segundos a correr no ecra. Um estado que so' sabe avancar nao sabe
+    terminar.
+    """
+    try:
+        base = os.path.dirname(os.path.abspath(__file__))
+        alvo = os.path.join(base, "weblog", "live.json")
+        d = json.load(open(alvo))
+        if d.get("game_id") != game_id:
+            return
+        d["terminado"] = resultado
+        d["ts"] = time.time()
+        tmp = alvo + ".tmp"
+        json.dump(d, open(tmp, "w"))
+        os.replace(tmp, alvo)
+    except Exception:
+        pass
+
+
+def _write_live(game_id, state, moves, my_color, score_cp, opp_rating, speed, ph):
+    """Tudo o que uma janela precisa para mostrar o jogo, num ficheiro.
+
+    Escrito por quem JA' TEM os dados. A alternativa -- uma pagina a ler o
+    stream do jogo por sua conta -- poe um segundo consumidor na mesma ligacao
+    que a ponte usa para jogar, e o unico corte de stream que este bot ja teve
+    custou um jogo por tempo. Uma janela nao vale isso.
+
+    Substituicao atomica, para que quem le nunca apanhe meio ficheiro.
+    """
+    try:
+        b = chess.Board()
+        for m in moves:
+            b.push_uci(m)
+        h = _live_hist.setdefault(game_id, [])
+        if score_cp is not None:
+            # Sempre do ponto de vista das BRANCAS, que e' como um grafico se le.
+            h.append(score_cp if my_color == "white" else -score_cp)
+        d = {
+            "game_id": game_id,
+            "url": f"https://lichess.org/{game_id}",
+            "fen": b.fen(),
+            "ultimo_lance": moves[-1] if moves else None,
+            "nossa_cor": my_color,
+            "opp_rating": opp_rating,
+            "speed": speed,
+            "wtime": state.get("wtime"),
+            "btime": state.get("btime"),
+            "score_cp": score_cp,
+            "pensou_s": round(ph.get("think", 0.0), 2),
+            "ply": len(moves),
+            "historico": h[-200:],
+            "ts": time.time(),
+        }
+        base = os.path.dirname(os.path.abspath(__file__))
+        alvo = os.path.join(base, "weblog", "live.json")
+        tmp = alvo + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(d, f)
+        os.replace(tmp, alvo)
+    except Exception as e:
+        print(f"[{game_id}] live.json falhou (ignorado): {e}", file=sys.stderr)
 
 
 def _append_eval_log(game_id, score_cp, my_color, ply, mv):
@@ -761,6 +853,37 @@ def _append_eval_log(game_id, score_cp, my_color, ply, mv):
                     f.writelines(lines[-EVAL_LOG_LINES:])
     except Exception:
         pass  # log-only, nao afecta o jogo
+
+
+# Threads repartidas pelos jogos que existirem, nao fixas por jogo.
+#
+# A ponte recusa desafios enquanto ha jogo a decorrer, e mesmo assim apanhamos
+# dois em simultaneo -- basta um desafio nosso ser aceite ao mesmo tempo que
+# outro chega. Com KESTREL_THREADS=4 isso sao oito threads em seis nucleos, que
+# e' exactamente a contencao que hoje matou um jogo por tempo: nao e' o motor
+# que fica lento, e' o leitor do socket em Python que deixa de ser escalonado, o
+# stream morre e o relogio esvazia-se sozinho.
+#
+# Fechar a corrida seria a correccao obvia e nao e' a robusta: haveria sempre
+# uma janela. Isto assume que dois jogos acontecem e reparte o que ha.
+_motores_vivos = []
+
+
+def reparte_threads():
+    total = int(os.environ.get("KESTREL_THREADS", "1"))
+    vivos = [m for m in _motores_vivos if m.proc and m.proc.poll() is None]
+    _motores_vivos[:] = vivos
+    if not vivos:
+        return
+    # Um nucleo fica sempre de fora para esta propria ponte ler os sockets.
+    cada = max(1, total // len(vivos))
+    for m in vivos:
+        try:
+            m.set_threads(cada)
+        except Exception as e:
+            print(f"threads: nao consegui ajustar: {e}", file=sys.stderr)
+    print(f"threads: {len(vivos)} jogo(s) a decorrer -> {cada} thread(s) cada "
+          f"(de {total})", flush=True)
 
 
 def adopt_orphans(active_games, my_id):
@@ -849,7 +972,9 @@ def play_game(game_id, my_id):
     # with tests and tooling; the dedicated box has twelve and nothing else to
     # do with them. Defaulting to 1 was silently costing the bot every game it
     # played on hardware that had more.
-    engine = Engine(threads=int(os.environ.get("KESTREL_THREADS", "1")))
+    engine = Engine(threads=1)   # arranca modesto; reparte-se ja a seguir
+    _motores_vivos.append(engine)
+    reparte_threads()
     engine.newgame()
     my_color = None
     speed = None
@@ -932,7 +1057,14 @@ def play_game(game_id, my_id):
                     # it is our move.
                     time.sleep(0.5)
     finally:
+        _marca_fim(game_id)
         engine.quit()
+        # O jogo acabou: devolver as threads a quem ficou. Sem isto, o que
+        # sobra continua com metade da maquina e a jogar mais fraco do que
+        # podia, para nada.
+        if engine in _motores_vivos:
+            _motores_vivos.remove(engine)
+        reparte_threads()
     print(f"[{game_id}] terminou")
 
 

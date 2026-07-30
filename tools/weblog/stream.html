@@ -1,0 +1,296 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Kestrel — live</title>
+<style>
+  /* 1080x1920: vertical, para telemovel. O OBS captura esta janela inteira. */
+  :root{
+    --fundo:#0e1116; --painel:#161b22; --linha:#232a34;
+    --texto:#e6edf3; --fraco:#8b949e;
+    --nos:#58a6ff; --ele:#f85149; --bom:#3fb950; --claro:#edeed1; --escuro:#779952;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{width:100%;height:100%;overflow:hidden;background:#000;
+    color:var(--texto);font:400 26px/1.3 ui-sans-serif,system-ui,sans-serif;
+    -webkit-font-smoothing:antialiased;display:flex;justify-content:center;
+    align-items:flex-start}
+  /* Desenhado em 1080x1920 e ESCALADO para a janela.
+     Escalar em vez de reflow mantem as proporcoes exactas do formato vertical
+     -- e o OBS captura seja qual for o tamanho da janela, sem o desenho mudar
+     de forma pelo caminho. */
+  /* O invólucro ocupa o tamanho JA' ESCALADO; o palco desenha por cima dele a
+     partir do canto superior esquerdo. Escalar a partir do centro e depois
+     corrigir com margens soma-se ao alinhamento do pai e atira o desenho para
+     um canto -- que foi exactamente o que aconteceu. */
+  .env{position:relative;flex:0 0 auto}
+  .palco{position:absolute;top:0;left:0;width:1080px;height:1920px;
+    background:var(--fundo);transform-origin:top left}
+  .app{display:grid;grid-template-rows:auto auto 1fr auto auto;height:100%;padding:40px;gap:26px}
+
+  /* --- topo: quem joga --- */
+  .cab{display:flex;align-items:baseline;justify-content:space-between}
+  .nome{font-size:62px;font-weight:700;letter-spacing:-.02em}
+  .sub{color:var(--fraco);font-size:30px}
+  .rat{font-size:44px;font-weight:700;font-variant-numeric:tabular-nums}
+  .rat small{font-size:24px;color:var(--fraco);font-weight:400}
+
+  .adv{display:flex;justify-content:space-between;align-items:center;
+    background:var(--painel);border:1px solid var(--linha);border-radius:20px;padding:22px 30px}
+  .pill{font-size:24px;color:var(--fraco)}
+  .vs{font-size:38px;font-weight:600}
+
+  /* --- tabuleiro --- */
+  .zona{display:flex;align-items:center;justify-content:center;gap:22px}
+  .tab{position:relative;width:860px;height:860px;border-radius:16px;overflow:hidden;
+    box-shadow:0 24px 70px #0008}
+  .casa{position:absolute;width:12.5%;height:12.5%}
+  /* As pecas sao as SVG da Lichess, guardadas em disco. A fonte Unicode sai
+     fina e desalinhada num tabuleiro deste tamanho, e um CDN faria a janela
+     depender da rede para desenhar. */
+  .peca{position:absolute;width:12.5%;height:12.5%;
+    background-repeat:no-repeat;background-position:center;background-size:92%;
+    transition:transform .18s cubic-bezier(.2,.8,.25,1);will-change:transform;
+    filter:drop-shadow(0 3px 5px #0006)}
+  .ult{position:absolute;width:12.5%;height:12.5%;background:#ffe06666;pointer-events:none}
+
+  /* barra de avaliacao, ao lado */
+  .barra{width:46px;height:860px;border-radius:12px;overflow:hidden;background:#111;
+    border:1px solid var(--linha);position:relative}
+  .barra i{position:absolute;left:0;right:0;bottom:0;background:#eee;
+    transition:height .35s cubic-bezier(.2,.8,.25,1)}
+  .barra u{position:absolute;left:0;right:0;top:50%;height:2px;background:#0008}
+
+  /* --- relogios --- */
+  .relogios{display:grid;grid-template-columns:1fr 1fr;gap:26px}
+  .rel{background:var(--painel);border:1px solid var(--linha);border-radius:20px;
+    padding:24px 30px;display:flex;justify-content:space-between;align-items:center}
+  .rel b{font-size:56px;font-variant-numeric:tabular-nums;font-weight:700}
+  .rel.baixo b{color:var(--ele)}
+  .rel.activo{border-color:var(--nos);box-shadow:0 0 0 2px #58a6ff33}
+
+  /* --- rodape: grafico --- */
+  .graf{background:var(--painel);border:1px solid var(--linha);border-radius:20px;padding:26px 30px}
+  .graf h2{font-size:26px;color:var(--fraco);font-weight:500;margin-bottom:12px;
+    display:flex;justify-content:space-between}
+  svg{width:100%;height:180px;display:block}
+  .wdl{display:flex;height:26px;border-radius:8px;overflow:hidden;margin-top:18px;background:#111}
+  .wdl i{transition:width .35s ease}
+  .wdl .w{background:var(--bom)} .wdl .d{background:#6e7681} .wdl .l{background:var(--ele)}
+  .leg{display:flex;justify-content:space-between;font-size:22px;color:var(--fraco);margin-top:8px}
+  .espera{text-align:center;color:var(--fraco);font-size:34px;padding:60px 0}
+</style>
+
+<div class="env" id="env"><div class="palco" id="palco"><div class="app">
+  <div class="cab">
+    <div><div class="nome">Kestrel</div><div class="sub" id="modo">à espera de jogo</div></div>
+    <div style="text-align:right">
+      <div class="rat" id="rBullet">—<small> bullet</small></div>
+      <div class="rat" id="rBlitz">—<small> blitz</small></div>
+    </div>
+  </div>
+
+  <div class="adv">
+    <span class="pill">adversário</span>
+    <span class="vs" id="adv">—</span>
+  </div>
+
+  <div class="zona">
+    <div class="tab" id="tab"></div>
+    <div class="barra"><i id="evalbar" style="height:50%"></i><u></u></div>
+  </div>
+
+  <div class="relogios">
+    <div class="rel" id="relNos"><span class="pill">nós</span><b id="ckNos">—</b></div>
+    <div class="rel" id="relEle"><span class="pill">ele</span><b id="ckEle">—</b></div>
+  </div>
+
+  <div class="graf">
+    <h2><span>avaliação ao longo do jogo</span><span id="scoretxt">—</span></h2>
+    <svg id="svg" viewBox="0 0 1000 180" preserveAspectRatio="none"></svg>
+    <div class="wdl"><i class="w" id="pw" style="width:33%"></i><i class="d" id="pd" style="width:34%"></i><i class="l" id="pl" style="width:33%"></i></div>
+    <div class="leg"><span id="lw">—</span><span id="ld">—</span><span id="ll">—</span></div>
+  </div>
+</div>
+</div>
+</div>
+
+<script>
+// A janela pode ter qualquer tamanho; o desenho tem sempre 1080x1920.
+function ajusta(){
+  const k=Math.min(innerWidth/1080, innerHeight/1920);
+  const env=document.getElementById('env');
+  document.getElementById('palco').style.transform='scale('+k+')';
+  // O invólucro fica com o tamanho depois de escalar, que e' o que o
+  // alinhamento do pai le'. Sem isto ele continua a reservar 1080x1920.
+  env.style.width=(1080*k)+'px';
+  env.style.height=(1920*k)+'px';
+}
+addEventListener('resize',ajusta); ajusta();
+
+// Um relogio que anda a 60fps e dados que chegam de segundo a segundo.
+//
+// Ler o ficheiro sessenta vezes por segundo nao mostrava nada de novo: a
+// posicao so' muda quando alguem joga. O que tem de correr a 60fps e' o
+// RELOGIO, que desce continuamente, e as animacoes -- e essas sao do
+// navegador. Por isso: dados a 1Hz, desenho a 60.
+const FICH = c => 'pecas/' + (c===c.toUpperCase()?'w':'b') + c.toUpperCase() + '.svg';
+const tab = document.getElementById('tab');
+let estado = null, vivo = null, tLido = 0, virado = false;
+
+// casas, uma vez
+for (let r=0;r<8;r++) for (let f=0;f<8;f++){
+  const d=document.createElement('div');
+  d.className='casa';
+  d.style.left=(f*12.5)+'%'; d.style.top=(r*12.5)+'%';
+  d.style.background=((r+f)%2? 'var(--escuro)':'var(--claro)');
+  tab.appendChild(d);
+}
+const capaUlt=document.createElement('div'); // realce do ultimo lance
+const capaUlt2=document.createElement('div');
+capaUlt.className=capaUlt2.className='ult';
+capaUlt.style.display=capaUlt2.style.display='none';
+tab.append(capaUlt,capaUlt2);
+
+const pecas = new Map(); // chave -> elemento
+
+function xy(sq){ // "e4" -> {f,r} ja com a orientacao aplicada
+  let f = sq.charCodeAt(0)-97, r = 8-parseInt(sq[1]);
+  if (virado){ f=7-f; r=7-r; }
+  return {f,r};
+}
+function porFen(fen){
+  const linhas = fen.split(' ')[0].split('/');
+  const alvo = new Map();
+  linhas.forEach((linha,r)=>{
+    let f=0;
+    for (const c of linha){
+      if (c>='1'&&c<='8'){ f+=+c; continue; }
+      const ficheiro=String.fromCharCode(97+f), rank=8-r;
+      alvo.set(ficheiro+rank, c); f++;
+    }
+  });
+  // remove o que saiu
+  for (const [sq,el] of pecas) if (!alvo.has(sq) || alvo.get(sq)!==el.dataset.p){ el.remove(); pecas.delete(sq); }
+  // poe o que entrou
+  for (const [sq,p] of alvo){
+    if (pecas.has(sq)) continue;
+    const el=document.createElement('div');
+    el.className='peca'; el.dataset.p=p;
+    el.style.backgroundImage="url('"+FICH(p)+"')";
+    const {f,r}=xy(sq);
+    el.style.transform=`translate(${f*100}%,${r*100}%)`;
+    el.style.left='0'; el.style.top='0';
+    tab.appendChild(el); pecas.set(sq,el);
+  }
+}
+function realce(lance){
+  if(!lance||lance.length<4){ capaUlt.style.display=capaUlt2.style.display='none'; return; }
+  [[capaUlt,lance.slice(0,2)],[capaUlt2,lance.slice(2,4)]].forEach(([el,sq])=>{
+    const {f,r}=xy(sq);
+    el.style.left=(f*12.5)+'%'; el.style.top=(r*12.5)+'%'; el.style.display='block';
+  });
+}
+const mmss = ms => {
+  if (ms==null) return '—';
+  const s=Math.max(0,ms/1000);
+  return s<20 ? s.toFixed(1) : Math.floor(s/60)+':'+String(Math.floor(s%60)).padStart(2,'0');
+};
+
+function grafico(h){
+  const svg=document.getElementById('svg');
+  if(!h||h.length<2){ svg.innerHTML=''; return; }
+  const lim=Math.max(200,...h.map(v=>Math.abs(v)));
+  const px=(i)=> i*(1000/(h.length-1));
+  const py=(v)=> 90 - (Math.max(-lim,Math.min(lim,v))/lim)*82;
+  const d=h.map((v,i)=>(i?'L':'M')+px(i).toFixed(1)+' '+py(v).toFixed(1)).join(' ');
+  const area=d+` L 1000 90 L 0 90 Z`;
+  svg.innerHTML=
+    `<path d="${area}" fill="#58a6ff22"/>`+
+    `<line x1="0" y1="90" x2="1000" y2="90" stroke="#2a3038" stroke-width="1.5"/>`+
+    `<path d="${d}" fill="none" stroke="var(--nos)" stroke-width="3.5" stroke-linejoin="round"/>`;
+}
+
+// Probabilidades a partir da avaliacao, com a mesma forma que o motor usa:
+// a escala depende da fase, e um centipeao vale muito mais com o tabuleiro
+// vazio do que cheio.
+function wdl(cp, pecas){
+  if (cp==null) return null;
+  const D = 400 + 36*Math.max(0,pecas-4);
+  const s = 1/(1+Math.pow(10,-cp/D));
+  const dr = Math.min(0.62/(1+Math.pow(cp/D,2)), 2*Math.min(s,1-s));
+  return {w:s-dr/2, d:dr, l:1-s-dr/2};
+}
+
+async function puxa(){
+  try{
+    const [b,l] = await Promise.all([
+      fetch('bot.json?'+Date.now()).then(r=>r.json()).catch(()=>null),
+      fetch('live.json?'+Date.now()).then(r=>r.json()).catch(()=>null),
+    ]);
+    if(b) estado=b;
+    if(l) vivo=l;
+    tLido=performance.now();
+  }catch(e){}
+}
+
+function pinta(){
+  if(estado){
+    document.getElementById('rBullet').innerHTML=(estado.ratings.bullet??'—')+'<small> bullet</small>';
+    document.getElementById('rBlitz').innerHTML=(estado.ratings.blitz??'—')+'<small> blitz</small>';
+  }
+  // Quem manda no "esta a jogar" e' o ficheiro FRESCO, nao o lento.
+  //
+  // O estado da conta e' lido de 30 em 30 segundos e o jogo escreve a cada
+  // lance. A pagina dizia "a espera de jogo" com o tabuleiro a mexer e os
+  // relogios a correr, porque perguntava ao lento. Meio minuto de atraso e'
+  // invisivel num numero de rating e e' ridiculo num jogo a decorrer.
+  // Acabou e' acabou: nem relogio a andar, nem "esta a jogar".
+  const acabou = !!(vivo && vivo.terminado);
+  const jogoVivo = vivo && !acabou && (Date.now()/1000 - vivo.ts) < 90;
+  const activo = jogoVivo;
+  if (estado || vivo) {
+    const nome = estado?.adversario;
+    document.getElementById('adv').textContent = (jogoVivo || estado?.a_jogar) && nome
+      ? nome.replace(/^BOT /,'')+(estado.adv_rating?'  '+estado.adv_rating:'')
+      : (jogoVivo && vivo.opp_rating ? String(vivo.opp_rating) : '—');
+    document.getElementById('modo').textContent = jogoVivo
+      ? (vivo.speed || 'a jogar') + ' · lance ' + Math.ceil(vivo.ply/2)
+      : (acabou ? 'jogo terminado' : estado?.a_jogar ? 'a jogar' : 'à espera de jogo');
+  }
+  if(vivo){
+    virado = vivo.nossa_cor === 'black';
+    porFen(vivo.fen);
+    realce(vivo.ultimo_lance);
+    const nBrancas = vivo.nossa_cor==='white';
+    const nosMs = nBrancas? vivo.wtime : vivo.btime;
+    const eleMs = nBrancas? vivo.btime : vivo.wtime;
+    // Descontar o tempo passado desde a leitura, so' para quem esta a jogar.
+    const passou = activo ? (performance.now()-tLido) : 0;
+    const nossaVez = (vivo.ply % 2 === 0) === nBrancas;
+    document.getElementById('ckNos').textContent = mmss(nosMs!=null? nosMs-(nossaVez?passou:0):null);
+    document.getElementById('ckEle').textContent = mmss(eleMs!=null? eleMs-(nossaVez?0:passou):null);
+    document.getElementById('relNos').className='rel'+(nossaVez?' activo':'')+((nosMs<20000)?' baixo':'');
+    document.getElementById('relEle').className='rel'+(!nossaVez?' activo':'')+((eleMs<20000)?' baixo':'');
+
+    const cp = vivo.score_cp;
+    const nPecas = (vivo.fen.split(' ')[0].match(/[a-zA-Z]/g)||[]).length;
+    const p = wdl(cp, nPecas);
+    if(p){
+      // A barra e' SEMPRE do nosso ponto de vista, que e' o do espectador.
+      const nossa = p.w + p.d/2;
+      document.getElementById('evalbar').style.height=(nossa*100).toFixed(1)+'%';
+      document.getElementById('pw').style.width=(p.w*100).toFixed(1)+'%';
+      document.getElementById('pd').style.width=(p.d*100).toFixed(1)+'%';
+      document.getElementById('pl').style.width=(p.l*100).toFixed(1)+'%';
+      document.getElementById('lw').textContent='ganhar '+Math.round(p.w*100)+'%';
+      document.getElementById('ld').textContent='empate '+Math.round(p.d*100)+'%';
+      document.getElementById('ll').textContent='perder '+Math.round(p.l*100)+'%';
+      document.getElementById('scoretxt').textContent=(cp>0?'+':'')+(cp/100).toFixed(2);
+    }
+    // O historico vem do ponto de vista das brancas; o grafico le-se assim.
+    grafico(vivo.historico);
+  }
+  requestAnimationFrame(pinta);
+}
+
+puxa(); setInterval(puxa, 1000); requestAnimationFrame(pinta);
+</script>

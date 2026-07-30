@@ -190,13 +190,42 @@ def main():
     print(f"loop: {len(PROVEN)} adversarios ja jogaram connosco: "
           f"{', '.join(sorted(PROVEN))}", flush=True)
     my_id = me.get("id")
-    my_r = me.get("perfs", {}).get("blitz", {}).get("rating", 1500)
+    # O nosso rating, relido de tempos a tempos.
+    #
+    # Era lido UMA vez ao arrancar. O bot subiu de 2290 para 2318 num dia sem a
+    # banda se mexer -- procurava adversarios para o motor que ele era de manha.
+    # E era sempre o de blitz, mesmo para desafiar bullet, que sao numeros
+    # diferentes: 2318 e 2364 hoje.
+    ratings = {"bullet": 1500, "blitz": 1500}
+    ratings_lidos = [0.0]
+
+    def actualiza_ratings(force=False):
+        if not force and time.time() - ratings_lidos[0] < 600:
+            return
+        try:
+            d = api_get("/api/account")
+            for k in ("bullet", "blitz"):
+                r = d.get("perfs", {}).get(k, {}).get("rating")
+                if r:
+                    ratings[k] = r
+            ratings_lidos[0] = time.time()
+        except Exception as e:
+            print(f"loop: nao consegui reler o rating: {e}", flush=True)
+
+    actualiza_ratings(force=True)
     base_below = int(os.environ.get("KESTREL_ELO_BELOW", "300"))
     base_above = int(os.environ.get("KESTREL_ELO_ABOVE", "100"))
     max_widen = int(os.environ.get("KESTREL_ELO_WIDEN_MAX", "200"))
     widen = 0
-    print(f"loop: sou {me.get('username')} (blitz {my_r}), MAX_CONCURRENT={MAX_CONCURRENT}, "
-          f"banda {my_r-base_below} a {my_r+base_above}", flush=True)
+    print(f"loop: sou {me.get('username')} (bullet {ratings['bullet']}, blitz {ratings['blitz']}), "
+          f"MAX_CONCURRENT={MAX_CONCURRENT}", flush=True)
+    # Alternado, e nao so' blitz.
+    #
+    # TIME_CONTROLS existia e nunca era usado: o codigo chamava sempre
+    # challenge(uid, 180), portanto o bot NUNCA desafiou para bullet -- so'
+    # jogava bullet quando alguem o desafiava a ele. Metade do rating que
+    # queremos medir vinha de jogos que nunca pediamos.
+    rodizio = [0]
     # Gentle by design: Lichess rate-limits challenge spam (HTTP 429). We
     # send AT MOST one challenge per cycle, skip a bot for a while after
     # challenging it (declined ones especially), and back off hard on 429.
@@ -215,7 +244,16 @@ def main():
             print(f"loop: erro a listar bots: {e}", flush=True)
             time.sleep(POLL_SECONDS); continue
         now = time.time()
-        def blitz(b): return b.get("perfs", {}).get("blitz", {}).get("rating")
+        actualiza_ratings()
+        # Este ciclo joga a este tempo, e o proximo ao outro.
+        base_s = TIME_CONTROLS[rodizio[0] % len(TIME_CONTROLS)]
+        rodizio[0] += 1
+        perf = "bullet" if base_s < 180 else "blitz"
+        my_r = ratings[perf]
+        # O rating do ADVERSARIO tambem tem de ser o do mesmo tempo de jogo.
+        # Estava a filtrar toda a gente pelo rating de blitz, inclusive para
+        # jogos de bullet, e um bot pode ser 2400 a blitz e 2000 a bullet.
+        def blitz(b): return b.get("perfs", {}).get(perf, {}).get("rating")
         # Only opponents within reach, in both directions.
         #
         # Sorting by closeness without filtering meant that whenever the
@@ -278,7 +316,7 @@ def main():
         # one challenge per cycle, to the closest-rated eligible bot, at 3+0
         # (180s: best acceptance among strong bots; bullet is mostly declined)
         b = cand[0]; uid = b["id"]
-        ok, msg = challenge(uid, 180)
+        ok, msg = challenge(uid, base_s)
         if ok:
             rl_backoff = 120  # the challenge went out: the limit has cleared
             try:
@@ -292,7 +330,7 @@ def main():
             # the alternative is an empty board. Rated stays the default,
             # because that is the only kind whose result moves a number.
             if state == "declined" and why == "casual":
-                ok2, msg2 = challenge(uid, 180, rated=False)
+                ok2, msg2 = challenge(uid, base_s, rated=False)
                 if ok2:
                     try:
                         cid2 = json.loads(msg2).get("id")

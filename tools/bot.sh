@@ -38,7 +38,20 @@ case "${1:-status}" in
       export KESTREL_HEATMAP_ONLY=1 KESTREL_HEATMAP_PLIES=${HEATMAP_PLIES:-2}
       echo "modo HEATMAP: joga so da avaliacao, sem busca (plies=${KESTREL_HEATMAP_PLIES})"
     fi
-    export KESTREL_THREADS=${KESTREL_THREADS:-4}
+    # Tres, nao quatro, e a razao esta em tres jogos perdidos.
+    #
+    # Sao seis nucleos. Quatro para o motor mais um para o ponder deixam um
+    # para tudo o resto, e "tudo o resto" inclui o processo Python que le o
+    # socket do jogo. Quando ele nao e' escalonado, a ligacao morre com "read
+    # operation timed out" e o relogio corre sozinho: tres quedas de stream no
+    # log, duas delas custaram o jogo, uma por bandeira ao lance 35 de um 1+0.
+    #
+    # O sinal que o denuncia e' o POST do lance imediatamente antes: 3.05s onde
+    # o normal sao 0.05s. Cem vezes mais lento nao e' a rede -- e' o processo a
+    # nao apanhar CPU. A rede daqui chega ao site em 46ms.
+    #
+    # Um ply de profundidade vale menos do que um jogo inteiro.
+    export KESTREL_THREADS=${KESTREL_THREADS:-3}
     export KESTREL_ELO_BELOW=${KESTREL_ELO_BELOW:-3000} KESTREL_ELO_ABOVE=${KESTREL_ELO_ABOVE:-3000}
     setsid nohup python3 -u lichess_bridge.py > lichess_bridge.log 2>&1 < /dev/null &
     sleep 6; tail -1 lichess_bridge.log
