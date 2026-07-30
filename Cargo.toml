@@ -27,6 +27,9 @@ goldeneye = []
 # O mesmo ajuste, noutro conjunto de dados: 1.4M de posicoes quietas publicas.
 fittedquiet = []
 
+# O mesmo ajuste sobre o binpack publico (test80-2024-06). Ver fitted_sf80.rs.
+fittedsf80 = []
+
 [dependencies]
 
 [profile.release]

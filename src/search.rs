@@ -3004,7 +3004,26 @@ impl<'a> Searcher<'a> {
                     NO_SCORE
                 };
             }
-            if score > best_score {
+            // Um lance cuja propria busca o relogio cortou nao tem score, e
+            // isso ja' foi dito dez linhas acima ao gravar NO_SCORE em
+            // root_scores: "Unmeasured is the truth here". Deixa-lo competir
+            // aqui era usar exactamente o numero que acabamos de declarar
+            // invalido -- o valor de uma busca abortada e' o que a janela
+            // parcial tinha, na pratica 0.
+            //
+            // Num posicao perdida TODOS os lances reais pontuam negativo,
+            // portanto esse 0 ganha-lhes a todos e o lance jogado passa a ser
+            // aquele em que o relogio calhou de cortar. Medido: a mesma
+            // posicao, 1 thread, mesmo relogio, cinco corridas -- tres lances
+            // diferentes (518k-604k nos, todos a -95cp). Um motor de
+            // referencia nas mesmas condicoes devolveu o mesmo lance e o mesmo
+            // numero de nos as cinco vezes. A instabilidade era nossa, e era
+            // aqui.
+            //
+            // O jogo IZt573pD perdeu-se assim: 27.Rh3 num posicao que a busca
+            // completa avalia a -705.
+            let medido = !(ply == 0 && self.stop);
+            if medido && score > best_score {
                 best_score = score;
                 best_move = Some(mv);
                 if ply == 0 {
