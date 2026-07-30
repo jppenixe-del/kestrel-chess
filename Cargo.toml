@@ -24,6 +24,9 @@ widekingzone = []
 # See conversion_drive in endgame.rs.
 goldeneye = []
 
+# O mesmo ajuste, noutro conjunto de dados: 1.4M de posicoes quietas publicas.
+fittedquiet = []
+
 [dependencies]
 
 [profile.release]

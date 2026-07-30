@@ -811,7 +811,13 @@ const TM_ALERT_CP: i32 = 50;
 /// command-line tools, which stop on node counts and nothing else. Never set.
 pub static NO_STOP: AtomicBool = AtomicBool::new(false);
 
+/// Quanto custa um empate, em centipeoes. Ver `valor_empate`.
+pub static CONTEMPT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(20);
+
 pub struct Searcher<'a> {
+    /// Quem manda na raiz. Um empate e' mau para ESTE lado, e um no' qualquer
+    /// da arvore pode ser de qualquer um dos dois.
+    pub root_side: crate::types::Color,
     pub atk: &'a Attacks,
     pub zob: &'a Zobrist,
     pub tt: &'a TranspositionTable,
@@ -1400,6 +1406,35 @@ impl<'a> Searcher<'a> {
             }
         }
         self.stop
+    }
+
+    /// Quanto vale um empate -- e nao e' zero.
+    ///
+    /// Valia. E com zero, um empate e' um resultado aceitavel sempre que as
+    /// alternativas nao parecem muito melhores: o adversario repete, a busca
+    /// ve zero, compara com uma linha que a nossa avaliacao pontua em +40, e
+    /// quarenta centipeoes de vantagem incerta nem sempre ganham a um zero
+    /// garantido. O resultado e' meio ponto entregue em posicoes que estavamos
+    /// a ganhar.
+    ///
+    /// Um empate custa-nos alguma coisa, e o numero diz isso: e' pontuado como
+    /// ligeiramente MAU para quem esta a decidir a raiz. Assim, entre repetir
+    /// e continuar a jogar, a busca prefere jogar -- e so' aceita o empate
+    /// quando a alternativa e' mesmo pior, que e' quando um empate e' de facto
+    /// o melhor que ha.
+    ///
+    /// Pequeno de proposito. Grande demais e o motor recusa empates em
+    /// posicoes perdidas, que e' deitar fora meio ponto pela razao oposta.
+    /// Vinte centipeoes e' menos de um quinto de peao: chega para desempatar
+    /// entre repetir e jogar, e nao chega para inventar vantagem nenhuma.
+    fn valor_empate(&self, board: &Board) -> i32 {
+        let c = CONTEMPT.load(std::sync::atomic::Ordering::Relaxed);
+        if c == 0 {
+            return 0;
+        }
+        // Do ponto de vista de quem joga NESTE no', e negativo para o lado que
+        // manda na raiz: e' a nos que um empate custa.
+        if board.side == self.root_side { -c } else { c }
     }
 
     fn is_repetition_or_fifty(&self, board: &Board, hash: u64) -> bool {
@@ -2003,7 +2038,7 @@ impl<'a> Searcher<'a> {
 
         let hash = self.zob.hash(board);
         if ply > 0 && self.is_repetition_or_fifty(board, hash) {
-            return 0;
+            return self.valor_empate(board);
         }
 
         // Mate distance pruning: se um mate mais curto do que o melhor

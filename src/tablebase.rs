@@ -32,7 +32,17 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const MAX_PIECES: u32 = 7;
-const TIMEOUT_S: &str = "1.2";
+/// Cem milissegundos, e nem um a mais.
+///
+/// A consulta corre no NOSSO relogio, antes de o motor pensar. Com 1.2s, nos
+/// ultimos segundos de um bullet a consulta era o orcamento inteiro do lance:
+/// trocava-se uma jogada perfeita por uma bandeira, que e' o pior negocio
+/// possivel. E a rede daqui chega ao servico em 46ms, portanto cem
+/// milissegundos e' folga suficiente para uma resposta que va' mesmo chegar.
+///
+/// Se nao responder a tempo, joga-se. Uma jogada boa a horas bate uma jogada
+/// perfeita fora de horas, e a tabela nao vale nada a quem perdeu por tempo.
+const TIMEOUT_S: &str = "0.10";
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static QUIET_UNTIL: AtomicI64 = AtomicI64::new(0);
