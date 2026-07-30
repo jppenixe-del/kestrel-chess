@@ -2077,11 +2077,39 @@ static SCALED_WEIGHTS: OnceLock<Weights> = OnceLock::new();
 /// from the unscaled one begins by rediscovering the profile, and a fit
 /// started from zero begins by rediscovering chess.
 pub fn effective_weights_for_bucket(bucket: usize) -> Weights {
-    if family_scaling_active() {
-        scaled_weights_for(bucket)
-    } else {
-        default_weights().clone()
-    }
+    // Ask the evaluation, do not reconstruct what it probably does.
+    //
+    // This used to rebuild the answer from the family factors, and it was wrong
+    // the moment a fitted table was compiled in: it returned V3 while the engine
+    // played something else, so a fit told to start from "the engine" started
+    // 380 centipawns away from it on its very first weight, and nothing said so.
+    //
+    // Same failure as the one that made KESTREL_BUCKET_WEIGHTS dead code --
+    // a second path that describes the first instead of calling it. There is
+    // one function that decides which weights a position gets, and this is it.
+    let board = Board::from_fen(bucket_probe_fen(bucket));
+    debug_assert_eq!(bucket_of(&board), bucket);
+    weights_for(&board).clone()
+}
+
+/// A position with the pawn count that lands in this bucket.
+///
+/// `weights_for` takes a board because the bucket is a property of the
+/// position; asking it for a particular bucket means handing it one.
+fn bucket_probe_fen(bucket: usize) -> &'static str {
+    // Pawn counts 0, 5, 7, 9, 10, 12, 13, 16 -- one inside each bucket of the
+    // V4 boundaries (0-3, 4-6, 7-8, 9, 10-11, 12, 13, 14+).
+    const FENS: [&str; 8] = [
+        "4k3/8/8/8/8/8/8/4K3 w - - 0 1",
+        "4k3/ppp5/8/8/8/8/PP6/4K3 w - - 0 1",
+        "4k3/pppp4/8/8/8/8/PPP5/4K3 w - - 0 1",
+        "4k3/ppppp3/8/8/8/8/PPPP4/4K3 w - - 0 1",
+        "4k3/ppppp3/8/8/8/8/PPPPP3/4K3 w - - 0 1",
+        "4k3/pppppp2/8/8/8/8/PPPPPP2/4K3 w - - 0 1",
+        "4k3/ppppppp1/8/8/8/8/PPPPPP2/4K3 w - - 0 1",
+        "4k3/pppppppp/8/8/8/8/PPPPPPPP/4K3 w - - 0 1",
+    ];
+    FENS[bucket.min(FENS.len() - 1)]
 }
 
 fn scaled_weights_for(bucket: usize) -> Weights {
