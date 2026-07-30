@@ -171,7 +171,11 @@ fn main() {
         // louder than the set it replaced.
         let v = search::SearchParams::default().to_vec();
         let scale: i32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1000);
-        if scale == 1000 {
+        // No argument lists names and values; ANY argument prints the vector,
+        // 1000 included -- a scale of 1000 is the identity and is exactly what
+        // the baseline side of an A/B needs, so that both engines take the same
+        // code path and the comparison is the parameters and nothing else.
+        if args.get(2).is_none() {
             for (n, x) in search::PARAM_NAMES.iter().zip(v.iter()) {
                 let unit = if search::param_in_eval_units(n) { "  [eval units]" } else { "" };
                 println!("{:34} {}{}", n, x, unit);
