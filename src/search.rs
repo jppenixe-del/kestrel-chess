@@ -844,6 +844,8 @@ pub struct Searcher<'a> {
     pub stop_flag: &'a AtomicBool,
     /// Nodes where a beta cutoff happened, and how many of those took only
     /// the first move. See the note at the increment.
+    pub asp_re: u64,
+    pub asp_nos: u64,
     pub cut_nodes: u64,
     pub cut_first: u64,
     /// Nodes spent in quiescence. It obeys neither the depth limit nor
@@ -3248,11 +3250,14 @@ impl<'a> Searcher<'a> {
             (-MATE_SCORE - 1, MATE_SCORE + 1)
         };
         let mut asp_depth = depth;
+        let nos_antes = self.nodes;
         loop {
             let score = self.negamax(board, asp_depth.max(1), alpha, beta, 0, false);
             if self.stop {
                 return score;
             }
+            self.asp_re += 1;
+            self.asp_nos = self.asp_nos.saturating_add(self.nodes - nos_antes);
             if score <= alpha {
                 beta = (alpha + beta) / 2;
                 alpha = (alpha - delta).max(-MATE_SCORE - 1);
@@ -3630,6 +3635,11 @@ impl<'a> Searcher<'a> {
             } else {
                 0.0
             };
+            eprintln!(
+                "asp: re-pesquisas={} nos-gastos-em-re-pesquisa={} ({:.0}% do total)",
+                self.asp_re, self.asp_nos,
+                100.0 * self.asp_nos as f64 / self.nodes.max(1) as f64
+            );
             eprintln!(
                 "cut-stats: cortes={} ao-primeiro-lance={} ({:.1}%)",
                 self.cut_nodes, self.cut_first, pct
