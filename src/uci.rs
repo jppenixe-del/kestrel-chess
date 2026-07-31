@@ -74,7 +74,7 @@ fn move_overhead_ms() -> i64 {
 const TIME_SLICE_DIVISOR: i64 = 55;
 
 /// Multiplicador do orcamento por fase do jogo, em percentagem. Portado do
-/// Pond (lc0, src/search/pond/search.cc), onde foi calibrado em jogos reais a
+/// Pond (src/search/pond/search.cc), onde foi calibrado em jogos reais a
 /// 60+0.
 ///
 /// A nossa fatia era 1/55 do relogio a cada lance, o que e' geometricamente

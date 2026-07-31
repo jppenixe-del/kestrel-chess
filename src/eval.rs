@@ -235,6 +235,7 @@ fn eg_value(i: usize) -> i32 {
 /// Set one material value by name, e.g. `eg_rook`. Returns false for an
 /// unknown name so a typo is reported rather than silently ignored.
 pub fn set_material(name: &str, value: i32) -> bool {
+    invalida_cache_peoes();
     const PIECES: [&str; 5] = ["pawn", "knight", "bishop", "rook", "queen"];
     let (phase, piece) = match name.split_once('_') {
         Some(x) => x,
@@ -307,6 +308,7 @@ const PSQT_NAMES: [&str; 6] = ["pawn", "knight", "bishop", "rook", "queen", "kin
 
 /// Set one piece's PSQT factor, e.g. `psqt_king`. False on an unknown name.
 pub fn set_psqt_scale(name: &str, bucket: Option<usize>, per_mille: i32) -> bool {
+    invalida_cache_peoes();
     let i = match PSQT_NAMES.iter().position(|&p| p == name) {
         Some(i) => i,
         None => return false,
@@ -371,6 +373,7 @@ static MATERIAL_BUCKETS_ON: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
 
 pub fn set_material_buckets(on: bool) {
+    invalida_cache_peoes();
     MATERIAL_BUCKETS_ON.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
@@ -1872,6 +1875,7 @@ pub fn psqt_scale_default(name: &str) -> Option<i32> {
 }
 
 pub fn set_family_scale(name: &str, bucket: Option<usize>, per_mille: i32) -> bool {
+    invalida_cache_peoes();
     let i = match FAMILIES.iter().position(|&f| f == name) {
         Some(i) => i,
         None => return false,
@@ -2657,6 +2661,250 @@ fn king_flank(king_sq: Square, color: Color) -> Bitboard {
         RANK_8 | RANK_7 | RANK_6 | RANK_5 | RANK_4
     };
     file_band & rank_band
+}
+
+// === Cache de estrutura de peoes ===
+//
+// A estrutura de peoes muda raramente: numa partida de 40 lances ha' talvez
+// 15 lances de peao, e todos os milhoes de nos entre eles partilham
+// exactamente a mesma estrutura. Recalcula-la em cada no' e' copiar a
+// mesma pagina do livro mil vezes.
+//
+// O que entra aqui e' SO' o que depende exclusivamente dos dois bitboards
+// de peoes: atrasado, candidato, isolado, defendido, falange, dobrado.
+// O peao PASSADO nao entra -- vale conforme a casa de avanco esta'
+// bloqueada, conforme quem a controla, conforme a distancia dos reis e
+// conforme ha' torre/dama atras. Isso muda sem nenhum peao se mexer, e
+// cachea-lo pela chave dos peoes devolveria um valor errado em silencio.
+//
+// Mas a parte CARA do teste de passado -- varrer as tres colunas a frente
+// de cada peao, fila a fila -- essa e' pura, e por isso o resultado dela
+// (o bitboard dos passados por cor) viaja na cache. Quem chama so' percorre
+// esses poucos peoes para aplicar os termos que dependem das pecas.
+#[derive(Clone, Copy)]
+struct EntradaPeoes {
+    chave: u64,
+    geracao: u64,
+    mg: i32,
+    eg: i32,
+    passados: [Bitboard; 2],
+}
+
+/// Os pesos NAO sao imutaveis: `set_family_scale` (ha' uma familia chamada
+/// exactamente "pawns"), `set_psqt_scale`, `set_material` e
+/// `set_material_buckets` alteram-nos em runtime por setoption -- e' assim
+/// que o afinador trabalha, e uma cache de VALORES que nao reparasse nisso
+/// devolveria a calibracao anterior sem dar sinal nenhum.
+///
+/// Medido: hoje isso nao chega a acontecer, porque `uci.rs` corre cada
+/// busca em `std::thread::scope` e as tabelas thread_local morrem com as
+/// threads no fim de cada `go`. Confirmado com uma versao sem este guarda:
+/// o score muda na mesma quando `scale_pawns` muda. Fica na mesma porque
+/// custa uma leitura atomica relaxed por avaliacao e e' o que nos protege
+/// no dia em que as threads passarem a ser reaproveitadas -- altura em que
+/// a falha seria silenciosa e daria numeros de afinacao errados.
+static GERACAO_PESOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Chamada por quem altera pesos em runtime.
+pub fn invalida_cache_peoes() {
+    GERACAO_PESOS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+const CACHE_PEOES_BITS: usize = 15; // 32768 entradas, ~0.5 MB por thread
+
+// Uma por thread: a busca corre Lazy SMP e uma tabela partilhada exigiria
+// sincronizacao para poupar memoria que nao falta.
+thread_local! {
+    static CACHE_PEOES: std::cell::RefCell<Vec<EntradaPeoes>> =
+        std::cell::RefCell::new(vec![
+            EntradaPeoes { chave: 0, geracao: u64::MAX, mg: 0, eg: 0, passados: [0; 2] };
+            1 << CACHE_PEOES_BITS
+        ]);
+}
+
+/// Chave Zobrist-equivalente sobre SO' os peoes. Multiplicacao por
+/// constante impar e' bijectiva em u64; a entrada guarda a chave inteira e
+/// comparamo-la, portanto uma colisao exige coincidencia nos 64 bits.
+#[inline(always)]
+fn chave_peoes(board: &Board) -> u64 {
+    let wp = board.pieces[Color::White.idx()][PieceType::Pawn.idx()];
+    let bp = board.pieces[Color::Black.idx()][PieceType::Pawn.idx()];
+    wp.wrapping_mul(0x9E3779B97F4A7C15) ^ bp.wrapping_mul(0xC2B2AE3D27D4EB4F)
+}
+
+/// Percorre a estrutura de peoes de raiz. Devolve (mg, eg) ja' com sinal
+/// (brancas positivo, pretas negativo) e o bitboard dos passados por cor.
+/// Nao le' NADA do tabuleiro alem dos dois bitboards de peoes -- e' isso
+/// que torna o resultado cacheavel.
+fn estrutura_de_peoes(board: &Board, w: &Weights) -> (i32, i32, [Bitboard; 2]) {
+    let a = atk();
+    let mut mg = 0i32;
+    let mut eg = 0i32;
+    let mut passados = [0 as Bitboard; 2];
+
+    for c in [Color::White, Color::Black] {
+        let sign = if c == Color::White { 1 } else { -1 };
+        let own_pawns = board.pieces[c.idx()][PieceType::Pawn.idx()];
+        let enemy_pawns = board.pieces[c.opp().idx()][PieceType::Pawn.idx()];
+        let mut pawns = own_pawns;
+        while pawns != 0 {
+            let s = pawns.trailing_zeros() as Square;
+            pawns &= pawns - 1;
+            let f = file_of(s) as i32;
+            let r = rank_of(s) as i32;
+            let rel_rank = if c == Color::White { r as usize } else { (7 - r) as usize };
+
+            // Teste de passado -- caro, e puro. O resultado sai daqui pelo
+            // bitboard `passados`; os termos que dependem das pecas sao
+            // aplicados por quem chama.
+            let mut blocked = false;
+            for adj in (f - 1)..=(f + 1) {
+                if !(0..8).contains(&adj) { continue; }
+                let mut m: Bitboard = 0;
+                if c == Color::White {
+                    for rr in (r + 1)..8 { m |= bb(sq(adj as u8, rr as u8)); }
+                } else {
+                    for rr in 0..r { m |= bb(sq(adj as u8, rr as u8)); }
+                }
+                if enemy_pawns & m != 0 { blocked = true; break; }
+            }
+            if !blocked {
+                passados[c.idx()] |= bb(s);
+            } else {
+                // Peao atrasado.
+                let front_r = if c == Color::White { r + 1 } else { r - 1 };
+                let mut supported_ever = false;
+                for adj in [f - 1, f + 1] {
+                    if !(0..8).contains(&adj) { continue; }
+                    let mut m: Bitboard = 0;
+                    if c == Color::White {
+                        for rr in 0..=r { m |= bb(sq(adj as u8, rr as u8)); }
+                    } else {
+                        for rr in r..8 { m |= bb(sq(adj as u8, rr as u8)); }
+                    }
+                    if own_pawns & m != 0 { supported_ever = true; break; }
+                }
+                if !supported_ever && (0..8).contains(&front_r) {
+                    let front_sq = sq(f as u8, front_r as u8);
+                    if a.pawn[c.idx()][front_sq as usize] & enemy_pawns != 0 {
+                        mg += sign * w.backward_pawn.0;
+                        eg += sign * w.backward_pawn.1;
+
+                        let mut ahead_same_file: Bitboard = 0;
+                        if c == Color::White {
+                            for rr in (r + 1)..8 { ahead_same_file |= bb(sq(f as u8, rr as u8)); }
+                        } else {
+                            for rr in 0..r { ahead_same_file |= bb(sq(f as u8, rr as u8)); }
+                        }
+                        if enemy_pawns & ahead_same_file == 0 {
+                            mg += sign * w.backward_exposed.0;
+                            eg += sign * w.backward_exposed.1;
+                        }
+                    }
+                }
+
+                // Passado candidato.
+                if enemy_pawns & (FILE_A << f) == 0 {
+                    let mut enemy_ahead = 0u32;
+                    let mut own_support = 0u32;
+                    for adj in [f - 1, f + 1] {
+                        if !(0..8).contains(&adj) { continue; }
+                        let mut ahead: Bitboard = 0;
+                        let mut behind: Bitboard = 0;
+                        if c == Color::White {
+                            for rr in (r + 1)..8 { ahead |= bb(sq(adj as u8, rr as u8)); }
+                            for rr in 0..=r { behind |= bb(sq(adj as u8, rr as u8)); }
+                        } else {
+                            for rr in 0..r { ahead |= bb(sq(adj as u8, rr as u8)); }
+                            for rr in r..8 { behind |= bb(sq(adj as u8, rr as u8)); }
+                        }
+                        enemy_ahead += count(enemy_pawns & ahead);
+                        own_support += count(own_pawns & behind);
+                    }
+                    if enemy_ahead >= 1 && enemy_ahead <= own_support {
+                        let defenders = count(a.pawn[c.opp().idx()][s as usize] & own_pawns);
+                        let threats = count(a.pawn[c.idx()][s as usize] & enemy_pawns);
+                        let defended = defenders >= threats;
+                        let cp = w.candidate_passer[defended as usize][rel_rank];
+                        mg += sign * cp.0;
+                        eg += sign * cp.1;
+                    }
+                }
+            }
+
+            // Peao isolado.
+            let mut has_neighbor = false;
+            for adj in (f - 1)..=(f + 1) {
+                if adj == f || !(0..8).contains(&adj) { continue; }
+                if own_pawns & (FILE_A << adj) != 0 { has_neighbor = true; break; }
+            }
+            if !has_neighbor {
+                let edge_idx = (f.min(7 - f)) as usize;
+                mg += sign * w.isolated_pawn[edge_idx].0;
+                eg += sign * w.isolated_pawn[edge_idx].1;
+
+                let mut ahead_same_file: Bitboard = 0;
+                if c == Color::White {
+                    for rr in (r + 1)..8 { ahead_same_file |= bb(sq(f as u8, rr as u8)); }
+                } else {
+                    for rr in 0..r { ahead_same_file |= bb(sq(f as u8, rr as u8)); }
+                }
+                if enemy_pawns & ahead_same_file == 0 {
+                    mg += sign * w.isolated_exposed.0;
+                    eg += sign * w.isolated_exposed.1;
+                }
+            }
+
+            // Peao defendido por outro peao proprio.
+            if a.pawn[c.opp().idx()][s as usize] & own_pawns != 0 {
+                mg += sign * w.defended_pawn[rel_rank].0;
+                eg += sign * w.defended_pawn[rel_rank].1;
+            }
+
+            // Falange.
+            for adj in [f - 1, f + 1] {
+                if (0..8).contains(&adj) && own_pawns & bb(sq(adj as u8, r as u8)) != 0 {
+                    mg += sign * w.pawn_phalanx[rel_rank].0;
+                    eg += sign * w.pawn_phalanx[rel_rank].1;
+                    break;
+                }
+            }
+        }
+
+        // Peoes dobrados.
+        for file in 0..8u32 {
+            let n = count(own_pawns & (FILE_A << file)) as i32;
+            if n > 1 {
+                let edge_idx = (file.min(7 - file)) as usize;
+                mg += sign * w.doubled_pawn[edge_idx].0 * (n - 1);
+                eg += sign * w.doubled_pawn[edge_idx].1 * (n - 1);
+            }
+        }
+    }
+
+    (mg, eg, passados)
+}
+
+/// Consulta a cache; em falha calcula e guarda. Substituicao sempre (a
+/// entrada nova e' a mais provavel de voltar a ser pedida).
+///
+/// Os pesos `w` sao carregados uma vez no arranque do processo e nunca
+/// mudam depois -- e' o que permite guardar o VALOR e nao so' a forma.
+#[inline]
+fn estrutura_de_peoes_cache(board: &Board, w: &Weights) -> (i32, i32, [Bitboard; 2]) {
+    let chave = chave_peoes(board);
+    let geracao = GERACAO_PESOS.load(std::sync::atomic::Ordering::Relaxed);
+    let idx = (chave as usize) & ((1 << CACHE_PEOES_BITS) - 1);
+    CACHE_PEOES.with(|t| {
+        let mut t = t.borrow_mut();
+        let e = t[idx];
+        if e.chave == chave && e.geracao == geracao {
+            return (e.mg, e.eg, e.passados);
+        }
+        let (mg, eg, passados) = estrutura_de_peoes(board, w);
+        t[idx] = EntradaPeoes { chave, geracao, mg, eg, passados };
+        (mg, eg, passados)
+    })
 }
 
 pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
@@ -3566,220 +3814,63 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
         }
     }
 
-    // === Estrutura de peoes (mantem-se por cor, dentro de novo loop) ===
+    // === Estrutura de peoes (via cache dedicada) ===
+    //
+    // Tudo o que depende so' dos peoes vem da cache de uma vez. O que sai
+    // de la' em `passados` e' o bitboard dos peoes passados por cor -- o
+    // teste caro de os identificar ja' foi feito (ou reaproveitado).
+    let (mg_peoes, eg_peoes, passados) = estrutura_de_peoes_cache(board, w);
+    mg += mg_peoes;
+    eg += eg_peoes;
+
+    // Termos do peao passado que NAO sao cacheaveis: dependem de onde
+    // estao as pecas, e mudam sem nenhum peao se mexer.
     for c in [Color::White, Color::Black] {
         let sign = if c == Color::White { 1 } else { -1 };
-
-        // Estrutura de peoes.
-        let own_pawns = board.pieces[c.idx()][PieceType::Pawn.idx()];
-        let enemy_pawns = board.pieces[c.opp().idx()][PieceType::Pawn.idx()];
-        let mut pawns = own_pawns;
-        while pawns != 0 {
-            let s = pawns.trailing_zeros() as Square;
-            pawns &= pawns - 1;
+        let mut pp_bb = passados[c.idx()];
+        while pp_bb != 0 {
+            let s = pp_bb.trailing_zeros() as Square;
+            pp_bb &= pp_bb - 1;
             let f = file_of(s) as i32;
             let r = rank_of(s) as i32;
             let rel_rank = if c == Color::White { r as usize } else { (7 - r) as usize };
+            if rel_rank < 3 { continue; }
+            let push_r = if c == Color::White { r + 1 } else { r - 1 };
+            if !(0..8).contains(&push_r) { continue; }
+            let push_sq = sq(f as u8, push_r as u8);
+            let push_bb = bb(push_sq);
+            let push_blocked = board.occ_all & push_bb != 0;
+            let push_controlled = attacked[c.opp().idx()] & push_bb != 0;
+            let pp = w.passed_pawn[push_blocked as usize][push_controlled as usize][rel_rank];
+            mg += sign * pp.0;
+            eg += sign * pp.1;
 
-            // Peao passado.
-            let mut blocked = false;
-            for adj in (f - 1)..=(f + 1) {
-                if !(0..8).contains(&adj) { continue; }
-                let mut m: Bitboard = 0;
-                if c == Color::White {
-                    for rr in (r + 1)..8 { m |= bb(sq(adj as u8, rr as u8)); }
-                } else {
-                    for rr in 0..r { m |= bb(sq(adj as u8, rr as u8)); }
-                }
-                if enemy_pawns & m != 0 { blocked = true; break; }
+            let own_king = board.king_sq(c);
+            let enemy_king = board.king_sq(c.opp());
+            let our_dist = chebyshev_distance(own_king, push_sq);
+            let their_dist = chebyshev_distance(enemy_king, push_sq);
+            mg += sign * w.our_passer_proximity[our_dist].0;
+            eg += sign * w.our_passer_proximity[our_dist].1;
+            mg += sign * w.their_passer_proximity[their_dist].0;
+            eg += sign * w.their_passer_proximity[their_dist].1;
+
+            if attacked[c.idx()] & push_bb != 0 {
+                mg += sign * w.passer_defended_push[rel_rank].0;
+                eg += sign * w.passer_defended_push[rel_rank].1;
             }
-            if !blocked {
-                // 2026-07-23: PASSED_PAWN agora e' [push_blocked]
-                // [push_controlled][rank] (ver comentario da const) --
-                // so' avaliado a partir de rel_rank>=3 (rank 4 relativo),
-                // ja' que as entradas 0/1/2/7 sao sempre zero de
-                // qualquer forma.
-                if rel_rank >= 3 {
-                    let push_r = if c == Color::White { r + 1 } else { r - 1 };
-                    if (0..8).contains(&push_r) {
-                        let push_sq = sq(f as u8, push_r as u8);
-                        let push_bb = bb(push_sq);
-                        let push_blocked = board.occ_all & push_bb != 0;
-                        let push_controlled = attacked[c.opp().idx()] & push_bb != 0;
-                        let pp = w.passed_pawn[push_blocked as usize][push_controlled as usize][rel_rank];
-                        mg += sign * pp.0;
-                        eg += sign * pp.1;
 
-                        let own_king = board.king_sq(c);
-                        let enemy_king = board.king_sq(c.opp());
-                        let our_dist = chebyshev_distance(own_king, push_sq);
-                        let their_dist = chebyshev_distance(enemy_king, push_sq);
-                        mg += sign * w.our_passer_proximity[our_dist].0;
-                        eg += sign * w.our_passer_proximity[our_dist].1;
-                        mg += sign * w.their_passer_proximity[their_dist].0;
-                        eg += sign * w.their_passer_proximity[their_dist].1;
-
-                        if attacked[c.idx()] & push_bb != 0 {
-                            mg += sign * w.passer_defended_push[rel_rank].0;
-                            eg += sign * w.passer_defended_push[rel_rank].1;
-                        }
-
-                        // Torre/dama inimiga atras do peao passado, na
-                        // mesma coluna, do lado de tras (a favor do
-                        // classico "torre atras do peao passado",
-                        // aplicado ao lado adversario).
-                        let mut behind: Bitboard = 0;
-                        if c == Color::White {
-                            for rr in 0..r { behind |= bb(sq(f as u8, rr as u8)); }
-                        } else {
-                            for rr in (r + 1)..8 { behind |= bb(sq(f as u8, rr as u8)); }
-                        }
-                        let enemy_rq = board.pieces[c.opp().idx()][PieceType::Rook.idx()]
-                            | board.pieces[c.opp().idx()][PieceType::Queen.idx()];
-                        if behind & enemy_rq != 0 {
-                            mg += sign * w.passer_slider_behind[rel_rank].0;
-                            eg += sign * w.passer_slider_behind[rel_rank].1;
-                        }
-                    }
-                }
+            // Torre/dama inimiga atras do peao passado, na mesma coluna.
+            let mut behind: Bitboard = 0;
+            if c == Color::White {
+                for rr in 0..r { behind |= bb(sq(f as u8, rr as u8)); }
             } else {
-                // Peao atrasado: nenhum peao proprio numa coluna adjacente
-                // ao mesmo nivel ou atras pode alguma vez apoiar o avanco
-                // deste peao, E a casa de avanco esta controlada por peao
-                // inimigo -- preso, nao avanca em seguranca nem e' defendido.
-                let front_r = if c == Color::White { r + 1 } else { r - 1 };
-                let mut supported_ever = false;
-                for adj in [f - 1, f + 1] {
-                    if !(0..8).contains(&adj) { continue; }
-                    let mut m: Bitboard = 0;
-                    if c == Color::White {
-                        for rr in 0..=r { m |= bb(sq(adj as u8, rr as u8)); }
-                    } else {
-                        for rr in r..8 { m |= bb(sq(adj as u8, rr as u8)); }
-                    }
-                    if own_pawns & m != 0 { supported_ever = true; break; }
-                }
-                if !supported_ever && (0..8).contains(&front_r) {
-                    let front_sq = sq(f as u8, front_r as u8);
-                    if a.pawn[c.idx()][front_sq as usize] & enemy_pawns != 0 {
-                        mg += sign * w.backward_pawn.0;
-                        eg += sign * w.backward_pawn.1;
-
-                        // BACKWARD_EXPOSED: mesma ideia do
-                        // ISOLATED_EXPOSED, aplicada ao peao atrasado.
-                        let mut ahead_same_file: Bitboard = 0;
-                        if c == Color::White {
-                            for rr in (r + 1)..8 { ahead_same_file |= bb(sq(f as u8, rr as u8)); }
-                        } else {
-                            for rr in 0..r { ahead_same_file |= bb(sq(f as u8, rr as u8)); }
-                        }
-                        if enemy_pawns & ahead_same_file == 0 {
-                            mg += sign * w.backward_exposed.0;
-                            eg += sign * w.backward_exposed.1;
-                        }
-                    }
-                }
-
-                // Peao passado candidato: nenhum peao inimigo na MESMA
-                // coluna a frente (essa parte da corrida ja' esta' livre),
-                // e nas colunas adjacentes a frente o numero de bloqueadores
-                // inimigos nao excede o numero de apoiadores proprios ao
-                // mesmo nivel ou atras -- depois de uma troca razoavel,
-                // este peao fica realmente passado.
-                if enemy_pawns & (FILE_A << f) == 0 {
-                    let mut enemy_ahead = 0u32;
-                    let mut own_support = 0u32;
-                    for adj in [f - 1, f + 1] {
-                        if !(0..8).contains(&adj) { continue; }
-                        let mut ahead: Bitboard = 0;
-                        let mut behind: Bitboard = 0;
-                        if c == Color::White {
-                            for rr in (r + 1)..8 { ahead |= bb(sq(adj as u8, rr as u8)); }
-                            for rr in 0..=r { behind |= bb(sq(adj as u8, rr as u8)); }
-                        } else {
-                            for rr in 0..r { ahead |= bb(sq(adj as u8, rr as u8)); }
-                            for rr in r..8 { behind |= bb(sq(adj as u8, rr as u8)); }
-                        }
-                        enemy_ahead += count(enemy_pawns & ahead);
-                        own_support += count(own_pawns & behind);
-                    }
-                    if enemy_ahead >= 1 && enemy_ahead <= own_support {
-                        // 2026-07-23: CANDIDATE_PASSER agora e'
-                        // [defended][rank] em vez de um escalar unico --
-                        // "defended" = pelo menos
-                        // tantos peoes proprios a defender esta casa
-                        // quanto peoes inimigos a atacar (mesmo padrao
-                        // assimetrico `a.pawn[cor][casa]` ja usado
-                        // acima para o peao atrasado, com as cores
-                        // trocadas para "defensores proprios").
-                        let defenders = count(a.pawn[c.opp().idx()][s as usize] & own_pawns);
-                        let threats = count(a.pawn[c.idx()][s as usize] & enemy_pawns);
-                        let defended = defenders >= threats;
-                        let cp = w.candidate_passer[defended as usize][rel_rank];
-                        mg += sign * cp.0;
-                        eg += sign * cp.1;
-                    }
-                }
+                for rr in (r + 1)..8 { behind |= bb(sq(f as u8, rr as u8)); }
             }
-
-            // Peao isolado. 2026-07-23: agora indexado por distancia a'
-            // margem do tabuleiro (`min(f,7-f)` -- peoes isolados nas
-            // colunas centrais custam mais que nas colunas a/h) + termo
-            // `_EXPOSED` extra quando nenhum peao
-            // inimigo na MESMA coluna a frente pode alguma vez o
-            // contestar/capturar (fraqueza mais permanente que o
-            // isolamento sozinho).
-            let mut has_neighbor = false;
-            for adj in (f - 1)..=(f + 1) {
-                if adj == f || !(0..8).contains(&adj) { continue; }
-                if own_pawns & (FILE_A << adj) != 0 { has_neighbor = true; break; }
-            }
-            if !has_neighbor {
-                let edge_idx = (f.min(7 - f)) as usize;
-                mg += sign * w.isolated_pawn[edge_idx].0;
-                eg += sign * w.isolated_pawn[edge_idx].1;
-
-                let mut ahead_same_file: Bitboard = 0;
-                if c == Color::White {
-                    for rr in (r + 1)..8 { ahead_same_file |= bb(sq(f as u8, rr as u8)); }
-                } else {
-                    for rr in 0..r { ahead_same_file |= bb(sq(f as u8, rr as u8)); }
-                }
-                if enemy_pawns & ahead_same_file == 0 {
-                    mg += sign * w.isolated_exposed.0;
-                    eg += sign * w.isolated_exposed.1;
-                }
-            }
-
-            // Peao defendido por outro peao proprio (usa mesmo truque
-            // reversed pawn-attack table do SEE em search.rs).
-            if a.pawn[c.opp().idx()][s as usize] & own_pawns != 0 {
-                mg += sign * w.defended_pawn[rel_rank].0;
-                eg += sign * w.defended_pawn[rel_rank].1;
-            }
-
-            // Falange (outro peao proprio na mesma fileira, coluna
-            // adjacente).
-            for adj in [f - 1, f + 1] {
-                if (0..8).contains(&adj) && own_pawns & bb(sq(adj as u8, r as u8)) != 0 {
-                    mg += sign * w.pawn_phalanx[rel_rank].0;
-                    eg += sign * w.pawn_phalanx[rel_rank].1;
-                    break;
-                }
-            }
-        }
-
-        // Peoes dobrados (por peao excedente na mesma coluna).
-        // 2026-07-23: indexado por distancia a' margem -- note a
-        // penalidade eg e' bem mais severa nas colunas laterais do que
-        // nas centrais, contra-intuitivo mas e' o que a afinacao
-        // produziu, mantido tal como veio (nao re-derivado a mao).
-        for file in 0..8u32 {
-            let n = count(own_pawns & (FILE_A << file)) as i32;
-            if n > 1 {
-                let edge_idx = (file.min(7 - file)) as usize;
-                mg += sign * w.doubled_pawn[edge_idx].0 * (n - 1);
-                eg += sign * w.doubled_pawn[edge_idx].1 * (n - 1);
+            let enemy_rq = board.pieces[c.opp().idx()][PieceType::Rook.idx()]
+                | board.pieces[c.opp().idx()][PieceType::Queen.idx()];
+            if behind & enemy_rq != 0 {
+                mg += sign * w.passer_slider_behind[rel_rank].0;
+                eg += sign * w.passer_slider_behind[rel_rank].1;
             }
         }
     }
