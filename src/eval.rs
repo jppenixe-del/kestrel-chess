@@ -2663,6 +2663,90 @@ fn king_flank(king_sq: Square, color: Color) -> Bitboard {
     file_band & rank_band
 }
 
+// === Mascaras pre-computadas de peao ===
+//
+// Estas mascaras eram construidas bit a bit, com ciclos aninhados sobre
+// tres colunas e ate' sete filas -- ~21 iteracoes por peao so' para
+// decidir se ele esta' passado. Sao funcao apenas da casa e da cor,
+// portanto pertencem a uma tabela, nao a um ciclo em tempo de busca.
+//
+//   PASSADO_MASK   colunas f-1,f,f+1, filas estritamente a frente
+//   FRENTE_MASK    mesma coluna, filas estritamente a frente
+//   TRAS_MASK      mesma coluna, filas estritamente atras
+//   ADJ_FRENTE     colunas f-1,f+1, filas estritamente a frente
+//   ADJ_TRAS_INCL  colunas f-1,f+1, mesma fila ou atras
+//   ADJ_MESMA_FILA colunas f-1,f+1, mesma fila (falange)
+//   ADJ_COLUNAS    colunas f-1,f+1 inteiras (isolado)
+struct MascarasPeao {
+    passado: [[Bitboard; 64]; 2],
+    frente: [[Bitboard; 64]; 2],
+    tras: [[Bitboard; 64]; 2],
+    adj_frente: [[Bitboard; 64]; 2],
+    adj_tras_incl: [[Bitboard; 64]; 2],
+    adj_mesma_fila: [Bitboard; 64],
+    adj_colunas: [Bitboard; 64],
+}
+
+static MASCARAS_PEAO: std::sync::OnceLock<Box<MascarasPeao>> = std::sync::OnceLock::new();
+
+fn constroi_mascaras_peao() -> Box<MascarasPeao> {
+    let mut m = Box::new(MascarasPeao {
+        passado: [[0; 64]; 2],
+        frente: [[0; 64]; 2],
+        tras: [[0; 64]; 2],
+        adj_frente: [[0; 64]; 2],
+        adj_tras_incl: [[0; 64]; 2],
+        adj_mesma_fila: [0; 64],
+        adj_colunas: [0; 64],
+    });
+    for s in 0..64u8 {
+        let f = file_of(s as Square) as i32;
+        let r = rank_of(s as Square) as i32;
+        for adj in [f - 1, f + 1] {
+            if !(0..8).contains(&adj) { continue; }
+            m.adj_colunas[s as usize] |= FILE_A << adj;
+            m.adj_mesma_fila[s as usize] |= bb(sq(adj as u8, r as u8));
+        }
+        for &c in &[Color::White, Color::Black] {
+            let i = c.idx();
+            // Filas a frente / atras do ponto de vista desta cor.
+            let (a_frente, a_tras): (Vec<i32>, Vec<i32>) = if c == Color::White {
+                (((r + 1)..8).collect(), (0..r).collect())
+            } else {
+                ((0..r).collect(), ((r + 1)..8).collect())
+            };
+            for &rr in &a_frente {
+                m.frente[i][s as usize] |= bb(sq(f as u8, rr as u8));
+            }
+            for &rr in &a_tras {
+                m.tras[i][s as usize] |= bb(sq(f as u8, rr as u8));
+            }
+            for adj in (f - 1)..=(f + 1) {
+                if !(0..8).contains(&adj) { continue; }
+                for &rr in &a_frente {
+                    m.passado[i][s as usize] |= bb(sq(adj as u8, rr as u8));
+                    if adj != f {
+                        m.adj_frente[i][s as usize] |= bb(sq(adj as u8, rr as u8));
+                    }
+                }
+                if adj != f {
+                    // Mesma fila ou atras.
+                    for &rr in &a_tras {
+                        m.adj_tras_incl[i][s as usize] |= bb(sq(adj as u8, rr as u8));
+                    }
+                    m.adj_tras_incl[i][s as usize] |= bb(sq(adj as u8, r as u8));
+                }
+            }
+        }
+    }
+    m
+}
+
+#[inline(always)]
+fn masc() -> &'static MascarasPeao {
+    MASCARAS_PEAO.get_or_init(constroi_mascaras_peao)
+}
+
 // === Cache de estrutura de peoes ===
 //
 // A estrutura de peoes muda raramente: numa partida de 40 lances ha' talvez
@@ -2738,6 +2822,7 @@ fn chave_peoes(board: &Board) -> u64 {
 /// que torna o resultado cacheavel.
 fn estrutura_de_peoes(board: &Board, w: &Weights) -> (i32, i32, [Bitboard; 2]) {
     let a = atk();
+    let mk = masc();
     let mut mg = 0i32;
     let mut eg = 0i32;
     let mut passados = [0 as Bitboard; 2];
@@ -2757,46 +2842,20 @@ fn estrutura_de_peoes(board: &Board, w: &Weights) -> (i32, i32, [Bitboard; 2]) {
             // Teste de passado -- caro, e puro. O resultado sai daqui pelo
             // bitboard `passados`; os termos que dependem das pecas sao
             // aplicados por quem chama.
-            let mut blocked = false;
-            for adj in (f - 1)..=(f + 1) {
-                if !(0..8).contains(&adj) { continue; }
-                let mut m: Bitboard = 0;
-                if c == Color::White {
-                    for rr in (r + 1)..8 { m |= bb(sq(adj as u8, rr as u8)); }
-                } else {
-                    for rr in 0..r { m |= bb(sq(adj as u8, rr as u8)); }
-                }
-                if enemy_pawns & m != 0 { blocked = true; break; }
-            }
+            let blocked = enemy_pawns & mk.passado[c.idx()][s as usize] != 0;
             if !blocked {
                 passados[c.idx()] |= bb(s);
             } else {
                 // Peao atrasado.
                 let front_r = if c == Color::White { r + 1 } else { r - 1 };
-                let mut supported_ever = false;
-                for adj in [f - 1, f + 1] {
-                    if !(0..8).contains(&adj) { continue; }
-                    let mut m: Bitboard = 0;
-                    if c == Color::White {
-                        for rr in 0..=r { m |= bb(sq(adj as u8, rr as u8)); }
-                    } else {
-                        for rr in r..8 { m |= bb(sq(adj as u8, rr as u8)); }
-                    }
-                    if own_pawns & m != 0 { supported_ever = true; break; }
-                }
+                let supported_ever = own_pawns & mk.adj_tras_incl[c.idx()][s as usize] != 0;
                 if !supported_ever && (0..8).contains(&front_r) {
                     let front_sq = sq(f as u8, front_r as u8);
                     if a.pawn[c.idx()][front_sq as usize] & enemy_pawns != 0 {
                         mg += sign * w.backward_pawn.0;
                         eg += sign * w.backward_pawn.1;
 
-                        let mut ahead_same_file: Bitboard = 0;
-                        if c == Color::White {
-                            for rr in (r + 1)..8 { ahead_same_file |= bb(sq(f as u8, rr as u8)); }
-                        } else {
-                            for rr in 0..r { ahead_same_file |= bb(sq(f as u8, rr as u8)); }
-                        }
-                        if enemy_pawns & ahead_same_file == 0 {
+                        if enemy_pawns & mk.frente[c.idx()][s as usize] == 0 {
                             mg += sign * w.backward_exposed.0;
                             eg += sign * w.backward_exposed.1;
                         }
@@ -2805,22 +2864,8 @@ fn estrutura_de_peoes(board: &Board, w: &Weights) -> (i32, i32, [Bitboard; 2]) {
 
                 // Passado candidato.
                 if enemy_pawns & (FILE_A << f) == 0 {
-                    let mut enemy_ahead = 0u32;
-                    let mut own_support = 0u32;
-                    for adj in [f - 1, f + 1] {
-                        if !(0..8).contains(&adj) { continue; }
-                        let mut ahead: Bitboard = 0;
-                        let mut behind: Bitboard = 0;
-                        if c == Color::White {
-                            for rr in (r + 1)..8 { ahead |= bb(sq(adj as u8, rr as u8)); }
-                            for rr in 0..=r { behind |= bb(sq(adj as u8, rr as u8)); }
-                        } else {
-                            for rr in 0..r { ahead |= bb(sq(adj as u8, rr as u8)); }
-                            for rr in r..8 { behind |= bb(sq(adj as u8, rr as u8)); }
-                        }
-                        enemy_ahead += count(enemy_pawns & ahead);
-                        own_support += count(own_pawns & behind);
-                    }
+                    let enemy_ahead = count(enemy_pawns & mk.adj_frente[c.idx()][s as usize]);
+                    let own_support = count(own_pawns & mk.adj_tras_incl[c.idx()][s as usize]);
                     if enemy_ahead >= 1 && enemy_ahead <= own_support {
                         let defenders = count(a.pawn[c.opp().idx()][s as usize] & own_pawns);
                         let threats = count(a.pawn[c.idx()][s as usize] & enemy_pawns);
@@ -2833,23 +2878,13 @@ fn estrutura_de_peoes(board: &Board, w: &Weights) -> (i32, i32, [Bitboard; 2]) {
             }
 
             // Peao isolado.
-            let mut has_neighbor = false;
-            for adj in (f - 1)..=(f + 1) {
-                if adj == f || !(0..8).contains(&adj) { continue; }
-                if own_pawns & (FILE_A << adj) != 0 { has_neighbor = true; break; }
-            }
+            let has_neighbor = own_pawns & mk.adj_colunas[s as usize] != 0;
             if !has_neighbor {
                 let edge_idx = (f.min(7 - f)) as usize;
                 mg += sign * w.isolated_pawn[edge_idx].0;
                 eg += sign * w.isolated_pawn[edge_idx].1;
 
-                let mut ahead_same_file: Bitboard = 0;
-                if c == Color::White {
-                    for rr in (r + 1)..8 { ahead_same_file |= bb(sq(f as u8, rr as u8)); }
-                } else {
-                    for rr in 0..r { ahead_same_file |= bb(sq(f as u8, rr as u8)); }
-                }
-                if enemy_pawns & ahead_same_file == 0 {
+                if enemy_pawns & mk.frente[c.idx()][s as usize] == 0 {
                     mg += sign * w.isolated_exposed.0;
                     eg += sign * w.isolated_exposed.1;
                 }
@@ -2862,12 +2897,9 @@ fn estrutura_de_peoes(board: &Board, w: &Weights) -> (i32, i32, [Bitboard; 2]) {
             }
 
             // Falange.
-            for adj in [f - 1, f + 1] {
-                if (0..8).contains(&adj) && own_pawns & bb(sq(adj as u8, r as u8)) != 0 {
-                    mg += sign * w.pawn_phalanx[rel_rank].0;
-                    eg += sign * w.pawn_phalanx[rel_rank].1;
-                    break;
-                }
+            if own_pawns & mk.adj_mesma_fila[s as usize] != 0 {
+                mg += sign * w.pawn_phalanx[rel_rank].0;
+                eg += sign * w.pawn_phalanx[rel_rank].1;
             }
         }
 
@@ -3860,12 +3892,7 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
             }
 
             // Torre/dama inimiga atras do peao passado, na mesma coluna.
-            let mut behind: Bitboard = 0;
-            if c == Color::White {
-                for rr in 0..r { behind |= bb(sq(f as u8, rr as u8)); }
-            } else {
-                for rr in (r + 1)..8 { behind |= bb(sq(f as u8, rr as u8)); }
-            }
+            let behind = masc().tras[c.idx()][s as usize];
             let enemy_rq = board.pieces[c.opp().idx()][PieceType::Rook.idx()]
                 | board.pieces[c.opp().idx()][PieceType::Queen.idx()];
             if behind & enemy_rq != 0 {
