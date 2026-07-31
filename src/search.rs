@@ -770,6 +770,16 @@ const TM_SETTLE_POWER: f64 = -1.5;
 const TM_SETTLE_MIN: f64 = 1.0;
 // The envelope, on top of which the hard deadline is a second and
 // independent bound.
+/// Um lance obvio custa isto do orcamento. Ver o bloco em
+/// iterative_deepening: o melhor a' frente do segundo por TM_OBVIO_CP,
+/// estavel ha' TM_OBVIO_ITERS profundidades e com o score parado.
+const TM_OBVIO_SCALE: f64 = 0.35;
+/// Quanto o melhor tem de estar a' frente do segundo para o lance ser obvio.
+/// Meia peca menor: abaixo disto ha' escolha a fazer.
+const TM_OBVIO_CP: i32 = 150;
+/// E ha' quantas profundidades tem de ser o mesmo lance.
+const TM_OBVIO_ITERS: u32 = 4;
+
 const TM_SCALE_MIN: f64 = 0.65;
 /// The most the search may award itself over the base allowance.
 ///
@@ -3546,6 +3556,38 @@ impl<'a> Searcher<'a> {
                     let mut scale = time_scale(effort_frac, stable_count, score_drop, move_changes);
                     if quiet_iters >= TM_QUIET_ITERS {
                         scale = scale.min(1.0);
+                    }
+                    // Lance obvio: nao ha nada para decidir.
+                    //
+                    // `quiet_iters` ja' reconhece "o score parou", mas so'
+                    // trava a escala em 1.0 -- o orcamento inteiro. Numa
+                    // recaptura forcada, ou numa troca em que qualquer outra
+                    // coisa perde peca, gastar o orcamento inteiro e' deitar
+                    // relogio fora: o lance ja' esta' escolhido a' quarta
+                    // profundidade e nao volta a mudar.
+                    //
+                    // Tres condicoes ao mesmo tempo, porque cada uma sozinha
+                    // engana. O score parado sozinho acontece em posicoes
+                    // quietas com dez lances equivalentes -- e essas nao sao
+                    // obvias, sao indiferentes. O melhor lance estavel sozinho
+                    // acontece por acaso. O que nao engana e' o melhor estar
+                    // muito a' frente do SEGUNDO: aí ha' um lance e os outros
+                    // sao piores, que e' a definicao de obvio.
+                    let margem = {
+                        let mut sc: Vec<i32> = self
+                            .root_scores
+                            .iter()
+                            .filter(|e| e.1 != NO_SCORE)
+                            .map(|e| e.1)
+                            .collect();
+                        sc.sort_unstable_by(|a, b| b.cmp(a));
+                        if sc.len() >= 2 { sc[0] - sc[1] } else { i32::MAX }
+                    };
+                    if quiet_iters >= TM_QUIET_ITERS
+                        && stable_count >= TM_OBVIO_ITERS
+                        && margem >= TM_OBVIO_CP
+                    {
+                        scale = scale.min(TM_OBVIO_SCALE);
                     }
                     if in_book {
                         scale = scale.min(TM_BOOK_SCALE);

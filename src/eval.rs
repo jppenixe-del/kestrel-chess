@@ -635,8 +635,40 @@ fn mirror_idx(color: Color, s: Square) -> usize {
     }
 }
 
+/// A mesma casa, mas lida do ponto de vista de "o meu rei esta' no flanco da
+/// dama". Se estiver no do rei, espelha-se a COLUNA.
+///
+/// Ideia vinda da estrutura do Sirius (duas tabelas por peca, a segunda e' a
+/// primeira com a coluna trocada). Nao custa um unico peso novo: e' a MESMA
+/// tabela lida de duas maneiras.
+///
+/// O que resolve: hoje damos o mesmo valor a um cavalo em f5 quer o nosso rei
+/// esteja em g1 quer esteja em c1, e a um peao na coluna h quer ele seja
+/// abrigo do nosso roque quer seja um passado remoto do outro lado do
+/// tabuleiro. Sao coisas diferentes e a tabela nao as distinguia.
+///
+/// Medido: a nossa cauda de erros caros e' 7% dos lances tranquilos em finais
+/// e 0% na abertura -- e o final e' precisamente onde a posicao do rei decide
+/// o valor de cada casa, enquanto na abertura os dois reis estao quase sempre
+/// no mesmo sitio.
+#[inline]
+fn psqt_idx(color: Color, s: Square, rei_no_flanco_do_rei: bool) -> usize {
+    let i = mirror_idx(color, s);
+    if rei_no_flanco_do_rei { i ^ 0b111 } else { i }
+}
+
+/// O flanco do rei de uma cor: verdadeiro se estiver nas colunas e-h.
+#[inline]
+pub fn flanco_do_rei(board: &Board, c: Color) -> bool {
+    file_of(board.king_sq(c)) >= 4
+}
+
 fn pst_mg(kind: PieceType, color: Color, s: Square) -> i32 {
-    let idx = mirror_idx(color, s);
+    pst_mg_esp(kind, color, s, false)
+}
+
+fn pst_mg_esp(kind: PieceType, color: Color, s: Square, esp: bool) -> i32 {
+    let idx = psqt_idx(color, s, esp);
     if let Some(v) = psqt_from_override(kind, idx, false) {
         return v;
     }
@@ -651,7 +683,11 @@ fn pst_mg(kind: PieceType, color: Color, s: Square) -> i32 {
 }
 
 fn pst_eg(kind: PieceType, color: Color, s: Square) -> i32 {
-    let idx = mirror_idx(color, s);
+    pst_eg_esp(kind, color, s, false)
+}
+
+fn pst_eg_esp(kind: PieceType, color: Color, s: Square, esp: bool) -> i32 {
+    let idx = psqt_idx(color, s, esp);
     if let Some(v) = psqt_from_override(kind, idx, true) {
         return v;
     }
@@ -672,13 +708,31 @@ fn pst_eg(kind: PieceType, color: Color, s: Square) -> i32 {
 /// add_piece()/remove_piece(), em vez de recalcular material_pst() do
 /// zero em cada no' da busca (era o maior custo por no' que faltava
 /// tornar incremental).
+/// Ligar a leitura das PSQT pelo flanco do rei. Interruptor de compilacao para
+/// as duas versoes poderem ser medidas uma contra a outra como dois binarios,
+/// que e' a unica comparacao em que confiamos.
+pub const PSQT_ESPELHO_REI: bool = cfg!(feature = "psqtmirror");
+
 pub fn piece_contribution(kind: PieceType, color: Color, s: Square) -> (i32, i32, i32) {
+    piece_contribution_flanco(kind, color, s, false)
+}
+
+/// A contribuicao de uma peca, lida do ponto de vista de um dado flanco do rei
+/// DA SUA PROPRIA COR.
+pub fn piece_contribution_flanco(
+    kind: PieceType,
+    color: Color,
+    s: Square,
+    flanco_rei: bool,
+) -> (i32, i32, i32) {
     let sign = if color == Color::White { 1 } else { -1 };
     let f = psqt_factor(kind.idx());
+    let esp = PSQT_ESPELHO_REI && flanco_rei;
     let (pmg, peg) = if f == 1000 {
-        (pst_mg(kind, color, s), pst_eg(kind, color, s))
+        (pst_mg_esp(kind, color, s, esp), pst_eg_esp(kind, color, s, esp))
     } else {
-        (pst_mg(kind, color, s) * f / 1000, pst_eg(kind, color, s) * f / 1000)
+        (pst_mg_esp(kind, color, s, esp) * f / 1000,
+         pst_eg_esp(kind, color, s, esp) * f / 1000)
     };
     let mg = sign * (mg_value(kind.idx()) + pmg);
     let eg = sign * (eg_value(kind.idx()) + peg);
@@ -4173,7 +4227,19 @@ pub fn phase_fraction(board: &Board) -> f32 {
 
 pub fn material_pst_white(board: &Board) -> i32 {
     let phase = board.phase.min(MAX_PHASE);
-    (board.mg_score * phase + board.eg_score * (MAX_PHASE - phase)) / MAX_PHASE
+    // Com o espelho ligado le-se o acumulador do flanco em que cada rei
+    // esta'; sem ele, o de sempre. Sao os dois mantidos em paralelo, portanto
+    // isto e' so' escolher qual ler -- um lance de rei nao custa nada.
+    let (mg, eg) = if PSQT_ESPELHO_REI {
+        let fw = flanco_do_rei(board, Color::White) as usize;
+        let fb = flanco_do_rei(board, Color::Black) as usize;
+        let w = board.psqt_por_flanco[Color::White.idx()][fw];
+        let b = board.psqt_por_flanco[Color::Black.idx()][fb];
+        (w.0 + b.0, w.1 + b.1)
+    } else {
+        (board.mg_score, board.eg_score)
+    };
+    (mg * phase + eg * (MAX_PHASE - phase)) / MAX_PHASE
 }
 
 fn positional_terms_signed(board: &Board) -> i32 {
