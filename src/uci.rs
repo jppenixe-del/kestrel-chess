@@ -73,11 +73,53 @@ fn move_overhead_ms() -> i64 {
 /// the whole point of the change.
 const TIME_SLICE_DIVISOR: i64 = 55;
 
-/// Quantas vezes o gasto do adversario podemos gastar, em decimos, quando nao
-/// estamos a' frente no relogio. 25 = duas vezes e meia. Pensar o dobro do
-/// tempo dele e' uma vantagem; pensar quatro vezes mais e' como se perde por
-/// bandeira com a posicao ganha.
-const TETO_RITMO: i64 = 25;
+/// Multiplicador do orcamento por fase do jogo, em percentagem. Portado do
+/// Pond (lc0, src/search/pond/search.cc), onde foi calibrado em jogos reais a
+/// 60+0.
+///
+/// A nossa fatia era 1/55 do relogio a cada lance, o que e' geometricamente
+/// PESADO no inicio -- medido nos nossos jogos de blitz: 4 segundos por lance
+/// entre o lance 10 e o 25, cinquenta e seis segundos de cento e oitenta em
+/// dezasseis lances, com o adversario a ir a um segundo. Ao lance 40
+/// estavamos cinco segundos atras e a jogar a correr.
+///
+/// A abertura leva 30%: e' onde pensar rende menos, porque ha muitos lances
+/// razoaveis e o livro cobre boa parte. O meio-jogo a serio leva 110%, que e'
+/// onde se decidem os jogos. No Pond este valor esteve em 160% e foi BAIXADO
+/// para 110% depois de um jogo real em que doze segundos de sessenta se foram
+/// em tres lances desta fase.
+const FASE_ABERTURA_PCT: i64 = 30;    // ply < 12
+const FASE_MEIO_CEDO_PCT: i64 = 70;   // ply < 24
+const FASE_MEIO_PCT: i64 = 110;       // ply < 45
+const FASE_MEIO_TARDE_PCT: i64 = 100; // ply < 65
+const FASE_SIMPLIFICADO_PCT: i64 = 60; // <= 10 pecas, ja' fora das fases acima
+
+/// Pressao pelo relogio. Com folga confortavel investe-se mais; atras, menos.
+/// Reage a' saude geral do relogio, ao contrario do ritmo do adversario, que
+/// reage ao curto prazo.
+const PRESSAO_FOLGADO_PCT: i64 = 115;  // acima de 1.5x o relogio dele
+const PRESSAO_APERTADO_PCT: i64 = 85;  // abaixo de 0.7x
+
+/// Modo predador: podemos pensar ate' esta percentagem do que ele pensa.
+///
+/// E' um PISO sobre o que ja' esta' orcamentado, nao um tecto. Nunca pensar
+/// muito mais devagar do que um adversario que pensa muito -- mas por ser 95 e
+/// nao 100, se ambos formos ao limite ganhamos relogio a cada lance. Como
+/// tecto absoluto apagava o investimento do meio-jogo sempre que ele
+/// respondesse depressa, mesmo com relogio de sobra do nosso lado.
+const PREDADOR_PCT: i64 = 95;
+
+/// O mesmo quando temos o relogio CONFORTAVELMENTE a nosso favor.
+///
+/// O 95 e' para recuperar: gastar menos do que ele para o relogio voltar a
+/// nosso lado. Mas aplicado tambem com folga era conservador de mais -- com
+/// vantagem de relogio o que se deve fazer e' usa-la, e nao ficar a poupar
+/// tempo que ja' sobra. Aqui podemos pensar mais do que ele, com margem.
+const PREDADOR_FOLGADO_PCT: i64 = 130;
+
+/// A partir de que vantagem, em decimos do relogio dele, se considera folga.
+/// 13 = 1.3x o relogio dele.
+const PREDADOR_FOLGA_R10: i64 = 13;
 /// The hard ceiling, as a percentage of the remaining clock. Guards the game
 /// as a whole; on a healthy clock the ceiling below binds long before it.
 const HARD_CAP_PERCENT: i64 = 45;
@@ -205,7 +247,38 @@ fn compute_time_budget(
     // decays with the clock instead of accelerating against it, and it does
     // not need to know how long the game will be -- which is not knowable.
     let moves_left = movestogo.unwrap_or(TIME_SLICE_DIVISOR);
-    let base = safe_time / moves_left + my_inc * 3 / 4;
+    let mut base = safe_time / moves_left + my_inc * 3 / 4;
+
+    // Fase do jogo. A fatia constante do relogio e' geometricamente pesada no
+    // inicio, que e' precisamente onde pensar rende menos. Ver as constantes.
+    let fase = if game_ply < 12 {
+        FASE_ABERTURA_PCT
+    } else if game_ply < 24 {
+        FASE_MEIO_CEDO_PCT
+    } else if game_ply < 45 {
+        FASE_MEIO_PCT
+    } else if game_ply < 65 {
+        FASE_MEIO_TARDE_PCT
+    } else if pieces_left <= 10 {
+        FASE_SIMPLIFICADO_PCT
+    } else {
+        100
+    };
+    base = base * fase / 100;
+
+    // Pressao pelo relogio: com folga confortavel investe-se mais, atras
+    // investe-se menos. Saude geral do relogio, nao ritmo do momento.
+    if opp_time > 0 {
+        let r10 = my_time * 10 / opp_time;
+        let pressao = if r10 > 15 {
+            PRESSAO_FOLGADO_PCT
+        } else if r10 < 7 {
+            PRESSAO_APERTADO_PCT
+        } else {
+            100
+        };
+        base = base * pressao / 100;
+    }
     // 2026-07-20 (BUG REAL/CRASH corrigido -- encontrado ao testar
     // manualmente "go depth N" sem wtime, um pedido perfeitamente valido
     // do protocolo UCI, ex.: ferramentas de analise/debug): com
@@ -266,10 +339,34 @@ fn compute_time_budget(
     // still afford it.
     let by_phase = (10 + game_ply / 4).clamp(10, EMERGENCY_MULT_MAX);
     let emergency_mult = by_clock.min(by_phase);
+    // Com incremento o tecto pode ser mais largo, sem ele nao.
+    //
+    // Gastar tempo a mais e' recuperavel quando ha incremento -- o relogio
+    // volta a encher a cada lance -- e irrecuperavel em morte subita, onde
+    // cada segundo gasto e' um segundo que nunca mais existe. Toda a
+    // calibracao acima (fase, pressao, predador) foi pensada para morte
+    // subita, que e' o que o bot joga no Lichess (60+0 e 180+0). Aplicar a
+    // mesma aperto a um controlo com incremento seria deixar em cima da mesa
+    // tempo que ia ser devolvido de qualquer maneira.
+    //
+    // O incremento entra em proporcao do que ele vale por lance face a' fatia
+    // base: um incremento que iguala a fatia duplica o tecto; um incremento
+    // insignificante nao muda nada. Limitado a' dobra para nao transformar um
+    // 1+1 num convite a gastar o relogio todo num lance.
+    let fatia = (safe_time / moves_left).max(1);
+    let folga_inc = (100 + (my_inc * 100 / fatia)).clamp(100, 200);
     let mut hard_cap = (safe_time * HARD_CAP_PERCENT / 100)
         .min((safe_time / horizon) * emergency_mult / 10)
         .min(soft * HARD_CAP_BUDGET_MULT / 10)
         .max(soft);
+    // Aplicado ao tecto JA' decidido, e nao a um dos tres termos.
+    //
+    // A primeira tentativa alargou so' a percentagem do relogio -- e ficou
+    // inerte, porque quem manda nestes controlos e' o termo do horizonte. Um
+    // tecto que e' o minimo de tres coisas so' se alarga alargando a que
+    // aperta, e qual delas e' depende do relogio e da fase. Multiplicar o
+    // resultado resolve isso sem ter de adivinhar qual esta' a morder.
+    hard_cap = hard_cap * folga_inc / 100;
 
     // Nivel 1.5: "olhar para o adversario" antes de decidir quanto gastar
     // -- pedido directo depois de reparar que o motor por vezes joga
@@ -296,44 +393,29 @@ fn compute_time_budget(
         hard_cap = hard_cap * adj / 10;
         // Being far behind on the clock also caps the base allowance, not just
         // the emergency ceiling -- thinking well and flagging is still a loss.
-        // A resposta ao relogio era um DEGRAU: so' cortava o `soft` quando ja'
-        // tinhamos metade do relogio do adversario. Medido em 40 jogos de
-        // blitz nossos, esse ponto quase nunca chega -- ao lance 40 estavamos
-        // 5 segundos atras de 60, racio 0.92, e nao acontecia nada. Ficamos a
-        // perder terreno lance a lance ate' termos de jogar a correr.
-        //
-        // Continuo, e em percentagem para a divisao inteira nao comer o
-        // efeito: a 92% do relogio dele tira 4%, a 70% tira 15%, a 50% tira
-        // 25%. Nunca acelera por estarmos a' frente -- o tecto ja' trata
-        // disso acima; aqui so' se trava.
-        let pct = (my_time * 100 / opp_time).clamp(30, 200);
-        if pct < 100 {
-            let corte = (100 + (pct - 100) / 2).clamp(60, 100);
-            soft = soft * corte / 100;
+    }
+
+    // Modo predador: acompanhar o ritmo dele, 5% mais depressa.
+    //
+    // PISO sobre o que ja' esta' orcamentado, nao tecto. Se ele pensa dez
+    // segundos, podemos pensar nove e meio -- nao se deixa um adversario
+    // lento pensar o dobro de nos. E por ser 95 e nao 100, sempre que ambos
+    // vamos ao limite ganhamos meio segundo de relogio por lance.
+    //
+    // O tecto duro por percentagem do NOSSO relogio continua a aplicar-se por
+    // cima disto, portanto nunca estoura o orcamento quando somos nos a estar
+    // apertados.
+    if let Some(pace) = opp_pace {
+        if pace > 0 {
+            // Com folga de relogio podemos pensar MAIS do que ele; atras ou a
+            // par, menos, que e' o que faz o relogio voltar a nosso favor.
+            let folgado = opp_time > 0 && my_time * 10 >= opp_time * PREDADOR_FOLGA_R10;
+            let fac = if folgado { PREDADOR_FOLGADO_PCT } else { PREDADOR_PCT };
+            let predador = pace * fac / 100;
+            soft = soft.max(predador.min(hard_cap));
         }
     }
 
-    // Nao deixar o adversario fugir no relogio.
-    //
-    // O problema medido: entre os lances 10 e 25 gastavamos 4 segundos por
-    // lance de um relogio de 180 -- 56 segundos em dezasseis lances, um terco
-    // do jogo -- enquanto o adversario ia a um. Ao lance 40 estavamos atras e
-    // a jogar a correr, e quatro de quarenta jogos de blitz acabaram por
-    // bandeira.
-    //
-    // Pensar melhor nao vale nada se o preco for chegar ao final sem relogio.
-    // Aqui olha-se para o que ELE esta' a gastar e nao se paga mais do que
-    // TETO_RITMO vezes isso -- mas so' quando nao estamos a' frente, porque
-    // com vantagem de relogio gastar mais e' precisamente o que se deve fazer.
-    //
-    // O chao de 300ms existe para nao nos deixarmos arrastar a jogar de
-    // borla so' porque o adversario tem um livro e responde a zero.
-    if let Some(pace) = opp_pace {
-        if opp_time > 0 && my_time <= opp_time && pace > 0 {
-            let teto = (pace * TETO_RITMO / 10).max(300);
-            soft = soft.min(teto);
-        }
-    }
 
     let clearly_winning = last_score.map(|s| s >= 400).unwrap_or(false);
     let clearly_losing = last_score.map(|s| s <= -400).unwrap_or(false);
@@ -422,6 +504,85 @@ fn compute_time_budget(
 /// espalhado pelo codigo.
 const BOOK_MIN_COUNT: u32 = 1;   // MEDIDO e rejeitado: com 3, 391-430-233 em 1054 jogos (-13 Elo). Fica inerte.
 
+/// Escolher entre os lances que o livro da' para esta posicao, com peso.
+///
+/// Escolhiamos sempre o mais frequente. Determinista, e por isso TODOS os
+/// jogos com a mesma cor seguiam a mesma linha, lance por lance -- coisa que
+/// qualquer adversario que jogue connosco duas vezes repara, e que qualquer
+/// livro do outro lado explora de graca.
+///
+/// Sorteio proporcional a' contagem: a linha principal continua a sair na
+/// maioria das vezes, mas nao sempre. Um lance jogado metade das vezes da
+/// linha principal sai metade das vezes.
+///
+/// Xorshift proprio e nao uma biblioteca: sao tres linhas, nao ha dependencias
+/// no projecto, e a semente vem do relogio uma vez por processo -- o que basta
+/// para dois jogos seguidos nao serem iguais.
+/// Repertorio no PRIMEIRO lance de brancas: d4, e depois e4.
+///
+/// Medido nos nossos 300 ultimos jogos, de brancas:
+///   30+0   d4  13-0-2  em 15 jogos = 87%      e4  4-0-1 =  80%
+///          c4   4-0-0  em  4 jogos = 100%     Nf3 2-0-1 =  67%
+///   60+0   d4  50-9-20 em 79 jogos = 69%      e4  4-2-2 =  62%
+///
+/// O c4 esta' a 100% mas com quatro jogos, o que nao prova nada; o d4 e' a
+/// unica linha com amostra que se aguente e e' a melhor. O sorteio entre
+/// quatro estava a tirar jogos ao d4 para os dar ao Nf3, que e' o pior.
+/// Variedade vale contra quem nos estude, e bots nao estudam.
+const ABERTURA_BRANCAS: [&str; 2] = ["d2d4", "e2e4"];
+
+/// Resposta ao primeiro lance dele. Medido nos mesmos 300 jogos, de pretas,
+/// em 30+0 e 60+0:
+///   contra e4  ->  c5   8-3-0 em 11 jogos = 86%, SEM UMA DERROTA
+///   contra d4  ->  Nf6  6-4-3 em 13 jogos = 62%
+///   contra Nf3 ->  Nf6  2-1-3 em  6 jogos = 42%   <- a nossa pior entrada
+///   contra c4  ->  varias, 3-0-3 em 6     = 50%
+///
+/// A Siciliana e' o melhor terreno de todo o repertorio. Contra d4 o Nf6 e' o
+/// que ja' jogavamos e aguenta-se. Nas outras duas a amostra e' pequena de
+/// mais para escolher, e o livro decide como sempre.
+fn resposta_de_pretas(board: &Board) -> Option<&'static str> {
+    use crate::types::{Color, PieceType};
+    let pw = board.pieces[Color::White.idx()][PieceType::Pawn.idx()];
+    const E4: u64 = 1u64 << 28;
+    const D4: u64 = 1u64 << 27;
+    if pw & E4 != 0 {
+        Some("c7c5")
+    } else if pw & D4 != 0 {
+        Some("g8f6")
+    } else {
+        None
+    }
+}
+
+fn escolhe_do_livro(
+    cands: &[(u32, crate::moves::Move)],
+    rng: &mut u64,
+) -> Option<crate::moves::Move> {
+    if cands.is_empty() {
+        return None;
+    }
+    if cands.len() == 1 {
+        return Some(cands[0].1);
+    }
+    let total: u64 = cands.iter().map(|(c, _)| *c as u64).sum();
+    if total == 0 {
+        return Some(cands[0].1);
+    }
+    *rng ^= *rng << 13;
+    *rng ^= *rng >> 7;
+    *rng ^= *rng << 17;
+    let mut alvo = *rng % total;
+    for (c, mv) in cands {
+        let c = *c as u64;
+        if alvo < c {
+            return Some(*mv);
+        }
+        alvo -= c;
+    }
+    Some(cands[cands.len() - 1].1)
+}
+
 fn default_style_book_path() -> String {
     // 2026-07-22: the Judit Polgar signature book was the user's
     // original IDEA for the project's personality, not a fixed
@@ -463,6 +624,8 @@ pub struct Engine {
     // Relogio do adversario no `go` anterior, e a media corrida do que ele
     // gasta por lance. Serve para nao o deixar fugir no relogio -- ver
     // TETO_RITMO em compute_time_budget.
+    /// Semente para escolher entre lances de livro. Ver escolhe_do_livro.
+    book_rng: u64,
     opp_time_anterior: Option<i64>,
     opp_pace: Option<i64>,
     last_score: Option<i32>, // score (cp, nossa perspetiva) do ultimo "go" -- para os niveis 2/3 de compute_time_budget
@@ -507,6 +670,11 @@ impl Engine {
             zob,
             tt: TranspositionTable::new(64),
             history: Vec::new(),
+            book_rng: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0x9E3779B97F4A7C15)
+                | 1,
             opp_time_anterior: None,
             opp_pace: None,
             last_score: None,
@@ -582,7 +750,7 @@ impl Engine {
     /// or en-passant rights in ways the key does not capture. Playing an
     /// illegal move loses the game outright, which is far worse than the cost
     /// of generating the move list once.
-    fn book_move(&self) -> Option<crate::moves::Move> {
+    fn book_move(&mut self) -> Option<crate::moves::Move> {
         let book = self.style_book.as_ref()?;
         let entries = book.lookup(self.zob.hash(&self.board));
         if entries.is_empty() {
@@ -590,7 +758,7 @@ impl Engine {
         }
         let mut b = self.board.clone();
         let legal = crate::movegen::generate_legal(&mut b, &self.atk);
-        entries
+        let cands: Vec<(u32, crate::moves::Move)> = entries
             .iter()
             .filter_map(|(m16, count)| {
                 let (from, to, promo) = crate::book::decode_move16(*m16);
@@ -619,7 +787,8 @@ impl Engine {
                 ap.make_move(mv);
                 !self.history.contains(&self.zob.hash(&ap))
             })
-            .max_by_key(|(count, _)| *count)
+            .collect::<Vec<_>>()
+            .into_iter()
             // Um lance visto num unico jogo nao e' teoria, e' a escolha de
             // alguem naquele dia. Contado no proprio livro: em 23% das
             // posicoes o lance MAIS jogado aparece uma unica vez, e em 43%
@@ -631,7 +800,31 @@ impl Engine {
             // livro e' 17445, e sao essas as posicoes que aparecem quase
             // sempre. O que se recusa e' a cauda rara e profunda.
             .filter(|(count, _)| *count >= BOOK_MIN_COUNT)
-            .map(|(_, mv)| mv)
+            .collect::<Vec<_>>();
+        // Primeiro lance de brancas: so' o repertorio. Em qualquer outra
+        // posicao o livro responde como sempre.
+        // Primeiro lance de pretas: a resposta do repertorio, se houver.
+        if self.history.len() == 2 && self.board.side == crate::types::Color::Black {
+            if let Some(alvo) = resposta_de_pretas(&self.board) {
+                if let Some((_, mv)) = cands.iter().find(|(_, m)| m.to_uci() == alvo) {
+                    return Some(*mv);
+                }
+            }
+        }
+        if self.history.len() == 1 && self.board.side == crate::types::Color::White {
+            let rep: Vec<(u32, crate::moves::Move)> = cands
+                .iter()
+                .filter(|(_, mv)| {
+                    let u = mv.to_uci();
+                    ABERTURA_BRANCAS.iter().any(|a| *a == u)
+                })
+                .cloned()
+                .collect();
+            if !rep.is_empty() {
+                return escolhe_do_livro(&rep, &mut self.book_rng);
+            }
+        }
+        escolhe_do_livro(&cands, &mut self.book_rng)
     }
 
     fn cmd_go(&mut self, tokens: &[&str], out: &mut impl Write) {
@@ -680,6 +873,34 @@ impl Engine {
         let side_white = self.board.side == crate::types::Color::White;
         let (my_time, my_inc) = if side_white { (wtime, winc) } else { (btime, binc) };
         let opp_time = if side_white { btime } else { wtime };
+
+        // Ritmo do adversario: quanto gastou desde o nosso `go` anterior.
+        //
+        // Tem de ficar AQUI, antes do livro e das tablebases. Estava a seguir
+        // a eles e nunca arrancava: as primeiras dez ou quinze jogadas saem do
+        // livro, que devolve sem passar pelo calculo do tempo, portanto
+        // `opp_time_anterior` ficava por preencher e o ritmo dele era None
+        // exactamente nos lances em que ele comeca a contar.
+        //
+        // O incremento dele volta ao relogio depois de jogar, logo entra na
+        // conta: gasto = anterior + inc - agora.
+        if let Some(ant) = self.opp_time_anterior {
+            let opp_inc = if side_white { binc } else { winc };
+            let gasto = ant + opp_inc - opp_time;
+            if gasto >= 0 && gasto < 600_000 {
+                // Media corrida curta -- o que ele fez ha vinte lances nao diz
+                // nada sobre o que vai fazer agora, e uma media longa demora
+                // demasiado a reagir a uma mudanca de ritmo, que e'
+                // precisamente quando isto importa.
+                self.opp_pace = Some(match self.opp_pace {
+                    Some(p) => (p * 2 + gasto) / 3,
+                    None => gasto,
+                });
+            }
+        }
+        if wtime > 0 || btime > 0 {
+            self.opp_time_anterior = Some(opp_time);
+        }
 
         let instant_book_ok = restrict_root.is_empty()
             && !infinite
@@ -939,24 +1160,6 @@ impl Engine {
                 .flat_map(|side| side.iter())
                 .map(|bb| bb.count_ones() as i64)
                 .sum::<i64>();
-            // Quanto e' que ele gastou desde o nosso `go` anterior. O
-            // incremento dele volta ao relogio depois de jogar, portanto
-            // conta-se: gasto = anterior + inc - agora.
-            if let Some(ant) = self.opp_time_anterior {
-                let opp_inc = if side_white { binc } else { winc };
-                let gasto = ant + opp_inc - opp_time;
-                if gasto >= 0 && gasto < 600_000 {
-                    // Media corrida curta: o que ele fez ha vinte lances nao
-                    // diz nada sobre o que vai fazer agora, e uma media longa
-                    // demora demasiado a reagir a uma mudanca de ritmo -- que
-                    // e' precisamente quando isto importa.
-                    self.opp_pace = Some(match self.opp_pace {
-                        Some(p) => (p * 2 + gasto) / 3,
-                        None => gasto,
-                    });
-                }
-            }
-            self.opp_time_anterior = Some(opp_time);
             let (mut soft, mut hard_cap) =
                 compute_time_budget(my_time, my_inc, opp_time, movestogo, self.last_score,
                                     pieces_left, (self.board.fullmove as i64 - 1) * 2
@@ -994,13 +1197,14 @@ impl Engine {
             // engine considered spending more and declined, or was never
             // allowed to. This line is what the heatmap reads.
             println!(
-                "info string tm soft {} hard {} horizon {} pieces {} myclock {} oppclock {}",
+                "info string tm soft {} hard {} horizon {} pieces {} myclock {} oppclock {} pace {:?}",
                 soft,
                 hard_cap,
                 (12 + (pieces_left - 2) * 7 / 5).clamp(12, 42),
                 pieces_left,
                 my_time,
-                opp_time
+                opp_time,
+                self.opp_pace,
             );
             soft_budget_ms = Some(soft);
             // `hard_cap` is live again, and this time it is a ceiling rather

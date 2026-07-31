@@ -25,6 +25,15 @@ pub struct Board {
     // (ver eval::PHASE_INC), nao inclui peoes.
     pub mg_score: i32,
     pub eg_score: i32,
+    /// O mesmo, mas com as PSQT lidas do ponto de vista de "o rei desta cor
+    /// esta' no flanco do rei". Indexado [cor][flanco].
+    ///
+    /// Quatro somas em vez de uma porque o valor de cada casa passa a depender
+    /// de onde esta' o rei DA PROPRIA COR -- e um lance de rei que atravesse a
+    /// coluna e mudaria TODAS as pecas de uma vez, o que mataria o
+    /// incremental. Mantendo as duas leituras sempre actualizadas, um lance de
+    /// rei nao custa nada: e' so' passar a ler a outra.
+    pub psqt_por_flanco: [[(i32, i32); 2]; 2],
     pub phase: i32,
     // Mailbox O(1) -- piece_at() fazia uma varredura ate' 12 bitboards
     // (2 cores x 6 tipos) a cada chamada; era uma fatia real do tempo
@@ -125,6 +134,7 @@ impl Board {
             fullmove,
             mg_score: 0,
             eg_score: 0,
+            psqt_por_flanco: [[(0, 0); 2]; 2],
             phase: 0,
             mailbox,
         };
@@ -216,6 +226,11 @@ impl Board {
         let (mg, eg, ph) = crate::eval::piece_contribution(pt, c, s);
         self.mg_score -= mg;
         self.eg_score -= eg;
+        for fl in 0..2 {
+            let (m, e, _) = crate::eval::piece_contribution_flanco(pt, c, s, fl == 1);
+            self.psqt_por_flanco[c.idx()][fl].0 -= m;
+            self.psqt_por_flanco[c.idx()][fl].1 -= e;
+        }
         self.phase -= ph;
     }
     fn add_piece(&mut self, pt: PieceType, c: Color, s: Square) {
@@ -226,6 +241,11 @@ impl Board {
         let (mg, eg, ph) = crate::eval::piece_contribution(pt, c, s);
         self.mg_score += mg;
         self.eg_score += eg;
+        for fl in 0..2 {
+            let (m, e, _) = crate::eval::piece_contribution_flanco(pt, c, s, fl == 1);
+            self.psqt_por_flanco[c.idx()][fl].0 += m;
+            self.psqt_por_flanco[c.idx()][fl].1 += e;
+        }
         self.phase += ph;
     }
 
