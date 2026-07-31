@@ -34,6 +34,13 @@ pub struct Board {
     /// incremental. Mantendo as duas leituras sempre actualizadas, um lance de
     /// rei nao custa nada: e' so' passar a ler a outra.
     pub psqt_por_flanco: [[(i32, i32); 2]; 2],
+    /// Um acumulador por bucket de contagem de peoes. Mantidos os oito em
+    /// paralelo: assim um lance que mude o bucket -- uma captura de peao --
+    /// nao custa nada, e' so' passar a ler outro indice.
+    ///
+    /// O ciclo de oito e' desenrolado pelo compilador e os arrays cabem na
+    /// cache L1; o custo medido esta' na nota do commit.
+    pub psqt_bucket: [(i32, i32); crate::eval::NUM_BUCKETS],
     pub phase: i32,
     // Mailbox O(1) -- piece_at() fazia uma varredura ate' 12 bitboards
     // (2 cores x 6 tipos) a cada chamada; era uma fatia real do tempo
@@ -135,6 +142,7 @@ impl Board {
             mg_score: 0,
             eg_score: 0,
             psqt_por_flanco: [[(0, 0); 2]; 2],
+            psqt_bucket: [(0, 0); crate::eval::NUM_BUCKETS],
             phase: 0,
             mailbox,
         };
@@ -162,6 +170,8 @@ impl Board {
         self.mg_score = 0;
         self.eg_score = 0;
         self.phase = 0;
+        self.psqt_por_flanco = [[(0, 0); 2]; 2];
+        self.psqt_bucket = [(0, 0); crate::eval::NUM_BUCKETS];
         for c in [Color::White, Color::Black] {
             for pt in ALL_PIECES {
                 let mut bbp = self.pieces[c.idx()][pt.idx()];
@@ -172,6 +182,20 @@ impl Board {
                     self.mg_score += mg;
                     self.eg_score += eg;
                     self.phase += ph;
+                    // Os acumuladores novos tem de ser preenchidos AQUI
+                    // tambem, senao o recalculo do zero da' zeros e a
+                    // verificacao acusa uma divergencia que nao existe --
+                    // ou pior, deixa de acusar as que existem.
+                    for fl in 0..2 {
+                        let (m, e, _) = crate::eval::piece_contribution_flanco(pt, c, s, fl == 1);
+                        self.psqt_por_flanco[c.idx()][fl].0 += m;
+                        self.psqt_por_flanco[c.idx()][fl].1 += e;
+                    }
+                    for b in 0..crate::eval::NUM_BUCKETS {
+                        let (m, e, _) = crate::eval::piece_contribution_bucket(pt, c, s, b);
+                        self.psqt_bucket[b].0 += m;
+                        self.psqt_bucket[b].1 += e;
+                    }
                 }
             }
         }
@@ -239,6 +263,11 @@ impl Board {
                 self.psqt_por_flanco[c.idx()][fl].1 -= e;
             }
         }
+        for b in 0..crate::eval::NUM_BUCKETS {
+            let (m, e, _) = crate::eval::piece_contribution_bucket(pt, c, s, b);
+            self.psqt_bucket[b].0 -= m;
+            self.psqt_bucket[b].1 -= e;
+        }
         self.phase -= ph;
     }
     fn add_piece(&mut self, pt: PieceType, c: Color, s: Square) {
@@ -261,6 +290,11 @@ impl Board {
                 self.psqt_por_flanco[c.idx()][fl].0 += m;
                 self.psqt_por_flanco[c.idx()][fl].1 += e;
             }
+        }
+        for b in 0..crate::eval::NUM_BUCKETS {
+            let (m, e, _) = crate::eval::piece_contribution_bucket(pt, c, s, b);
+            self.psqt_bucket[b].0 += m;
+            self.psqt_bucket[b].1 += e;
         }
         self.phase += ph;
     }
