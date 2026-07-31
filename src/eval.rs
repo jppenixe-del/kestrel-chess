@@ -3639,8 +3639,13 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
                 if atk_bb == 0 {
                     continue;
                 }
+                // A cor tem de ser a de QUEM ATACA. Era `board.side`, o que
+                // e' o mesmo enquanto so' se avalia o lado que nao joga (o
+                // caminho por omissao), mas com `KESTREL_SEE_BOTH=1` a
+                // interseccao dava vazia para o segundo lado e a peca era
+                // saltada em silencio -- a feature nao fazia nada.
                 if let Some((from, _)) =
-                    crate::search::see::least_valuable_attacker(board, atk_bb, board.side)
+                    crate::search::see::least_valuable_attacker(board, atk_bb, victim.opp())
                 {
                     let mv = crate::moves::Move {
                         from,
