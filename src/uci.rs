@@ -72,6 +72,12 @@ fn move_overhead_ms() -> i64 {
 /// Matched on the total, the only remaining difference is the shape, which is
 /// the whole point of the change.
 const TIME_SLICE_DIVISOR: i64 = 55;
+
+/// Quantas vezes o gasto do adversario podemos gastar, em decimos, quando nao
+/// estamos a' frente no relogio. 25 = duas vezes e meia. Pensar o dobro do
+/// tempo dele e' uma vantagem; pensar quatro vezes mais e' como se perde por
+/// bandeira com a posicao ganha.
+const TETO_RITMO: i64 = 25;
 /// The hard ceiling, as a percentage of the remaining clock. Guards the game
 /// as a whole; on a healthy clock the ceiling below binds long before it.
 const HARD_CAP_PERCENT: i64 = 45;
@@ -181,6 +187,7 @@ fn compute_time_budget(
     last_score: Option<i32>,
     pieces_left: i64,
     game_ply: i64,
+    opp_pace: Option<i64>,
 ) -> (i64, i64) {
     let safe_time = (my_time - move_overhead_ms()).max(1);
 
@@ -289,8 +296,42 @@ fn compute_time_budget(
         hard_cap = hard_cap * adj / 10;
         // Being far behind on the clock also caps the base allowance, not just
         // the emergency ceiling -- thinking well and flagging is still a loss.
-        if ratio <= 5 {
-            soft = soft * 3 / 4;
+        // A resposta ao relogio era um DEGRAU: so' cortava o `soft` quando ja'
+        // tinhamos metade do relogio do adversario. Medido em 40 jogos de
+        // blitz nossos, esse ponto quase nunca chega -- ao lance 40 estavamos
+        // 5 segundos atras de 60, racio 0.92, e nao acontecia nada. Ficamos a
+        // perder terreno lance a lance ate' termos de jogar a correr.
+        //
+        // Continuo, e em percentagem para a divisao inteira nao comer o
+        // efeito: a 92% do relogio dele tira 4%, a 70% tira 15%, a 50% tira
+        // 25%. Nunca acelera por estarmos a' frente -- o tecto ja' trata
+        // disso acima; aqui so' se trava.
+        let pct = (my_time * 100 / opp_time).clamp(30, 200);
+        if pct < 100 {
+            let corte = (100 + (pct - 100) / 2).clamp(60, 100);
+            soft = soft * corte / 100;
+        }
+    }
+
+    // Nao deixar o adversario fugir no relogio.
+    //
+    // O problema medido: entre os lances 10 e 25 gastavamos 4 segundos por
+    // lance de um relogio de 180 -- 56 segundos em dezasseis lances, um terco
+    // do jogo -- enquanto o adversario ia a um. Ao lance 40 estavamos atras e
+    // a jogar a correr, e quatro de quarenta jogos de blitz acabaram por
+    // bandeira.
+    //
+    // Pensar melhor nao vale nada se o preco for chegar ao final sem relogio.
+    // Aqui olha-se para o que ELE esta' a gastar e nao se paga mais do que
+    // TETO_RITMO vezes isso -- mas so' quando nao estamos a' frente, porque
+    // com vantagem de relogio gastar mais e' precisamente o que se deve fazer.
+    //
+    // O chao de 300ms existe para nao nos deixarmos arrastar a jogar de
+    // borla so' porque o adversario tem um livro e responde a zero.
+    if let Some(pace) = opp_pace {
+        if opp_time > 0 && my_time <= opp_time && pace > 0 {
+            let teto = (pace * TETO_RITMO / 10).max(300);
+            soft = soft.min(teto);
         }
     }
 
@@ -379,7 +420,7 @@ fn compute_time_budget(
 /// e 43% com 2 ou menos. Abaixo deste numero o livro cala-se e a posicao vai a
 /// busca. Valor a medir em A/B -- por isso e' uma constante e nao um palpite
 /// espalhado pelo codigo.
-const BOOK_MIN_COUNT: u32 = 1;   // inerte por agora: uma medicao de cada vez. Subir para 3 quando for a vez dele.
+const BOOK_MIN_COUNT: u32 = 1;   // MEDIDO e rejeitado: com 3, 391-430-233 em 1054 jogos (-13 Elo). Fica inerte.
 
 fn default_style_book_path() -> String {
     // 2026-07-22: the Judit Polgar signature book was the user's
@@ -419,6 +460,11 @@ pub struct Engine {
     zob: Zobrist,
     tt: TranspositionTable,
     history: Vec<u64>,
+    // Relogio do adversario no `go` anterior, e a media corrida do que ele
+    // gasta por lance. Serve para nao o deixar fugir no relogio -- ver
+    // TETO_RITMO em compute_time_budget.
+    opp_time_anterior: Option<i64>,
+    opp_pace: Option<i64>,
     last_score: Option<i32>, // score (cp, nossa perspetiva) do ultimo "go" -- para os niveis 2/3 de compute_time_budget
     style_book: Option<crate::book::Book>, // "assinatura" da Judit Polgar -- ver book.rs
     threads: usize, // Lazy SMP -- ver search_mt(). 1 = sem paralelismo (comportamento antigo).
@@ -461,6 +507,8 @@ impl Engine {
             zob,
             tt: TranspositionTable::new(64),
             history: Vec::new(),
+            opp_time_anterior: None,
+            opp_pace: None,
             last_score: None,
             style_book,
             threads: 1,
@@ -891,10 +939,29 @@ impl Engine {
                 .flat_map(|side| side.iter())
                 .map(|bb| bb.count_ones() as i64)
                 .sum::<i64>();
+            // Quanto e' que ele gastou desde o nosso `go` anterior. O
+            // incremento dele volta ao relogio depois de jogar, portanto
+            // conta-se: gasto = anterior + inc - agora.
+            if let Some(ant) = self.opp_time_anterior {
+                let opp_inc = if side_white { binc } else { winc };
+                let gasto = ant + opp_inc - opp_time;
+                if gasto >= 0 && gasto < 600_000 {
+                    // Media corrida curta: o que ele fez ha vinte lances nao
+                    // diz nada sobre o que vai fazer agora, e uma media longa
+                    // demora demasiado a reagir a uma mudanca de ritmo -- que
+                    // e' precisamente quando isto importa.
+                    self.opp_pace = Some(match self.opp_pace {
+                        Some(p) => (p * 2 + gasto) / 3,
+                        None => gasto,
+                    });
+                }
+            }
+            self.opp_time_anterior = Some(opp_time);
             let (mut soft, mut hard_cap) =
                 compute_time_budget(my_time, my_inc, opp_time, movestogo, self.last_score,
                                     pieces_left, (self.board.fullmove as i64 - 1) * 2
-                                        + if side_white { 0 } else { 1 });
+                                        + if side_white { 0 } else { 1 },
+                                    self.opp_pace);
             // The opening is played, not calculated -- including the parts of
             // it the book does not reach.
             //
@@ -1494,6 +1561,8 @@ impl Engine {
                     self.hist.clear(); // new game -> forget learned tables
                     self.history.clear();
                     self.last_score = None;
+                    self.opp_time_anterior = None;
+                    self.opp_pace = None;
                 }
                 "position" => {
                     self.set_position(&tokens[1..]);
