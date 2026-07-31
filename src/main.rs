@@ -40,6 +40,16 @@ use std::time::Instant;
 use zobrist::Zobrist;
 
 fn main() {
+    // Buckets de PSQT: ligados por feature. Arrancam com as OITO tabelas
+    // iguais a' compilada, que e' a condicao do invariante da identidade --
+    // nesse estado o motor com buckets tem de avaliar exactamente como o motor
+    // sem eles, em qualquer posicao.
+    if cfg!(feature = "psqtbuckets") {
+        // Nada a fazer aqui: as tabelas enchem-se sozinhas na primeira
+        // leitura, com as compiladas, e um carregamento afinado que chegue
+        // antes disso substitui-as.
+    }
+
     let args: Vec<String> = env::args().collect();
     if args.len() >= 2 && args[1] == "bench" {
         // Fixed-work benchmark, in the shape a distributed test framework
@@ -349,6 +359,36 @@ fn main() {
             std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
         });
         selfplay_datagen_tc(num_games, out_path, base_ms, inc_ms, threads);
+        return;
+    }
+    if args.len() >= 3 && args[1] == "psqtbuckets" {
+        // psqtbuckets <pesos.txt> [buckets_cobertos]  ex: "0,1,2,3,4"
+        //
+        // Os buckets NAO listados ficam com a tabela compilada. Um dataset so'
+        // de finais nao produz sinal nenhum para os buckets de muitos peoes, e
+        // escrever la' o que saiu do treino seria levar para o meio-jogo pesos
+        // aprendidos numa populacao que nao e' a dele.
+        let txt = std::fs::read_to_string(&args[2]).expect("nao consegui ler os pesos");
+        let v: Vec<i32> = txt.split(|c: char| c == ',' || c.is_whitespace())
+            .filter(|t| !t.is_empty())
+            .filter_map(|t| t.parse().ok()).collect();
+        let stride = v.len() / eval::NUM_BUCKETS;
+        let mut cobertos = [false; eval::NUM_BUCKETS];
+        if let Some(lista) = args.get(3) {
+            for t in lista.split(',') {
+                if let Ok(b) = t.trim().parse::<usize>() {
+                    if b < eval::NUM_BUCKETS { cobertos[b] = true; }
+                }
+            }
+        } else {
+            for c in cobertos.iter_mut() { *c = true; }
+        }
+        println!("psqtbuckets: {} valores, stride {}, cobertos {:?}", v.len(), stride, cobertos);
+        if !eval::psqt_buckets_de_vector(&v, stride, &cobertos) {
+            eprintln!("psqtbuckets: falhou (tamanho errado?)");
+            return;
+        }
+        println!("psqtbuckets: carregadas");
         return;
     }
     if args.len() >= 4 && args[1] == "rotula" {
