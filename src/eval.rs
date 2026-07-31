@@ -638,9 +638,8 @@ fn mirror_idx(color: Color, s: Square) -> usize {
 /// A mesma casa, mas lida do ponto de vista de "o meu rei esta' no flanco da
 /// dama". Se estiver no do rei, espelha-se a COLUNA.
 ///
-/// Ideia vinda da estrutura do Sirius (duas tabelas por peca, a segunda e' a
-/// primeira com a coluna trocada). Nao custa um unico peso novo: e' a MESMA
-/// tabela lida de duas maneiras.
+/// Duas tabelas por peca, a segunda e' a primeira com a coluna trocada. Nao
+/// custa um unico peso novo: e' a MESMA tabela lida de duas maneiras.
 ///
 /// O que resolve: hoje damos o mesmo valor a um cavalo em f5 quer o nosso rei
 /// esteja em g1 quer esteja em c1, e a um peao na coluna h quer ele seja

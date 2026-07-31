@@ -33,7 +33,7 @@ fittedsf80 = []
 # Ajustado nas posicoes dos nossos proprios jogos. Ver fitted_ciclo.rs.
 fittedciclo = []
 
-# PSQT lidas pelo flanco do proprio rei (estrutura vinda do Sirius). A MESMA
+# PSQT lidas pelo flanco do proprio rei. A MESMA
 # tabela lida de duas maneiras -- zero pesos novos. Precisa das tabelas
 # reajustadas para render, por isso vem com interruptor.
 psqtmirror = []
