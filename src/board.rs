@@ -226,10 +226,18 @@ impl Board {
         let (mg, eg, ph) = crate::eval::piece_contribution(pt, c, s);
         self.mg_score -= mg;
         self.eg_score -= eg;
-        for fl in 0..2 {
-            let (m, e, _) = crate::eval::piece_contribution_flanco(pt, c, s, fl == 1);
-            self.psqt_por_flanco[c.idx()][fl].0 -= m;
-            self.psqt_por_flanco[c.idx()][fl].1 -= e;
+        // Os acumuladores por flanco so' sao LIDOS com a feature `psqtmirror`
+        // ligada (ver `material_pst_white`). Sem ela isto era trabalho morto
+        // pago em cada peca colocada ou retirada, ou seja, em cada lance da
+        // busca -- duas consultas de tabela por peca para um valor que
+        // ninguem consultava. Sendo uma const de compilacao, com a feature
+        // desligada o compilador apaga o bloco por inteiro.
+        if crate::eval::PSQT_ESPELHO_REI {
+            for fl in 0..2 {
+                let (m, e, _) = crate::eval::piece_contribution_flanco(pt, c, s, fl == 1);
+                self.psqt_por_flanco[c.idx()][fl].0 -= m;
+                self.psqt_por_flanco[c.idx()][fl].1 -= e;
+            }
         }
         self.phase -= ph;
     }
@@ -241,10 +249,18 @@ impl Board {
         let (mg, eg, ph) = crate::eval::piece_contribution(pt, c, s);
         self.mg_score += mg;
         self.eg_score += eg;
-        for fl in 0..2 {
-            let (m, e, _) = crate::eval::piece_contribution_flanco(pt, c, s, fl == 1);
-            self.psqt_por_flanco[c.idx()][fl].0 += m;
-            self.psqt_por_flanco[c.idx()][fl].1 += e;
+        // Os acumuladores por flanco so' sao LIDOS com a feature `psqtmirror`
+        // ligada (ver `material_pst_white`). Sem ela isto era trabalho morto
+        // pago em cada peca colocada ou retirada, ou seja, em cada lance da
+        // busca -- duas consultas de tabela por peca para um valor que
+        // ninguem consultava. Sendo uma const de compilacao, com a feature
+        // desligada o compilador apaga o bloco por inteiro.
+        if crate::eval::PSQT_ESPELHO_REI {
+            for fl in 0..2 {
+                let (m, e, _) = crate::eval::piece_contribution_flanco(pt, c, s, fl == 1);
+                self.psqt_por_flanco[c.idx()][fl].0 += m;
+                self.psqt_por_flanco[c.idx()][fl].1 += e;
+            }
         }
         self.phase += ph;
     }
