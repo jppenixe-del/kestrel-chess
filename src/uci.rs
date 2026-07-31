@@ -122,7 +122,23 @@ const PREDADOR_FOLGADO_PCT: i64 = 130;
 const PREDADOR_FOLGA_R10: i64 = 13;
 /// The hard ceiling, as a percentage of the remaining clock. Guards the game
 /// as a whole; on a healthy clock the ceiling below binds long before it.
-const HARD_CAP_PERCENT: i64 = 45;
+/// Corrigido de 45 para 25: o tecto real nunca passava dos 25%.
+///
+/// A 45 este parametro era uma fraude analitica. O minimo do horizonte e' 12 e
+/// o multiplicador de emergencia vai no maximo a 30 decimos, portanto o melhor
+/// caso possivel era (safe/12)*3 = 25% -- e no meio-jogo, com o horizonte no
+/// tecto de 42 e o multiplicador limitado pela fase, o real anda nos 3.6-4.8%.
+/// Medido com a linha de debug do proprio motor.
+///
+/// Quem baixasse isto de 45 para 35 a tentar ser conservador nao mudava nada, e
+/// nao teria como saber. Custou-me hoje uma alteracao inteira que ficou inerte.
+///
+/// Nao se sobe. Um tecto de 45% deixaria um unico lance comer vinte e cinco
+/// lances normais, com o `soft` a 1/55 do relogio -- e' a receita para perder
+/// por bandeira com a posicao ganha, que foi o defeito que custou uma manha a
+/// corrigir. Se 4x o orcamento normal for apertado, mede-se em
+/// HARD_CAP_BUDGET_MULT com SPRT, um valor de cada vez.
+const HARD_CAP_PERCENT: i64 = 25;
 /// The hard ceiling as a multiple of the base slice, in tenths. Sits just
 /// above the largest scaling the search can award itself, so a move that has
 /// earned every extension still gets cut before it can overshoot.

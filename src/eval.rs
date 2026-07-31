@@ -712,7 +712,39 @@ fn pst_eg_esp(kind: PieceType, color: Color, s: Square, esp: bool) -> i32 {
 /// que e' a unica comparacao em que confiamos.
 pub const PSQT_ESPELHO_REI: bool = cfg!(feature = "psqtmirror");
 
+/// A contribuicao de cada peca ja' calculada: material + PSQT + factor de
+/// amplitude, com o sinal da cor. [cor][peca][casa], 12 KB.
+///
+/// Nao tem nada que ver com buckets -- e' a mesma ideia aplicada ao motor
+/// normal. Cada peca que entra ou sai do tabuleiro fazia mirror_idx, lia o
+/// factor, indexava a tabela, multiplicava por mil e dividia, somava o
+/// material e aplicava o sinal. Tudo isso e' deterministico e cabe numa
+/// tabela; `make_move` passa a ler dois inteiros.
+static CONTRIB: std::sync::OnceLock<Box<[[[(i32, i32); 64]; 6]; 2]>> =
+    std::sync::OnceLock::new();
+
+fn constroi_contrib() -> Box<[[[(i32, i32); 64]; 6]; 2]> {
+    let mut t = Box::new([[[(0i32, 0i32); 64]; 6]; 2]);
+    for (ci, color) in [Color::White, Color::Black].iter().enumerate() {
+        for pi in 0..6 {
+            let kind = ALL_PIECES[pi];
+            for sq in 0..64u8 {
+                let (mg, eg, _) = piece_contribution_lenta(kind, *color, sq);
+                t[ci][pi][sq as usize] = (mg, eg);
+            }
+        }
+    }
+    t
+}
+
+#[inline(always)]
 pub fn piece_contribution(kind: PieceType, color: Color, s: Square) -> (i32, i32, i32) {
+    let t = CONTRIB.get_or_init(constroi_contrib);
+    let (mg, eg) = t[color.idx()][kind.idx()][s as usize];
+    (mg, eg, PHASE_INC[kind.idx()])
+}
+
+fn piece_contribution_lenta(kind: PieceType, color: Color, s: Square) -> (i32, i32, i32) {
     piece_contribution_flanco(kind, color, s, false)
 }
 
