@@ -351,6 +351,14 @@ fn main() {
         selfplay_datagen_tc(num_games, out_path, base_ms, inc_ms, threads);
         return;
     }
+    if args.len() >= 4 && args[1] == "rotula" {
+        // rotula <in.epd> <out.epd> [depth] [threads]
+        let d: i32 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(8);
+        let t: usize = args.get(5).and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4));
+        rotula_dataset(&args[2], &args[3], d, t);
+        return;
+    }
     if args.len() >= 4 && args[1] == "resolvequiet" {
         resolve_quiet_dataset(&args[2], &args[3]);
         return;
@@ -2655,6 +2663,90 @@ fn resolve_quiet_dataset(in_path: &str, out_path: &str) {
     std::fs::write(out_path, &out).expect("nao consegui escrever o output");
     println!("wrote {} quiet-resolved positions ({} skipped as forced mate) to {} in {:.0}s",
         lines.len() as u32 - skipped, skipped, out_path, t0.elapsed().as_secs_f64());
+}
+
+/// Etiquetar posicoes com o que a NOSSA busca ve a profundidade fixa.
+///
+/// Porque isto e' diferente de treinar contra a avaliacao de outro motor:
+/// as margens de poda, o desprezo pelo empate e os limiares desta busca estao
+/// todos calibrados para a escala da avaliacao que ela usa. Ensinar a
+/// avaliacao a imitar os numeros de outro motor da' uma que ve melhor e joga
+/// pior -- medido, -65.4 Elo em 629 jogos com a receita ja' corrigida.
+///
+/// A etiqueta daqui esta' na nossa escala por construcao. E o que a avaliacao
+/// estatica aprende e' a antecipar o que a busca encontraria mais fundo, que
+/// e' exactamente o que faz um motor jogar bem sem gastar relogio.
+///
+/// Iterativo por natureza: cada versao melhor produz etiquetas melhores.
+fn rotula_dataset(in_path: &str, out_path: &str, depth: i32, threads: usize) {
+    use crate::search::{Searcher, SearchLimits, CONT_HIST_SIZE, CORR_HIST_SIZE, MAX_PLY, MATE_SCORE};
+    let atk = Attacks::new();
+    let zob = zobrist::Zobrist::new();
+    let text = std::fs::read_to_string(in_path).expect("nao consegui ler o dataset");
+    let lines: Vec<String> = text.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+    let total = lines.len();
+    println!("rotula: {} posicoes, profundidade {}, {} threads", total, depth, threads);
+    let t0 = std::time::Instant::now();
+    let feito = std::sync::atomic::AtomicUsize::new(0);
+    let partes: Vec<Vec<String>> = (0..threads)
+        .map(|k| lines.iter().skip(k).step_by(threads).cloned().collect())
+        .collect();
+    let saidas: Vec<String> = std::thread::scope(|sc| {
+        let hs: Vec<_> = partes.iter().map(|parte| {
+            let atk = &atk; let zob = &zob; let feito = &feito;
+            sc.spawn(move || {
+                let tt = tt::TranspositionTable::new(16);
+                let mut out = String::new();
+                for linha in parte {
+                    let fen = linha.split('\t').next().unwrap_or("");
+                    let mut board = Board::from_fen(fen);
+                    let mut s = Searcher {
+                        root_side: board.side,
+                        stop_flag: &crate::search::NO_STOP,
+                        cut_nodes: 0, cut_first: 0, nmp_tried: 0, nmp_tried_pv: 0,
+                        nmp_failed_pv: 0, nmp_cutoff_raw: 0, nmp_cut_taken: 0,
+                        nmp_verify_tried: 0, nmp_verify_ok: 0, nmp_verify_failed: 0,
+                        nmp_failed_low: 0, qnodes: 0, cut_rfp: 0, cut_razor: 0,
+                        cut_futility: 0, nodes_shallow: 0, lmr_quiet_total: 0,
+                        lmr_skip_check: 0, lmr_skip_depth: 0, lmr_skip_extend: 0,
+                        lmr_skip_early: 0, lmr_tried: 0, lmr_research: 0, lmr_sum: 0,
+                        atk, zob, tt: &tt, nodes: 0,
+                        limits: SearchLimits { deadline: None, max_depth: depth, max_nodes: None, soft_budget: None },
+                        stop: false, history: Vec::new(), killers: [[None; 2]; MAX_PLY],
+                        history_scores: [[[0; 64]; 64]; 2], countermoves: [[None; 64]; 6],
+                        cont_hist: vec![0i32; CONT_HIST_SIZE].into_boxed_slice(),
+                        corr_hist: vec![0i32; CORR_HIST_SIZE * 2].into_boxed_slice(),
+                        corr_hist_np_stm: vec![0i32; CORR_HIST_SIZE * 2].into_boxed_slice(),
+                        corr_hist_np_nstm: vec![0i32; CORR_HIST_SIZE * 2].into_boxed_slice(),
+                        corr_hist_minor: vec![0i32; CORR_HIST_SIZE * 2].into_boxed_slice(),
+                        corr_hist_major: vec![0i32; CORR_HIST_SIZE * 2].into_boxed_slice(),
+                        corr_hist_threats: vec![0i32; CORR_HIST_SIZE * 2].into_boxed_slice(),
+                        ply_last_move: [None; MAX_PLY], static_evals: [0i32; MAX_PLY],
+                        root_best: None, root_scores: Vec::new(), nmp_min_ply: 0,
+                        excluded_move: None, excluded_root_moves: vec![], style_book: None,
+                        root_move_nodes: Vec::new(), capture_history: [[[0; 6]; 6]; 2],
+                        dextensions: [0; MAX_PLY], report: false,
+                    };
+                    let (_mv, score, _d, _n) = s.iterative_deepening(&mut board);
+                    let n = feito.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if n % 20000 == 0 { println!("  {} posicoes", n); }
+                    // Mates fora: uma posicao ja' decidida tacticamente nao
+                    // ensina nada a uma avaliacao estatica.
+                    if score.abs() >= MATE_SCORE - MAX_PLY as i32 { continue; }
+                    // Score na perspectiva das BRANCAS, que e' a convencao do
+                    // extractor de features.
+                    let branco = if board.side == crate::types::Color::White { score } else { -score };
+                    out.push_str(fen); out.push('\t');
+                    out.push_str(&branco.to_string()); out.push('\n');
+                }
+                out
+            })
+        }).collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let junto: String = saidas.concat();
+    std::fs::write(out_path, &junto).expect("nao consegui escrever");
+    println!("rotula: {} linhas em {:.0}s -> {}", junto.lines().count(), t0.elapsed().as_secs_f64(), out_path);
 }
 
 /// Debug helper: does `book_path` have an entry for `fen`? Prints the
