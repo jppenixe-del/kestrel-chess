@@ -161,8 +161,23 @@ pub mod see {
         let mut attacker_val = attacker_pt0.value();
         let mut side = attacker_color0.opp();
 
+        // Os atacantes eram revarridos DO ZERO a cada troca -- ate' 32 vezes
+        // por SEE, cada uma com duas consultas de peao, uma de cavalo, uma de
+        // rei, duas magias e oito ORs para montar as mascaras. Mas ao tirar
+        // uma peca do tabuleiro so' um deslizante pode passar a atacar a casa
+        // (a bateria atras dele); cavalos, peoes e reis nunca aparecem de
+        // novo. Entao calcula-se o conjunto uma vez e a seguir so' se
+        // reexaminam os deslizantes, com as mascaras montadas ca' fora.
+        let diag = board.pieces[Color::White.idx()][PieceType::Bishop.idx()]
+            | board.pieces[Color::Black.idx()][PieceType::Bishop.idx()]
+            | board.pieces[Color::White.idx()][PieceType::Queen.idx()]
+            | board.pieces[Color::Black.idx()][PieceType::Queen.idx()];
+        let orth = board.pieces[Color::White.idx()][PieceType::Rook.idx()]
+            | board.pieces[Color::Black.idx()][PieceType::Rook.idx()]
+            | board.pieces[Color::White.idx()][PieceType::Queen.idx()]
+            | board.pieces[Color::Black.idx()][PieceType::Queen.idx()];
+        let mut attackers = attackers_to(a, board, to, occ);
         loop {
-            let attackers = attackers_to(a, board, to, occ);
             let side_attackers = attackers & board.occ_color[side.idx()];
             let Some((lva_sq, lva_pt)) = least_valuable_attacker(board, side_attackers, side) else {
                 break;
@@ -170,6 +185,9 @@ pub mod see {
             gains.push(attacker_val - *gains.last().unwrap());
             attacker_val = lva_pt.value();
             occ &= !bb(lva_sq);
+            // Tira o atacante usado e junta o que ele tapava.
+            attackers |= (bishop_attacks(to, occ) & diag) | (rook_attacks(to, occ) & orth);
+            attackers &= occ;
             side = side.opp();
             if gains.len() > 32 {
                 break;
@@ -2201,7 +2219,17 @@ impl<'a> Searcher<'a> {
             // influencia a busca. Dentro da propria quiescence (resolucao
             // de capturas, que pode ter varios nos), usa-se a versao
             // rapida (ver quiescence()) para nao pagar o custo repetido.
-            let full_stand_pat = evaluate(board);
+            // Mesma reutilizacao que o caminho de profundidade > 0 faz dez
+            // linhas abaixo: se a TT ja' tem a avaliacao completa desta
+            // posicao, calcula-la outra vez e' repetir trabalho identico.
+            // Aqui pesa mais do que la', porque a entrada da quiescencia e'
+            // onde esta' a maioria dos nos.
+            let full_stand_pat = match tt_entry_captured
+                .filter(|e| e.static_eval != crate::tt::TT_EVAL_NONE)
+            {
+                Some(e) => e.static_eval as i32,
+                None => evaluate(board),
+            };
             return self.quiescence_from(board, alpha, beta, ply, full_stand_pat);
         }
 
