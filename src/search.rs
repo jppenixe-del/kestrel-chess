@@ -945,6 +945,8 @@ pub struct Searcher<'a> {
     pub stop_flag: &'a AtomicBool,
     /// Nodes where a beta cutoff happened, and how many of those took only
     /// the first move. See the note at the increment.
+    /// Indice desta thread na busca paralela. Zero e a principal.
+    pub thread_idx: usize,
     pub asp_re: u64,
     pub asp_nos: u64,
     pub cut_nodes: u64,
@@ -3424,7 +3426,32 @@ impl<'a> Searcher<'a> {
         self.killers = [[None; 2]; MAX_PLY];
         self.root_move_nodes.clear();
         self.root_scores.clear();
+        // Diversificacao das threads ajudantes.
+        //
+        // Antes disto a UNICA diferenca entre as N threads era qual delas
+        // narrava: mesmo tabuleiro, mesma busca, mesmos parametros. No
+        // meio-jogo safava-se, porque com trinta lances legais os historicos
+        // separam-se e cada thread acaba noutro ramo. Num final de rei e
+        // peoes ha seis lances: todas percorriam a MESMA arvore, escreviam
+        // nas mesmas linhas de cache da TT e atropelavam-se. Medido em
+        // Lasker-Reichhelm a profundidade 29: uma thread 825 mil nos em
+        // 376ms, quatro threads 11,2 MILHOES em 7527ms -- vinte vezes mais
+        // lento, com o ritmo a cair para um quinto ao mesmo tempo que os nos
+        // explodiam. As duas coisas juntas sao a assinatura de threads a
+        // lutar pelo mesmo trabalho, nao de sobrecarga de paralelismo.
+        //
+        // Cada ajudante salta um padrao proprio de profundidades, portanto
+        // chega a cada uma com a TT noutro estado e explora outra ordem. A
+        // thread 0 nunca salta nada: e ela que decide o lance.
+        const SALTO_TAM: [i32; 20] = [1, 1, 2, 2, 2, 3, 3, 4, 4, 4, 5, 5, 6, 6, 6, 7, 7, 8, 8, 8];
+        const SALTO_FASE: [i32; 20] = [0, 1, 0, 1, 2, 0, 1, 0, 1, 2, 0, 1, 0, 1, 2, 0, 1, 0, 1, 2];
         for depth in 1..=self.limits.max_depth {
+            if self.thread_idx > 0 {
+                let i = (self.thread_idx - 1) % 20;
+                if ((depth + SALTO_FASE[i]) / SALTO_TAM[i]) % 2 != 0 {
+                    continue;
+                }
+            }
             let score = self.search_root(board, depth, prev_score);
             // 2026-07-20 (BUG REAL corrigido -- irmao do bug ja' corrigido
             // dentro do loop de lances de negamax(), "nunca descartar o

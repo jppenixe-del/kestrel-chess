@@ -1544,6 +1544,7 @@ impl Engine {
                         // only thread 0 narrates, or each depth would be
                         // announced once per Lazy-SMP thread
                         report: ti == 0,
+                        thread_idx: ti,
                     };
                     scope.spawn(move || {
                         let mut searcher = searcher;
