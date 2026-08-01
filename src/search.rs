@@ -157,7 +157,14 @@ pub mod see {
             occ &= !bb(ep_captured);
         }
 
-        let mut gains: Vec<i32> = vec![victim_val0];
+        // Era um Vec com capacidade 1: uma alocacao no heap por CHAMADA, e
+        // cada push a realocar (1->2->4->8). SEE e' chamado na ordenacao de
+        // lances, na poda e na avaliacao de pecas penduradas -- milhoes de
+        // vezes por segundo. A sequencia de trocas tem um tecto de 32, por
+        // isso cabe na pilha e nunca precisou do heap.
+        let mut gains = [0i32; 34];
+        gains[0] = victim_val0;
+        let mut n_gains = 1usize;
         let mut attacker_val = attacker_pt0.value();
         let mut side = attacker_color0.opp();
 
@@ -182,19 +189,20 @@ pub mod see {
             let Some((lva_sq, lva_pt)) = least_valuable_attacker(board, side_attackers, side) else {
                 break;
             };
-            gains.push(attacker_val - *gains.last().unwrap());
+            gains[n_gains] = attacker_val - gains[n_gains - 1];
+            n_gains += 1;
             attacker_val = lva_pt.value();
             occ &= !bb(lva_sq);
             // Tira o atacante usado e junta o que ele tapava.
             attackers |= (bishop_attacks(to, occ) & diag) | (rook_attacks(to, occ) & orth);
             attackers &= occ;
             side = side.opp();
-            if gains.len() > 32 {
+            if n_gains > 32 {
                 break;
             }
         }
 
-        for i in (1..gains.len()).rev() {
+        for i in (1..n_gains).rev() {
             gains[i - 1] = (-gains[i]).min(gains[i - 1]);
         }
         gains[0]
