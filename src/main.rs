@@ -665,6 +665,7 @@ fn play_one_selfplay_game(
         }
 
         let mut searcher = Searcher {
+            thread_idx: 0,
             root_side: board.side,
             stop_flag: &crate::search::NO_STOP,
             asp_re: 0,
@@ -928,6 +929,7 @@ fn play_one_selfplay_game_tc(
         let move_t0 = Instant::now();
 
         let mut searcher = Searcher {
+            thread_idx: 0,
             root_side: board.side,
             stop_flag: &crate::search::NO_STOP,
             asp_re: 0,
@@ -2628,6 +2630,7 @@ fn resolve_quiet_dataset(in_path: &str, out_path: &str) {
         let mut board = Board::from_fen(fen);
 
         let mut searcher = Searcher {
+            thread_idx: 0,
             root_side: board.side,
             stop_flag: &crate::search::NO_STOP,
             asp_re: 0,
@@ -2744,6 +2747,7 @@ fn rotula_dataset(in_path: &str, out_path: &str, depth: i32, threads: usize) {
                     let fen = linha.split('\t').next().unwrap_or("");
                     let mut board = Board::from_fen(fen);
                     let mut s = Searcher {
+                        thread_idx: 0,
                         root_side: board.side,
                         stop_flag: &crate::search::NO_STOP,
                         asp_re: 0,
@@ -3125,6 +3129,7 @@ fn bench(depth: i32) {
         tt.clear();
         let stop = std::sync::atomic::AtomicBool::new(false);
         let mut searcher = search::Searcher {
+            thread_idx: 0,
             root_side: board.side,
             stop_flag: &stop,
             asp_re: 0,
