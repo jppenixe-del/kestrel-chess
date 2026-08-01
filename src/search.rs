@@ -207,6 +207,81 @@ pub mod see {
         }
         gains[0]
     }
+    /// `see(mv) >= limiar`, mas sem calcular o valor exacto.
+    ///
+    /// O SEE completo constroi a sequencia de trocas toda e so' no fim, na
+    /// passagem inversa, e' que sabe o resultado. Quando a pergunta e' apenas
+    /// "isto passa a fasquia?" -- e e' o que a maioria dos sitios pergunta:
+    /// `>= 0` na quiescencia, `< see_allowance` na poda -- a resposta costuma
+    /// ficar decidida a' primeira ou segunda troca. Aqui leva-se um valor
+    /// corrente com o truque negamax (`valor = peca - valor`) e sai-se assim
+    /// que o sinal deixa de poder mudar.
+    ///
+    /// Tem de concordar com `see(..) >= limiar` em TODAS as posicoes; se
+    /// discordar numa que seja, a contagem de nos do bench muda.
+    pub fn see_ge(a: &Attacks, board: &Board, mv: &Move, limiar: i32) -> bool {
+        let to = mv.to;
+        let Some((attacker_pt0, attacker_color0)) = board.piece_at(mv.from) else {
+            return 0 >= limiar;
+        };
+        let victim_val0 = if mv.flag == MoveFlag::EnPassant {
+            PieceType::Pawn.value()
+        } else {
+            match board.piece_at(to) {
+                Some((pt, _)) => pt.value(),
+                None => 0,
+            }
+        };
+
+        let mut valor = victim_val0 - limiar;
+        if valor < 0 {
+            return false;
+        }
+        valor = attacker_pt0.value() - valor;
+        if valor <= 0 {
+            return true;
+        }
+
+        let mut occ = board.occ_all;
+        occ &= !bb(mv.from);
+        if mv.flag == MoveFlag::EnPassant {
+            let ep_captured = sq(file_of(to), rank_of(mv.from));
+            occ &= !bb(ep_captured);
+        }
+
+        let diag = board.pieces[Color::White.idx()][PieceType::Bishop.idx()]
+            | board.pieces[Color::Black.idx()][PieceType::Bishop.idx()]
+            | board.pieces[Color::White.idx()][PieceType::Queen.idx()]
+            | board.pieces[Color::Black.idx()][PieceType::Queen.idx()];
+        let orth = board.pieces[Color::White.idx()][PieceType::Rook.idx()]
+            | board.pieces[Color::Black.idx()][PieceType::Rook.idx()]
+            | board.pieces[Color::White.idx()][PieceType::Queen.idx()]
+            | board.pieces[Color::Black.idx()][PieceType::Queen.idx()];
+        let mut attackers = attackers_to(a, board, to, occ);
+
+        let mut side = attacker_color0.opp();
+        let mut res = true;
+        loop {
+            attackers &= occ;
+            let side_attackers = attackers & board.occ_color[side.idx()];
+            let Some((lva_sq, lva_pt)) = least_valuable_attacker(board, side_attackers, side)
+            else {
+                break;
+            };
+            res = !res;
+            valor = lva_pt.value() - valor;
+            // `res` diz de quem e' a vez de ficar a ganhar: o limite muda de
+            // 0 para 1 conforme o lado, tal como na formulacao classica.
+            if valor < res as i32 {
+                break;
+            }
+            occ &= !bb(lva_sq);
+            attackers |= (bishop_attacks(to, occ) & diag) | (rook_attacks(to, occ) & orth);
+            side = side.opp();
+        }
+        res
+    }
+
     pub fn attackers_to(a: &Attacks, board: &Board, s: crate::types::Square, occ: crate::bitboard::Bitboard) -> crate::bitboard::Bitboard {
         let a = a;
         let mut att = 0u64;
@@ -1851,7 +1926,7 @@ impl<'a> Searcher<'a> {
             }
         } else {
             moves.retain(|m| m.is_capture() || m.promotion == Some(PieceType::Queen));
-            moves.retain(|m| !m.is_capture() || see::see(self.atk, board, m) >= 0);
+            moves.retain(|m| !m.is_capture() || see::see_ge(self.atk, board, m, 0));
             if alpha.abs() < MATE_SCORE - MAX_PLY as i32 {
                 let delta_margin = search_params().delta_margin;
                 moves.retain(|m| {
@@ -1944,7 +2019,7 @@ impl<'a> Searcher<'a> {
             // Promocoes de dama ficam sempre (mv.to nao e' captura nesse
             // caso, is_capture()==false, so' entram aqui por causa do
             // OR acima -- SEE nao se aplica, `is_capture()` protege isso).
-            moves.retain(|m| !m.is_capture() || see::see(self.atk, board, m) >= 0);
+            moves.retain(|m| !m.is_capture() || see::see_ge(self.atk, board, m, 0));
             // Delta pruning: a capture that CANNOT reach alpha even in
             // the best case (winning the captured piece outright, a
             // looser bound than the full SEE exchange) isn't worth
@@ -2530,7 +2605,7 @@ impl<'a> Searcher<'a> {
                     }
                     // SEE pre-filter: skip captures whose max plausible
                     // gain can't reach prob_beta from here anyway.
-                    if static_eval + see::see(self.atk, board, mv) < prob_beta {
+                    if !see::see_ge(self.atk, board, mv, prob_beta - static_eval) {
                         continue;
                     }
                     let undo = board.make_move(mv);
@@ -2788,7 +2863,7 @@ impl<'a> Searcher<'a> {
                 } else {
                     -100 * depth
                 };
-                if see::see(self.atk, board, &mv) < see_allowance {
+                if !see::see_ge(self.atk, board, &mv, see_allowance) {
                     i += 1;
                     continue;
                 }
