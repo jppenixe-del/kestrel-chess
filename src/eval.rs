@@ -4006,7 +4006,100 @@ fn eval_mode_material_only() -> bool {
         std::env::var("KESTREL_EVAL_MODE").map(|v| v == "material").unwrap_or(false)
     })
 }
+// === Cache de avaliacao por posicao ===
+//
+// Isto nao veio do motor de referencia -- veio de medir onde ELE nao pode ir.
+// Por no', ele falha a cache 14,45 vezes e nos 8,34; o IPC dele e' 1,10 e o
+// nosso 2,36. Ou seja: ele esta' preso a' memoria e nos estamos presos a
+// trabalho. Quem tem folga de memoria e falta de ciclos deve trocar uma pela
+// outra, e essa troca so' esta' disponivel para o nosso lado.
+//
+// A TT ja' guarda a avaliacao, mas e' o instrumento errado para isto: e'
+// substituida por buscas mais profundas e as entradas competem por espaco com
+// scores e lances. Uma cache dedicada guarda so' o que interessa e mantem
+// posicoes que a TT ja' deitou fora.
+//
+// A chave cobre tudo o que a avaliacao le': os doze bitboards, o lado a jogar
+// e os direitos de roque (ha' um termo de rei por rocar). Se faltasse alguma
+// coisa, o bench mudava de contagem.
+#[derive(Clone, Copy)]
+struct EntradaEval {
+    chave: u64,
+    geracao: u64,
+    valor: i32,
+}
+
+const CACHE_EVAL_BITS: usize = 17; // 131072 entradas, ~2 MB por thread
+
+thread_local! {
+    static CACHE_EVAL: std::cell::RefCell<Vec<EntradaEval>> =
+        std::cell::RefCell::new(vec![
+            EntradaEval { chave: 0, geracao: u64::MAX, valor: 0 };
+            1 << CACHE_EVAL_BITS
+        ]);
+}
+
+#[inline(always)]
+fn chave_posicao(board: &Board) -> u64 {
+    const K: [u64; 12] = [
+        0x9E3779B97F4A7C15, 0xC2B2AE3D27D4EB4F, 0x165667B19E3779F9, 0x27D4EB2F165667C5,
+        0x9E3779B185EBCA87, 0xFF51AFD7ED558CCD, 0xC4CEB9FE1A85EC53, 0xD6E8FEB86659FD93,
+        0xA24BAED4963EE407, 0x9FB21C651E98DF25, 0xEB44ACCAB455D165, 0x2545F4914F6CDD1D,
+    ];
+    let mut h = 0u64;
+    let mut i = 0;
+    for c in 0..2 {
+        for pt in 0..6 {
+            // Misturador completo, com deslocamento ANTES da primeira
+            // multiplicacao. Sem ele, uma peca no bit 63 e' invisivel: a
+            // multiplicacao so' propaga bits para cima e 2^63 vezes qualquer
+            // impar da' 2^63, portanto trocar h8 entre dois bitboards mexe
+            // nos dois termos pelo mesmo delta e o XOR cancela. Torre, bispo
+            // e cavalo em h8 davam a mesma chave -- foi assim que esta cache
+            // falhou, duas vezes, antes de eu perceber que o problema era o
+            // sentido em que a multiplicacao mistura.
+            let mut v = board.pieces[c][pt] ^ K[i];
+            v ^= v >> 30;
+            v = v.wrapping_mul(0xBF58476D1CE4E5B9);
+            v ^= v >> 27;
+            v = v.wrapping_mul(0x94D049BB133111EB);
+            v ^= v >> 31;
+            h ^= v;
+            i += 1;
+        }
+    }
+    h ^= (board.castling as u64).wrapping_mul(0x8EBC6AF09C88C6E3);
+    if board.side == Color::White {
+        h ^= 0x589965CC75374CC3;
+    }
+    h
+}
+
 pub fn evaluate(board: &Board) -> i32 {
+    let chave = chave_posicao(board);
+    let geracao = GERACAO_PESOS.load(std::sync::atomic::Ordering::Relaxed);
+    let idx = (chave as usize) & ((1 << CACHE_EVAL_BITS) - 1);
+    if let Some(v) = CACHE_EVAL.with(|t| {
+        let e = t.borrow()[idx];
+        if e.chave == chave && e.geracao == geracao { Some(e.valor) } else { None }
+    }) {
+        static VERIFICA: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *VERIFICA.get_or_init(|| std::env::var_os("KESTREL_VERIFICA_EVAL").is_some()) {
+            let real = evaluate_sem_cache(board);
+            if real != v {
+                eprintln!("EVAL-CACHE DISCORDA: cache={} real={} fen={}", v, real, board.to_fen());
+            }
+        }
+        return v;
+    }
+    let valor = evaluate_sem_cache(board);
+    CACHE_EVAL.with(|t| {
+        t.borrow_mut()[idx] = EntradaEval { chave, geracao, valor };
+    });
+    valor
+}
+
+fn evaluate_sem_cache(board: &Board) -> i32 {
     // Known endgames answer for themselves, before anything is counted.
     // Material is the wrong instrument here: it scored two knights against a
     // bare king at +4.20, a position with no mate in it at all, higher than
