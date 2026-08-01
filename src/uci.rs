@@ -1352,7 +1352,7 @@ impl Engine {
                 let mate_in = ((MATE_SCORE - score.abs() + 1) / 2).max(1);
                 format!("mate {}", if score > 0 { mate_in } else { -mate_in })
             } else {
-                format!("cp {}", score)
+                format!("cp {}", crate::eval::score_normalizado(score))
             };
             match best {
                 Some(mv) => {
@@ -1837,8 +1837,11 @@ impl Engine {
                         let v = crate::eval::evaluate(b);
                         if b.side == crate::types::Color::White { v } else { -v }
                     };
-                    let _ = writeln!(out, "eval(white) total={}  bruto={}  material_pst={}  positional={}",
-                                     seen, mat + pos, mat, pos);
+                    // O total sai normalizado (centipeoes comparaveis com
+                    // outros motores); o interno fica ao lado porque e' nele
+                    // que a busca e as margens de poda trabalham.
+                    let _ = writeln!(out, "eval(white) total={}cp  [interno={}]  bruto={}  material_pst={}  positional={}",
+                                     crate::eval::score_normalizado(seen), seen, mat + pos, mat, pos);
                     let _ = writeln!(out, "  pieces={} mobility={} king={} threats+pawns={}", pieces, mobility, king, rest);
                     let _ = out.flush();
                 }

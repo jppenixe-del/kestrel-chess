@@ -2212,7 +2212,28 @@ impl Weights {
 /// a comparable share: 23% / 28% / 29% / 19%.
 pub const NUM_BUCKETS: usize = 8;
 
+/// Particao alternativa POR PECAS (KESTREL_BUCKET_PECAS=1), a do Stockfish
+/// com NNUE: (npecas-1)/4, oito baldes. Existe para a comparacao ser feita
+/// com o MESMO binario e os MESMOS dados, mudando so' a particao.
+fn bucket_por_pecas(board: &Board) -> usize {
+    let mut n = 0u32;
+    for c in 0..2 {
+        for pt in 0..6 {
+            n += board.pieces[c][pt].count_ones();
+        }
+    }
+    (((n.max(1) - 1) / 4) as usize).min(NUM_BUCKETS - 1)
+}
+
+fn particao_por_pecas() -> bool {
+    static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *P.get_or_init(|| std::env::var_os("KESTREL_BUCKET_PECAS").is_some())
+}
+
 pub fn bucket_of(board: &Board) -> usize {
+    if particao_por_pecas() {
+        return bucket_por_pecas(board);
+    }
     let pawns = crate::bitboard::count(
         board.pieces[Color::White.idx()][PieceType::Pawn.idx()]
             | board.pieces[Color::Black.idx()][PieceType::Pawn.idx()],
@@ -4481,6 +4502,15 @@ fn eg_queen_minus_pawn() -> i32 {
 /// from zero without ever flipping who's better -- an easy mistake to
 /// make without it.
 fn complexity_adjustment(board: &Board, raw: i32, w: &Weights) -> i32 {
+    // DIAGNOSTICO (KESTREL_SEM_COMPLEXITY=1): este termo SOMA um bloco
+    // proporcional ao numero de peoes, com o sinal do que a avaliacao ja
+    // dizia, sem olhar a magnitude. Numa posicao perfeitamente simetrica com
+    // 16 peoes transforma -2 em -108. Serve para medir quanto da nossa escala
+    // (K=967 contra os 400 do NNUE) vem daqui.
+    static SEM_CX: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *SEM_CX.get_or_init(|| std::env::var_os("KESTREL_SEM_COMPLEXITY").is_some()) {
+        return 0;
+    }
     if raw == 0 {
         return 0;
     }
@@ -4724,4 +4754,25 @@ fn positional_terms_signed(board: &Board) -> i32 {
     } else {
         -p
     }
+}
+
+/// Converte a avaliacao INTERNA para centipeoes reportaveis.
+///
+/// As unidades internas nao tem de significar centipeoes -- sao o que o
+/// afinador produziu, e as margens de poda foram calibradas contra elas, por
+/// isso mexer nelas partia a coerencia da busca. O que tem de estar calibrado
+/// e' o numero que SAI. E' exactamente o que o motor de referencia faz:
+/// mantem o peao interno a 65 em meio-jogo e divide o score reportado por uma
+/// constante (102, no caso dele) afinada contra resultados reais.
+///
+/// A nossa constante vem da relacao `normalizado = k * bruto`, com o k medido
+/// por `medek` contra 200 mil posicoes rotuladas pelo Stockfish: k=0.4136,
+/// logo N = 100/k = 242. Antes disto a posicao inicial reportava 83 quando o
+/// motor de referencia reporta 28, e a startpos depois de e4 dava 103 -- tres
+/// vezes o que vale.
+pub const NORMALIZA_PARA_PEAO: i32 = 242;
+
+#[inline]
+pub fn score_normalizado(interno: i32) -> i32 {
+    interno * 100 / NORMALIZA_PARA_PEAO
 }

@@ -3612,7 +3612,7 @@ impl<'a> Searcher<'a> {
                         let mate_in = (MATE_SCORE - rs.abs() + 1) / 2;
                         format!("mate {}", if rs > 0 { mate_in } else { -mate_in })
                     } else {
-                        format!("cp {}", rs)
+                        format!("cp {}", crate::eval::score_normalizado(rs))
                     };
                     // The same number as chances of winning, drawing, losing.
                     //
