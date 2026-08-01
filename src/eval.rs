@@ -2212,8 +2212,8 @@ impl Weights {
 /// a comparable share: 23% / 28% / 29% / 19%.
 pub const NUM_BUCKETS: usize = 8;
 
-/// Particao alternativa POR PECAS (KESTREL_BUCKET_PECAS=1), a do Stockfish
-/// com NNUE: (npecas-1)/4, oito baldes. Existe para a comparacao ser feita
+/// Particao alternativa POR PECAS (KESTREL_BUCKET_PECAS=1), a que os
+/// motores com NNUE usam: (npecas-1)/4, oito baldes. Existe para a comparacao ser feita
 /// com o MESMO binario e os MESMOS dados, mudando so' a particao.
 fn bucket_por_pecas(board: &Board) -> usize {
     let mut n = 0u32;
@@ -4766,7 +4766,8 @@ fn positional_terms_signed(board: &Board) -> i32 {
 /// constante (102, no caso dele) afinada contra resultados reais.
 ///
 /// A nossa constante vem da relacao `normalizado = k * bruto`, com o k medido
-/// por `medek` contra 200 mil posicoes rotuladas pelo Stockfish: k=0.4136,
+/// por `medek` contra 200 mil posicoes com rotulos de um motor forte:
+/// k=0.4136,
 /// logo N = 100/k = 242. Antes disto a posicao inicial reportava 83 quando o
 /// motor de referencia reporta 28, e a startpos depois de e4 dava 103 -- tres
 /// vezes o que vale.

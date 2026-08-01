@@ -357,7 +357,7 @@ fn main() {
         return;
     }
     // Converte o formato .data2 (registos de 112 bytes com BITBOARDS e
-    // rotulos do Stockfish) para o `FEN<TAB>resultado` que o gpuextract le.
+    // rotulos de um motor forte) para o `FEN<TAB>resultado` que o gpuextract le.
     //
     // Le directamente os bitboards: sao a mesma estrutura que Board.pieces,
     // portanto nao ha' descodificacao nenhuma, so' montar o tabuleiro e pedir
@@ -375,7 +375,7 @@ fn main() {
     //
     // O sigmoide e' 1/(1+10^(-k*eval/400)), portanto o K CLASSICO e' 400/k.
     // k=1 significa que um centipeao nosso vale o mesmo que um centipeao do
-    // Stockfish ou de uma NNUE, que usam K=400. k<1 significa que avaliamos
+    // os motores de referencia, que usam K=400. k<1 significa que avaliamos
     // mais alto do que a probabilidade de vitoria justifica -- e como as
     // margens de poda sao em centipeoes FIXOS, uma avaliacao inflacionada
     // deixa-as efectivamente mais apertadas do que quem as calibrou queria.
