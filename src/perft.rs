@@ -29,6 +29,16 @@ pub fn verify_incremental_eval(board: &mut Board, depth: u32, atk: &Attacks) -> 
     let mut fresh = board.clone();
     fresh.recompute_eval_accumulators();
     let mut mismatches = 0u64;
+    // Os acumuladores por bucket entram na mesma rede: um erro de sinal ou
+    // uma casa esquecida num deles rebenta aqui, e nao numa partida.
+    for b in 0..crate::eval::NUM_BUCKETS {
+        if fresh.psqt_bucket[b] != board.psqt_bucket[b] {
+            mismatches += 1;
+            eprintln!("MISMATCH BUCKET {} fen={} incremental={:?} fresh={:?}",
+                      b, board.to_fen(), board.psqt_bucket[b], fresh.psqt_bucket[b]);
+            break;
+        }
+    }
     if fresh.mg_score != board.mg_score || fresh.eg_score != board.eg_score || fresh.phase != board.phase {
         mismatches += 1;
         eprintln!(

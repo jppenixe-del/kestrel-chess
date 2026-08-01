@@ -496,6 +496,195 @@ fn psqt_override() -> &'static Option<([Option<[i32; 64]>; 6], [Option<[i32; 64]
 static PSQT_OVERRIDE_ACTIVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// PSQT com dimensao de BUCKET: [bucket][peca][casa], MG e EG.
+///
+/// Porque isto teve de existir: o afinador, ao separar por contagem de peoes,
+/// mostrou que a torre quer coisas OPOSTAS conforme a fase. Na setima fila
+/// vale +56 quando ha' peoes para atacar e -32 quando nao ha' -- com o
+/// tabuleiro quase vazio a setima nao serve para nada e o que conta e' a torre
+/// atras do peao passado, na propria retaguarda.
+///
+/// Uma tabela global nao consegue exprimir isso. Qualquer numero que la' se
+/// ponha e' a media de duas verdades contrarias, e a media de duas verdades
+/// contrarias nao serve nenhuma delas. Foi exactamente assim que uma tabela
+/// escrita a mao, com +50 na setima para todos os casos, perdeu 23.8 Elo em
+/// 1171 partidas num livro de finais de torres feito para lhe ser favoravel.
+pub static PSQT_BUCKETS_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// [bucket][peca][casa] para MG e EG. So' consultada quando ACTIVE.
+pub static PSQT_BUCKETS: std::sync::OnceLock<Box<([[[i32; 64]; 6]; NUM_BUCKETS],
+                                                  [[[i32; 64]; 6]; NUM_BUCKETS])>> =
+    std::sync::OnceLock::new();
+
+/// A contribuicao JA' CALCULADA de cada peca, por bucket, cor e casa:
+/// material + PSQT do bucket + factor de amplitude, com o sinal da cor.
+///
+/// Sem isto, manter oito acumuladores custava 25% do debito: cada peca que
+/// entrava ou saia do tabuleiro fazia oito vezes o calculo inteiro --
+/// mirror_idx, leitura do factor, leitura da tabela -- em vez de oito somas.
+/// Medido em maquina livre: 499k nos por segundo contra 375k.
+///
+/// Com a tabela, `make_move` passa a ler inteiros de memoria contigua e a
+/// soma-los. Sao 8 x 2 x 6 x 64 pares de i32 = 48 KB, que cabe em L2 com
+/// folga -- e o ciclo de oito e' desenrolado pelo compilador.
+pub static PSQT_COMBINADO: std::sync::OnceLock<
+    Box<[[[[(i32, i32); 64]; 6]; 2]; NUM_BUCKETS]>,
+> = std::sync::OnceLock::new();
+
+/// Carregar as PSQT de um vector afinado, bucket a bucket.
+///
+/// `v` tem NUM_BUCKETS * stride valores, no layout do extractor:
+/// 705 posicionais | 12 de material | 768 de PSQT | 1 de bias.
+/// As PSQT sao 6 pecas x 64 casas em MG e depois o mesmo em EG.
+///
+/// Os buckets que o dataset nao cobriu ficam com a tabela COMPILADA. Um
+/// conjunto de treino so' de finais nao toca nos buckets de 12 peoes ou mais,
+/// e escrever la' zeros ou valores extrapolados seria estragar o meio-jogo
+/// para arranjar o final -- que e' precisamente o erro que este trabalho todo
+/// existe para evitar. `cobertos` diz quais confiar.
+pub fn psqt_buckets_de_vector(v: &[i32], stride: usize, cobertos: &[bool]) -> bool {
+    if v.len() < NUM_BUCKETS * stride || cobertos.len() < NUM_BUCKETS {
+        return false;
+    }
+    let mut mg = [[[0i32; 64]; 6]; NUM_BUCKETS];
+    let mut eg = [[[0i32; 64]; 6]; NUM_BUCKETS];
+    let tmg = [&MG_PAWN, &MG_KNIGHT, &MG_BISHOP, &MG_ROOK, &MG_QUEEN, &MG_KING];
+    let teg = [&EG_PAWN, &EG_KNIGHT, &EG_BISHOP, &EG_ROOK, &EG_QUEEN, &EG_KING];
+    const PSQT_OFF: usize = 705 + 12;
+    for b in 0..NUM_BUCKETS {
+        for p in 0..6 {
+            for i in 0..64 {
+                if cobertos[b] {
+                    mg[b][p][i] = v[b * stride + PSQT_OFF + p * 64 + i];
+                    eg[b][p][i] = v[b * stride + PSQT_OFF + 384 + p * 64 + i];
+                } else {
+                    mg[b][p][i] = tmg[p][i];
+                    eg[b][p][i] = teg[p][i];
+                }
+            }
+        }
+    }
+    if PSQT_BUCKETS.set(Box::new((mg, eg))).is_err() {
+        return false;
+    }
+    PSQT_BUCKETS_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+    psqt_combinado_reconstroi();
+    true
+}
+
+/// Reconstroi a tabela combinada a partir das tabelas por bucket em vigor.
+/// Chamada uma vez ao arranque e sempre que os buckets forem recarregados.
+pub fn psqt_combinado_reconstroi() {
+    let _ = PSQT_COMBINADO.set(constroi_combinado());
+}
+
+fn constroi_combinado() -> Box<[[[[(i32, i32); 64]; 6]; 2]; NUM_BUCKETS]> {
+    let mut t = Box::new([[[[(0i32, 0i32); 64]; 6]; 2]; NUM_BUCKETS]);
+    for b in 0..NUM_BUCKETS {
+        for (ci, color) in [Color::White, Color::Black].iter().enumerate() {
+            for pi in 0..6 {
+                let kind = ALL_PIECES[pi];
+                for sq in 0..64u8 {
+                    let (mg, eg, _) = piece_contribution_bucket_lento(kind, *color, sq, b);
+                    t[b][ci][pi][sq as usize] = (mg, eg);
+                }
+            }
+        }
+    }
+    t
+}
+
+/// A tabela de um bucket. Se os buckets nao estiverem activos, devolve None e
+/// tudo segue pelo caminho antigo.
+#[inline]
+fn psqt_do_bucket(bucket: usize, kind: PieceType, idx: usize, eg: bool) -> Option<i32> {
+    if !cfg!(feature = "psqtbuckets") {
+        return None;
+    }
+    let t = PSQT_BUCKETS.get_or_init(|| tabelas_do_ambiente().unwrap_or_else(tabelas_compiladas));
+    let tab = if eg { &t.1 } else { &t.0 };
+    Some(tab[bucket][kind.idx()][idx])
+}
+
+/// Encher os oito buckets com a MESMA tabela compilada.
+///
+/// E' o estado em que o invariante da identidade tem de valer: com as oito
+/// iguais, o motor com buckets tem de dar avaliacoes identicas ao motor sem
+/// eles, em qualquer posicao. Se diferirem num centipeao, ha' erro na
+/// refactorizacao e sabe-se antes de gastar um jogo.
+/// As tabelas por bucket, do ficheiro se houver um, senao as compiladas.
+///
+/// KESTREL_PSQT_BUCKETS aponta para um ficheiro de pesos no layout do
+/// extractor; KESTREL_PSQT_COBERTOS diz quais os buckets a confiar
+/// (ex. "0,1,2,3,4"). Os restantes ficam com as compiladas -- um treino so'
+/// de finais nao produz sinal nenhum para os buckets de muitos peoes.
+fn tabelas_do_ambiente() -> Option<Box<([[[i32; 64]; 6]; NUM_BUCKETS], [[[i32; 64]; 6]; NUM_BUCKETS])>> {
+    let caminho = std::env::var("KESTREL_PSQT_BUCKETS").ok()?;
+    let txt = std::fs::read_to_string(&caminho).ok()?;
+    let v: Vec<i32> = txt.split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|t| !t.is_empty()).filter_map(|t| t.parse().ok()).collect();
+    if v.len() < NUM_BUCKETS { return None; }
+    let stride = v.len() / NUM_BUCKETS;
+    let mut cobertos = [true; NUM_BUCKETS];
+    if let Ok(lista) = std::env::var("KESTREL_PSQT_COBERTOS") {
+        cobertos = [false; NUM_BUCKETS];
+        for t in lista.split(',') {
+            if let Ok(b) = t.trim().parse::<usize>() { if b < NUM_BUCKETS { cobertos[b] = true; } }
+        }
+    }
+    let mut mg = [[[0i32; 64]; 6]; NUM_BUCKETS];
+    let mut eg = [[[0i32; 64]; 6]; NUM_BUCKETS];
+    let tmg = [&MG_PAWN, &MG_KNIGHT, &MG_BISHOP, &MG_ROOK, &MG_QUEEN, &MG_KING];
+    let teg = [&EG_PAWN, &EG_KNIGHT, &EG_BISHOP, &EG_ROOK, &EG_QUEEN, &EG_KING];
+    const PSQT_OFF: usize = 705 + 12;
+    for b in 0..NUM_BUCKETS {
+        for p in 0..6 {
+            for i in 0..64 {
+                if cobertos[b] && b * stride + PSQT_OFF + 384 + p * 64 + i < v.len() {
+                    mg[b][p][i] = v[b * stride + PSQT_OFF + p * 64 + i];
+                    eg[b][p][i] = v[b * stride + PSQT_OFF + 384 + p * 64 + i];
+                } else {
+                    mg[b][p][i] = tmg[p][i];
+                    eg[b][p][i] = teg[p][i];
+                }
+            }
+        }
+    }
+    eprintln!("info string psqt buckets de {} (cobertos {:?})", caminho, cobertos);
+    Some(Box::new((mg, eg)))
+}
+
+fn tabelas_compiladas() -> Box<([[[i32; 64]; 6]; NUM_BUCKETS], [[[i32; 64]; 6]; NUM_BUCKETS])> {
+    let mut mg = [[[0i32; 64]; 6]; NUM_BUCKETS];
+    let mut eg = [[[0i32; 64]; 6]; NUM_BUCKETS];
+    let tmg = [&MG_PAWN, &MG_KNIGHT, &MG_BISHOP, &MG_ROOK, &MG_QUEEN, &MG_KING];
+    let teg = [&EG_PAWN, &EG_KNIGHT, &EG_BISHOP, &EG_ROOK, &EG_QUEEN, &EG_KING];
+    for b in 0..NUM_BUCKETS {
+        for p in 0..6 {
+            for i in 0..64 { mg[b][p][i] = tmg[p][i]; eg[b][p][i] = teg[p][i]; }
+        }
+    }
+    Box::new((mg, eg))
+}
+
+pub fn psqt_buckets_iguais() {
+    let mut mg = [[[0i32; 64]; 6]; NUM_BUCKETS];
+    let mut eg = [[[0i32; 64]; 6]; NUM_BUCKETS];
+    let tmg = [&MG_PAWN, &MG_KNIGHT, &MG_BISHOP, &MG_ROOK, &MG_QUEEN, &MG_KING];
+    let teg = [&EG_PAWN, &EG_KNIGHT, &EG_BISHOP, &EG_ROOK, &EG_QUEEN, &EG_KING];
+    for b in 0..NUM_BUCKETS {
+        for p in 0..6 {
+            for i in 0..64 {
+                mg[b][p][i] = tmg[p][i];
+                eg[b][p][i] = teg[p][i];
+            }
+        }
+    }
+    let _ = PSQT_BUCKETS.set(Box::new((mg, eg)));
+    PSQT_BUCKETS_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 #[inline]
 fn psqt_from_override(kind: PieceType, idx: usize, eg: bool) -> Option<i32> {
     if !PSQT_OVERRIDE_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
@@ -749,6 +938,34 @@ pub fn piece_contribution(kind: PieceType, color: Color, s: Square) -> (i32, i32
 
 fn piece_contribution_lenta(kind: PieceType, color: Color, s: Square) -> (i32, i32, i32) {
     piece_contribution_flanco(kind, color, s, false)
+}
+
+/// A contribuicao de uma peca lida pela tabela de um bucket especifico.
+/// Lookup na tabela combinada. E' esta que o `make_move` usa.
+#[inline(always)]
+pub fn piece_contribution_bucket(
+    kind: PieceType, color: Color, s: Square, bucket: usize,
+) -> (i32, i32, i32) {
+    // get_or_init em vez de get: assim quem carrega tabelas afinadas pode
+    // faze-lo ANTES da primeira leitura, sem lutar com um OnceLock ja' cheio.
+    // Encher no arranque obrigava o carregador a chegar primeiro que o main, o
+    // que nao e' possivel.
+    let t = PSQT_COMBINADO.get_or_init(constroi_combinado);
+    let (mg, eg) = t[bucket][color.idx()][kind.idx()][s as usize];
+    (mg, eg, PHASE_INC[kind.idx()])
+}
+
+/// O calculo por extenso. So' usado para CONSTRUIR a tabela acima.
+fn piece_contribution_bucket_lento(
+    kind: PieceType, color: Color, s: Square, bucket: usize,
+) -> (i32, i32, i32) {
+    let sign = if color == Color::White { 1 } else { -1 };
+    let f = psqt_factor(kind.idx());
+    let idx = mirror_idx(color, s);
+    let pmg = psqt_do_bucket(bucket, kind, idx, false).unwrap_or_else(|| pst_mg(kind, color, s));
+    let peg = psqt_do_bucket(bucket, kind, idx, true).unwrap_or_else(|| pst_eg(kind, color, s));
+    let (pmg, peg) = if f == 1000 { (pmg, peg) } else { (pmg * f / 1000, peg * f / 1000) };
+    (sign * (mg_value(kind.idx()) + pmg), sign * (eg_value(kind.idx()) + peg), PHASE_INC[kind.idx()])
 }
 
 /// A contribuicao de uma peca, lida do ponto de vista de um dado flanco do rei
@@ -1995,7 +2212,28 @@ impl Weights {
 /// a comparable share: 23% / 28% / 29% / 19%.
 pub const NUM_BUCKETS: usize = 8;
 
+/// Particao alternativa POR PECAS (KESTREL_BUCKET_PECAS=1), a que os
+/// motores com NNUE usam: (npecas-1)/4, oito baldes. Existe para a comparacao ser feita
+/// com o MESMO binario e os MESMOS dados, mudando so' a particao.
+fn bucket_por_pecas(board: &Board) -> usize {
+    let mut n = 0u32;
+    for c in 0..2 {
+        for pt in 0..6 {
+            n += board.pieces[c][pt].count_ones();
+        }
+    }
+    (((n.max(1) - 1) / 4) as usize).min(NUM_BUCKETS - 1)
+}
+
+fn particao_por_pecas() -> bool {
+    static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *P.get_or_init(|| std::env::var_os("KESTREL_BUCKET_PECAS").is_some())
+}
+
 pub fn bucket_of(board: &Board) -> usize {
+    if particao_por_pecas() {
+        return bucket_por_pecas(board);
+    }
     let pawns = crate::bitboard::count(
         board.pieces[Color::White.idx()][PieceType::Pawn.idx()]
             | board.pieces[Color::Black.idx()][PieceType::Pawn.idx()],
@@ -4264,6 +4502,15 @@ fn eg_queen_minus_pawn() -> i32 {
 /// from zero without ever flipping who's better -- an easy mistake to
 /// make without it.
 fn complexity_adjustment(board: &Board, raw: i32, w: &Weights) -> i32 {
+    // DIAGNOSTICO (KESTREL_SEM_COMPLEXITY=1): este termo SOMA um bloco
+    // proporcional ao numero de peoes, com o sinal do que a avaliacao ja
+    // dizia, sem olhar a magnitude. Numa posicao perfeitamente simetrica com
+    // 16 peoes transforma -2 em -108. Serve para medir quanto da nossa escala
+    // (K=967 contra os 400 do NNUE) vem daqui.
+    static SEM_CX: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *SEM_CX.get_or_init(|| std::env::var_os("KESTREL_SEM_COMPLEXITY").is_some()) {
+        return 0;
+    }
     if raw == 0 {
         return 0;
     }
@@ -4477,6 +4724,17 @@ pub fn material_pst_white(board: &Board) -> i32 {
     // Com o espelho ligado le-se o acumulador do flanco em que cada rei
     // esta'; sem ele, o de sempre. Sao os dois mantidos em paralelo, portanto
     // isto e' so' escolher qual ler -- um lance de rei nao custa nada.
+    // Buckets activos: o lookup e' directo, sem ciclo -- o trabalho ja' foi
+    // feito incrementalmente nos oito acumuladores.
+    // Decidido em COMPILACAO, nao com uma carga atomica por no'. A feature e'
+    // de compilacao; ler um atomico em cada evaluate para responder a uma
+    // pergunta que o compilador ja' sabe e' pagar um acesso a memoria e um
+    // branch milhoes de vezes por segundo para nada.
+    if cfg!(feature = "psqtbuckets") {
+        let b = bucket_of(board);
+        let (mg, eg) = board.psqt_bucket[b];
+        return (mg * phase + eg * (MAX_PHASE - phase)) / MAX_PHASE;
+    }
     let (mg, eg) = if PSQT_ESPELHO_REI {
         let fw = flanco_do_rei(board, Color::White) as usize;
         let fb = flanco_do_rei(board, Color::Black) as usize;
@@ -4496,4 +4754,26 @@ fn positional_terms_signed(board: &Board) -> i32 {
     } else {
         -p
     }
+}
+
+/// Converte a avaliacao INTERNA para centipeoes reportaveis.
+///
+/// As unidades internas nao tem de significar centipeoes -- sao o que o
+/// afinador produziu, e as margens de poda foram calibradas contra elas, por
+/// isso mexer nelas partia a coerencia da busca. O que tem de estar calibrado
+/// e' o numero que SAI. E' exactamente o que o motor de referencia faz:
+/// mantem o peao interno a 65 em meio-jogo e divide o score reportado por uma
+/// constante (102, no caso dele) afinada contra resultados reais.
+///
+/// A nossa constante vem da relacao `normalizado = k * bruto`, com o k medido
+/// por `medek` contra 200 mil posicoes com rotulos de um motor forte:
+/// k=0.4136,
+/// logo N = 100/k = 242. Antes disto a posicao inicial reportava 83 quando o
+/// motor de referencia reporta 28, e a startpos depois de e4 dava 103 -- tres
+/// vezes o que vale.
+pub const NORMALIZA_PARA_PEAO: i32 = 242;
+
+#[inline]
+pub fn score_normalizado(interno: i32) -> i32 {
+    interno * 100 / NORMALIZA_PARA_PEAO
 }
