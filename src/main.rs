@@ -356,6 +356,117 @@ fn main() {
         linearity_probe(&args[2]);
         return;
     }
+    // Converte o formato .data2 (registos de 112 bytes com BITBOARDS e
+    // rotulos do Stockfish) para o `FEN<TAB>resultado` que o gpuextract le.
+    //
+    // Le directamente os bitboards: sao a mesma estrutura que Board.pieces,
+    // portanto nao ha' descodificacao nenhuma, so' montar o tabuleiro e pedir
+    // o FEN. O rotulo usado e' o wdl (resultado), nao o cp, porque e' a
+    // resultados que o ajuste que ganhou 152 Elo foi feito.
+    //
+    //   data2epd <ficheiro.data2> <saida.epd> [n_posicoes] [passo]
+    //
+    // `passo` salta registos para amostrar o ficheiro todo em vez dos
+    // primeiros N: o ficheiro ja' vem baralhado, mas amostrar em passo
+    // protege contra qualquer ordem residual.
+    // Mede o K do motor contra rotulos externos.
+    //
+    //   medek <ficheiro.epd>     (FEN<TAB>resultado, resultado no POV das brancas)
+    //
+    // O sigmoide e' 1/(1+10^(-k*eval/400)), portanto o K CLASSICO e' 400/k.
+    // k=1 significa que um centipeao nosso vale o mesmo que um centipeao do
+    // Stockfish ou de uma NNUE, que usam K=400. k<1 significa que avaliamos
+    // mais alto do que a probabilidade de vitoria justifica -- e como as
+    // margens de poda sao em centipeoes FIXOS, uma avaliacao inflacionada
+    // deixa-as efectivamente mais apertadas do que quem as calibrou queria.
+    if args.len() >= 3 && args[1] == "medek" {
+        let txt = std::fs::read_to_string(&args[2]).expect("nao leu o ficheiro");
+        let mut evals: Vec<f64> = Vec::new();
+        let mut alvos: Vec<f64> = Vec::new();
+        for linha in txt.lines() {
+            let mut it = linha.split('\t');
+            let (fen, r) = match (it.next(), it.next()) { (Some(a), Some(b)) => (a, b), _ => continue };
+            let alvo: f64 = match r.trim().parse() { Ok(v) => v, Err(_) => continue };
+            let b = Board::from_fen(fen);
+            let e = eval::evaluate(&b);
+            let e_brancas = if b.side == types::Color::White { e as f64 } else { -(e as f64) };
+            evals.push(e_brancas);
+            alvos.push(alvo);
+        }
+        let erro = |k: f64| -> f64 {
+            let mut s = 0.0;
+            for (e, a) in evals.iter().zip(alvos.iter()) {
+                let p = 1.0 / (1.0 + 10f64.powf(-k * e / 400.0));
+                s += (a - p) * (a - p);
+            }
+            s / evals.len() as f64
+        };
+        // Varredura grosseira e depois refinamento, que chega para um escalar.
+        let (mut melhor_k, mut melhor) = (1.0f64, f64::INFINITY);
+        let mut k = 0.10;
+        while k <= 3.0 { let v = erro(k); if v < melhor { melhor = v; melhor_k = k; } k += 0.01; }
+        let mut passo = 0.005;
+        for _ in 0..40 {
+            for cand in [melhor_k - passo, melhor_k + passo] {
+                if cand > 0.0 { let v = erro(cand); if v < melhor { melhor = v; melhor_k = cand; } }
+            }
+            passo *= 0.7;
+        }
+        println!("{} posicoes", evals.len());
+        println!("k otimo = {:.4}   ->  K CLASSICO = {:.0}", melhor_k, 400.0 / melhor_k);
+        println!("erro quadratico medio = {:.6}", melhor);
+        println!("(NNUE usa K=400; k=1 seria estarmos na mesma escala)");
+        return;
+    }
+
+    if args.len() >= 4 && args[1] == "data2epd" {
+        use std::io::{Read, Write, BufWriter};
+        const R: usize = 112;
+        let quantas: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(8_000_000);
+        let passo: usize = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(1);
+        let mut f = std::fs::File::open(&args[2]).expect("nao abriu o .data2");
+        let total = f.metadata().map(|m| m.len() as usize / R).unwrap_or(0);
+        println!("{} registos no ficheiro; a escrever {} com passo {}", total, quantas, passo);
+        let saida = std::fs::File::create(&args[3]).expect("nao criou a saida");
+        let mut out = BufWriter::with_capacity(1 << 20, saida);
+        let mut buf = [0u8; R];
+        let mut escritas = 0usize;
+        let mut lidas = 0usize;
+        let mut saltados = 0usize;
+        while escritas < quantas {
+            if f.read_exact(&mut buf).is_err() { break; }
+            lidas += 1;
+            if passo > 1 && lidas % passo != 0 { continue; }
+            let mut b = Board::from_fen("8/8/8/8/8/8/8/8 w - - 0 1");
+            let mut ok = true;
+            for c in 0..2 {
+                for pt in 0..6 {
+                    let i = (c * 6 + pt) * 8;
+                    let bb = u64::from_le_bytes(buf[i..i + 8].try_into().unwrap());
+                    b.pieces[c][pt] = bb;
+                }
+            }
+            // Um rei de cada lado, senao o registo nao presta.
+            if b.pieces[0][5].count_ones() != 1 || b.pieces[1][5].count_ones() != 1 { ok = false; }
+            let stm = buf[96];
+            let wdl = f32::from_le_bytes(buf[104..108].try_into().unwrap());
+            if !ok || !wdl.is_finite() || !(0.0..=1.0).contains(&wdl) { saltados += 1; continue; }
+            b.side = if stm == 0 { types::Color::White } else { types::Color::Black };
+            b.castling = 0;
+            b.ep_square = 64;
+            b.recompute_occ();
+            b.rebuild_mailbox();
+            b.recompute_eval_accumulators();
+            // O wdl vem no ponto de vista de quem joga; o ajuste quer o das
+            // brancas.
+            let alvo = if b.side == types::Color::White { wdl } else { 1.0 - wdl };
+            writeln!(out, "{}\t{}", b.to_fen(), alvo).ok();
+            escritas += 1;
+        }
+        println!("escritas {} posicoes ({} registos saltados por invalidos)", escritas, saltados);
+        return;
+    }
+
     if args.len() >= 4 && args[1] == "gpuextract" {
         // gpuextract <dataset.epd> <out.bin> [max_positions] [buckets] [threads]
         let maxp: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(usize::MAX);

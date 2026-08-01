@@ -151,6 +151,23 @@ impl Board {
         b
     }
 
+    /// Repovoa o mailbox a partir dos bitboards. So' e' preciso quando um
+    /// tabuleiro e' montado de fora (ler bitboards de um ficheiro, por
+    /// exemplo) em vez de vir do from_fen ou de um make_move.
+    pub fn rebuild_mailbox(&mut self) {
+        self.mailbox = [None; 64];
+        for c in [Color::White, Color::Black] {
+            for pt in ALL_PIECES {
+                let mut bb = self.pieces[c.idx()][pt.idx()];
+                while bb != 0 {
+                    let s = bb.trailing_zeros() as usize;
+                    bb &= bb - 1;
+                    self.mailbox[s] = Some((pt, c));
+                }
+            }
+        }
+    }
+
     pub fn recompute_occ(&mut self) {
         for c in [Color::White, Color::Black] {
             let mut o = 0u64;
