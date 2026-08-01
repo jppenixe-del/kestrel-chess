@@ -379,6 +379,54 @@ fn main() {
     // mais alto do que a probabilidade de vitoria justifica -- e como as
     // margens de poda sao em centipeoes FIXOS, uma avaliacao inflacionada
     // deixa-as efectivamente mais apertadas do que quem as calibrou queria.
+    // Mede a QUIETUDE de um conjunto de treino.
+    //
+    //   quietude <ficheiro.epd> [n]
+    //
+    // O Texel tuning classico exige posicoes quietas: avaliar estaticamente uma
+    // posicao onde ha' uma peca pendurada e compara-la com o resultado da
+    // partida injecta ruido enorme, e o ruido cai desproporcionadamente no
+    // tempo -- porque numa posicao com material pendurado e' QUEM JOGA que o
+    // captura.
+    if args.len() >= 3 && args[1] == "quietude" {
+        let atk = attacks::Attacks::new();
+        let txt = std::fs::read_to_string(&args[2]).expect("nao leu");
+        let limite: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(20000);
+        let (mut n, mut xeque, mut captura_boa, mut promo, mut extremo) = (0usize, 0, 0, 0, 0);
+        let mut melhor_ganho_total = 0i64;
+        for linha in txt.lines().take(limite) {
+            let mut it = linha.split('\t');
+            let fen = match it.next() { Some(f) => f, None => continue };
+            let alvo: f32 = it.next().and_then(|r| r.trim().parse().ok()).unwrap_or(0.5);
+            let mut b = board::Board::from_fen(fen);
+            n += 1;
+            if alvo < 0.02 || alvo > 0.98 { extremo += 1; }
+            if b.in_check(b.side, &atk) { xeque += 1; continue; }
+            let moves = movegen::generate_legal(&mut b, &atk);
+            let mut melhor = 0i32;
+            for mv in moves.iter() {
+                if mv.promotion.is_some() { promo += 1; break; }
+            }
+            for mv in moves.iter() {
+                if !mv.is_capture() { continue; }
+                let g = search::see::see(&atk, &b, mv);
+                if g > melhor { melhor = g; }
+            }
+            if melhor > 0 { captura_boa += 1; melhor_ganho_total += melhor as i64; }
+        }
+        let pc = |x: usize| 100.0 * x as f64 / n.max(1) as f64;
+        println!("{} posicoes analisadas", n);
+        println!("  em xeque                        : {:5.1}%", pc(xeque));
+        println!("  com captura que GANHA material  : {:5.1}%  (SEE > 0)", pc(captura_boa));
+        println!("  com promocao disponivel         : {:5.1}%", pc(promo));
+        println!("  rotulo extremo (<0.02 ou >0.98) : {:5.1}%", pc(extremo));
+        if captura_boa > 0 {
+            println!("  ganho medio quando ha' captura  : {} cp", melhor_ganho_total / captura_boa as i64);
+        }
+        println!("  --- NAO QUIETAS (xeque ou captura a ganhar): {:.1}% ---", pc(xeque + captura_boa));
+        return;
+    }
+
     if args.len() >= 3 && args[1] == "medek" {
         let txt = std::fs::read_to_string(&args[2]).expect("nao leu o ficheiro");
         let mut evals: Vec<f64> = Vec::new();
