@@ -52,6 +52,43 @@ fn main() {
         bench(depth);
         return;
     }
+    // Confronta see_ge(mv, t) com see(mv) >= t em todas as capturas de todas
+    // as posicoes do bench, para cada limiar num intervalo largo. Uma so'
+    // discordancia e' um bug -- as duas TEM de ser a mesma funcao.
+    if args.len() >= 2 && args[1] == "seetest" {
+        let atk = attacks::Attacks::new();
+        let mut testes = 0u64;
+        let mut falhas = 0u64;
+        for fen in BENCH_FENS.iter() {
+            let mut b = board::Board::from_fen(fen);
+            let moves = movegen::generate_legal(&mut b, &atk);
+            for mv in moves.iter() {
+                for t in [-1000, -500, -330, -100, -1, 0, 1, 100, 330, 500, 900, 1000] {
+                    let exacto = search::see::see(&atk, &b, mv) >= t;
+                    let rapido = search::see::see_ge(&atk, &b, mv, t);
+                    testes += 1;
+                    if exacto != rapido {
+                        falhas += 1;
+                        if falhas <= 5 {
+                            println!(
+                                "DISCORDA fen={} lance={}->{} limiar={} exacto={} rapido={} see={}",
+                                fen,
+                                mv.from,
+                                mv.to,
+                                t,
+                                exacto,
+                                rapido,
+                                search::see::see(&atk, &b, mv)
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        println!("seetest: {} comparacoes, {} discordancias", testes, falhas);
+        return;
+    }
+
     if args.len() >= 2 && args[1] == "perft" {
         let depth: u32 = args.get(2).map(|s| s.parse().unwrap()).unwrap_or(5);
         let fen = if args.len() > 3 {
