@@ -1357,7 +1357,17 @@ impl Engine {
             match best {
                 Some(mv) => {
                     collected.push((((b'A' + (pv_index - 1) as u8)) as char, mv, score));
-                    if pv_index <= multipv {
+                    // Com MultiPV a 1 a busca ja' narrou esta profundidade enquanto
+                    // aprofundava, e esta era uma SEGUNDA linha para a mesma -- sem o
+                    // campo wdl e com o nps recalculado sobre o tempo total, portanto
+                    // com numeros diferentes dos da primeira. Uma interface que leia
+                    // info linha a linha via duas actualizacoes incoerentes para a
+                    // mesma profundidade, e um `tail -1` apanhava a errada -- foi o que
+                    // aconteceu a varias medicoes deste projecto.
+                    //
+                    // Com MultiPV > 1 continua a ser precisa: as linhas B, C e
+                    // seguintes nao passam pelo narrador da busca.
+                    if pv_index <= multipv && (multipv > 1 || pv_index > 1) {
                         let pv_str = if pv_line.is_empty() {
                             mv.to_uci()
                         } else {
