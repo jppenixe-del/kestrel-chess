@@ -38,6 +38,9 @@ fittedciclo = []
 # reajustadas para render, por isso vem com interruptor.
 psqtmirror = []
 
+# PSQT com dimensao de bucket: [bucket][peca][casa]. Ver PSQT_BUCKETS.
+psqtbuckets = []
+
 [dependencies]
 
 [profile.release]

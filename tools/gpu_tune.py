@@ -1,4 +1,4 @@
-"""Fitting the evaluation weights to game results, on the GPU.
+"""Texel tuning on the GPU.
 
 The engine already writes the hard part: `kestrel gpuextract <dataset> <out.bin>
 <max> <buckets> <threads>` decomposes each position into the linear
@@ -159,7 +159,17 @@ def main():
     t0 = time.time()
     counts, cols, vals, results = parse(feats_path)
     n_pos = len(counts)
+    # O tamanho vem do maior indice VISTO nos dados, e isso engana-se quando o
+    # dataset nao cobre todos os buckets: um conjunto so' de finais ocupa 5 dos
+    # 8 buckets (os buckets sao por contagem de peoes e num final ha poucos),
+    # e o vector de pesos saia 7430 em vez de 11888 -- incompativel com o
+    # ficheiro de arranque e com o que o motor le.
     n_par = int(cols.max()) + 1
+    npar_forcado = int(flag("--npar", 0))
+    if npar_forcado:
+        if npar_forcado < n_par:
+            raise SystemExit(f"--npar {npar_forcado} e' menor que o maior indice nos dados ({n_par})")
+        n_par = npar_forcado
     nnz = len(vals)
     print(f"{n_pos} positions, {n_par} parameters, {nnz} non-zeros "
           f"({nnz / max(1, n_pos):.0f} per position), read in {time.time() - t0:.1f}s")
@@ -259,12 +269,158 @@ def main():
         w = torch.zeros(n_par, device=dev)
 
     trainable = None
-    if stride and free:
+    # `--faixas a-b,c-d` treina apenas esses deslocamentos dentro de cada
+    # `--stride`, e serve para o que `--free N` nao consegue exprimir: treinar
+    # os posicionais E as PSQT deixando o MATERIAL congelado no meio.
+    #
+    # O layout de cada bucket e' 705 posicionais | 12 de material | 768 de
+    # PSQT | 1 de bias. Tunar o material junto com o resto e' o erro classico:
+    # os valores das pecas absorvem qualquer erro de escala do resto e a
+    # avaliacao inteira desloca-se, o que deixa as margens da busca -- que nao
+    # sao reajustadas -- calibradas para outro motor.
+    ancora = float(flag("--ancora", "0"))
+    ancora_par = float(flag("--ancora-par", "0"))
+    _pf = flag("--fixa-peao", "")
+    peao_fixo = tuple(float(x) for x in _pf.split(",")) if _pf else None
+    faixas = flag("--faixas", "")
+    if stride and faixas:
+        m = np.zeros(n_par, dtype=bool)
+        off = np.arange(n_par) % stride
+        for parte in faixas.split(","):
+            a, b = parte.split("-")
+            m |= (off >= int(a)) & (off <= int(b))
+        trainable = torch.from_numpy(m.astype(np.float32)).to(dev)
+        print(f"  a treinar {int(m.sum())} de {n_par} pesos (faixas {faixas} de cada {stride})",
+              flush=True)
+    elif stride and free:
         m = (np.arange(n_par) % stride) < free
         trainable = torch.from_numpy(m.astype(np.float32)).to(dev)
         print(f"  a treinar {int(m.sum())} de {n_par} pesos "
               f"(os primeiros {free} de cada {stride}); os restantes ficam como estao",
               flush=True)
+
+    # --- Ancora por sinal observado ---------------------------------------
+    #
+    # Um peso so' aprende na medida em que os dados o LEEM. Com avaliacao
+    # interpolada, o gradiente de um peso de final e' multiplicado por
+    # (1 - fase); num bucket cujas posicoes sao quase todas de abertura, esse
+    # peso quase nao recebe sinal nenhum. Medido nestes dados: o bucket dos
+    # 14+ peoes tem 21,21% das posicoes em fase de abertura e 0,10% em fase de
+    # final -- 212 vezes menos. Os pesos de final desse bucket sao treinados
+    # com ~0,3% dos dados e depois lidos a 100% na posicao rara que tenha
+    # muitos peoes e nenhuma peca. Foi assim que o tempo de final ficou em -5
+    # e uma posicao perfeitamente simetrica passou a valer -108.
+    #
+    # A correccao nao e' inventar dados nem amarrar buckets uns aos outros: e'
+    # deixar quieto o que os dados nao veem. O suporte de cada peso e' a soma
+    # dos valores absolutos da sua coluna -- que ja' existe, e' a linha
+    # correspondente da transposta. Abaixo de uma fraccao da mediana, o peso
+    # fica onde estava.
+    # --- Ancora POR PAR mg/eg (a que corresponde ao mecanismo) -----------
+    #
+    # Um limiar global nao serve: medido nestes dados, TODOS os pesos em causa
+    # estao acima da mediana global (24x a 443x). O que os distingue e' o
+    # racio dentro do proprio par: no bucket dos poucos peoes o lado de
+    # MEIO-JOGO recebe 1/5 do que o de final recebe; no bucket dos muitos
+    # peoes e' o lado de FINAL que recebe 1/13. E' sempre o lado cuja fase e'
+    # rara naquele bucket.
+    #
+    # Pares no layout de 1486: o bloco posicional usa pair!/pairs!, portanto
+    # mg e eg sao ADJACENTES (i, i+1); o material tem os 6 mg seguidos dos 6
+    # eg (desvio 6); a PSQT tem as 6 tabelas mg seguidas das 6 eg (desvio 384).
+    if ancora_par > 0.0:
+        vt2 = np.abs(Xval[np.argsort(Xcol, kind="stable")])
+        sup2 = np.add.reduceat(vt2, Tcrow[:-1].astype(np.int64))
+        sup2[np.diff(Tcrow) == 0] = 0.0
+        parceiro = np.arange(n_par)
+        for bk in range(n_par // stride):
+            b = bk * stride
+            for i in range(0, 705, 2):
+                parceiro[b + i], parceiro[b + i + 1] = b + i + 1, b + i
+            for p_ in range(6):
+                parceiro[b + 705 + p_], parceiro[b + 711 + p_] = b + 711 + p_, b + 705 + p_
+            for k in range(384):
+                parceiro[b + 717 + k], parceiro[b + 717 + 384 + k] = b + 717 + 384 + k, b + 717 + k
+        sup_par = sup2[parceiro]
+        cego = (sup2 < ancora_par * sup_par) & (sup_par > 0)
+        m_par = ~cego
+        if trainable is None:
+            trainable = torch.from_numpy(m_par.astype(np.float32)).to(dev)
+        else:
+            trainable = trainable * torch.from_numpy(m_par.astype(np.float32)).to(dev)
+        print(f"  ancora-par: {int(cego.sum())} de {n_par} pesos ficam quietos "
+              f"(suporte < {ancora_par:g} x o do seu par mg/eg)", flush=True)
+
+    if ancora > 0.0:
+        vt = np.abs(Xval[np.argsort(Xcol, kind="stable")])
+        sup = np.add.reduceat(vt, Tcrow[:-1].astype(np.int64))
+        vazios = np.diff(Tcrow) == 0
+        sup[vazios] = 0.0
+        med = float(np.median(sup[sup > 0])) if (sup > 0).any() else 0.0
+        m_anc = sup >= ancora * med
+        n_fixos = int((~m_anc).sum())
+        if trainable is None:
+            trainable = torch.from_numpy(m_anc.astype(np.float32)).to(dev)
+        else:
+            trainable = trainable * torch.from_numpy(m_anc.astype(np.float32)).to(dev)
+        print(f"  ancora: {n_fixos} de {n_par} pesos ficam quietos "
+              f"(suporte < {ancora:g} x mediana {med:.3g})", flush=True)
+
+    # --- Alvo em centipeoes, e nao resultado de partida ------------------
+    #
+    # Com etiquetas do `rotula` a segunda coluna e' o score da NOSSA busca a
+    # profundidade fixa, na NOSSA escala -- nao um resultado W/D/L.
+    #
+    # Quando o alvo e a previsao estao nas mesmas unidades nao ha traducao a
+    # fazer, e o K deixa de ser um factor de conversao entre reguas. Passam-se
+    # AMBOS pela mesma sigmoide: mantem-se a virtude dela -- posicoes a +-2000
+    # nao dominam o gradiente -- e a degenerescencia desaparece, porque o alvo
+    # move-se com o K tal como a previsao.
+    #
+    # Isto e' o que torna o self-labelling superior a treinar contra a
+    # avaliacao de outro motor: a regua e' a mesma dos dois lados por
+    # construcao, e nao por calibracao.
+    alvo_score = "--alvo-score" in sys.argv
+    if alvo_score:
+        print(f"  alvo em centipeoes (nao resultado): media |alvo| = "
+              f"{float(y.abs().mean()):.0f}cp", flush=True)
+        y = torch.sigmoid(y * K)
+        yv = torch.sigmoid(yv * K)
+
+    # --- Ajustar o K aos dados, antes de tocar num peso -----------------
+    #
+    # O K fixo em 1/400 vem do metodo original e pressupoe que a escala da
+    # avaliacao e' a do Elo. A nossa nao e': tem escalas por familia
+    # (scale.king 1100, scale.threats 1150), correccao de complexidade e
+    # factores de final. O K que minimiza o erro dos NOSSOS scores pode nao
+    # ser 1/400, e se nao for, os pesos vao inflar ou encolher so' para
+    # compensar um K errado.
+    #
+    # Ajustado SOZINHO e depois CONGELADO, e nao como parametro livre a par
+    # dos pesos. Livres, os dois sao degenerados: multiplicar todos os pesos
+    # por c e o K por c da' exactamente as mesmas previsoes, portanto existe
+    # uma familia inteira de solucoes com a mesma perda. O optimizador para
+    # numa qualquer -- e a escala dos pesos IMPORTA ao motor, porque as
+    # margens de poda sao comparadas com scores. Foi assim que um ajuste
+    # anterior chegou a pesos de 4264 e a -51 Elo com a perda a descer.
+    if "--ajusta-k" in sys.argv:
+        with torch.no_grad():
+            melhor_k, melhor_l = K, None
+            base = torch.mv(X, w)
+            for cand in [K * f for f in (0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.4, 1.7, 2.0)]:
+                pred = torch.sigmoid(base * cand)
+                l = float(((pred - y) ** 2).mean())
+                if melhor_l is None or l < melhor_l:
+                    melhor_k, melhor_l = cand, l
+            # refinar a' volta do melhor
+            for cand in [melhor_k * f for f in (0.92, 0.96, 1.0, 1.04, 1.08)]:
+                pred = torch.sigmoid(base * cand)
+                l = float(((pred - y) ** 2).mean())
+                if l < melhor_l:
+                    melhor_k, melhor_l = cand, l
+            print(f"  K ajustado aos dados: {melhor_k:.6f} (era {K:.6f}, "
+                  f"1/{1/melhor_k:.0f} contra 1/{1/K:.0f}); perda {melhor_l:.6f}", flush=True)
+            K = melhor_k
 
     opt = torch.optim.Adam([w], lr=lr)
     w.grad = torch.zeros_like(w)
@@ -279,6 +435,12 @@ def main():
             fh.write(text)
         os.replace(tmp, out_path)
 
+    _projeccao = os.environ.get("KESTREL_PROJECCAO", "") not in ("", "0")
+    if _projeccao:
+        print("  projeccao canonica LIGADA (PSQT de media zero)", flush=True)
+    _tracar = [int(x) for x in os.environ.get("KESTREL_TRACA", "").split(",") if x.strip().isdigit()]
+    if _tracar:
+        print(f"  a tracar os indices {_tracar}", flush=True)
     t0 = time.time()
     best_val, best_epoch, since, stop = float("inf"), 0, 0, ""
     for e in range(epochs):
@@ -298,6 +460,66 @@ def main():
             # never accumulates any.
             w.grad.mul_(trainable)
         opt.step()
+
+        # --- Projeccao canonica: PSQT de media zero, material carrega a media
+        #
+        # Material e PSQT sao COLINEARES: a PSQT de uma peca ja' contem um
+        # offset constante igual ao valor dela, portanto (material+c, psqt-c)
+        # e' uma familia inteira de solucoes com a MESMA perda. O optimizador
+        # nao tem como escolher entre elas e o material passeia por essa
+        # direccao plana -- foi assim que apareceu "peao a 330 na abertura e 69
+        # no final".
+        #
+        # A projeccao escolhe um representante canonico: a media de cada tabela
+        # vai para o valor de material e a tabela fica com o desvio. NAO altera
+        # a avaliacao em ponto nenhum -- material+psqt e' exactamente o mesmo --
+        # so' elimina a direccao degenerada. Verificado no motor de referencia:
+        # as PSQT dele somam praticamente zero (media <1cp por casa) nas quatro
+        # pecas que tem valor de material.
+        #
+        # Rei e peao ficam de fora: o rei nao tem valor de material (a tabela
+        # dele carrega tudo por definicao) e o peao so' ocupa 48 das 64 casas,
+        # com as filas 1 e 8 forcadas a zero, portanto a media nao e' o
+        # parametro certo para ele.
+        if _projeccao and stride:
+            with torch.no_grad():
+                wv = w.view(-1, stride)
+                base_mat = 705
+                base_psqt = 705 + 12
+                # O PEAO entra, mas so' nas 48 casas legais (filas 2 a 7 --
+                # indices 8..55). As filas 1 e 8 estao forcadas a zero e
+                # inclui-las na media deslocava-a por um sexto sem razao.
+                # Sem isto a colinearidade material/PSQT do peao fica intacta,
+                # que e' exactamente onde o colapso acontecia.
+                for fase in range(2):
+                    ini_p = base_psqt + (fase * 6 + 0) * 64
+                    bloco_p = wv[:, ini_p + 8:ini_p + 56]
+                    media_p = bloco_p.mean(dim=1, keepdim=True)
+                    bloco_p.sub_(media_p)
+                    wv[:, base_mat + fase * 6 + 0] += media_p.squeeze(1)
+                for fase in range(2):          # 0 = meio-jogo, 1 = final
+                    for peca in range(1, 5):   # cavalo, bispo, torre, dama
+                        ini = base_psqt + (fase * 6 + peca) * 64
+                        bloco = wv[:, ini:ini + 64]
+                        media = bloco.mean(dim=1, keepdim=True)
+                        bloco.sub_(media)
+                        wv[:, base_mat + fase * 6 + peca] += media.squeeze(1)
+                # O peao e' o PADRAO DE MEDIDA. Com ele pregado nao ha
+                # liberdade de escala nenhuma: tudo o resto encontra o seu
+                # valor em unidades de peao, e o K deixa de ser um numero a
+                # deriva para passar a significar alguma coisa.
+                if peao_fixo is not None:
+                    wv[:, base_mat + 0] = peao_fixo[0]
+                    wv[:, base_mat + 6] = peao_fixo[1]
+
+        # DIAGNOSTICO (KESTREL_TRACA=indices separados por virgula): regista a
+        # trajectoria de parametros escolhidos. Com Adam o passo e' normalizado
+        # pelo gradiente, portanto um parametro SEM sinal anda ~lr por iteracao
+        # na mesma -- passeia em vez de convergir. A paragem antecipada e'
+        # global e nao o trava. Isto mostra qual dos dois casos e' cada um.
+        if _tracar and (e % 10 == 0 or e == epochs - 1):
+            vals = " ".join(f"{i}={float(w[i]):+8.2f}" for i in _tracar)
+            print(f"  traca e={e:5d} {vals}", flush=True)
 
         # Validation decides when to stop, not the epoch count. Training loss
         # only ever falls; the held-out set is what says whether anything was
@@ -329,6 +551,24 @@ def main():
 
     print(f"  melhor validacao {best_val:.6f} na epoca {best_epoch} "
           f"-- e' esse o ficheiro em {out_path}", flush=True)
+
+    # --- Em que regua e' que o motor ficou? ------------------------------
+    #
+    # Com o peao pregado nao ha liberdade de escala: o K que melhor ajusta a
+    # validacao com os pesos FINAIS diz em que unidades a avaliacao ficou.
+    # A regua padrao dos motores e' K = 1/400. Se o K optimo sair MENOR que
+    # aquele com que se treinou, a avaliacao ficou mais alta do que devia.
+    with torch.no_grad():
+        base_v = torch.mv(Xv, w)
+        melhor_k, melhor_e = K, float("inf")
+        cand = K * 0.05
+        while cand <= K * 8.0:
+            e = float(torch.mean((torch.sigmoid(base_v * cand) - yv) ** 2))
+            if e < melhor_e:
+                melhor_e, melhor_k = e, cand
+            cand *= 1.02
+        print(f"  ESCALA FINAL: K classico {1.0 / melhor_k:.0f}"
+              f"   (padrao 400; treinou-se a {1.0 / K:.0f})", flush=True)
 
 
 main()
