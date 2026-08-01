@@ -1553,6 +1553,16 @@ impl<'a> Searcher<'a> {
     }
 
     fn is_repetition_or_fifty(&self, board: &Board, hash: u64) -> bool {
+        // DIAGNOSTICO (KESTREL_SEM_REPETICAO=1): desliga a deteccao de
+        // repeticao para testar se e' ela a origem da explosao a varias
+        // threads. O score de um no que repete depende do CAMINHO, e ainda
+        // assim vai parar a uma TT partilhada -- outra thread le-o num
+        // caminho onde nao havia repeticao. Nao e' para producao: sem isto o
+        // motor nao evita linhas de empate.
+        static SEM_REP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *SEM_REP.get_or_init(|| std::env::var_os("KESTREL_SEM_REPETICAO").is_some()) {
+            return false;
+        }
         if board.halfmove >= 100 {
             return true;
         }
