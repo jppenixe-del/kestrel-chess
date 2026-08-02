@@ -7,6 +7,7 @@ mod endgame;
 mod eval;
 #[cfg(all(feature = "fitted", not(feature = "widekingzone"), not(feature = "fittedquiet"), not(feature = "fittedsf80"), not(feature = "fittedciclo")))]
 pub mod fitted;
+mod fitted_psqt_b8;
 #[cfg(all(feature = "fitted", feature = "fittedciclo"))]
 #[path = "fitted_ciclo.rs"]
 pub mod fitted;
@@ -388,6 +389,135 @@ fn main() {
     // partida injecta ruido enorme, e o ruido cai desproporcionadamente no
     // tempo -- porque numa posicao com material pendurado e' QUEM JOGA que o
     // captura.
+    // Radiografia de uma avaliacao: mete-se um FEN e ve-se TUDO o que
+    // interfere ate' ao numero final -- os termos, os multiplicadores que se
+    // sobrepoem a eles, a interpolacao, e o que sobra no fim.
+    //
+    //   raiox "<fen>"
+    if args.len() >= 3 && args[1] == "raiox" {
+        let fen = args[2..].join(" ");
+        let b = board::Board::from_fen(&fen);
+        let atk = attacks::Attacks::new();
+        let w = eval::weights_for(&b);
+        let bucket = eval::bucket_of(&b);
+        let fase = b.phase.min(24);
+        let nomes = ["peao", "cavalo", "bispo", "torre", "dama", "rei"];
+
+        println!("FEN  {}", fen);
+        println!("{}", "=".repeat(78));
+        println!("  a jogar {}   bucket {} (peoes)   fase {}/24   xeque {}",
+                 if b.side == types::Color::White { "brancas" } else { "pretas" },
+                 bucket, fase, b.in_check(b.side, &atk));
+
+        // ---------- 1. material e PSQT ----------
+        println!("\n  [1] MATERIAL + PSQT   (perspectiva das brancas)");
+        println!("      {:<8} {:>3} {:>3} {:>9} {:>9} {:>10}", "peca", "B", "P", "mg", "eg", "interp");
+        let (mut tmg, mut teg) = (0i32, 0i32);
+        for pt in 0..6 {
+            let (mut mg, mut eg) = (0i32, 0i32);
+            for c in 0..2 {
+                let mut bb = b.pieces[c][pt];
+                while bb != 0 {
+                    let sq = bb.trailing_zeros() as u8;
+                    bb &= bb - 1;
+                    let cor = if c == 0 { types::Color::White } else { types::Color::Black };
+                    let (m, e, _) = eval::piece_contribution(types::ALL_PIECES[pt], cor, sq);
+                    mg += m; eg += e;
+                }
+            }
+            tmg += mg; teg += eg;
+            if mg != 0 || eg != 0 {
+                println!("      {:<8} {:>3} {:>3} {:>9} {:>9} {:>10}", nomes[pt],
+                         b.pieces[0][pt].count_ones(), b.pieces[1][pt].count_ones(),
+                         mg, eg, (mg * fase + eg * (24 - fase)) / 24);
+            }
+        }
+        let mat = eval::material_pst_white(&b);
+        println!("      {:<8} {:>7} {:>9} {:>9} {:>10}  <- material_pst", "SOMA", "", tmg, teg, mat);
+
+        // ---------- 2. posicional, termo a termo ----------
+        let base = eval::positional_terms(&b, w);
+        let v = w.to_vec();
+        let nomes_campo = w.field_names();
+        let fams = w.field_families();
+        let mut vistos: Vec<&str> = Vec::new();
+        for n in nomes_campo.iter() { if !vistos.contains(n) { vistos.push(n); } }
+        let mut linhas: Vec<(i32, &str, &str)> = Vec::new();
+        for nome in vistos.iter() {
+            let mut vz = v.clone();
+            let mut fam = "";
+            for (k, nm) in nomes_campo.iter().enumerate() {
+                if nm == nome && k < vz.len() { vz[k] = 0; fam = fams[k]; }
+            }
+            let d = base - eval::positional_terms(&b, &w.from_vec(&vz));
+            if d != 0 { linhas.push((d, nome, fam)); }
+        }
+        linhas.sort_by_key(|(d, _, _)| -(d.abs()));
+        println!("\n  [2] POSICIONAL, TERMO A TERMO   (so' os que nao sao zero, por magnitude)");
+        for (d, nome, fam) in linhas.iter() {
+            println!("      {:<28} {:>7}   [{}]", nome, d, fam);
+        }
+        let soma: i32 = linhas.iter().map(|(d, _, _)| d).sum();
+        // Verificacao da propria ferramenta: se from_vec(to_vec(w)) nao for w,
+        // a sondagem parte de uma base errada e tudo o que ela diz e' invencao.
+        let ida_volta = eval::positional_terms(&b, &w.from_vec(&v));
+        if ida_volta != base {
+            println!("      !! from_vec(to_vec(w)) da {} em vez de {} -- a sondagem NAO e' de confianca",
+                     ida_volta, base);
+        }
+        let zero = eval::positional_terms(&b, &w.from_vec(&vec![0i32; v.len()]));
+        println!("      {:<28} {:>7}", "SOMA DOS TERMOS", soma);
+        println!("      {:<28} {:>7}   <- com TODOS os pesos a zero", "residuo sem pesos", zero);
+        println!("      {:<28} {:>7}   (nao-linearidade: {})", "TOTAL POSICIONAL", base, base - soma - zero);
+
+        // ---------- 3. multiplicadores ----------
+        println!("\n  [3] MULTIPLICADORES SOBRE OS TERMOS   (por-mil, 1000 = identidade)");
+        for f in ["mobility", "king", "threats", "pawns", "pieces", "tempo"] {
+            let e = eval::escala_familia(f, bucket);
+            println!("      familia {:<10} {:>5}{}", f, e, if e != 1000 { "   <- activo" } else { "" });
+        }
+        for pt in 0..6 {
+            let e = eval::escala_psqt(pt, bucket);
+            if e != 1000 { println!("      psqt {:<13} {:>5}   <- activo", nomes[pt], e); }
+        }
+
+        // ---------- 4. a cadeia, passo a passo ----------
+        println!("\n  [4] CADEIA ATE' AO NUMERO FINAL");
+        let pos_sig = eval::positional_terms_signed(&b);
+        let bruto = mat + pos_sig;
+        println!("      material_pst                     {:>8}", mat);
+        println!("      positional (com sinal do lado)   {:>8}", pos_sig);
+        println!("      = bruto                          {:>8}", bruto);
+        let cx = eval::complexity_adjustment(&b, bruto, w);
+        println!("      + complexity_adjustment          {:>8}   -> {}", cx, bruto + cx);
+        let esc = eval::scale_endgame(&b, bruto + cx, w);
+        println!("      x scale_endgame                  {:>8}   -> {}", esc - (bruto + cx), esc);
+        let pbc = eval::psqt_bucket_correction(&b);
+        println!("      + psqt_bucket_correction         {:>8}   -> {}", pbc, esc + pbc);
+        let mbs = eval::material_bucket_scale(&b, esc + pbc);
+        println!("      x material_bucket_scale          {:>8}   -> {}", mbs - (esc + pbc), mbs);
+        let interno = { let e = eval::evaluate(&b); if b.side == types::Color::White { e } else { -e } };
+        println!("      INTERNO FINAL                    {:>8}{}", interno,
+                 if interno != mbs { "   (resta o tempo/rule50)" } else { "" });
+        println!("      REPORTADO                        {:>8} cp   (/{})",
+                 eval::score_normalizado(interno), eval::NORMALIZA_PARA_PEAO);
+
+        // ---------- 5. o que a busca faz com este numero ----------
+        println!("\n  [5] O QUE AS MARGENS DA BUSCA FAZEM COM ISTO");
+        let stm = if b.side == types::Color::White { interno } else { -interno };
+        println!("      eval do lado a jogar             {:>8}", stm);
+        let sp = search::SearchParams::default();
+        println!("      {:<4} {:>10} {:>12} {:>12}", "prof", "RFP+", "RFP-", "eval-RFP+");
+        for d in [1, 2, 3, 4, 6, 8] {
+            let mi = sp.rfp_improving.at(d);
+            let mn = sp.rfp_not_improving.at(d);
+            println!("      {:<4} {:>10} {:>12} {:>12}", d, mi, mn, stm - mi);
+        }
+        println!("      (RFP corta quando eval - margem >= beta; com a avaliacao inflacionada");
+        println!("       a margem fica pequena face ao numero com que se compara)");
+        return;
+    }
+
     if args.len() >= 3 && args[1] == "quietude" {
         let atk = attacks::Attacks::new();
         let txt = std::fs::read_to_string(&args[2]).expect("nao leu");

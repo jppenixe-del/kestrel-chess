@@ -184,7 +184,18 @@ const EG_KING: [i32; 64] = [
 ///  - Dama 950 mg / 960 eg: dama mantem-se (ambas fases).
 ///  - Rei 0: nao conta na soma material.
 /// Distintos de PieceType::value() (usado por SEE/MVV-LVA sem fase).
+// Com `fittedpsqtb8` entram os valores do ajuste: peao pregado como padrao de
+// medida, tudo o resto encontrado em unidades de peao sobre 9M de posicoes com
+// rotulos de um motor forte. A hierarquia sai do ajuste, nao da mao: cavalo
+// 4,47 peoes, bispo 4,36, torre 6,69, dama 13,20. E a escala aterra em K=402,
+// contra os 967 do conjunto anterior.
+#[cfg(feature = "fittedpsqtb8")]
+const MG_VALUE: [i32; 6] = [125, 559, 545, 836, 1651, 0];
+#[cfg(feature = "fittedpsqtb8")]
+const EG_VALUE: [i32; 6] = [140, 478, 538, 817, 1664, 0];
+#[cfg(not(feature = "fittedpsqtb8"))]
 const MG_VALUE: [i32; 6] = [125, 340, 355, 520, 990, 0];
+#[cfg(not(feature = "fittedpsqtb8"))]
 const EG_VALUE: [i32; 6] = [140, 300, 350, 570, 1050, 0];
 
 /// Material values, overridable at runtime so they can be swept without a
@@ -384,7 +395,7 @@ pub fn set_material_buckets(on: bool) {
 /// pawns are on the board. Where a bucket asks for a different amplitude, the
 /// difference is added here -- over the pieces that differ, which is normally
 /// just the queens.
-fn psqt_bucket_correction(board: &Board) -> i32 {
+pub fn psqt_bucket_correction(board: &Board) -> i32 {
     if !PSQT_BUCKETS_DIFFER.load(std::sync::atomic::Ordering::Relaxed) {
         return 0;
     }
@@ -656,6 +667,12 @@ fn tabelas_do_ambiente() -> Option<Box<([[[i32; 64]; 6]; NUM_BUCKETS], [[[i32; 6
 }
 
 fn tabelas_compiladas() -> Box<([[[i32; 64]; 6]; NUM_BUCKETS], [[[i32; 64]; 6]; NUM_BUCKETS])> {
+    // Com `fittedpsqtb8` as tabelas afinadas entram compiladas. Sem ela, os
+    // oito buckets recebem a MESMA tabela de sempre -- que e' a condicao do
+    // invariante da identidade e o que mantem o bench em 3377667.
+    if cfg!(feature = "fittedpsqtb8") {
+        return Box::new((crate::fitted_psqt_b8::PSQT_MG, crate::fitted_psqt_b8::PSQT_EG));
+    }
     let mut mg = [[[0i32; 64]; 6]; NUM_BUCKETS];
     let mut eg = [[[0i32; 64]; 6]; NUM_BUCKETS];
     let tmg = [&MG_PAWN, &MG_KNIGHT, &MG_BISHOP, &MG_ROOK, &MG_QUEEN, &MG_KING];
@@ -1410,19 +1427,28 @@ const UNCASTLED_KING_HAS_RIGHTS: (i32, i32) = (-8, 0);
 /// absent -- king danger should be able to outweigh a piece, but never run
 /// away far enough to make the rest of the evaluation irrelevant.
 fn king_danger_curve(v: i32) -> i32 {
-    let (knee, div) = king_curve_params();
-    if v <= knee {
-        // Straight through, negatives included. Clamping the low end to zero
-        // was a mistake worth naming: a king with nothing pointed at him is
-        // not the same as a king who is actively comfortable -- well defended
-        // ring, defended flank, shelter intact -- and flattening every such
-        // position onto the same zero threw away most of what this term was
-        // able to say. Measured: it halved the term's spread across real
-        // positions (32 down to 14), regardless of where the knee sat.
-        v
-    } else {
-        (knee + (v - knee) * (v - knee) / div).min(1200)
+    // DIAGNOSTICO (KESTREL_SEM_REI=1): anula a curva, para isolar o que vem daqui.
+    static SEM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *SEM.get_or_init(|| std::env::var_os("KESTREL_SEM_REI").is_some()) {
+        return 0;
     }
+    // A FORMA e' a que todos os motores fortes usam, e nao e' opiniao: uma
+    // parte linear mais uma parte quadratica de UM SO' LADO, ambas divididas
+    // por constantes grandes.
+    //
+    //     perigo = v/lin + max(v,0)*v/quad
+    //
+    // A nossa anterior tinha outra forma inteiramente -- passava v INTEIRO
+    // abaixo de um joelho em 100, depois (v-100)^2/40, com tecto rigido em
+    // 1200. Isso significa que ate' ao joelho nao havia amortecimento nenhum e
+    // a partir dele havia demais, e que o termo podia sozinho valer mais do
+    // que uma dama.
+    //
+    // Os VALORES sao nossos e sao para calibrar (KESTREL_KING_CURVE=lin,quad);
+    // o que se adopta e' a forma. Continua de um so' lado por construcao: com
+    // v negativo -- rei confortavel -- sobra a parte linear e nada acelera.
+    let (lin, quad) = king_curve_params();
+    v / lin + v.max(0) * v / quad
 }
 
 /// Where the curve stops being one-for-one, and how fast it climbs after.
@@ -1444,7 +1470,7 @@ fn king_curve_params() -> (i32, i32) {
                 let d: i32 = it.next()?.trim().parse().ok()?;
                 if d > 0 { Some((k, d)) } else { None }
             })
-            .unwrap_or((100, 40))
+            .unwrap_or((8, 1024))
     })
 }
 
@@ -2272,6 +2298,18 @@ static BUCKET_WEIGHTS: OnceLock<Vec<Weights>> = OnceLock::new();
 /// would otherwise seal this before any setoption arrived -- never reaches it.
 static SCALED_BUCKETS: OnceLock<Vec<Weights>> = OnceLock::new();
 
+/// Os multiplicadores, para quem os quiser ver em vez de os adivinhar.
+pub fn escala_familia(nome: &str, bucket: usize) -> i32 {
+    match FAMILIES.iter().position(|&f| f == nome) {
+        Some(k) => FAMILY_SCALE[bucket * 6 + k].load(std::sync::atomic::Ordering::Relaxed),
+        None => 1000,
+    }
+}
+
+pub fn escala_psqt(peca: usize, bucket: usize) -> i32 {
+    PSQT_SCALE[bucket * 6 + peca].load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn weights_for(board: &Board) -> &'static Weights {
     // A fitted file wins outright, and is checked BEFORE the family factors.
     //
@@ -2645,6 +2683,77 @@ impl Weights {
         // the generated body harder to keep in step with `to_vec`.
         macro_rules! two { ($n:expr) => {{ let g = family_of($n); f.push(g); f.push(g); }} }
         macro_rules! one { ($n:expr) => {{ f.push(family_of($n)); }} }
+        macro_rules! many {
+            ($n:expr, $len:expr) => {{
+                let g = family_of($n);
+                for _ in 0..$len { f.push(g); f.push(g); }
+            }}
+        }
+        two!("bishop_pair");
+        two!("long_diag_bishop");
+        two!("minor_behind_pawn");
+        two!("knight_outpost");
+        many!("rook_open", self.rook_open.len());
+        two!("rook_on_seventh");
+        two!("tempo");
+        many!("mobility_knight", self.mobility_knight.len());
+        many!("mobility_bishop", self.mobility_bishop.len());
+        many!("mobility_rook", self.mobility_rook.len());
+        many!("mobility_queen", self.mobility_queen.len());
+        many!("king_attacker_weight", self.king_attacker_weight.len());
+        two!("king_attacks");
+        two!("safe_knight_check");
+        two!("safe_bishop_check");
+        two!("safe_rook_check");
+        two!("safe_queen_check");
+        many!("pawn_shelter", self.pawn_shelter.len());
+        two!("shelter_open");
+        many!("pawn_storm", self.pawn_storm.len());
+        many!("threat_by_king", self.threat_by_king.len());
+        two!("knight_hit_queen");
+        two!("bishop_hit_queen");
+        two!("rook_hit_queen");
+        two!("push_threat");
+        two!("restricted_squares");
+        many!("pawn_phalanx", self.pawn_phalanx.len());
+        many!("defended_pawn", self.defended_pawn.len());
+        many!("isolated_pawn", self.isolated_pawn.len());
+        many!("doubled_pawn", self.doubled_pawn.len());
+        two!("isolated_exposed");
+        two!("backward_exposed");
+        many!("our_passer_proximity", self.our_passer_proximity.len());
+        many!("their_passer_proximity", self.their_passer_proximity.len());
+        many!("passer_defended_push", self.passer_defended_push.len());
+        many!("passer_slider_behind", self.passer_slider_behind.len());
+        two!("backward_pawn");
+        many!("bishop_pawns", self.bishop_pawns.len());
+        two!("weak_king_ring");
+        many!("king_flank_attacks", self.king_flank_attacks.len());
+        many!("king_flank_defenses", self.king_flank_defenses.len());
+        two!("uncastled_king_no_rights");
+        two!("uncastled_king_has_rights");
+        one!("scale_ocb_bishops_only");
+        one!("scale_ocb_one_rook");
+        one!("scale_ocb_one_knight");
+        one!("scale_fallback_base");
+        one!("scale_fallback_per_pawn");
+        one!("complexity_total_pawns");
+        one!("complexity_pawn_flanks");
+        one!("complexity_pawn_endgame");
+        one!("complexity_adjustment");
+        two!("stonewall");
+        two!("stonewall_outpost");
+        two!("stonewall_bad_bishop");
+        f
+    }
+
+    pub fn field_names(&self) -> Vec<&'static str> {
+        let mut f: Vec<&'static str> = Vec::with_capacity(512);
+        // Macros, not closures: three closures capturing the same Vec mutably
+        // cannot coexist, and splitting them into separate scopes would make
+        // the generated body harder to keep in step with `to_vec`.
+        macro_rules! two { ($n:expr) => {{ f.push($n); f.push($n); }} }
+        macro_rules! one { ($n:expr) => {{ f.push($n); }} }
         macro_rules! many {
             ($n:expr, $len:expr) => {{
                 let g = family_of($n);
@@ -4149,8 +4258,17 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
     // ponto de vista das brancas: se e' a vez das brancas, +w.tempo; se
     // e' a vez das pretas, -w.tempo.
     let tempo_sign = if board.side == Color::White { 1 } else { -1 };
-    mg += tempo_sign * w.tempo.0;
-    eg += tempo_sign * w.tempo.1;
+    // Ter o lance nunca e' desvantagem em media, e num final de peoes e'
+    // frequentemente decisivo. Um tempo negativo e' xadrez errado, e o ajuste
+    // produz um: no bucket dos muitos peoes so' 0,10% das posicoes estao em
+    // fase de final, portanto o lado `eg` deste peso treina com uma fraccao
+    // dos dados e deriva. Onde os dados sao mudos, decide o xadrez.
+    //
+    // Custo de nao o travar: numa posicao perfeitamente simetrica com dezasseis
+    // peoes e nenhuma peca, um eg de -5 passava a -108 depois da complexidade,
+    // que le' o SINAL da avaliacao e amplifica o que la' estiver.
+    mg += tempo_sign * w.tempo.0.max(0);
+    eg += tempo_sign * w.tempo.1.max(0);
 
     // Interpolacao final pela fase actual do board (mesma logica de
     // material_pst; fase mantida incrementalmente em add_piece/
@@ -4453,7 +4571,7 @@ pub fn win_draw_loss(board: &Board, eval_cp: i32) -> (i32, i32, i32) {
     (w.clamp(0, 1000), dr.clamp(0, 1000), (1000 - w - dr).clamp(0, 1000))
 }
 
-fn material_bucket_scale(board: &Board, v: i32) -> i32 {
+pub fn material_bucket_scale(board: &Board, v: i32) -> i32 {
     // Per mille, indexed by (piece count - 1) / 4, so bucket 7 is a full board.
     // Derived from measured slope: factor = 1 / slope, softened toward 1.0
     // because the sample is a few dozen positions per bucket, not a tuning run.
@@ -4501,7 +4619,7 @@ fn eg_queen_minus_pawn() -> i32 {
 /// guarantees the adjustment can only move the eval toward or away
 /// from zero without ever flipping who's better -- an easy mistake to
 /// make without it.
-fn complexity_adjustment(board: &Board, raw: i32, w: &Weights) -> i32 {
+pub fn complexity_adjustment(board: &Board, raw: i32, w: &Weights) -> i32 {
     // DIAGNOSTICO (KESTREL_SEM_COMPLEXITY=1): este termo SOMA um bloco
     // proporcional ao numero de peoes, com o sinal do que a avaliacao ja
     // dizia, sem olhar a magnitude. Numa posicao perfeitamente simetrica com
@@ -4531,7 +4649,21 @@ fn complexity_adjustment(board: &Board, raw: i32, w: &Weights) -> i32 {
         + if no_pieces { w.complexity_pawn_endgame } else { 0 }
         + w.complexity_adjustment;
 
-    raw.signum() * complexity.max(-raw.abs())
+    // A forma estabelecida define este termo com a componente de meio-jogo a
+    // ZERO -- existe so' no final. Faz sentido: ele diz "este final e' dificil
+    // de converter", e numa abertura com dezasseis peoes e todas as pecas isso
+    // nao quer dizer nada.
+    //
+    // A nossa aplicava-se ao valor JA' interpolado, cega a' fase, e por isso
+    // entrava na abertura: medido, somava 63 centipeoes a uma posicao inicial
+    // perfeitamente simetrica, e numa posicao simetrica de dezasseis peoes
+    // transformava -2 em -108, com o sinal decidido por um arredondamento.
+    //
+    // Ponderar pela fase de final e' o equivalente exacto de a por no slot eg
+    // de um par (mg=0, eg=x) antes da interpolacao.
+    let cheio = raw.signum() * complexity.max(-raw.abs());
+    let fase = board.phase.min(MAX_PHASE);
+    cheio * (MAX_PHASE - fase) / MAX_PHASE
 }
 
 /// Endgame scale factor (own thresholds below): known drawish/hard-to-convert
@@ -4549,7 +4681,7 @@ fn complexity_adjustment(board: &Board, raw: i32, w: &Weights) -> i32 {
 /// sign for side-to-move.
 const SCALE_NORMAL: i32 = 128;
 
-fn scale_endgame(board: &Board, raw: i32, weights: &Weights) -> i32 {
+pub fn scale_endgame(board: &Board, raw: i32, weights: &Weights) -> i32 {
     if raw == 0 {
         return 0;
     }
@@ -4747,7 +4879,7 @@ pub fn material_pst_white(board: &Board) -> i32 {
     (mg * phase + eg * (MAX_PHASE - phase)) / MAX_PHASE
 }
 
-fn positional_terms_signed(board: &Board) -> i32 {
+pub fn positional_terms_signed(board: &Board) -> i32 {
     let p = positional_terms(board, weights_for(board));
     if board.side == Color::White {
         p
@@ -4771,6 +4903,9 @@ fn positional_terms_signed(board: &Board) -> i32 {
 /// logo N = 100/k = 242. Antes disto a posicao inicial reportava 83 quando o
 /// motor de referencia reporta 28, e a startpos depois de e4 dava 103 -- tres
 /// vezes o que vale.
+// 242 dos dois lados ate' a escala do binario COMPLETO ser medida. O K=402
+// que o afinador reporta e' do modelo linear dele -- nao inclui a complexidade
+// nem a curva do rei, que o motor soma por cima e o ajuste nunca viu.
 pub const NORMALIZA_PARA_PEAO: i32 = 242;
 
 #[inline]
