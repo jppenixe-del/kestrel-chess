@@ -1714,6 +1714,64 @@ impl Engine {
                     let _ = writeln!(out, "option name Move Overhead type spin default {} min 0 max 5000", MOVE_OVERHEAD_DEFAULT_MS);
                     let _ = writeln!(out, "option name OnlineTablebase type check default false");
                     let _ = writeln!(out, "option name Contempt type spin default 20 min -200 max 200");
+                    // Every search parameter, announced as a spin so an SPSA
+                    // harness can read the default and the band straight from
+                    // `uci` and drive them with `setoption`. They were already
+                    // settable -- `set_param` and `PARAM_OVERRIDES` have been
+                    // there all along -- but a tuner cannot use what it cannot
+                    // see, so the whole calibration had to be done by hand or
+                    // through a file, and the file silently ignores a vector
+                    // of the wrong length.
+                    //
+                    // The band is the default plus or minus its own size, with
+                    // a floor of one unit so a parameter that defaults to zero
+                    // still has somewhere to move. Wide enough for the scale of
+                    // the evaluation to have changed underneath a margin,
+                    // narrow enough that a run cannot wander into nonsense.
+                    for (n, d) in crate::search::PARAM_NAMES
+                        .iter()
+                        .zip(crate::search::SearchParams::default().to_vec())
+                    {
+                        let band = (d.abs()).max(10);
+                        // A default below zero exists (`hist_malus_offset`),
+                        // and clamping the floor to zero puts the default
+                        // OUTSIDE its own declared range. A strict UCI client
+                        // rejects the option outright -- and a tuning harness
+                        // that swallows that error scores every game as a draw
+                        // and reports perfect convergence while learning
+                        // nothing at all.
+                        let lo = if d < 0 { d - band } else { (d - band).max(0) };
+                        let hi = d + band;
+                        let _ = writeln!(
+                            out,
+                            "option name {} type spin default {} min {} max {}",
+                            n, d, lo, hi
+                        );
+                    }
+                    // The king-safety weights, by name. They are the largest
+                    // block in the evaluation and the only one the gradient
+                    // fit is structurally unable to move, so the only way to
+                    // calibrate them is a tuner that plays games -- and a
+                    // tuner cannot drive what the engine does not announce.
+                    {
+                        let w = crate::eval::default_weights();
+                        let v = w.to_vec();
+                        let names = w.field_names();
+                        for i in crate::eval::king_field_indices() {
+                            let d = v[i];
+                            let band = (d.abs()).max(10);
+                            let lo = if d < 0 { d - band } else { (d - band).max(0) };
+                            let _ = writeln!(
+                                out,
+                                "option name ev_{}_{} type spin default {} min {} max {}",
+                                // `field_names()` is SHORTER than `to_vec()`
+                                // (525 against 771) -- they have drifted apart.
+                                // The index is the identity; the name is a
+                                // convenience, so fall back rather than panic.
+                                names.get(i).copied().unwrap_or("w"), i, d, lo, d + band
+                            );
+                        }
+                    }
                     let _ = writeln!(out, "uciok");
                     let _ = out.flush();
                 }
@@ -1750,6 +1808,21 @@ impl Engine {
                     } else if tokens.len() >= 5 && tokens[1] == "name" && tokens[2] == "Threads" && tokens[3] == "value" {
                         if let Ok(n) = tokens[4].parse::<usize>() {
                             self.threads = n.max(1);
+                        }
+                    } else if tokens.len() >= 5 && tokens[1] == "name" && tokens[3] == "value"
+                        && tokens[2].starts_with("ev_") {
+                        // Evaluation weights by flat index, encoded in the name
+                        // as `ev_<field>_<index>`. The index is what carries
+                        // the meaning -- the field name is there so a human
+                        // reading a tuner's output can tell what moved.
+                        let idx = tokens[2].rsplit('_').next().and_then(|x| x.parse::<usize>().ok());
+                        let val = tokens[4].parse::<i32>().ok();
+                        match (idx, val) {
+                            (Some(i), Some(v)) if crate::eval::set_eval_index(i, v) => {}
+                            _ => {
+                                let _ = writeln!(out, "info string unknown eval weight {}", tokens[2]);
+                                let _ = out.flush();
+                            }
                         }
                     } else if tokens.len() >= 5 && tokens[1] == "name" && tokens[3] == "value" {
                         // Search parameters by name. Sweeping a pruning margin

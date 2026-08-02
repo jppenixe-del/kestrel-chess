@@ -395,6 +395,64 @@ pub fn set_material_buckets(on: bool) {
 /// pawns are on the board. Where a bucket asks for a different amplitude, the
 /// difference is added here -- over the pieces that differ, which is normally
 /// just the queens.
+/// The flat indices of the king-safety fields -- the ones that feed the
+/// non-linear danger curve and are therefore held OUT of the gradient fit.
+///
+/// Found the same way `tune_fast` finds them: build a Weights with those
+/// fields set to 1 and everything else zero, then read `to_vec` back. Naming
+/// the offsets by hand is how a list like this goes stale in silence.
+///
+/// Why it exists. These are the largest block in the evaluation and the fit
+/// cannot touch them, so when the shape of the curve changes the weights that
+/// feed it stay calibrated for the old shape forever. Gradient descent has no
+/// way in; SPSA does, because it only needs games. Exposing them by name is
+/// what lets a tuner drive them.
+pub fn king_field_indices() -> Vec<usize> {
+    let dim = default_weights().to_vec().len();
+    let mut s = default_weights().from_vec(&vec![0i32; dim]);
+    s.king_attacker_weight = [(1, 1); 4];
+    s.king_attacks = (1, 1);
+    s.safe_knight_check = (1, 1);
+    s.safe_bishop_check = (1, 1);
+    s.safe_rook_check = (1, 1);
+    s.safe_queen_check = (1, 1);
+    s.pawn_shelter = [(1, 1); 4];
+    s.shelter_open = (1, 1);
+    s.pawn_tornado = [(1, 1); 4];
+    s.weak_king_ring = (1, 1);
+    s.king_flank_attacks = [(1, 1); 2];
+    s.king_flank_defenses = [(1, 1); 2];
+    // O offset entra DENTRO da curva (`v + offset`), portanto pertence ao
+    // bloco nao-linear tanto como os outros. Estava de fora -- aqui e no
+    // sentinela do `tune_fast` -- e por isso vinha a ser ajustado como se
+    // fosse linear, "quietly and wrongly" nas palavras do proprio comentario
+    // que existe la' para avisar disto.
+    s.king_safety_offset = (1, 1);
+    s.to_vec().iter().enumerate().filter(|(_, &v)| v == 1).map(|(i, _)| i).collect()
+}
+
+/// Bumped by every override so the per-bucket weight tables are rebuilt.
+pub static EVAL_GENERATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+fn bump_eval_generation() {
+    EVAL_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Overrides for individual evaluation weights, by flat index, applied to
+/// EVERY bucket. Set over UCI before the first evaluation.
+pub static EVAL_OVERRIDES: std::sync::Mutex<Vec<(usize, i32)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Set one evaluation weight by flat index. Returns false if out of range.
+pub fn set_eval_index(i: usize, v: i32) -> bool {
+    if i >= default_weights().to_vec().len() {
+        return false;
+    }
+    EVAL_OVERRIDES.lock().unwrap().push((i, v));
+    bump_eval_generation();
+    true
+}
+
 pub fn psqt_bucket_correction(board: &Board) -> i32 {
     if !PSQT_BUCKETS_DIFFER.load(std::sync::atomic::Ordering::Relaxed) {
         return 0;
@@ -1517,6 +1575,12 @@ fn king_danger_curve(v: i32) -> i32 {
 /// straight part instead. Adjustable so the right values can be measured
 /// rather than guessed: KESTREL_KING_CURVE=knee,div.
 static KING_CURVE: OnceLock<(i32, i32)> = OnceLock::new();
+/// Os dois parametros da curva, para quem afina os pesos que a alimentam
+/// poder aplicar a MESMA funcao em vez de uma parecida.
+pub fn king_curve_params_pub() -> (i32, i32) {
+    king_curve_params()
+}
+
 fn king_curve_params() -> (i32, i32) {
     *KING_CURVE.get_or_init(|| {
         std::env::var("KESTREL_KING_CURVE")
@@ -2481,8 +2545,26 @@ pub fn weights_for(board: &Board) -> &'static Weights {
     // were extracted, and applying them again would apply them twice.
     #[cfg(feature = "fitted")]
     {
-        static FIT: OnceLock<Vec<Weights>> = OnceLock::new();
-        return &FIT.get_or_init(|| {
+        // NAO e' um OnceLock. `warmup()` avalia uma posicao real ao arrancar,
+        // o que selaria a tabela antes de qualquer `setoption` chegar -- e um
+        // override que nao pega e' indistinguivel de um parametro sem efeito.
+        // A geracao sobe a cada override e obriga a reconstruir; no caminho
+        // quente e' uma leitura atomica relaxed e uma comparacao.
+        static FIT: std::sync::RwLock<Option<(u64, Vec<Weights>)>> =
+            std::sync::RwLock::new(None);
+        let ger = EVAL_GENERATION.load(std::sync::atomic::Ordering::Relaxed);
+        {
+            let r = FIT.read().unwrap();
+            if let Some((g, v)) = r.as_ref() {
+                if *g == ger {
+                    // Leak once per generation: the reference has to outlive
+                    // the guard, and there are at most a handful of them.
+                    let p: *const Weights = &v[bucket_of(board)];
+                    return unsafe { &*p };
+                }
+            }
+        }
+        let built = {
             let base = default_weights().clone();
             let dim = base.to_vec().len();
             assert_eq!(
@@ -2491,10 +2573,27 @@ pub fn weights_for(board: &Board) -> &'static Weights {
                 "fitted table is {} values, evaluation wants {} ({} buckets x {})",
                 crate::fitted::FITTED.len(), dim * NUM_BUCKETS, NUM_BUCKETS, dim
             );
+            // Overrides set over UCI land here, on every bucket. They exist so
+            // the king-safety block -- which the gradient fit cannot touch,
+            // because it feeds a non-linear curve -- can still be driven by a
+            // tuner that only needs games.
+            let ov = EVAL_OVERRIDES.lock().unwrap().clone();
             (0..NUM_BUCKETS)
-                .map(|b| base.from_vec(&crate::fitted::FITTED[b * dim..(b + 1) * dim]))
-                .collect()
-        })[bucket_of(board)];
+                .map(|b| {
+                    let mut v = crate::fitted::FITTED[b * dim..(b + 1) * dim].to_vec();
+                    for (i, val) in &ov {
+                        if *i < v.len() {
+                            v[*i] = *val;
+                        }
+                    }
+                    base.from_vec(&v)
+                })
+                .collect::<Vec<Weights>>()
+        };
+        let mut w = FIT.write().unwrap();
+        *w = Some((ger, built));
+        let p: *const Weights = &w.as_ref().unwrap().1[bucket_of(board)];
+        return unsafe { &*p };
     }
     #[cfg(not(feature = "fitted"))]
     {
@@ -3428,6 +3527,27 @@ fn estrutura_de_peoes_cache(board: &Board, w: &Weights) -> (i32, i32, [Bitboard;
     })
 }
 
+/// The king-danger accumulators of the last `positional_terms` call, per
+/// colour, as (mg, eg) -- the value that goes INTO the curve, before it.
+///
+/// Why it is exposed. `v` is linear in the king-safety weights; only `f(v)` is
+/// not. A tuner that can see `v` can recover each weight's raw count by the
+/// same linear probe it uses everywhere else, and then apply `f` itself --
+/// which is two lines of autograd. Without it the extractor has to fold the
+/// whole block into a per-position bias, which is what it does today, and the
+/// largest term in the evaluation becomes permanently untunable.
+///
+/// Thread-local because the extractor runs many threads over many positions.
+thread_local! {
+    pub static ULTIMO_KING_ACC: std::cell::Cell<[(i32, i32); 2]> =
+        const { std::cell::Cell::new([(0, 0); 2]) };
+}
+
+pub fn king_accumulators(board: &Board, w: &Weights) -> [(i32, i32); 2] {
+    let _ = positional_terms(board, w);
+    ULTIMO_KING_ACC.with(|c| c.get())
+}
+
 pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
     let a = atk();
     let occ = board.occ_all;
@@ -4093,6 +4213,14 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
         // afterwards it would be a constant that cancels between the two
         // sides and changes nothing; added before, it decides which part of
         // the curve the attack is measured on, which is the entire point.
+        ULTIMO_KING_ACC.with(|c| {
+            let mut a = c.get();
+            a[us] = (
+                king_attack_units[us].0 + w.king_safety_offset.0,
+                king_attack_units[us].1 + w.king_safety_offset.1,
+            );
+            c.set(a);
+        });
         mg += sign * king_danger_curve(king_attack_units[us].0 + w.king_safety_offset.0);
         eg += sign * king_danger_curve(king_attack_units[us].1 + w.king_safety_offset.1);
 
