@@ -1427,7 +1427,7 @@ fn tune_fast(dataset_path: &str, out_path: &str, iters: u32, lr: f64) {
     // off this list they would be tuned as if linear, quietly and wrongly.
     sentinel.pawn_shelter = [(1, 1); 4];
     sentinel.shelter_open = (1, 1);
-    sentinel.pawn_storm = [(1, 1); 4];
+    sentinel.pawn_tornado = [(1, 1); 4];
     sentinel.weak_king_ring = (1, 1);
     sentinel.king_flank_attacks = [(1, 1); 2];
     sentinel.king_flank_defenses = [(1, 1); 2];
@@ -1599,7 +1599,7 @@ fn tune_stream(dataset_path: &str, out_path: &str, epochs: u32, lr: f64, chunk_s
     // off this list they would be tuned as if linear, quietly and wrongly.
     sentinel.pawn_shelter = [(1, 1); 4];
     sentinel.shelter_open = (1, 1);
-    sentinel.pawn_storm = [(1, 1); 4];
+    sentinel.pawn_tornado = [(1, 1); 4];
     sentinel.weak_king_ring = (1, 1);
     sentinel.king_flank_attacks = [(1, 1); 2];
     sentinel.king_flank_defenses = [(1, 1); 2];
@@ -1894,7 +1894,7 @@ fn tune_full(dataset_path: &str, out_path: &str, epochs: u32, lr: f64, chunk_siz
     // off this list they would be tuned as if linear, quietly and wrongly.
     sentinel.pawn_shelter = [(1, 1); 4];
     sentinel.shelter_open = (1, 1);
-    sentinel.pawn_storm = [(1, 1); 4];
+    sentinel.pawn_tornado = [(1, 1); 4];
     sentinel.weak_king_ring = (1, 1);
     sentinel.king_flank_attacks = [(1, 1); 2];
     sentinel.king_flank_defenses = [(1, 1); 2];
@@ -2442,7 +2442,7 @@ fn gpu_extract(dataset_path: &str, out_path: &str, max_positions: usize, buckets
     sentinel.safe_queen_check = (1, 1);
     sentinel.pawn_shelter = [(1, 1); 4];
     sentinel.shelter_open = (1, 1);
-    sentinel.pawn_storm = [(1, 1); 4];
+    sentinel.pawn_tornado = [(1, 1); 4];
     sentinel.weak_king_ring = (1, 1);
     sentinel.king_flank_attacks = [(1, 1); 2];
     sentinel.king_flank_defenses = [(1, 1); 2];
@@ -3319,7 +3319,7 @@ fn tune_king(dataset_path: &str, out_path: &str, max_positions: usize, threads: 
     sentinel.safe_queen_check = (1, 1);
     sentinel.pawn_shelter = [(1, 1); 4];
     sentinel.shelter_open = (1, 1);
-    sentinel.pawn_storm = [(1, 1); 4];
+    sentinel.pawn_tornado = [(1, 1); 4];
     sentinel.weak_king_ring = (1, 1);
     sentinel.king_flank_attacks = [(1, 1); 2];
     sentinel.king_flank_defenses = [(1, 1); 2];

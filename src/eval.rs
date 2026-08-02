@@ -1172,6 +1172,30 @@ const ROOK_ON_SEVENTH: (i32, i32) = (-2, 41);
 // Valor classico 15-25.
 const TEMPO: (i32, i32) = (22, 15);
 
+/// Avanco TRANCADO: o peao dele que vem contra o nosso rei tem um peao nosso
+/// imediatamente a' frente, cabeca com cabeca, e nao passa dali.
+///
+/// Um peao que avanca contra o rei so' e' perigoso porque pode ABRIR a coluna.
+/// Trancado nao abre nada -- nem avanca, nem troca, nem cria linha. O termo
+/// normal de avanco assume que ele pode progredir, e por isso pune uma ameaca
+/// que nao existe.
+///
+/// Arranca a zero: a distincao entra agora, os valores vem do ajuste.
+const TORNADO_LOCKED: [(i32, i32); 4] = [(0, 0); 4];
+
+/// Peao passado EXTERIOR -- quanto vale estar longe do centro.
+///
+/// Aplicado por unidade de centralidade (0 nas colunas a/h, 3 nas d/e). O
+/// passado exterior e' conhecimento classico de finais: arrasta o rei
+/// defensor para um lado do tabuleiro e o atacante decide no outro. Com pecas
+/// no tabuleiro a logica inverte-se, porque um passado central e' mais activo
+/// e apoia mais depressa.
+///
+/// A nossa tabela de passado e' [bloqueado][controlado][fila] e nao tinha
+/// dimensao de COLUNA nenhuma -- um passado na coluna a valia o mesmo que na
+/// coluna d. Arranca a zero; os valores vem do ajuste.
+const PASSER_OUTSIDE: (i32, i32) = (0, 0);
+
 /// Desequilibrio material: quanto vale cada peca NOSSA contra cada peca DELE.
 ///
 /// [nossa][dele], indices 0..4 = peao cavalo bispo torre dama. Dois cavalos
@@ -1505,7 +1529,7 @@ const KING_DANGER_TABLE: [i32; 128] = {
 // inimigo): o inverso -- quanto mais perto do rei, mais perigoso.
 const PAWN_SHELTER: [(i32, i32); 4] = [(0, 0), (-10, -2), (-24, -4), (-34, -6)];
 const SHELTER_OPEN: (i32, i32) = (-30, -6);
-const PAWN_STORM: [(i32, i32); 4] = [(-38, -8), (-22, -5), (-10, -2), (0, 0)];
+const PAWN_TORNADO: [(i32, i32); 4] = [(-38, -8), (-22, -5), (-10, -2), (0, 0)];
 
 /// Rank offset (sempre positivo, "para a frente" do rei) do peao mais
 /// perto do rei nesta bitboard (ja filtrada a uma unica coluna). `None`
@@ -1788,7 +1812,11 @@ pub struct Weights {
     pub king_danger_table: [i32; 128],
     pub pawn_shelter: [(i32, i32); 4],
     pub shelter_open: (i32, i32),
-    pub pawn_storm: [(i32, i32); 4],
+    pub pawn_tornado: [(i32, i32); 4],
+    /// Ver TORNADO_LOCKED.
+    pub tornado_locked: [(i32, i32); 4],
+    /// Ver PASSER_OUTSIDE.
+    pub passer_outside: (i32, i32),
     pub threat_by_pawn: [[(i32, i32); 6]; 2],
     pub threat_by_knight: [[(i32, i32); 6]; 2],
     pub threat_by_bishop: [[(i32, i32); 6]; 2],
@@ -1927,7 +1955,9 @@ impl Default for Weights {
             king_danger_table: KING_DANGER_TABLE,
             pawn_shelter: PAWN_SHELTER,
             shelter_open: SHELTER_OPEN,
-            pawn_storm: PAWN_STORM,
+            pawn_tornado: PAWN_TORNADO,
+            tornado_locked: TORNADO_LOCKED,
+            passer_outside: PASSER_OUTSIDE,
             threat_by_pawn: THREAT_BY_PAWN,
             threat_by_knight: THREAT_BY_KNIGHT,
             threat_by_bishop: THREAT_BY_BISHOP,
@@ -2084,7 +2114,9 @@ fn field_family(name: &str) -> Option<&'static str> {
             "passer_slider_behind" => Some("pawns"),
             "pawn_phalanx" => Some("pawns"),
             "pawn_shelter" => Some("king"),
-            "pawn_storm" => Some("king"),
+            "pawn_tornado" => Some("king"),
+            "tornado_locked" => Some("king"),
+            "passer_outside" => Some("pawns"),
             "push_threat" => Some("threats"),
             "restricted_squares" => Some("threats"),
             "rook_hit_queen" => Some("threats"),
@@ -2620,7 +2652,7 @@ impl Weights {
         pair!(self.safe_queen_check);
         pairs!(self.pawn_shelter);
         pair!(self.shelter_open);
-        pairs!(self.pawn_storm);
+        pairs!(self.pawn_tornado);
         for row in self.threat_by_pawn.iter() { pairs!(row); }
         for row in self.threat_by_knight.iter() { pairs!(row); }
         for row in self.threat_by_bishop.iter() { pairs!(row); }
@@ -2690,6 +2722,8 @@ impl Weights {
         for linha in self.imbalance.iter() {
             for x in linha.iter() { v.push(x.0); v.push(x.1); }
         }
+        pairs!(self.tornado_locked);
+        pair!(self.passer_outside);
         v
     }
     /// The family of every scalar `to_vec` emits, in the same order.
@@ -2730,7 +2764,7 @@ impl Weights {
         two!("safe_queen_check");
         many!("pawn_shelter", self.pawn_shelter.len());
         two!("shelter_open");
-        many!("pawn_storm", self.pawn_storm.len());
+        many!("pawn_tornado", self.pawn_tornado.len());
         many!("threat_by_king", self.threat_by_king.len());
         two!("knight_hit_queen");
         two!("bishop_hit_queen");
@@ -2767,6 +2801,8 @@ impl Weights {
         two!("stonewall_outpost");
         two!("stonewall_bad_bishop");
         many!("imbalance", 25);
+        many!("tornado_locked", 4);
+        two!("passer_outside");
         f
     }
 
@@ -2802,7 +2838,7 @@ impl Weights {
         two!("safe_queen_check");
         many!("pawn_shelter", self.pawn_shelter.len());
         two!("shelter_open");
-        many!("pawn_storm", self.pawn_storm.len());
+        many!("pawn_tornado", self.pawn_tornado.len());
         many!("threat_by_king", self.threat_by_king.len());
         two!("knight_hit_queen");
         two!("bishop_hit_queen");
@@ -2839,6 +2875,8 @@ impl Weights {
         two!("stonewall_outpost");
         two!("stonewall_bad_bishop");
         many!("imbalance", 25);
+        many!("tornado_locked", 4);
+        two!("passer_outside");
         f
     }
 
@@ -2876,7 +2914,7 @@ impl Weights {
         let safe_queen_check = pair!();
         let pawn_shelter = pairs!(4);
         let shelter_open = pair!();
-        let pawn_storm = pairs!(4);
+        let pawn_tornado = pairs!(4);
         let threat_by_pawn = [pairs!(6), pairs!(6)];
         let threat_by_knight = [pairs!(6), pairs!(6)];
         let threat_by_bishop = [pairs!(6), pairs!(6)];
@@ -2933,6 +2971,8 @@ impl Weights {
             for i in 0..5 { for j in 0..5 { t[i][j] = (next!(), next!()); } }
             t
         };
+        let tornado_locked = pairs!(4);
+        let passer_outside = pair!();
         Weights {
             bishop_pair, long_diag_bishop, minor_behind_pawn, knight_outpost, rook_open, rook_on_seventh, tempo,
             mobility_knight, mobility_bishop, mobility_rook, mobility_queen,
@@ -2960,12 +3000,12 @@ impl Weights {
             safety_pinned: self.safety_pinned,
             safety_discovered: self.safety_discovered,
             king_danger_table: self.king_danger_table,
-            pawn_shelter, shelter_open, pawn_storm,
+            pawn_shelter, shelter_open, pawn_tornado,
             threat_by_pawn, threat_by_knight, threat_by_bishop, threat_by_rook, threat_by_queen, threat_by_king,
             knight_hit_queen, bishop_hit_queen, rook_hit_queen, push_threat, restricted_squares,
             pawn_phalanx, defended_pawn, isolated_pawn, doubled_pawn, isolated_exposed, backward_exposed, passed_pawn,
             our_passer_proximity, their_passer_proximity, passer_defended_push, passer_slider_behind,
-            backward_pawn, candidate_passer, bishop_pawns, imbalance, weak_king_ring,
+            backward_pawn, candidate_passer, bishop_pawns, imbalance, tornado_locked, passer_outside, weak_king_ring,
             king_flank_attacks, king_flank_defenses,
             uncastled_king_no_rights, uncastled_king_has_rights,
             scale_ocb_bishops_only, scale_ocb_one_rook, scale_ocb_one_knight,
@@ -3225,7 +3265,13 @@ fn estrutura_de_peoes(board: &Board, w: &Weights) -> (i32, i32, [Bitboard; 2]) {
                 // Peao atrasado.
                 let front_r = if c == Color::White { r + 1 } else { r - 1 };
                 let supported_ever = own_pawns & mk.adj_tras_incl[c.idx()][s as usize] != 0;
-                if !supported_ever && (0..8).contains(&front_r) {
+                // Atrasado e' ALTERNATIVA a isolado, nao acumula com ele. Nas
+                // duas referencias e' um `else if`: um peao sem vizinhos
+                // nenhuns e' isolado, e chamar-lhe atrasado por cima disso e'
+                // penalizar a mesma falta de apoio duas vezes. Nos tinhamos os
+                // dois blocos independentes.
+                let tem_vizinho = own_pawns & mk.adj_colunas[s as usize] != 0;
+                if !supported_ever && tem_vizinho && (0..8).contains(&front_r) {
                     let front_sq = sq(f as u8, front_r as u8);
                     if a.pawn[c.idx()][front_sq as usize] & enemy_pawns != 0 {
                         mg += sign * w.backward_pawn.0;
@@ -3254,8 +3300,23 @@ fn estrutura_de_peoes(board: &Board, w: &Weights) -> (i32, i32, [Bitboard; 2]) {
             }
 
             // Peao isolado.
+            //
+            // Nao penalizar a fraqueza quando o peao ja' esta' sob ataque de
+            // peao: o problema dele ja' esta' contado pelo termo de ameacas.
+            //
+            // CUIDADO -- isto e' de UMA referencia so'. A outra penaliza sempre,
+            // sem condicao. Pela nossa propria regra (o que ambas fazem e'
+            // estrutura, o que so' uma faz e' escolha) isto NAO se adopta as
+            // cegas: fica atras de interruptor ate' ser medido.
+            // KESTREL_FRAQUEZA_SO_SE_LIVRE=1 liga-o.
+            let so_se_livre = {
+                static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                *F.get_or_init(|| std::env::var_os("KESTREL_FRAQUEZA_SO_SE_LIVRE").is_some())
+            };
+            let sob_ataque_de_peao = so_se_livre
+                && a.pawn[c.idx()][s as usize] & enemy_pawns != 0;
             let has_neighbor = own_pawns & mk.adj_colunas[s as usize] != 0;
-            if !has_neighbor {
+            if !has_neighbor && !sob_ataque_de_peao {
                 let edge_idx = (f.min(7 - f)) as usize;
                 mg += sign * w.isolated_pawn[edge_idx].0;
                 eg += sign * w.isolated_pawn[edge_idx].1;
@@ -3658,8 +3719,19 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
             }
             if let Some(off) = shield_pawn_offset(enemy_pawns, kr, white) {
                 let idx = (off - 1).clamp(0, 3) as usize;
-                shelter_penalty[c.idx()].0 += w.pawn_storm[idx].0;
-                shelter_penalty[c.idx()].1 += w.pawn_storm[idx].1;
+                // Avanco TRANCADO: o nosso peao esta' imediatamente a' frente
+                // do dele nesta coluna. Um peao que vem contra o rei so' e'
+                // perigoso porque pode abrir a coluna; cabeca com cabeca nao
+                // abre nada. Usar a tabela normal aqui pune uma ameaca que nao
+                // existe -- e' a distincao que um dos motores de referencia faz
+                // e nos nao faziamos.
+                let trancado = match shield_pawn_offset(own_pawns, kr, white) {
+                    Some(nosso_off) => nosso_off == off - 1,
+                    None => false,
+                };
+                let t = if trancado { w.tornado_locked[idx] } else { w.pawn_tornado[idx] };
+                shelter_penalty[c.idx()].0 += t.0;
+                shelter_penalty[c.idx()].1 += t.1;
             }
         }
     }
@@ -4338,6 +4410,14 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
             let pp = w.passed_pawn[push_blocked as usize][push_controlled as usize][rel_rank];
             mg += sign * pp.0;
             eg += sign * pp.1;
+
+            // Passado exterior: por unidade de CENTRALIDADE (0 nas colunas a/h,
+            // 3 nas d/e). A nossa tabela de passado nao tinha dimensao de
+            // coluna -- um passado na coluna a valia o mesmo que na d, quando
+            // o exterior e' precisamente o que decide finais de rei e peoes.
+            let centralidade = f.min(7 - f);
+            mg += sign * w.passer_outside.0 * centralidade;
+            eg += sign * w.passer_outside.1 * centralidade;
 
             let own_king = board.king_sq(c);
             let enemy_king = board.king_sq(c.opp());
