@@ -38,6 +38,9 @@ fittedciclo = []
 # reajustadas para render, por isso vem com interruptor.
 psqtmirror = []
 
+# PSQT afinadas com dimensao de bucket, compiladas. Implica psqtbuckets.
+fittedpsqtb8 = ["psqtbuckets"]
+
 # PSQT com dimensao de bucket: [bucket][peca][casa]. Ver PSQT_BUCKETS.
 psqtbuckets = []
 

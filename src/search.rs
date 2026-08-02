@@ -327,7 +327,7 @@ pub mod see {
 
 impl DepthMargin {
     #[inline]
-    fn at(&self, depth: i32) -> i32 {
+    pub fn at(&self, depth: i32) -> i32 {
         self.base + self.slope * depth
     }
 }
