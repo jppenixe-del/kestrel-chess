@@ -1213,6 +1213,10 @@ const PASSER_OUTSIDE: (i32, i32) = (0, 0);
 const BISHOP_TRAPPED: (i32, i32) = (0, 0);
 const ROOK_TRAPPED: (i32, i32) = (0, 0);
 
+/// A bishop on an outpost square -- the same square the knight bonus already
+/// recognises, scored for the other minor. Starts at zero; the fit decides.
+const BISHOP_OUTPOST: (i32, i32) = (0, 0);
+
 /// Desequilibrio material: quanto vale cada peca NOSSA contra cada peca DELE.
 ///
 /// [nossa][dele], indices 0..4 = peao cavalo bispo torre dama. Dois cavalos
@@ -1951,6 +1955,7 @@ pub struct Weights {
     /// here the king HAS moved, and moved to the square that entombs the rook,
     /// which now needs two tempi to reach a file it can use.
     pub rook_trapped: (i32, i32),
+    pub bishop_outpost: (i32, i32),
 }
 
 impl Default for Weights {
@@ -1989,6 +1994,7 @@ impl Default for Weights {
             passer_outside: PASSER_OUTSIDE,
             bishop_trapped: BISHOP_TRAPPED,
             rook_trapped: ROOK_TRAPPED,
+            bishop_outpost: BISHOP_OUTPOST,
             threat_by_pawn: THREAT_BY_PAWN,
             threat_by_knight: THREAT_BY_KNIGHT,
             threat_by_bishop: THREAT_BY_BISHOP,
@@ -2150,6 +2156,7 @@ fn field_family(name: &str) -> Option<&'static str> {
             "passer_outside" => Some("pawns"),
             "bishop_trapped" => Some("pieces"),
             "rook_trapped" => Some("pieces"),
+            "bishop_outpost" => Some("pieces"),
             "push_threat" => Some("threats"),
             "restricted_squares" => Some("threats"),
             "rook_hit_queen" => Some("threats"),
@@ -2759,6 +2766,7 @@ impl Weights {
         pair!(self.passer_outside);
         pair!(self.bishop_trapped);
         pair!(self.rook_trapped);
+        pair!(self.bishop_outpost);
         v
     }
     /// The family of every scalar `to_vec` emits, in the same order.
@@ -2840,6 +2848,7 @@ impl Weights {
         two!("passer_outside");
         two!("bishop_trapped");
         two!("rook_trapped");
+        two!("bishop_outpost");
         f
     }
 
@@ -2916,6 +2925,7 @@ impl Weights {
         two!("passer_outside");
         two!("bishop_trapped");
         two!("rook_trapped");
+        two!("bishop_outpost");
         f
     }
 
@@ -3014,6 +3024,7 @@ impl Weights {
         let passer_outside = pair!();
         let bishop_trapped = pair!();
         let rook_trapped = pair!();
+        let bishop_outpost = pair!();
         Weights {
             bishop_pair, long_diag_bishop, minor_behind_pawn, knight_outpost, rook_open, rook_on_seventh, tempo,
             mobility_knight, mobility_bishop, mobility_rook, mobility_queen,
@@ -3046,7 +3057,7 @@ impl Weights {
             knight_hit_queen, bishop_hit_queen, rook_hit_queen, push_threat, restricted_squares,
             pawn_phalanx, defended_pawn, isolated_pawn, doubled_pawn, isolated_exposed, backward_exposed, passed_pawn,
             our_passer_proximity, their_passer_proximity, passer_defended_push, passer_slider_behind,
-            backward_pawn, candidate_passer, bishop_pawns, imbalance, tornado_locked, passer_outside, bishop_trapped, rook_trapped, weak_king_ring,
+            backward_pawn, candidate_passer, bishop_pawns, imbalance, tornado_locked, passer_outside, bishop_trapped, rook_trapped, bishop_outpost, weak_king_ring,
             king_flank_attacks, king_flank_defenses,
             uncastled_king_no_rights, uncastled_king_has_rights,
             scale_ocb_bishops_only, scale_ocb_one_rook, scale_ocb_one_knight,
@@ -3737,14 +3748,27 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
                         eg += sign * w.minor_behind_pawn.1;
                     }
 
-                    if pt == PieceType::Knight {
+                    // An outpost square is the same square whichever minor
+                    // stands on it: far enough forward, defended by one of our
+                    // pawns, and out of reach of every enemy pawn forever. We
+                    // scored it for the knight only. A bishop on such a square
+                    // is not the same piece as a knight there -- it wants
+                    // diagonals, not a permanent home -- so it gets its own
+                    // weight rather than sharing the knight's, and the fit
+                    // decides how much each is worth.
+                    if pt == PieceType::Knight || pt == PieceType::Bishop {
                         let own_side_rank = if c == Color::White { r } else { 7 - r };
                         if (3..=5).contains(&own_side_rank) {
                             let defended = a.pawn[c.opp().idx()][s as usize] & board.pieces[c.idx()][PieceType::Pawn.idx()] != 0;
                             let ever_attackable = span[c.opp().idx()] & bb(s) != 0;
                             if defended && !ever_attackable {
-                                mg += sign * w.knight_outpost.0;
-                                eg += sign * w.knight_outpost.1;
+                                let post = if pt == PieceType::Knight {
+                                    w.knight_outpost
+                                } else {
+                                    w.bishop_outpost
+                                };
+                                mg += sign * post.0;
+                                eg += sign * post.1;
                             }
                         }
                     }
