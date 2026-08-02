@@ -149,7 +149,7 @@ fn gen_from_attacks(out: &mut Vec<Move>, from: Square, targets: Bitboard, board:
 /// slider that would hit our king on an otherwise-empty board (a
 /// "sniper"), if exactly one piece sits between it and the king, that
 /// piece is pinned.
-fn compute_pinned(board: &Board, atk: &Attacks, us: Color, king_sq: Square) -> Bitboard {
+pub fn compute_pinned(board: &Board, atk: &Attacks, us: Color, king_sq: Square) -> Bitboard {
     let them = us.opp();
     let occ = board.occ_all;
     let enemy_rq = board.pieces[them.idx()][PieceType::Rook.idx()]
