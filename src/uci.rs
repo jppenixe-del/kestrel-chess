@@ -1926,6 +1926,44 @@ impl Engine {
                     let _ = writeln!(out, "eval(white) total={}cp  [interno={}]  bruto={}  material_pst={}  positional={}",
                                      crate::eval::score_normalizado(seen), seen, mat + pos, mat, pos);
                     let _ = writeln!(out, "  pieces={} mobility={} king={} threats+pawns={}", pieces, mobility, king, rest);
+                    // O CIRCUITO: cada etapa entre os termos crus e o numero
+                    // que a busca ve. Sem isto o comando mostra as pontas e
+                    // esconde onde o valor se perde -- e o valor perde-se
+                    // sempre no meio, nao nas pontas.
+                    {
+                        let w = crate::eval::weights_for(b);
+                        let bruto = mat + pos;
+                        let cx = crate::eval::complexity_adjustment(b, bruto, w);
+                        let apos_cx = bruto + cx;
+                        let escalado = crate::eval::scale_endgame(b, apos_cx, w);
+                        let corr = crate::eval::psqt_bucket_correction(b);
+                        let pct = |x: i32, base: i32| if base == 0 { 0.0 } else { 100.0 * x as f64 / base as f64 };
+                        let _ = writeln!(out, "  --- circuito (tudo em unidades INTERNAS) ---");
+                        let _ = writeln!(out, "    bruto (material+posicional)   {:>7}", bruto);
+                        let _ = writeln!(out, "    complexidade                  {:>7}   ({:+.1}%)", cx, pct(cx, bruto));
+                        let _ = writeln!(out, "    apos complexidade             {:>7}", apos_cx);
+                        let _ = writeln!(out, "    escala de final               {:>7}   ({:+.1}%)", escalado - apos_cx, pct(escalado - apos_cx, apos_cx));
+                        let _ = writeln!(out, "    correccao de bucket           {:>7}", corr);
+                        // A conta tem de FECHAR. Se nao fechar, ha uma etapa
+                        // que nao esta listada -- e uma etapa escondida e' onde
+                        // o valor se perde sem ninguem dar por ela.
+                        // A ULTIMA etapa, e a que nao estava em lado nenhum:
+                        // um factor por contagem de pecas aplicado DEPOIS de
+                        // tudo, ligado por omissao. Vale ate' 15% da avaliacao
+                        // inteira e nao aparecia em nenhum diagnostico.
+                        let antes_mb = escalado + corr;
+                        let previsto = crate::eval::material_bucket_scale(b, antes_mb);
+                        let _ = writeln!(out, "    escala por material           {:>7}   ({:+.1}%)",
+                                         previsto - antes_mb, pct(previsto - antes_mb, antes_mb));
+                        let _ = writeln!(out, "    = previsto pela formula       {:>7}", previsto);
+                        let _ = writeln!(out, "    = o que a BUSCA ve            {:>7}", seen);
+                        if previsto != seen {
+                            let _ = writeln!(out, "    !! FUGA NAO EXPLICADA         {:>7}   <- falta uma etapa nesta lista", seen - previsto);
+                        }
+                        let _ = writeln!(out, "    reportado (cosmetico, /{:.2})  {:>7}cp",
+                                         if seen != 0 { seen as f64 / crate::eval::score_normalizado(seen).max(1) as f64 } else { 1.0 },
+                                         crate::eval::score_normalizado(seen));
+                    }
                     let _ = out.flush();
                 }
                 "quit" => break,
