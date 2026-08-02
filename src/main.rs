@@ -394,6 +394,22 @@ fn main() {
     // sobrepoem a eles, a interpolacao, e o que sobra no fim.
     //
     //   raiox "<fen>"
+    if args.len() >= 2 && args[1] == "kingcurve" {
+        let (lin, quad) = eval::king_curve_params_pub();
+        println!("{} {}", lin, quad);
+        return;
+    }
+    if args.len() >= 2 && args[1] == "kingidx" {
+        // Os indices achatados do bloco do rei, para o afinador saber quais
+        // as colunas que tem de passar pela curva em vez de somar direito.
+        let idx = eval::king_field_indices();
+        println!("{}", idx.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(" "));
+        return;
+    }
+    if args.len() >= 3 && args[1] == "kinglin" {
+        kinglin(&args[2..].join(" "));
+        return;
+    }
     if args.len() >= 3 && args[1] == "raiox" {
         let fen = args[2..].join(" ");
         let b = board::Board::from_fen(&fen);
@@ -2493,6 +2509,26 @@ fn gpu_extract(dataset_path: &str, out_path: &str, max_positions: usize, buckets
             .collect()
     };
 
+    // The same idea for the king fields, but built on an ALL-ZERO base rather
+    // than on `w_king_only`: the probe is read against the accumulator, and
+    // the accumulator has to start from zero for the difference to be the
+    // field's own count and nothing else.
+    let probes_king: Vec<eval::Weights> = {
+        let zero = default.from_vec(&vec![0i32; dim]);
+        let mut v = vec![0i32; dim];
+        (0..dim)
+            .map(|i| {
+                if !is_king_field[i] {
+                    return zero.clone();  // never used; keeps indices aligned
+                }
+                v[i] = probe_mult;
+                let w = zero.from_vec(&v);
+                v[i] = 0;
+                w
+            })
+            .collect()
+    };
+
     let chunk = (lines.len() + threads - 1) / threads.max(1);
     let out: Vec<Vec<u8>> = std::thread::scope(|scope| {
         let mut handles = Vec::new();
@@ -2501,6 +2537,7 @@ fn gpu_extract(dataset_path: &str, out_path: &str, max_positions: usize, buckets
             let king_only_vec = &king_only_vec;
             let is_king_field = &is_king_field;
             let probes = &probes;
+            let probes_king = &probes_king;
             handles.push(scope.spawn(move || {
                 let mut buf: Vec<u8> = Vec::new();
                 // Probes run from an all-zero weight set so nothing else is
@@ -2516,13 +2553,18 @@ fn gpu_extract(dataset_path: &str, out_path: &str, max_positions: usize, buckets
                         None => continue,
                     };
                     let board = Board::from_fen(fen);
-                    // Bias: only king safety now. It goes through the danger
-                    // curve, so it is not linear in its weights and cannot be
-                    // fitted here. Material and the piece-square tables used
-                    // to sit in here with it; they are features now.
-                    let bias = eval::positional_terms(&board, w_king_only);
-
                     let probe_base = eval::positional_terms(&board, &w_zero);
+                    // Bias: what the linear model cannot express. King safety
+                    // used to live here -- it goes through the danger curve,
+                    // so it is not linear in its weights -- and that is why the
+                    // largest block in the evaluation was never fitted.
+                    //
+                    // It comes OUT now: the king fields go in as raw counts
+                    // above and the model applies the curve itself. Leaving it
+                    // here as well would count it twice, and silently: the bias
+                    // is per position and nothing downstream would complain.
+                    let bias = probe_base;
+                    let _ = &w_king_only;
                     let phase = eval::phase_fraction(&board);
                     // The SAME partition the engine uses to pick a weight set.
                     //
@@ -2551,8 +2593,37 @@ fn gpu_extract(dataset_path: &str, out_path: &str, max_positions: usize, buckets
                     // instead. The model this feeds is then linear in exact
                     // arithmetic, which is what it claims to be.
                     let mut feats: Vec<(u16, f32)> = Vec::new();
+                    // King-safety fields go in as RAW COUNTS, not as a
+                    // contribution. The curve sits between them and the score,
+                    // so probing the score measures a slope somewhere on that
+                    // curve rather than the field's own quantity -- which is
+                    // why they used to be skipped and folded into the bias,
+                    // and why the largest block in the evaluation has never
+                    // been fitted.
+                    //
+                    // But the ACCUMULATOR the curve is applied to is exactly
+                    // linear in these weights, measured: `kestrel kinglin`
+                    // probes each one at +1 and +2 and gets x and 2x on all 46,
+                    // with zero exceptions. So a linear probe against the
+                    // accumulator recovers each field's count exactly, and the
+                    // model downstream applies the curve itself.
+                    //
+                    // The 46 slots already exist in the layout and were always
+                    // zero, so nothing about the file's shape changes: white's
+                    // count goes in the pair's mg slot, black's in its eg slot.
+                    let acc0 = eval::king_accumulators(&board, &w_zero);
                     for i in 0..is_king_field.len() {
                         if is_king_field[i] {
+                            let acc = eval::king_accumulators(&board, &probes_king[i]);
+                            // Even index of a pair -> White's count; odd -> Black's.
+                            let x = if i % 2 == 0 {
+                                acc[0].0 - acc0[0].0
+                            } else {
+                                acc[1].0 - acc0[1].0
+                            };
+                            if x != 0 {
+                                feats.push((off + i as u16, x as f32 / probe_mult as f32));
+                            }
                             continue;
                         }
                         let v = eval::positional_terms(&board, &probes[i]) - probe_base;
@@ -3522,4 +3593,34 @@ fn bench(depth: i32) {
     }
     let ms = start.elapsed().as_millis().max(1) as u64;
     println!("{} nodes {} nps", total, total * 1000 / ms);
+}
+
+/// Diagnostic: is the king accumulator linear in the king weights?
+/// `kinglin <fen>` probes each king field at +1 and +2 and prints the two
+/// deltas. Linear means they are exactly x_i and 2*x_i.
+pub fn kinglin(fen: &str) {
+    let b = board::Board::from_fen(fen);
+    let base = eval::default_weights().clone();
+    let dim = base.to_vec().len();
+    let idx = eval::king_field_indices();
+    let v0 = eval::king_accumulators(&b, &base);
+    let mut nao_lineares = 0;
+    let mut fired = 0;
+    for &i in idx.iter() {
+        let mut probe = |k: i32| {
+            let mut v = base.to_vec();
+            v[i] += k;
+            let w = base.from_vec(&v);
+            eval::king_accumulators(&b, &w)
+        };
+        let (a, c) = (probe(1), probe(2));
+        for us in 0..2 {
+            let d1 = a[us].0 - v0[us].0;
+            let d2 = c[us].0 - v0[us].0;
+            if d1 != 0 { fired += 1; }
+            if d2 != 2 * d1 { nao_lineares += 1; }
+        }
+    }
+    let _ = dim;
+    println!("king fields: {}  probes that fired: {}  NON-LINEAR: {}", idx.len(), fired, nao_lineares);
 }
