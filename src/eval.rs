@@ -1084,9 +1084,11 @@ pub const MAT_PST_DIM: usize = 12 + 6 * 64 * 2;
 /// Vector actual de material/PST (mesma ordem que `material_pst_features`
 /// abaixo), para servir de ponto de partida ao tuner.
 pub fn material_pst_current_vec() -> Vec<i32> {
+    // Os 12 slots de material saem a ZERO: o valor da peca passou para dentro
+    // da tabela, que e' a forma combinada. Sao mantidos no vector so' para o
+    // comprimento nao mudar; ninguem os le e o extractor nao os emite.
     let mut v = Vec::with_capacity(MAT_PST_DIM);
-    for pt in 0..6 { v.push(MG_VALUE[pt]); }
-    for pt in 0..6 { v.push(EG_VALUE[pt]); }
+    for _ in 0..12 { v.push(0); }
     let tables_mg = [&MG_PAWN, &MG_KNIGHT, &MG_BISHOP, &MG_ROOK, &MG_QUEEN, &MG_KING];
     let tables_eg = [&EG_PAWN, &EG_KNIGHT, &EG_BISHOP, &EG_ROOK, &EG_QUEEN, &EG_KING];
     // Through the same scale the evaluation applies. `piece_contribution`
@@ -1105,11 +1107,12 @@ pub fn material_pst_current_vec() -> Vec<i32> {
     // meant -- if it changes, it changes because the simulator says so.
     for (i, t) in tables_mg.iter().enumerate() {
         let f = psqt_factor(i);
-        for &x in t.iter() { v.push(if f == 1000 { x } else { x * f / 1000 }); }
+        // COMBINADA: o valor da peca somado a cada casa.
+        for &x in t.iter() { v.push(MG_VALUE[i] + if f == 1000 { x } else { x * f / 1000 }); }
     }
     for (i, t) in tables_eg.iter().enumerate() {
         let f = psqt_factor(i);
-        for &x in t.iter() { v.push(if f == 1000 { x } else { x * f / 1000 }); }
+        for &x in t.iter() { v.push(EG_VALUE[i] + if f == 1000 { x } else { x * f / 1000 }); }
     }
     v
 }
@@ -1139,8 +1142,22 @@ pub fn material_pst_features(board: &Board, feats: &mut [f32]) {
                 bb &= bb - 1;
                 let idx = mirror_idx(c, s);
                 let pt_i = pt.idx();
-                feats[MG_VAL_OFF + pt_i] += sign * mg_w;
-                feats[EG_VAL_OFF + pt_i] += sign * eg_w;
+                // UMA quantidade, nao duas. O valor da peca e a tabela
+                // disparavam os dois para a mesma peca na mesma casa, e o
+                // ajuste podia deslocar valor de um para o outro sem a perda
+                // mexer -- uma familia inteira de solucoes equivalentes, que e'
+                // como se produz peao a 330 no meio-jogo e 69 no final.
+                //
+                // A referencia nunca as tem separadas: soma-as numa tabela
+                // combinada e e' essa que acumula. O motor tambem ja' o faz
+                // (`piece_contribution` le a tabela combinada); so' o extractor
+                // e' que as via como duas coisas. Agora emite a casa, e a
+                // tabela carrega o valor da peca dentro dela.
+                //
+                // Os 12 slots de material ficam a ZERO e sao inertes: o
+                // comprimento do vector nao muda, portanto nada a jusante
+                // desalinha.
+                let _ = (MG_VAL_OFF, EG_VAL_OFF);
                 feats[MG_PST_OFF + pt_i * 64 + idx] += sign * mg_w;
                 feats[EG_PST_OFF + pt_i * 64 + idx] += sign * eg_w;
             }
