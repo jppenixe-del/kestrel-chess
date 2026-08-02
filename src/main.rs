@@ -534,6 +534,92 @@ fn main() {
         return;
     }
 
+    // `filtraquieto <in> <out> [best_move_col]` -- o filtro das duas referencias.
+    //
+    // Porque existe: avaliar estaticamente uma posicao onde uma peca esta
+    // pendurada e comparar com o rotulo injecta o tamanho dessa peca como
+    // ruido. Numa posicao onde se esta uma dama acima MAS ela vai ser
+    // recapturada, a avaliacao e' ~0 -- e o modelo aprende, correctamente para
+    // aqueles dados, que uma dama nao vale nada. Medido: descartar tacticas
+    // subiu a dama de 5,75 para 6,75 peoes num so' superbatch.
+    //
+    // Os criterios sao os das duas referencias, que coincidem no essencial:
+    //
+    //   min_ply       16   as aberturas repetem-se milhoes de vezes e valem
+    //                      todas ~0; treinar nelas e' ensinar "esta igual"
+    //   min_pieces     4   em finais nus decide a tecnica, nao a avaliacao
+    //   tactical      sim  o LANCE ser captura ou promocao (nao a posicao ter
+    //                      capturas disponiveis -- isso descartava demasiado)
+    //   check         sim
+    //
+    // Sem a coluna do melhor lance nao se sabe se ELE e' tactico; nesse caso
+    // cai-se no criterio da posicao, que e' mais agressivo e fica dito.
+    if args.len() >= 4 && args[1] == "filtraquieto" {
+        let atk = attacks::Attacks::new();
+        let txt = std::fs::read_to_string(&args[2]).expect("nao leu");
+        let mut out = std::io::BufWriter::new(std::fs::File::create(&args[3]).expect("nao criou"));
+        let col_mv: Option<usize> = args.get(4).and_then(|s| s.parse().ok());
+        // DESLIGADO por omissao, e nao por preguica: nenhum dos nossos conjuntos
+        // traz o numero de lance a serio. O do Lichess guarda FENs de quatro
+        // campos e quem os completa poe " 0 1"; o de auto-confronto tem seis
+        // campos mas com "0 1" em TODAS as linhas. Com 16, como a referencia
+        // usa, o filtro descarta 100% do conjunto -- medido, nos dois.
+        //
+        // A referencia pode usa-lo porque gera os dados e sabe o ply. Nos so' o
+        // poderemos usar quando o gerarmos tambem. Filtrar por um campo sem
+        // informacao parece funcionar e deita tudo fora em silencio.
+        let min_ply: usize = std::env::var("FQ_MIN_PLY").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let min_pecas: u32 = std::env::var("FQ_MIN_PECAS").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
+        let (mut n, mut passou) = (0usize, 0usize);
+        let (mut fp, mut fpe, mut fx, mut ft) = (0usize, 0usize, 0usize, 0usize);
+        for linha in txt.lines() {
+            let campos: Vec<&str> = linha.split(|c| c == '\t' || c == '|').map(|x| x.trim()).collect();
+            let fen = match campos.first() { Some(f) if !f.is_empty() => *f, _ => continue };
+            n += 1;
+            let mut b = board::Board::from_fen(fen);
+
+            // O ply so' se aplica se o FEN o trouxer A SERIO. A base do Lichess
+            // guarda FENs de QUATRO campos -- posicao, lado, roque, en-passant --
+            // e quem os completa poe " 0 1" no fim. O numero de lance fica 1 em
+            // todas, e um filtro por ply descarta o conjunto inteiro sem dizer
+            // porque. Apanhado a correr: 100% fora por ply<16, e sem esta
+            // verificacao teria passado por um filtro a funcionar.
+            let campos_fen = fen.split_whitespace().count();
+            if campos_fen >= 6 {
+                let ply = fen.split_whitespace().nth(5)
+                    .and_then(|x| x.parse::<usize>().ok())
+                    .map(|m| m.saturating_sub(1) * 2).unwrap_or(min_ply);
+                if ply < min_ply { fp += 1; continue; }
+            }
+
+            if (b.occ_color[0] | b.occ_color[1]).count_ones() < min_pecas { fpe += 1; continue; }
+            if b.in_check(b.side, &atk) { fx += 1; continue; }
+
+            let moves = movegen::generate_legal(&mut b, &atk);
+            let taticas = match col_mv.and_then(|i| campos.get(i)) {
+                // O LANCE jogado: taticas = captura ou promocao.
+                Some(mv_txt) => moves.iter().find(|m| m.to_uci() == *mv_txt)
+                    .map(|m| m.is_capture() || m.promotion.is_some())
+                    .unwrap_or(false),
+                // Sem o lance: a posicao ter uma captura que ganha material.
+                None => moves.iter().any(|m| m.is_capture()
+                    && search::see::see(&atk, &b, m) > 0),
+            };
+            if taticas { ft += 1; continue; }
+
+            let _ = writeln!(out, "{}", linha);
+            passou += 1;
+        }
+        let pc = |x: usize| 100.0 * x as f64 / n.max(1) as f64;
+        println!("  {} linhas, {} quietas ({:.1}%)", n, passou, pc(passou));
+        println!("    fora por ply<{:<3}      {:6.1}%", min_ply, pc(fp));
+        println!("    fora por pecas<{:<3}    {:6.1}%", min_pecas, pc(fpe));
+        println!("    fora por xeque        {:6.1}%", pc(fx));
+        println!("    fora por tactica      {:6.1}%  ({})", pc(ft),
+                 if col_mv.is_some() { "lance jogado" } else { "captura disponivel" });
+        return;
+    }
+
     if args.len() >= 3 && args[1] == "quietude" {
         let atk = attacks::Attacks::new();
         let txt = std::fs::read_to_string(&args[2]).expect("nao leu");
