@@ -384,7 +384,7 @@ fn main() {
     //
     //   quietude <ficheiro.epd> [n]
     //
-    // O Texel tuning classico exige posicoes quietas: avaliar estaticamente uma
+    // Fitting weights to game results demands quiet positions: avaliar estaticamente uma
     // posicao onde ha' uma peca pendurada e compara-la com o resultado da
     // partida injecta ruido enorme, e o ruido cai desproporcionadamente no
     // tempo -- porque numa posicao com material pendurado e' QUEM JOGA que o

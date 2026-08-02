@@ -1196,6 +1196,23 @@ const TORNADO_LOCKED: [(i32, i32); 4] = [(0, 0); 4];
 /// coluna d. Arranca a zero; os valores vem do ajuste.
 const PASSER_OUTSIDE: (i32, i32) = (0, 0);
 
+/// Trapped pieces -- two named patterns where a piece is on the board, counted
+/// at full material value, and has no future.
+///
+/// The bishop is the one that took the rook-pawn: a7 or b8 walled in by enemy
+/// pawns on b6 and c7 (mirrored for the other wing and the other colour).
+/// Every square it can reach loses it, so the pawn it won cost a piece.
+///
+/// The rook is the one its own king entombed: a1, a2 or b1 with the king on b1
+/// or c1. Distinct from an uncastled king, which is about the king staying
+/// home -- here the king moved, and moved onto the square that seals the rook
+/// in. Neither pattern is visible to material, and mobility understates both,
+/// because the squares exist and are merely fatal.
+///
+/// Both start at zero; the values come from the fit.
+const BISHOP_TRAPPED: (i32, i32) = (0, 0);
+const ROOK_TRAPPED: (i32, i32) = (0, 0);
+
 /// Desequilibrio material: quanto vale cada peca NOSSA contra cada peca DELE.
 ///
 /// [nossa][dele], indices 0..4 = peao cavalo bispo torre dama. Dois cavalos
@@ -1922,6 +1939,18 @@ pub struct Weights {
     pub stonewall: (i32, i32),
     pub stonewall_outpost: (i32, i32),
     pub stonewall_bad_bishop: (i32, i32),
+    /// A bishop that took the rook-pawn and cannot come back: on a7/b8 with
+    /// enemy pawns on b6 and c7, or the mirror on the other wing. The piece is
+    /// still on the board and still counted at full value by material, but it
+    /// has no move that does not lose it, so the pawn it won was a gift.
+    /// Material cannot express this and mobility barely does -- the bishop has
+    /// squares, they are simply all fatal.
+    pub bishop_trapped: (i32, i32),
+    /// A rook buried in the corner by its own king: on a1/a2/b1 with the king
+    /// on b1 or c1, or the mirror. Not the same thing as an uncastled king --
+    /// here the king HAS moved, and moved to the square that entombs the rook,
+    /// which now needs two tempi to reach a file it can use.
+    pub rook_trapped: (i32, i32),
 }
 
 impl Default for Weights {
@@ -1958,6 +1987,8 @@ impl Default for Weights {
             pawn_tornado: PAWN_TORNADO,
             tornado_locked: TORNADO_LOCKED,
             passer_outside: PASSER_OUTSIDE,
+            bishop_trapped: BISHOP_TRAPPED,
+            rook_trapped: ROOK_TRAPPED,
             threat_by_pawn: THREAT_BY_PAWN,
             threat_by_knight: THREAT_BY_KNIGHT,
             threat_by_bishop: THREAT_BY_BISHOP,
@@ -2117,6 +2148,8 @@ fn field_family(name: &str) -> Option<&'static str> {
             "pawn_tornado" => Some("king"),
             "tornado_locked" => Some("king"),
             "passer_outside" => Some("pawns"),
+            "bishop_trapped" => Some("pieces"),
+            "rook_trapped" => Some("pieces"),
             "push_threat" => Some("threats"),
             "restricted_squares" => Some("threats"),
             "rook_hit_queen" => Some("threats"),
@@ -2724,6 +2757,8 @@ impl Weights {
         }
         pairs!(self.tornado_locked);
         pair!(self.passer_outside);
+        pair!(self.bishop_trapped);
+        pair!(self.rook_trapped);
         v
     }
     /// The family of every scalar `to_vec` emits, in the same order.
@@ -2803,6 +2838,8 @@ impl Weights {
         many!("imbalance", 25);
         many!("tornado_locked", 4);
         two!("passer_outside");
+        two!("bishop_trapped");
+        two!("rook_trapped");
         f
     }
 
@@ -2877,6 +2914,8 @@ impl Weights {
         many!("imbalance", 25);
         many!("tornado_locked", 4);
         two!("passer_outside");
+        two!("bishop_trapped");
+        two!("rook_trapped");
         f
     }
 
@@ -2973,6 +3012,8 @@ impl Weights {
         };
         let tornado_locked = pairs!(4);
         let passer_outside = pair!();
+        let bishop_trapped = pair!();
+        let rook_trapped = pair!();
         Weights {
             bishop_pair, long_diag_bishop, minor_behind_pawn, knight_outpost, rook_open, rook_on_seventh, tempo,
             mobility_knight, mobility_bishop, mobility_rook, mobility_queen,
@@ -3005,7 +3046,7 @@ impl Weights {
             knight_hit_queen, bishop_hit_queen, rook_hit_queen, push_threat, restricted_squares,
             pawn_phalanx, defended_pawn, isolated_pawn, doubled_pawn, isolated_exposed, backward_exposed, passed_pawn,
             our_passer_proximity, their_passer_proximity, passer_defended_push, passer_slider_behind,
-            backward_pawn, candidate_passer, bishop_pawns, imbalance, tornado_locked, passer_outside, weak_king_ring,
+            backward_pawn, candidate_passer, bishop_pawns, imbalance, tornado_locked, passer_outside, bishop_trapped, rook_trapped, weak_king_ring,
             king_flank_attacks, king_flank_defenses,
             uncastled_king_no_rights, uncastled_king_has_rights,
             scale_ocb_bishops_only, scale_ocb_one_rook, scale_ocb_one_knight,
@@ -3599,6 +3640,31 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
                 mg += sign * m.0;
                 eg += sign * m.1;
 
+                // A bishop that has squares and no way out. Mobility cannot
+                // see this: the squares are real, they are simply all inside a
+                // pocket the enemy pawns own, so the count is healthy while
+                // the piece is lost. Measured on the poisoned rook-pawn (a
+                // bishop on a7 behind enemy pawns on b6 and c7) our mobility
+                // reads well above zero, so this is not a second helping of
+                // `mobility_bishop[0]`.
+                //
+                // Stated as one condition rather than as the four square-sets
+                // the pattern is usually written out as: at most one square to
+                // go to that a pawn does not cover. That reduces to the same
+                // positions and also catches the ones nobody wrote down.
+                //
+                // Restricted to the enemy half. On our own side the same test
+                // fires on a bishop that simply has not been developed yet,
+                // which is a different thing and already priced elsewhere.
+                if pt == PieceType::Bishop {
+                    let sr = rank_of(s);
+                    let rel_rank = if c == Color::White { sr } else { 7 - sr };
+                    if rel_rank >= 4 && count(attacks & !enemy_pawn_attacks & !own) <= 1 {
+                        mg += sign * w.bishop_trapped.0;
+                        eg += sign * w.bishop_trapped.1;
+                    }
+                }
+
                 let hits = count(attacks & enemy_king_zone) as i32;
                 if hits > 0 {
                     king_attackers[ci] += 1;
@@ -3612,6 +3678,27 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
                     let aw = w.king_attacker_weight[widx];
                     king_attack_units[ci].0 += aw.0 + hits * w.king_attacks.0;
                     king_attack_units[ci].1 += aw.1 + hits * w.king_attacks.1;
+                }
+
+                // A rook its own king sealed in. Not the uncastled-king term:
+                // there the king is still at home and the rights are the
+                // point. Here the king HAS moved, and moved to the one square
+                // that buries the rook behind it -- the rook needs the king to
+                // step aside before it reaches any file worth having, and
+                // until then it is a spectator with full material value.
+                if pt == PieceType::Rook {
+                    let home = if c == Color::White { 0 } else { 7 };
+                    let ksq = board.king_sq(c);
+                    if rank_of(ksq) == home && rank_of(s) <= home + 1 && rank_of(s) + 1 >= home {
+                        let kf = file_of(ksq);
+                        let rf = file_of(s);
+                        let queenside = (kf == 1 || kf == 2) && rf <= 1;
+                        let kingside = (kf == 5 || kf == 6) && rf >= 6;
+                        if queenside || kingside {
+                            mg += sign * w.rook_trapped.0;
+                            eg += sign * w.rook_trapped.1;
+                        }
+                    }
                 }
 
                 if pt == PieceType::Rook {
