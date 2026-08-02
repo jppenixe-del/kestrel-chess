@@ -1,4 +1,4 @@
-"""Texel tuning on the GPU.
+"""Fitting evaluation weights to game results, on the GPU.
 
 The engine already writes the hard part: `kestrel gpuextract <dataset> <out.bin>
 <max> <buckets> <threads>` decomposes each position into the linear
