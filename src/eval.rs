@@ -1172,6 +1172,18 @@ const ROOK_ON_SEVENTH: (i32, i32) = (-2, 41);
 // Valor classico 15-25.
 const TEMPO: (i32, i32) = (22, 15);
 
+/// Desequilibrio material: quanto vale cada peca NOSSA contra cada peca DELE.
+///
+/// [nossa][dele], indices 0..4 = peao cavalo bispo torre dama. Dois cavalos
+/// contra dois bispos nao vale o mesmo que dois cavalos contra cavalo e bispo,
+/// e uma soma de valores fixos por peca nao pode dizer isso -- so' o produto
+/// cruzado pode. Ambos os motores de referencia tem esta tabela e nos nao
+/// tinhamos nada.
+///
+/// Arranca a ZERO: a estrutura entra agora, os valores vem do ajuste. Comecar
+/// com numeros inventados era pior do que nao ter o termo.
+const IMBALANCE: [[(i32, i32); 5]; 5] = [[(0, 0); 5]; 5];
+
 // === Mobility ===
 // Ideia geral: 0 lances legais = peca presa, penalidade forte. Curva
 // concava crescente ate' plateau (mobilidade extra alem de "activa" da'
@@ -1802,6 +1814,8 @@ pub struct Weights {
     pub backward_pawn: (i32, i32),
     pub candidate_passer: [[(i32, i32); 8]; 2],
     pub bishop_pawns: [(i32, i32); 7],
+    /// [nossa][dele] -- ver IMBALANCE.
+    pub imbalance: [[(i32, i32); 5]; 5],
     pub weak_king_ring: (i32, i32),
     pub king_flank_attacks: [(i32, i32); 2],
     pub king_flank_defenses: [(i32, i32); 2],
@@ -1939,6 +1953,7 @@ impl Default for Weights {
             backward_pawn: BACKWARD_PAWN,
             candidate_passer: CANDIDATE_PASSER,
             bishop_pawns: BISHOP_PAWNS,
+            imbalance: IMBALANCE,
             weak_king_ring: WEAK_KING_RING,
             king_flank_attacks: KING_FLANK_ATTACKS,
             king_flank_defenses: KING_FLANK_DEFENSES,
@@ -2045,6 +2060,7 @@ fn field_family(name: &str) -> Option<&'static str> {
             "bishop_hit_queen" => Some("threats"),
             "bishop_pair" => Some("pieces"),
             "bishop_pawns" => Some("pawns"),
+            "imbalance" => Some("pieces"),
             "candidate_passer" => Some("pawns"),
             "defended_pawn" => Some("pawns"),
             "doubled_pawn" => Some("pawns"),
@@ -2668,6 +2684,12 @@ impl Weights {
         pair!(self.blocked_pawns);
         pairs!(self.king_aim);
         pair!(self.king_battery);
+        // NO FIM de proposito: acrescentar um termo a meio desloca tudo o que
+        // vem depois, e as tabelas ja' ajustadas passam a ser lidas nos sitios
+        // errados sem que nada avise. No fim, expandir e' acrescentar zeros.
+        for linha in self.imbalance.iter() {
+            for x in linha.iter() { v.push(x.0); v.push(x.1); }
+        }
         v
     }
     /// The family of every scalar `to_vec` emits, in the same order.
@@ -2744,6 +2766,7 @@ impl Weights {
         two!("stonewall");
         two!("stonewall_outpost");
         two!("stonewall_bad_bishop");
+        many!("imbalance", 25);
         f
     }
 
@@ -2815,6 +2838,7 @@ impl Weights {
         two!("stonewall");
         two!("stonewall_outpost");
         two!("stonewall_bad_bishop");
+        many!("imbalance", 25);
         f
     }
 
@@ -2904,6 +2928,11 @@ impl Weights {
         let king_aim_v = pairs!(3);
         let king_battery_v = pair!();
         debug_assert!(i >= v.len(), "from_vec: read fewer values than supplied");
+        let imbalance = {
+            let mut t = [[(0i32, 0i32); 5]; 5];
+            for i in 0..5 { for j in 0..5 { t[i][j] = (next!(), next!()); } }
+            t
+        };
         Weights {
             bishop_pair, long_diag_bishop, minor_behind_pawn, knight_outpost, rook_open, rook_on_seventh, tempo,
             mobility_knight, mobility_bishop, mobility_rook, mobility_queen,
@@ -2936,7 +2965,7 @@ impl Weights {
             knight_hit_queen, bishop_hit_queen, rook_hit_queen, push_threat, restricted_squares,
             pawn_phalanx, defended_pawn, isolated_pawn, doubled_pawn, isolated_exposed, backward_exposed, passed_pawn,
             our_passer_proximity, their_passer_proximity, passer_defended_push, passer_slider_behind,
-            backward_pawn, candidate_passer, bishop_pawns, weak_king_ring,
+            backward_pawn, candidate_passer, bishop_pawns, imbalance, weak_king_ring,
             king_flank_attacks, king_flank_defenses,
             uncastled_king_no_rights, uncastled_king_has_rights,
             scale_ocb_bishops_only, scale_ocb_one_rook, scale_ocb_one_knight,
@@ -3318,6 +3347,36 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
         attacked_by_pt[c.idx()][PieceType::King.idx()] |= ka;
     }
 
+    // Attack-span dos peoes: todas as casas que os peoes de uma cor podem VIR
+    // a atacar, propagadas para a frente. As duas referencias usam isto para
+    // decidir o posto avancado; nos olhavamos apenas se EXISTE peao inimigo na
+    // coluna adjacente, que e' diferente -- um peao que ja' passou o posto
+    // nunca mais o pode atacar, e para nos continuava a invalida-lo.
+    let span = {
+        let wp = board.pieces[0][PieceType::Pawn.idx()];
+        let bp = board.pieces[1][PieceType::Pawn.idx()];
+        let mut w_at = ((wp & !FILE_A) << 7) | ((wp & !(FILE_A << 7)) << 9);
+        let mut b_at = ((bp & !FILE_A) >> 9) | ((bp & !(FILE_A << 7)) >> 7);
+        w_at |= w_at << 8; w_at |= w_at << 16; w_at |= w_at << 32;
+        b_at |= b_at >> 8; b_at |= b_at >> 16; b_at |= b_at >> 32;
+        [w_at, b_at]
+    };
+
+    // Peoes proprios travados: tem algo imediatamente a' frente e nao se
+    // podem mexer. Sao casas mortas para efeito de mobilidade.
+    let peoes_travados = [
+        board.pieces[0][PieceType::Pawn.idx()] & (board.occ_all >> 8),
+        board.pieces[1][PieceType::Pawn.idx()] & (board.occ_all << 8),
+    ];
+
+    // Pecas cravadas de cada cor, uma vez por avaliacao. A geracao de lances
+    // ja' sabe calcula-las; aqui servem para nao dar mobilidade a quem nao a
+    // tem.
+    let pinned_de = [
+        crate::movegen::compute_pinned(board, a, Color::White, board.king_sq(Color::White)),
+        crate::movegen::compute_pinned(board, a, Color::Black, board.king_sq(Color::Black)),
+    ];
+
     // === Tropismo: onde esta o jogo ===========================================
     //
     // Todos os outros termos de rei contam casas ATACADAS. Nenhum repara numa
@@ -3390,6 +3449,21 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
         let enemy_king_zone = if c == Color::White { black_king_zone } else { white_king_zone };
         let ci = c.idx();
 
+        // Desequilibrio material: produto cruzado das nossas pecas pelas dele.
+        // Uma soma de valores fixos por peca nao consegue dizer que dois
+        // cavalos valem coisas diferentes conforme o que esta' do outro lado.
+        for i in 0..5 {
+            let nossas = count(board.pieces[c.idx()][i]) as i32;
+            if nossas == 0 { continue; }
+            for j in 0..5 {
+                let delas = count(board.pieces[c.opp().idx()][j]) as i32;
+                if delas == 0 { continue; }
+                let t = w.imbalance[i][j];
+                mg += sign * t.0 * nossas * delas;
+                eg += sign * t.1 * nossas * delas;
+            }
+        }
+
         if count(board.pieces[c.idx()][PieceType::Bishop.idx()]) >= 2 {
             mg += sign * w.bishop_pair.0;
             eg += sign * w.bishop_pair.1;
@@ -3400,13 +3474,36 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
             while bbp != 0 {
                 let s = bbp.trailing_zeros() as Square;
                 bbp &= bbp - 1;
-                let attacks = match pt {
+                // Ocupacao com RAIOS-X entre pecas proprias da mesma linha.
+                //
+                // Dois bispos na mesma diagonal, ou torre e dama na mesma
+                // coluna, veem atraves um do outro: a de tras exerce pressao
+                // atraves da da frente, e sai para la' assim que a primeira se
+                // mexa. Contar a da frente como bloqueio e' contar uma bateria
+                // como se fosse uma peca so'. E' o que os motores fortes fazem
+                // e nos usavamos a ocupacao inteira.
+                let occ_xray = match pt {
+                    PieceType::Bishop => occ & !(board.pieces[ci][PieceType::Bishop.idx()]
+                        | board.pieces[ci][PieceType::Queen.idx()]),
+                    PieceType::Rook => occ & !(board.pieces[ci][PieceType::Rook.idx()]
+                        | board.pieces[ci][PieceType::Queen.idx()]),
+                    PieceType::Queen => occ & !(board.pieces[ci][PieceType::Bishop.idx()]
+                        | board.pieces[ci][PieceType::Rook.idx()]),
+                    _ => occ,
+                };
+                let mut attacks = match pt {
                     PieceType::Knight => a.knight[s as usize],
-                    PieceType::Bishop => bishop_attacks(s, occ),
-                    PieceType::Rook => rook_attacks(s, occ),
-                    PieceType::Queen => queen_attacks(s, occ),
+                    PieceType::Bishop => bishop_attacks(s, occ_xray),
+                    PieceType::Rook => rook_attacks(s, occ_xray),
+                    PieceType::Queen => queen_attacks(s, occ_xray),
                     _ => 0,
                 };
+                // Uma peca CRAVADA so' se pode mexer ao longo da linha da
+                // cravada. Contar-lhe a mobilidade toda e' dar-lhe casas onde
+                // ela nao pode por os pes sem perder o rei.
+                if bb(s) & pinned_de[ci] != 0 {
+                    attacks &= a.between[s as usize][board.king_sq(c) as usize] | bb(board.king_sq(c));
+                }
                 // Registar em EvalData para a fase de threats abaixo.
                 attacked_by_2[c.idx()] |= attacked[c.idx()] & attacks;
                 attacked[c.idx()] |= attacks;
@@ -3416,8 +3513,20 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
                 // pawns (moving there just hangs the piece for a pawn,
                 // not real mobility) as well as own-occupied squares.
                 // Standard refinement: the "mobility area".
+                // Area de mobilidade, na forma estabelecida: fora as casas
+                // atacadas por peoes inimigos, fora a casa do proprio rei, e
+                // fora os PEOES PROPRIOS TRAVADOS -- peoes com algo em frente
+                // sao casas mortas e uma peca que os "ataca" nao ganha
+                // mobilidade nenhuma com isso.
+                //
+                // Nos excluiamos TODAS as pecas proprias, o que e' diferente:
+                // uma torre que cobre a casa do proprio bispo tem essa casa
+                // disponivel assim que o bispo saia, e a forma estabelecida
+                // conta-a. Excluiamos casas a mais e casas a menos ao mesmo
+                // tempo.
                 let enemy_pawn_attacks = attacked_by_pt[c.opp().idx()][PieceType::Pawn.idx()];
-                let mobility = count(attacks & !own & !enemy_pawn_attacks) as usize;
+                let area = !enemy_pawn_attacks & !bb(board.king_sq(c)) & !peoes_travados[ci];
+                let mobility = count(attacks & area) as usize;
                 let mob_table = match pt {
                     PieceType::Knight => &w.mobility_knight,
                     PieceType::Bishop => &w.mobility_bishop,
@@ -3468,7 +3577,13 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
                     let r = rank_of(s) as i32;
                     let front_r = if c == Color::White { r + 1 } else { r - 1 };
                     if (0..8).contains(&front_r)
-                        && board.pieces[c.idx()][PieceType::Pawn.idx()] & bb(sq(f as u8, front_r as u8)) != 0
+                        // Peao de QUALQUER cor. As duas referencias usam o
+                        // conjunto de todos os peoes: uma peca menor abrigada
+                        // atras de um peao inimigo esta' igualmente protegida
+                        // de ser expulsa por peao, e nos exigiamos que fosse
+                        // nosso.
+                        && (board.pieces[0][PieceType::Pawn.idx()] | board.pieces[1][PieceType::Pawn.idx()])
+                            & bb(sq(f as u8, front_r as u8)) != 0
                     {
                         mg += sign * w.minor_behind_pawn.0;
                         eg += sign * w.minor_behind_pawn.1;
@@ -3478,12 +3593,7 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
                         let own_side_rank = if c == Color::White { r } else { 7 - r };
                         if (3..=5).contains(&own_side_rank) {
                             let defended = a.pawn[c.opp().idx()][s as usize] & board.pieces[c.idx()][PieceType::Pawn.idx()] != 0;
-                            let mut ever_attackable = false;
-                            for adj in [f - 1, f + 1] {
-                                if (0..8).contains(&adj) && board.pieces[c.opp().idx()][PieceType::Pawn.idx()] & (FILE_A << adj) != 0 {
-                                    ever_attackable = true;
-                                }
-                            }
+                            let ever_attackable = span[c.opp().idx()] & bb(s) != 0;
                             if defended && !ever_attackable {
                                 mg += sign * w.knight_outpost.0;
                                 eg += sign * w.knight_outpost.1;
