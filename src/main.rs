@@ -158,6 +158,65 @@ fn main() {
         println!("# Buckets: {} (por contagem de peoes)", eval::NUM_BUCKETS);
         return;
     }
+    // SPSA config for an external tuning harness (OpenBench's format), the
+    // same thing a reference engine's own search-params file does -- it
+    // does not run its own SPSA either, it exports "name, int, default,
+    // min, max, step, C_end" and lets OpenBench (or WeatherFactory) play
+    // the games and do the math. `PARAM_NAMES`/`SearchParams::to_vec` are
+    // already the same kind of registry that reference's `SEARCH_PARAM`
+    // macro builds; this just prints it in the shape OpenBench expects,
+    // reusing the exact min/max band the UCI option listing already uses
+    // (see the `option name ... type spin` loop) so the two never disagree
+    // about a parameter's legal range.
+    if args.len() >= 2 && args[1] == "openbench" {
+        for (n, d) in crate::search::PARAM_NAMES
+            .iter()
+            .zip(crate::search::SearchParams::default().to_vec())
+        {
+            let band = d.abs().max(10);
+            let lo = if d < 0 { d - band } else { (d - band).max(0) };
+            let hi = d + band;
+            // Common OpenBench convention: step is a fraction of the
+            // range, not the raw band -- small enough that SPSA takes
+            // several steps to cross the interval instead of one.
+            let step = (band / 10).max(1);
+            println!("{}, int, {}, {}, {}, {}, 0.002", n, d, lo, hi, step);
+        }
+        return;
+    }
+    // List the feature switches and what they cost, so "which of the 74 is
+    // paying for this" has an answer that does not require reading eval.rs.
+    if args.len() >= 2 && args[1] == "features" {
+        let w = eval::default_weights();
+        let v = w.to_vec();
+        let nomes = w.field_names();
+        let fams = w.field_families();
+        let mut por_campo: Vec<(&str, &str, usize, bool, i64)> = Vec::new();
+        for (i, n) in nomes.iter().enumerate() {
+            match por_campo.last_mut() {
+                Some(e) if e.0 == *n => { e.2 += 1; e.4 += v[i].abs() as i64; }
+                _ => por_campo.push((n, fams[i], 1, eval::feature_on(n), v[i].abs() as i64)),
+            }
+        }
+        let (mut on, mut off) = (0usize, 0usize);
+        for (_, _, d, lig, _) in &por_campo { if *lig { on += d } else { off += d } }
+        println!("{:<28} {:<11} {:>5} {:>6}  {}", "campo", "familia", "pesos", "|soma|", "estado");
+        println!("{}", "-".repeat(66));
+        for grupo in [true, false] {
+            for (n, f, d, lig, mag) in &por_campo {
+                if *lig == grupo {
+                    println!("{:<28} {:<11} {:>5} {:>6}  {}", n, f, d, mag,
+                             if *lig { "ON" } else { "off" });
+                }
+            }
+            println!();
+        }
+        println!("{} ligados / {} desligados de {} escalares posicionais", on, off, v.len());
+        println!("material e PSQT estao sempre ligados (nao estao neste vector)");
+        println!("KESTREL_FEATURES=+nome,-nome  |  all  |  base  |  none");
+        return;
+    }
+
     if args.len() >= 2 && args[1] == "checkweights" {
         check_weights_roundtrip();
         return;
@@ -174,6 +233,40 @@ fn main() {
         let text: Vec<String> = v.iter().map(|x| x.to_string()).collect();
         std::fs::write(&args[2], text.join(",")).expect("nao consegui escrever");
         println!("wrote {} weights to {}", v.len(), args[2]);
+        return;
+    }
+    // The full starting vector, in exactly the layout the extractor emits.
+    //
+    // Two tuning runs were lost to this. The positional block came from
+    // `dumpweights` and the material/PST block from `dumpmatpst`, and if the
+    // two were produced by binaries that disagreed -- one before a change, one
+    // after -- the fit started from a set of weights no engine ever held. Once
+    // that meant material counted twice (3-797); once it meant the tables were
+    // exported against material they had not been fitted with (0-799-1).
+    //
+    // One command, one binary, one read of the weights the engine ACTUALLY
+    // uses (gated, fitted, whatever this build resolves to), laid out as
+    //   dim positional | MAT_PST_DIM material and PST | 1 bias
+    // per bucket. If the file and the .bin come from the same executable they
+    // cannot disagree.
+    if args.len() >= 3 && args[1] == "initvec" {
+        let b = board::Board::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+        let w = eval::weights_for(&b);
+        let pos = w.to_vec();
+        let mat = eval::material_pst_current_vec();
+        assert_eq!(mat.len(), eval::MAT_PST_DIM, "material/PST block is the wrong width");
+        let mut out: Vec<i32> = Vec::with_capacity((pos.len() + mat.len() + 1) * eval::NUM_BUCKETS);
+        for _ in 0..eval::NUM_BUCKETS {
+            out.extend_from_slice(&pos);
+            out.extend_from_slice(&mat);
+            out.push(0); // bias
+        }
+        let text: Vec<String> = out.iter().map(|x| x.to_string()).collect();
+        std::fs::write(&args[2], text.join(",")).expect("nao consegui escrever");
+        let off = w.field_names().iter().filter(|n| !eval::feature_on(n)).count();
+        println!("wrote {} values to {} ({} buckets x [{} positional | {} mat/PST | 1 bias])",
+                 out.len(), args[2], eval::NUM_BUCKETS, pos.len(), mat.len());
+        println!("  {} positional weights are switched off and are zero here", off);
         return;
     }
     if args.len() >= 3 && args[1] == "dumpmatpst" {
@@ -510,24 +603,26 @@ fn main() {
         println!("      x scale_endgame                  {:>8}   -> {}", esc - (bruto + cx), esc);
         let pbc = eval::psqt_bucket_correction(&b);
         println!("      + psqt_bucket_correction         {:>8}   -> {}", pbc, esc + pbc);
-        let mbs = eval::material_bucket_scale(&b, esc + pbc);
-        println!("      x material_bucket_scale          {:>8}   -> {}", mbs - (esc + pbc), mbs);
+        let mbs = if eval::material_buckets_on() { eval::material_bucket_scale(&b, esc + pbc) } else { esc + pbc };
+        println!("      x material_bucket_scale          {:>8}   -> {}{}", mbs - (esc + pbc), mbs,
+                 if eval::material_buckets_on() { "" } else { "   (desligado por defeito)" });
+        let sps = eval::strong_side_pawn_scale(&b, mbs);
+        println!("      x escala por peoes do lado forte {:>8}   -> {}", sps - mbs, sps);
         let interno = { let e = eval::evaluate(&b); if b.side == types::Color::White { e } else { -e } };
         println!("      INTERNO FINAL                    {:>8}{}", interno,
-                 if interno != mbs { "   (resta o tempo/rule50)" } else { "" });
-        println!("      REPORTADO                        {:>8} cp   (/{})",
-                 eval::score_normalizado(interno), eval::NORMALIZA_PARA_PEAO);
+                 if interno != sps { "   (resta o tempo/rule50)" } else { "" });
+        println!("      REPORTADO                        {:>8} cp   (identidade -- ver score_normalizado)",
+                 eval::score_normalizado(interno));
 
         // ---------- 5. o que a busca faz com este numero ----------
         println!("\n  [5] O QUE AS MARGENS DA BUSCA FAZEM COM ISTO");
         let stm = if b.side == types::Color::White { interno } else { -interno };
         println!("      eval do lado a jogar             {:>8}", stm);
-        let sp = search::SearchParams::default();
-        println!("      {:<4} {:>10} {:>12} {:>12}", "prof", "RFP+", "RFP-", "eval-RFP+");
+        let sp = search::search_params();
+        println!("      {:<4} {:>10} {:>12}", "prof", "RFP margem", "eval-RFP");
         for d in [1, 2, 3, 4, 6, 8] {
-            let mi = sp.rfp_improving.at(d);
-            let mn = sp.rfp_not_improving.at(d);
-            println!("      {:<4} {:>10} {:>12} {:>12}", d, mi, mn, stm - mi);
+            let m = (sp.rfp_step * d * d / 2 - sp.rfp_step * d / 2 + sp.rfp_base * d).max(20);
+            println!("      {:<4} {:>10} {:>12}", d, m, stm - m);
         }
         println!("      (RFP corta quando eval - margem >= beta; com a avaliacao inflacionada");
         println!("       a margem fica pequena face ao numero com que se compara)");
@@ -682,15 +777,27 @@ fn main() {
             s / evals.len() as f64
         };
         // Varredura grosseira e depois refinamento, que chega para um escalar.
+        // A varredura grosseira comecava em 0.10, e o refinamento a seguir --
+        // passo 0.005 a encolher por 0.7 durante 40 iteracoes -- so' consegue
+        // afastar-se da soma da serie geometrica, uns 0.0167. Se o k real
+        // estiver abaixo de 0.10, fica PRESO no limite do que consegue
+        // alcancar: 0.10 - 0.0167 = 0.0833. Saiu esse numero, identico ate' a'
+        // quarta casa decimal, em tres conjuntos de dados completamente
+        // diferentes (abertura, meio-jogo, final) -- nao era o dado a falar,
+        // era o algoritmo a bater no proprio tecto.
         let (mut melhor_k, mut melhor) = (1.0f64, f64::INFINITY);
-        let mut k = 0.10;
-        while k <= 3.0 { let v = erro(k); if v < melhor { melhor = v; melhor_k = k; } k += 0.01; }
-        let mut passo = 0.005;
-        for _ in 0..40 {
+        let mut k = 0.001;
+        while k <= 5.0 {
+            let v = erro(k);
+            if v < melhor { melhor = v; melhor_k = k; }
+            k += if k < 0.20 { 0.001 } else { 0.02 };
+        }
+        let mut passo = melhor_k.max(0.05) * 0.3;
+        for _ in 0..60 {
             for cand in [melhor_k - passo, melhor_k + passo] {
                 if cand > 0.0 { let v = erro(cand); if v < melhor { melhor = v; melhor_k = cand; } }
             }
-            passo *= 0.7;
+            passo *= 0.8;
         }
         println!("{} posicoes", evals.len());
         println!("k otimo = {:.4}   ->  K CLASSICO = {:.0}", melhor_k, 400.0 / melhor_k);
@@ -886,6 +993,21 @@ fn check_weights_roundtrip() {
     let original = eval::default_weights().clone();
     let v = original.to_vec();
     println!("flat vector length: {}", v.len());
+    // `field_names` TEM de acompanhar `to_vec`, escalar a escalar. Divergiram a
+    // 29/07 -- seis campos acrescentados ao vector e nao a lista -- e a partir
+    // do primeiro em falta todos os nomes ficam desfasados dos pesos. O `raiox`
+    // passou a zerar um peso e a imprimir o nome de outro, e diagnosticos
+    // inteiros da avaliacao foram feitos em cima disso.
+    {
+        let nn = original.field_names().len();
+        let nf = original.field_families().len();
+        if v.len() != nn || v.len() != nf {
+            println!("!! DESALINHADO: to_vec {} field_names {} field_families {}", v.len(), nn, nf);
+            println!("   o raiox e tudo o que indexa por nome estao a mentir");
+        } else {
+            println!("OK: field_names/field_families alinhados ({} escalares)", v.len());
+        }
+    }
     if std::env::var("PRINT_DEFAULT_VEC").is_ok() {
         let s: Vec<String> = v.iter().map(|x| x.to_string()).collect();
         println!("{}", s.join(","));
@@ -2551,6 +2673,20 @@ fn gpu_extract(dataset_path: &str, out_path: &str, max_positions: usize, buckets
     let is_king_field: Vec<bool> = sentinel.to_vec().iter().map(|&x| x == 1).collect();
     let n_king = is_king_field.iter().filter(|&&b| b).count();
 
+    // The switched-off features, by index.
+    //
+    // The probes below call `positional_terms` directly and so bypass the gate
+    // that `weights_for` applies. Emitting a column the engine zeroes would
+    // train the model on an evaluation that does not exist -- it would learn a
+    // weight for the term and the engine would then ignore it.
+    let feature_off: Vec<bool> =
+        default.field_names().iter().map(|n| !eval::feature_on(n)).collect();
+    let n_off = feature_off.iter().filter(|&&b| b).count();
+    if n_off > 0 {
+        eprintln!("gpuextract: {} of {} positional features are switched off and \
+                   will emit no column", n_off, feature_off.len());
+    }
+
     let mut king_only_vec = vec![0i32; dim];
     for i in 0..dim {
         if is_king_field[i] {
@@ -2622,6 +2758,7 @@ fn gpu_extract(dataset_path: &str, out_path: &str, max_positions: usize, buckets
             let w_king_only = &w_king_only;
             let king_only_vec = &king_only_vec;
             let is_king_field = &is_king_field;
+            let feature_off = &feature_off;
             let probes = &probes;
             let probes_king = &probes_king;
             handles.push(scope.spawn(move || {
@@ -2699,6 +2836,9 @@ fn gpu_extract(dataset_path: &str, out_path: &str, max_positions: usize, buckets
                     // count goes in the pair's mg slot, black's in its eg slot.
                     let acc0 = eval::king_accumulators(&board, &w_zero);
                     for i in 0..is_king_field.len() {
+                        if feature_off[i] {
+                            continue;
+                        }
                         if is_king_field[i] {
                             let acc = eval::king_accumulators(&board, &probes_king[i]);
                             // Even index of a pair -> White's count; odd -> Black's.
