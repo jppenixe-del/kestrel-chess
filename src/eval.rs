@@ -1107,12 +1107,32 @@ pub fn material_pst_current_vec() -> Vec<i32> {
     // meant -- if it changes, it changes because the simulator says so.
     for (i, t) in tables_mg.iter().enumerate() {
         let f = psqt_factor(i);
-        // COMBINADA: o valor da peca somado a cada casa.
-        for &x in t.iter() { v.push(MG_VALUE[i] + if f == 1000 { x } else { x * f / 1000 }); }
+        // COMBINADA: o valor da peca somado a cada casa. No modo FACTOR sai
+        // como milesimos de MATERIAL, que e' o mesmo valor escrito de outra
+        // maneira -- 1000 e' "vale exactamente o que a peca vale".
+        for &x in t.iter() {
+            let d = if f == 1000 { x } else { x * f / 1000 };
+            v.push(if psqt_factor_mode() && MG_VALUE[i] != 0 {
+                1000 + d * 1000 / MG_VALUE[i]
+            } else if psqt_factor_mode() {
+                d                      // rei: aditivo, valor absoluto
+            } else {
+                MG_VALUE[i] + d
+            });
+        }
     }
     for (i, t) in tables_eg.iter().enumerate() {
         let f = psqt_factor(i);
-        for &x in t.iter() { v.push(EG_VALUE[i] + if f == 1000 { x } else { x * f / 1000 }); }
+        for &x in t.iter() {
+            let d = if f == 1000 { x } else { x * f / 1000 };
+            v.push(if psqt_factor_mode() && EG_VALUE[i] != 0 {
+                1000 + d * 1000 / EG_VALUE[i]
+            } else if psqt_factor_mode() {
+                d
+            } else {
+                EG_VALUE[i] + d
+            });
+        }
     }
     v
 }
@@ -1124,6 +1144,14 @@ pub fn material_pst_current_vec() -> Vec<i32> {
 /// material_pst_white(board)` a menos do arredondamento inteiro do taper.
 /// Ordem: [MG_VALUE 0..6][EG_VALUE 6..12][MG_PST pecas 12..396][EG_PST
 /// pecas 396..780], PST por peca na ordem P,N,B,R,Q,K, 64 casas cada.
+/// A PSQT como FACTOR do valor da peca, em vez de parcela aditiva.
+/// Ligada por `KESTREL_PSQT_FACTOR`. Ver a nota dentro de
+/// `material_pst_features`.
+fn psqt_factor_mode() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var_os("KESTREL_PSQT_FACTOR").is_some())
+}
+
 pub fn material_pst_features(board: &Board, feats: &mut [f32]) {
     for f in feats.iter_mut().take(MAT_PST_DIM) { *f = 0.0; }
     let phase = board.phase.min(MAX_PHASE);
@@ -1158,8 +1186,51 @@ pub fn material_pst_features(board: &Board, feats: &mut [f32]) {
                 // comprimento do vector nao muda, portanto nada a jusante
                 // desalinha.
                 let _ = (MG_VAL_OFF, EG_VAL_OFF);
-                feats[MG_PST_OFF + pt_i * 64 + idx] += sign * mg_w;
-                feats[EG_PST_OFF + pt_i * 64 + idx] += sign * eg_w;
+                if psqt_factor_mode() {
+                    // FORMA MULTIPLICATIVA: valor = MATERIAL[p] x FACTOR[casa],
+                    // o factor em milesimos e com media fixada em 1000.
+                    //
+                    // Fundir o material na tabela nao chega, e ancora-lo tambem
+                    // nao: com a PSQT aditiva e livre, 64 numeros por peca que
+                    // SOMAM ao valor conseguem sempre anular o que se fixou.
+                    // Medido: material preso em 990 e a tabela da dama a sair
+                    // com media -304 -- valor efectivo 686. Fecha-se uma porta
+                    // e o ajuste sai pela outra.
+                    //
+                    // Com o factor de media 1 a restricao passa a ser sobre a
+                    // tabela INTEIRA: baixar o valor efectivo obrigaria a
+                    // baixar a media, e a media esta presa.
+                    //
+                    // Continua LINEAR nos pesos -- com MATERIAL fixo,
+                    // d(eval)/d(FACTOR) e' MATERIAL[p] -- portanto o afinador
+                    // nao muda; muda o valor da feature.
+                    //
+                    // E exprime uma verdade que o aditivo aprende casa a casa:
+                    // a casa importa muito a um peao e quase nada a uma dama.
+                    // Nas nossas tabelas o desvio do factor cai monotonicamente
+                    // com o valor da peca -- peao 0.31, dama 0.025.
+                    // O REI fica ADITIVO, e nao e' excepcao arbitraria: o seu
+                    // MATERIAL e' zero por definicao -- esta sempre no
+                    // tabuleiro -- e um factor de zero e' zero. A tabela dele,
+                    // que vai de -116 a 133 e e' real, desaparecia por
+                    // completo. Apanhado pela auto-verificacao do extractor:
+                    // 88,5 cp de desvio contra os 2,2 habituais.
+                    //
+                    // E' tambem o que faz sentido: a tabela do rei e' posicao
+                    // pura, nao uma fraccao de um valor que ele nao tem.
+                    let mv = mg_value(pt_i);
+                    let ev = eg_value(pt_i);
+                    if mv == 0 || ev == 0 {
+                        feats[MG_PST_OFF + pt_i * 64 + idx] += sign * mg_w;
+                        feats[EG_PST_OFF + pt_i * 64 + idx] += sign * eg_w;
+                    } else {
+                        feats[MG_PST_OFF + pt_i * 64 + idx] += sign * mg_w * (mv as f32 / 1000.0);
+                        feats[EG_PST_OFF + pt_i * 64 + idx] += sign * eg_w * (ev as f32 / 1000.0);
+                    }
+                } else {
+                    feats[MG_PST_OFF + pt_i * 64 + idx] += sign * mg_w;
+                    feats[EG_PST_OFF + pt_i * 64 + idx] += sign * eg_w;
+                }
             }
         }
     }
