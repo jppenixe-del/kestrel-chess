@@ -33,142 +33,142 @@ fn atk() -> &'static Attacks {
     ATTACKS.get_or_init(Attacks::new)
 }
 
-// Tapered piece-square tables (perspetiva das brancas, a1=indice 0 ..
-// h8=indice 63 -- peca preta usa espelho vertical). PSQT publicas de
-// ponto de partida educacional classico -- valores para afinar via o
-// nosso tuner a seguir, nao um estado final. Convertidas de rank8-first
-// para rank1-first (convencao deste codigo).
+// Tapered piece-square tables, rank8-first (index 0 = a8, index 63 = h8) --
+// the same layout every reference engine we studied uses, so a table can be
+// pasted in from one and read at a glance instead of transposed by hand.
+// `mirror_idx` is where this gets translated to and from `Square`'s own
+// numbering, which stays a1=0 for the bitboard code elsewhere.
 #[rustfmt::skip]
 const MG_PAWN: [i32; 64] = [
-       0,    0,    0,    0,    0,    0,    0,    0,
-     -35,   -1,  -20,  -23,  -15,   24,   38,  -22,
-     -26,   -4,   -4,  -10,    3,    3,   33,  -12,
-     -27,   -2,   -5,   12,   17,    6,   10,  -25,
-     -14,   13,    6,   21,   23,   12,   17,  -23,
-      -6,    7,   26,   31,   65,   56,   25,  -20,
-      98,  134,   61,   95,   68,  126,   34,  -11,
-       0,    0,    0,    0,    0,    0,    0,    0,
+             0,      0,      0,      0,      0,      0,      0,      0,
+            46,     14,     12,     34,     46,     21,     25,     53,
+            -1,    -16,      4,     10,      6,      2,    -19,     -5,
+            -4,     -6,      0,      0,     -3,     -4,     -9,    -10,
+           -11,    -14,      2,      7,      5,     -5,    -18,    -16,
+           -17,     -6,     -8,     -5,     -9,    -13,    -20,    -22,
+            -8,      8,      5,     -1,     -4,     -9,     -9,    -15,
+             0,      0,      0,      0,      0,      0,      0,      0,
 ];
 #[rustfmt::skip]
 const EG_PAWN: [i32; 64] = [
-       0,    0,    0,    0,    0,    0,    0,    0,
-      13,    8,    8,   10,   13,    0,    2,   -7,
-       4,    7,   -6,    1,    0,   -5,   -1,   -8,
-      13,    9,   -3,   -7,   -7,   -8,    3,   -1,
-      32,   24,   13,    5,   -2,    4,   17,   17,
-      94,  100,   85,   67,   56,   53,   82,   84,
-     178,  173,  158,  134,  147,  132,  165,  187,
-       0,    0,    0,    0,    0,    0,    0,    0,
+             0,      0,      0,      0,      0,      0,      0,      0,
+            81,    100,     98,     76,     65,     78,    100,     81,
+            10,     24,    -16,    -33,    -36,    -19,     21,      9,
+             0,     -3,    -25,    -37,    -37,    -28,     -7,     -1,
+           -20,    -10,    -38,    -35,    -36,    -32,    -11,    -21,
+           -26,    -18,    -22,    -21,    -21,    -25,    -16,    -26,
+           -24,    -15,     14,    -15,    -19,    -21,    -13,    -23,
+             0,      0,      0,      0,      0,      0,      0,      0,
 ];
 #[rustfmt::skip]
 const MG_KNIGHT: [i32; 64] = [
-    -105,  -21,  -58,  -33,  -17,  -28,  -19,  -23,
-     -29,  -53,  -12,   -3,   -1,   18,  -14,  -19,
-     -23,   -9,   12,   10,   19,   17,   25,  -16,
-     -13,    4,   16,   13,   28,   19,   21,   -8,
-      -9,   17,   19,   53,   37,   69,   18,   22,
-     -47,   60,   37,   65,   84,  129,   73,   44,
-     -73,  -41,   72,   36,   23,   62,    7,  -17,
-    -167,  -89,  -34,  -49,   61,  -97,  -15, -107,
+           -78,    -94,    -93,    -20,    -27,    -66,   -102,    -94,
+           -14,    -11,     17,     29,     22,     18,    -13,    -17,
+            21,     17,     27,     20,     17,     23,     17,     19,
+            24,     26,     37,     27,     30,     30,     21,     16,
+            19,     27,     31,     25,     25,     28,     22,     13,
+             1,     12,     17,     13,     12,      9,      5,     -5,
+            -2,      2,      6,     12,      8,      4,     -2,    -14,
+           -33,     -4,     -2,      6,      3,     -7,     -7,    -34,
 ];
 #[rustfmt::skip]
 const EG_KNIGHT: [i32; 64] = [
-     -29,  -51,  -23,  -15,  -22,  -18,  -50,  -64,
-     -42,  -20,  -10,   -5,   -2,  -20,  -23,  -44,
-     -23,   -3,   -1,   15,   10,   -3,  -20,  -22,
-     -18,   -6,   16,   25,   16,   17,    4,  -18,
-     -17,    3,   22,   22,   22,   11,    8,  -18,
-     -24,  -20,   10,    9,   -1,   -9,  -19,  -41,
-     -25,   -8,  -25,   -2,   -9,  -25,  -24,  -52,
-     -58,  -38,  -13,  -28,  -31,  -27,  -63,  -99,
+           -72,      7,     26,      2,      2,      8,      4,    -45,
+             1,     16,      3,      4,      8,     -5,     12,     -3,
+           -10,      4,      9,     11,     11,      7,      3,    -13,
+            10,     10,     10,     16,     15,     10,      6,      9,
+             8,      5,     15,     21,     17,     15,      3,      6,
+            -8,     -5,     -2,     13,     11,     -2,     -8,     -9,
+           -10,     -7,    -10,     -4,     -4,     -9,     -9,    -15,
+           -12,    -16,    -13,     -4,     -2,    -14,    -17,    -21,
 ];
 #[rustfmt::skip]
 const MG_BISHOP: [i32; 64] = [
-     -33,   -3,  -14,  -21,  -13,  -12,  -39,  -21,
-       4,   15,   16,    0,    7,   21,   33,    1,
-       0,   15,   15,   15,   14,   27,   18,   10,
-      -6,   13,   13,   26,   34,   12,   10,    4,
-      -4,    5,   19,   50,   37,   37,    7,   -2,
-     -16,   37,   43,   40,   35,   50,   37,   -2,
-     -26,   16,  -18,  -13,   30,   59,   18,  -47,
-     -29,    4,  -82,  -37,  -25,  -42,    7,   -8,
+           -32,    -54,    -64,    -65,    -71,    -54,    -52,    -34,
+           -17,    -36,     -1,    -18,    -13,     -2,    -23,    -15,
+             9,      7,     -5,     15,     13,    -10,     11,      2,
+             1,     15,     11,      7,     12,     12,     15,      1,
+            16,      6,     12,     21,     21,     13,      7,     13,
+            16,     25,     13,     15,     15,     10,     27,     12,
+            18,     21,     26,     11,      6,     19,     12,     16,
+             8,      9,      1,     13,     10,      5,     15,      5,
 ];
 #[rustfmt::skip]
 const EG_BISHOP: [i32; 64] = [
-     -23,   -9,  -23,   -5,   -9,  -16,   -5,  -17,
-     -14,  -18,   -7,   -1,    4,   -9,  -15,  -27,
-     -12,   -3,    8,   10,   13,    3,   -7,  -15,
-      -6,    3,   13,   19,    7,   10,   -3,   -9,
-      -3,    9,   12,    9,   14,   10,    3,    2,
-       2,   -8,    0,   -1,   -2,    6,    0,    4,
-      -8,   -4,    7,  -12,   -3,  -13,   -4,  -14,
-     -14,  -21,  -11,   -8,   -7,   -9,  -17,  -24,
+           -17,     22,     14,     23,     27,     13,     20,     -6,
+             0,      0,      4,     13,     15,      5,     -8,      2,
+             0,     11,      0,      6,      7,     -3,      7,      3,
+             2,      9,     13,     26,     24,     11,      7,      0,
+            -8,      6,     12,     10,     12,      9,      6,     -7,
+           -11,     -2,    -11,      7,      3,    -12,     -3,    -12,
+           -15,    -36,    -18,     -5,     -5,    -20,    -34,    -12,
+           -35,    -11,     -6,     -9,     -7,     -5,    -16,    -29,
 ];
 #[rustfmt::skip]
 const MG_ROOK: [i32; 64] = [
-     -19,  -13,    1,   17,   16,    7,  -37,  -26,
-     -44,  -16,  -20,   -9,   -1,   11,   -6,  -71,
-     -45,  -25,  -16,  -17,    3,    0,   -5,  -33,
-     -36,  -26,  -12,   -1,    9,   -7,    6,  -23,
-     -24,  -11,    7,   26,   24,   35,   -8,  -20,
-      -5,   19,   26,   36,   17,   45,   61,   16,
-      27,   32,   58,   62,   80,   67,   26,   44,
-      32,   42,   32,   51,   63,    9,   31,   43,
+             2,     14,     11,     -9,     -4,      5,      7,      5,
+            12,      2,     16,     22,     25,     14,      3,      9,
+           -16,     16,     12,     15,     14,      9,     14,     -9,
+           -13,      0,      9,      8,     11,     10,      2,     -7,
+           -19,     -8,     -6,     -1,     -2,     -8,    -11,    -14,
+           -17,      0,     -4,      1,      1,     -6,     -5,    -18,
+           -32,     -6,      4,      4,      5,      0,     -9,    -17,
+           -10,    -12,      2,     10,      7,     -2,     -3,     -3,
 ];
 #[rustfmt::skip]
 const EG_ROOK: [i32; 64] = [
-      -9,    2,    3,   -1,   -5,  -13,    4,  -20,
-      -6,   -6,    0,    2,   -9,   -9,  -11,   -3,
-      -4,    0,   -5,   -1,   -7,  -12,   -8,  -16,
-       3,    5,    8,    4,   -5,   -6,   -8,  -11,
-       4,    3,   13,    1,    2,    1,   -1,    2,
-       7,    7,    7,    5,    4,   -3,   -5,   -3,
-      11,   13,   13,   11,   -3,    3,    8,    3,
-      13,   10,   18,   15,   12,   12,    8,    5,
+            10,     10,     13,     19,     14,     16,     15,     12,
+             3,     14,     12,      5,      7,     14,     14,      7,
+            10,      4,      4,     -1,     -1,      6,      7,     12,
+            13,     13,     11,      1,     -1,      9,     13,     14,
+             5,      8,      9,      3,      1,     10,     12,      7,
+           -11,    -18,     -7,    -13,    -14,     -7,    -12,     -6,
+           -19,    -21,    -17,    -20,    -21,    -14,    -15,    -17,
+           -20,    -15,    -14,    -24,    -24,    -13,    -17,    -14,
 ];
 #[rustfmt::skip]
 const MG_QUEEN: [i32; 64] = [
-      -1,  -18,   -9,   10,  -15,  -25,  -31,  -50,
-     -35,   -8,   11,    2,    8,   15,   -3,    1,
-     -14,    2,  -11,   -2,   -5,    2,   14,    5,
-      -9,  -26,   -9,  -10,   -2,   -4,    3,   -3,
-     -27,  -27,  -16,  -16,   -1,   17,   -2,    1,
-     -13,  -17,    7,    8,   29,   56,   47,   57,
-     -24,  -39,   -5,    1,  -16,   57,   28,   54,
-     -28,    0,   29,   12,   59,   44,   43,   45,
+           -41,     13,     22,     10,     14,     25,     -1,    -54,
+             1,      4,      2,    -17,     -3,      5,     -3,    -10,
+             2,      9,     -5,     -2,      5,      4,     17,      8,
+            -2,     -5,     -2,    -18,    -16,      7,      3,      3,
+            -2,     -6,     -7,    -12,    -13,     -4,     -1,      3,
+             2,      6,      0,     -6,     -2,      2,     10,      5,
+             7,     11,     11,      9,      7,     14,      8,      8,
+            -6,     -9,     -4,      3,      5,     -1,     -4,     -8,
 ];
 #[rustfmt::skip]
 const EG_QUEEN: [i32; 64] = [
-     -33,  -28,  -22,  -43,   -5,  -32,  -20,  -41,
-     -22,  -23,  -30,  -16,  -16,  -23,  -36,  -32,
-     -16,  -27,   15,    6,    9,   17,   10,    5,
-     -18,   28,   19,   47,   31,   34,   39,   23,
-       3,   22,   24,   45,   57,   40,   57,   36,
-     -20,    6,    9,   49,   47,   35,   19,    9,
-     -17,   20,   32,   41,   58,   25,   30,    0,
-      -9,   22,   22,   27,   27,   19,   10,   20,
+            55,     -3,      9,     27,     21,      0,      2,     58,
+             6,     -4,     23,     34,     26,     11,     -6,      9,
+             1,     -3,     23,     25,     24,      9,    -21,     -9,
+            13,     28,     27,     43,     42,     20,     25,      5,
+             8,     28,     25,     42,     48,     27,     25,      0,
+           -23,    -15,      2,     10,     10,      4,     -9,    -17,
+           -61,    -66,    -48,    -28,    -24,    -40,    -39,    -39,
+           -36,    -58,    -47,    -40,    -36,    -37,    -39,    -22,
 ];
 #[rustfmt::skip]
 const MG_KING: [i32; 64] = [
-     -15,   36,   12,  -54,    8,  -28,   24,   14,
-       1,    7,   -8,  -64,  -43,  -16,    9,    8,
-     -14,  -14,  -22,  -46,  -44,  -30,  -15,  -27,
-     -49,   -1,  -27,  -39,  -46,  -44,  -33,  -51,
-     -17,  -20,  -12,  -27,  -30,  -25,  -14,  -36,
-      -9,   24,    2,  -16,  -20,    6,   22,  -22,
-      29,   -1,  -20,   -7,   -8,   -4,  -38,  -29,
-     -65,   23,   16,  -15,  -56,  -34,    2,   13,
+            59,     89,     45,     -1,     -1,     45,     89,     59,
+            88,    120,     65,     33,     33,     65,    120,     88,
+           123,    145,     81,     31,     31,     81,    145,    123,
+           154,    179,    105,     70,     70,    105,    179,    154,
+           164,    190,    138,     98,     98,    138,    190,    164,
+           195,    258,    169,    120,    120,    169,    258,    195,
+           278,    303,    234,    179,    179,    234,    303,    278,
+           271,    327,    271,    198,    198,    271,    327,    271,
 ];
 #[rustfmt::skip]
 const EG_KING: [i32; 64] = [
-     -53,  -34,  -21,  -11,  -28,  -14,  -24,  -43,
-     -27,  -11,    4,   13,   14,    4,   -5,  -17,
-     -19,   -3,   11,   21,   23,   16,    7,   -9,
-     -18,   -4,   21,   24,   27,   23,    9,  -11,
-      -8,   22,   24,   27,   26,   33,   26,    3,
-      10,   17,   23,   15,   20,   45,   44,   13,
-     -12,   17,   14,   17,   17,   38,   23,   11,
-     -74,  -35,  -18,  -18,  -11,   15,    4,  -17,
+            11,     59,     73,     78,     78,     73,     59,     11,
+            47,    121,    116,    131,    131,    116,    121,     47,
+            92,    172,    184,    191,    191,    184,    172,     92,
+            96,    166,    199,    199,    199,    199,    166,     96,
+           103,    156,    172,    172,    172,    172,    156,    103,
+            88,    130,    169,    175,    175,    169,    130,     88,
+            53,    100,    133,    135,    135,    133,    100,     53,
+             1,     45,     85,     76,     76,     85,     45,      1,
 ];
 
 /// Material tapered. Raciocinio:
@@ -216,20 +216,31 @@ const EG_VALUE: [i32; 6] = [140, 300, 350, 570, 1050, 0];
 /// accept the option, report nothing wrong, and evaluate with the old number.
 /// That exact failure cost a whole parameter sweep earlier today. A relaxed
 /// atomic load costs the same as a plain load here and cannot be sealed.
+// 2026-08-04: found via dissecting a real blunder (raiox showed +47 where
+// two references independently agreed on roughly -200 to -700). The gap
+// traced to material itself, not anything positional: our pawn-to-rook
+// ratio was 0.30, the two references' own material tables average 0.18 --
+// our pawn was worth 60-75% too much relative to everything above it, not
+// just the rook. Recomputed here as pawn fixed (the unit everything else
+// was already anchored to today) times the AVERAGE of the two references'
+// own piece/pawn ratios -- their two tables disagree with each other by a
+// wide margin on some pieces (queen ranges 10x-14x a pawn between them),
+// so neither alone is "the" answer; splitting the difference is a
+// synthesis, not a copy of either.
 static MG_ATOMIC: [std::sync::atomic::AtomicI32; 6] = [
-    std::sync::atomic::AtomicI32::new(125),
-    std::sync::atomic::AtomicI32::new(340),
-    std::sync::atomic::AtomicI32::new(355),
-    std::sync::atomic::AtomicI32::new(520),
-    std::sync::atomic::AtomicI32::new(990),
+    std::sync::atomic::AtomicI32::new(165),
+    std::sync::atomic::AtomicI32::new(655),
+    std::sync::atomic::AtomicI32::new(674),
+    std::sync::atomic::AtomicI32::new(975),
+    std::sync::atomic::AtomicI32::new(1896),
     std::sync::atomic::AtomicI32::new(0),
 ];
 static EG_ATOMIC: [std::sync::atomic::AtomicI32; 6] = [
-    std::sync::atomic::AtomicI32::new(140),
-    std::sync::atomic::AtomicI32::new(300),
-    std::sync::atomic::AtomicI32::new(350),
-    std::sync::atomic::AtomicI32::new(570),
-    std::sync::atomic::AtomicI32::new(1050),
+    std::sync::atomic::AtomicI32::new(201),
+    std::sync::atomic::AtomicI32::new(654),
+    std::sync::atomic::AtomicI32::new(673),
+    std::sync::atomic::AtomicI32::new(1147),
+    std::sync::atomic::AtomicI32::new(2430),
     std::sync::atomic::AtomicI32::new(0),
 ];
 
@@ -292,24 +303,20 @@ const MAX_PHASE: i32 = 24;
 /// differs between buckets, which in the V4 profile is the queen alone.
 static PSQT_SCALE: [std::sync::atomic::AtomicI32; 6 * NUM_BUCKETS] = {
     use std::sync::atomic::AtomicI32;
-    [
-        AtomicI32::new(1000), AtomicI32::new(1000), AtomicI32::new(1000),
-        AtomicI32::new(1000), AtomicI32::new(1000), AtomicI32::new(1350),
-        AtomicI32::new(1000), AtomicI32::new(1000), AtomicI32::new(1000),
-        AtomicI32::new(1000), AtomicI32::new(1000), AtomicI32::new(1350),
-        AtomicI32::new(1000), AtomicI32::new(1000), AtomicI32::new(1000),
-        AtomicI32::new(1000), AtomicI32::new(1000), AtomicI32::new(1350),
-        AtomicI32::new(1000), AtomicI32::new(1000), AtomicI32::new(1000),
-        AtomicI32::new(1000), AtomicI32::new(1000), AtomicI32::new(1350),
-        AtomicI32::new(1000), AtomicI32::new(1000), AtomicI32::new(1000),
-        AtomicI32::new(1000), AtomicI32::new(1000), AtomicI32::new(1350),
-        AtomicI32::new(1000), AtomicI32::new(1000), AtomicI32::new(1000),
-        AtomicI32::new(1000), AtomicI32::new(1000), AtomicI32::new(1350),
-        AtomicI32::new(1000), AtomicI32::new(1000), AtomicI32::new(1000),
-        AtomicI32::new(1000), AtomicI32::new(1000), AtomicI32::new(1350),
-        AtomicI32::new(1000), AtomicI32::new(1000), AtomicI32::new(1000),
-        AtomicI32::new(1000), AtomicI32::new(1000), AtomicI32::new(1350),
-    ]
+    // Escrita a mao, os oito buckets estavam aqui em texto e ficavam do
+    // tamanho errado assim que NUM_BUCKETS mudasse. Gerada, nao pode
+    // desalinhar.
+    #[allow(clippy::declare_interior_mutable_const)]
+    const UM: AtomicI32 = AtomicI32::new(1000);
+    #[allow(clippy::declare_interior_mutable_const)]
+    const REI: AtomicI32 = AtomicI32::new(1350);
+    let mut t = [UM; 6 * NUM_BUCKETS];
+    let mut b = 0;
+    while b < NUM_BUCKETS {
+        t[b * 6 + 5] = REI;
+        b += 1;
+    }
+    t
 };
 
 /// The bucket whose factors the incremental accumulator is built with.
@@ -378,10 +385,29 @@ fn family_buckets_differ() -> bool {
 /// profile replaces nothing, and turning this off costs the 4 suite positions
 /// it is worth for no reason at all.
 ///
-/// So it is explicit: `scale.material_buckets 0` in a profile turns it off,
-/// and a profile that flattens the slope itself should say so.
+/// So it is explicit: `scale.material_buckets 1` in a profile turns it on.
+///
+/// 2026-08-03: default flipped to OFF. Three reference engines were read end
+/// to end for this one question -- what do they do between the tapered sum
+/// and the number the search uses -- and none has anything like it. Each has
+/// narrow, NAMED endgame scales (opposite-coloured bishops, insufficient
+/// material, pawn count) that touch specific known-drawn patterns; none has a
+/// generic multiplier keyed on total piece count that touches every position,
+/// on the theory that the evaluation is "too loud" or "too quiet" at a given
+/// phase. Their tuners fit the tapered formula directly against real
+/// outcomes, so whatever slope a phase needs is already inside the weights --
+/// there is nothing left over for a stage like this to correct.
+///
+/// Ours has one because our weights were never fit that way; this was
+/// patching a symptom of that gap, not a mechanism any of the references
+/// needed. Left in, switchable, in case a future measurement says otherwise,
+/// but off by default is the position the evidence supports.
 static MATERIAL_BUCKETS_ON: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(true);
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn material_buckets_on() -> bool {
+    MATERIAL_BUCKETS_ON.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 pub fn set_material_buckets(on: bool) {
     invalida_cache_peoes();
@@ -728,8 +754,19 @@ fn tabelas_compiladas() -> Box<([[[i32; 64]; 6]; NUM_BUCKETS], [[[i32; 64]; 6]; 
     // Com `fittedpsqtb8` as tabelas afinadas entram compiladas. Sem ela, os
     // oito buckets recebem a MESMA tabela de sempre -- que e' a condicao do
     // invariante da identidade e o que mantem o bench em 3377667.
-    if cfg!(feature = "fittedpsqtb8") {
-        return Box::new((crate::fitted_psqt_b8::PSQT_MG, crate::fitted_psqt_b8::PSQT_EG));
+    // A feature `fittedpsqtb8` tem oito tabelas por construcao (o nome di-lo).
+    // Com NUM_BUCKETS a um, so' a primeira e' usada -- e a feature esta
+    // desligada por omissao e medida a 17,8% em 800 jogos, portanto isto e'
+    // compatibilidade, nao um caminho a seguir.
+    #[cfg(feature = "fittedpsqtb8")]
+    {
+        let mut mg = [[[0i32; 64]; 6]; NUM_BUCKETS];
+        let mut eg = [[[0i32; 64]; 6]; NUM_BUCKETS];
+        for b in 0..NUM_BUCKETS {
+            mg[b] = crate::fitted_psqt_b8::PSQT_MG[b];
+            eg[b] = crate::fitted_psqt_b8::PSQT_EG[b];
+        }
+        return Box::new((mg, eg));
     }
     let mut mg = [[[0i32; 64]; 6]; NUM_BUCKETS];
     let mut eg = [[[0i32; 64]; 6]; NUM_BUCKETS];
@@ -892,13 +929,31 @@ pub fn load_profile(path: &str) -> Result<usize, String> {
     Ok(n)
 }
 
+/// Index into the PSQT constant tables.
+///
+/// 2026-08-03: the two branches swapped. The tables themselves used to be
+/// stored rank1-first (`Square`'s own numbering, a1=0, is rank1-first, and
+/// White read it directly) with Black reached by flipping rank -- the
+/// opposite of how every reference engine we studied lays its own tables out
+/// (rank8-first, a8=0). Pasting a reference's array in meant silently
+/// mirroring the whole board top-to-bottom unless someone remembered to flip
+/// it by hand first, which is exactly the kind of mistake that is invisible
+/// until a real position exposes it.
+///
+/// `Square` itself is untouched -- it has to stay a1=0 for the bitboard math
+/// everywhere else in the engine. Only the STORED tables flipped (every row
+/// reversed, so index 0 is now a8), and to keep reading the same values at
+/// the same squares, the lookup that used to belong to Black now belongs to
+/// White, and vice versa. Nothing else changes: `psqt_do_bucket`, the tuned
+/// per-bucket overrides, and every caller go through this one function, so
+/// they all follow the new convention automatically.
 fn mirror_idx(color: Color, s: Square) -> usize {
     if color == Color::White {
-        s as usize
-    } else {
         let f = file_of(s);
         let r = 7 - rank_of(s);
         (r * 8 + f) as usize
+    } else {
+        s as usize
     }
 }
 
@@ -1383,36 +1438,52 @@ const IMBALANCE: [[(i32, i32); 5]; 5] = [[(0, 0); 5]; 5];
 // de mobility). Cavalo tem so' 8 slots mas cada casa vale mais (cavalo
 // preso em canto vale muito pouco). eg = ligeiramente mais baixo que
 // mg em geral (mobility conta menos com menos pecas para interagir).
+// 2026-08-03: replaced. The hand-set values above topped out around 24-36
+// internal units at full mobility -- a fair curve SHAPE, but a ceiling far
+// below what a reference engine's own tuner settles on for the same terms
+// (queen mobility alone reaching into the hundreds there). With the cosmetic
+// /242 divisor gone, "internal units" and "reported cp" are the same thing,
+// and a ceiling of 24 cp for a queen with the whole board to move to is not
+// a calibrated number, it is a placeholder that happened to look plausible
+// while a compression stage was hiding how small it really was.
+//
+// These are a reference engine's tuned mobility bonuses, taken as a starting
+// point the way the piece-square tables were: known-good numbers to measure
+// from, not a literal port of how that engine computes mobility (the safe-
+// square counting here is our own). Index 0 in their convention is "zero
+// legal squares", which is why it is sharply negative (a knight with no
+// moves is a real liability, not a neutral non-event) -- our old tables
+// treated it far too gently.
 const MOBILITY_KNIGHT: [(i32, i32); 28] = {
     let mut t = [(0i32, 0i32); 28];
-    // 0..=8 lances
-    let mg = [-40, -15, -5, 5, 12, 18, 25, 30, 35];
-    let eg = [-32, -14, -5, 3, 9, 14, 18, 22, 25];
+    // 0..=8 destinations
+    let mg = [-158, -117, -98, -86, -77, -69, -60, -52, -44];
+    let eg = [-34, 38, 76, 89, 100, 111, 113, 115, 107];
     let mut i = 0; while i < 9 { t[i] = (mg[i], eg[i]); i += 1; }
     t
 };
 const MOBILITY_BISHOP: [(i32, i32); 28] = {
     let mut t = [(0i32, 0i32); 28];
-    // 0..=13 lances
-    let mg = [-40, -20, -8, 0, 7, 13, 18, 22, 25, 28, 30, 32, 34, 36];
-    let eg = [-30, -18, -8, -2, 5, 10, 14, 18, 20, 22, 24, 25, 26, 27];
+    // 0..=13 destinations
+    let mg = [-19, 5, 18, 25, 32, 36, 39, 43, 43, 47, 55, 69, 70, 79];
+    let eg = [47, 72, 92, 112, 119, 129, 135, 138, 140, 141, 137, 132, 139, 125];
     let mut i = 0; while i < 14 { t[i] = (mg[i], eg[i]); i += 1; }
     t
 };
 const MOBILITY_ROOK: [(i32, i32); 28] = {
     let mut t = [(0i32, 0i32); 28];
-    // 0..=14 lances -- torre ganha mais no eg (colunas abertas)
-    let mg = [-45, -25, -12, -4, 2, 7, 12, 16, 20, 23, 25, 27, 28, 28, 28];
-    let eg = [-35, -22, -12, -4, 3, 8, 13, 18, 23, 28, 30, 32, 33, 34, 34];
+    // 0..=14 destinations
+    let mg = [-94, -107, -91, -83, -85, -83, -89, -85, -80, -74, -71, -72, -69, -60, -45];
+    let eg = [-78, 135, 169, 174, 198, 207, 218, 219, 224, 228, 231, 236, 238, 243, 235];
     let mut i = 0; while i < 15 { t[i] = (mg[i], eg[i]); i += 1; }
     t
 };
 const MOBILITY_QUEEN: [(i32, i32); 28] = {
     let mut t = [(0i32, 0i32); 28];
-    // 0..=27 lances. Cada slot vale menos (dama ja' e' potente).
-    // Plateau depois de ~20 lances.
-    let mg = [-30, -25, -15, -8, -3, 2, 6, 10, 13, 16, 18, 20, 22, 23, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24];
-    let eg = [-25, -20, -15, -8, -3, 2, 5, 8, 11, 14, 16, 18, 20, 21, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22];
+    // 0..=27 destinations. Index 0 is the extreme case (queen fully boxed
+    // in) and is an outlier by construction, not a typo.
+    let mg = [-1750, -129, -82, -60, -49, -44, -44, -43, -40, -37, -35, -32, -33, -29, -31, -25, -28, -29, -22, -5, 13, 28, 67, 108, 71, 194, 48, 33];
+    let eg = [-1344, -426, 99, 231, 275, 289, 318, 341, 357, 360, 365, 366, 372, 371, 374, 365, 365, 364, 342, 313, 279, 239, 200, 114, 126, -7, -1, -32];
     let mut i = 0; while i < 28 { t[i] = (mg[i], eg[i]); i += 1; }
     t
 };
@@ -1550,7 +1621,16 @@ const SAFETY_DISCOVERED: [[(i32, i32); 3]; 5] = [
 /// change is that the number can now be seen by the tuner and can differ by
 /// piece. The old values here were absolute centipawn penalties from the
 /// version before SEE priced this term, and were dead.
-const HANGING: [(i32, i32); 5] = [(750, 750), (750, 750), (750, 750), (750, 750), (750, 750)];
+// 2026-08-04: was 750 (the old hardcoded 3/4 fraction, reproduced to the
+// unit when this became a weight). Found via raiox on a real position: SEE
+// found a knight capturable for +320 on ONE square, static eval reported
+// +550 from this term alone, and the real search -- which sees the whole
+// board, not one square -- settled the position at +9 to +22. SEE cannot
+// see a counter-attack elsewhere that makes the capture bad; that blind
+// spot is structural to SEE itself, not a bug here, and 75% weight leans
+// on a signal known to have it. Lowered to measure, not because 40% is
+// known correct.
+const HANGING: [(i32, i32); 5] = [(400, 400), (400, 400), (400, 400), (400, 400), (400, 400)];
 
 /// Cavalo, bispo, torre, dama -- por unidade de proximidade (7 - distancia).
 /// Ponto de partida pequeno: um termo novo errado e' pior que ausente.
@@ -2250,16 +2330,21 @@ static DEFAULT_WEIGHTS: OnceLock<Weights> = OnceLock::new();
 /// turning the mechanism on changes nothing until a profile says otherwise.
 static FAMILY_SCALE: [std::sync::atomic::AtomicI32; 6 * NUM_BUCKETS] = {
     use std::sync::atomic::AtomicI32;
-    [
-        AtomicI32::new(1000), AtomicI32::new(1100), AtomicI32::new(1150), AtomicI32::new(1000), AtomicI32::new(1000), AtomicI32::new(1000),
-        AtomicI32::new(1000), AtomicI32::new(1100), AtomicI32::new(1150), AtomicI32::new(1000), AtomicI32::new(1000), AtomicI32::new(1000),
-        AtomicI32::new(1000), AtomicI32::new(1100), AtomicI32::new(1150), AtomicI32::new(1000), AtomicI32::new(1000), AtomicI32::new(1000),
-        AtomicI32::new(1000), AtomicI32::new(1100), AtomicI32::new(1150), AtomicI32::new(1000), AtomicI32::new(1000), AtomicI32::new(1000),
-        AtomicI32::new(1000), AtomicI32::new(1100), AtomicI32::new(1150), AtomicI32::new(1000), AtomicI32::new(1000), AtomicI32::new(1000),
-        AtomicI32::new(1000), AtomicI32::new(1100), AtomicI32::new(1150), AtomicI32::new(1000), AtomicI32::new(1000), AtomicI32::new(1000),
-        AtomicI32::new(1000), AtomicI32::new(1100), AtomicI32::new(1150), AtomicI32::new(1000), AtomicI32::new(1000), AtomicI32::new(1000),
-        AtomicI32::new(1000), AtomicI32::new(1100), AtomicI32::new(1150), AtomicI32::new(1000), AtomicI32::new(1000), AtomicI32::new(1000),
-    ]
+    // Idem: king 1100 e threats 1150 do perfil V3, o resto neutro.
+    #[allow(clippy::declare_interior_mutable_const)]
+    const UM: AtomicI32 = AtomicI32::new(1000);
+    #[allow(clippy::declare_interior_mutable_const)]
+    const K: AtomicI32 = AtomicI32::new(1100);
+    #[allow(clippy::declare_interior_mutable_const)]
+    const T: AtomicI32 = AtomicI32::new(1150);
+    let mut t = [UM; 6 * NUM_BUCKETS];
+    let mut b = 0;
+    while b < NUM_BUCKETS {
+        t[b * 6 + 1] = K;
+        t[b * 6 + 2] = T;
+        b += 1;
+    }
+    t
 };
 
 const FAMILIES: [&str; 6] = ["mobility", "king", "threats", "pawns", "pieces", "tempo"];
@@ -2270,6 +2355,213 @@ const FAMILIES: [&str; 6] = ["mobility", "king", "threats", "pawns", "pieces", "
 
 fn family_of(name: &str) -> &'static str {
     field_family(name).unwrap_or("")
+}
+
+// ---------------------------------------------------------------------------
+// Feature switches
+// ---------------------------------------------------------------------------
+
+/// Which positional features contribute, and which are compiled in but silent.
+///
+/// The evaluation grew by accretion until it held 74 term families and 771
+/// positional weights per bucket. Nothing here was ever measured against its
+/// own absence: a term was added, the whole thing was refitted, and the fit
+/// absorbed whatever the term did or did not do. When the fits started
+/// producing a queen worth 686 there was no way to ask which of the 74 was
+/// paying for it.
+///
+/// So there is a base, and everything else starts off.
+///
+/// The base is, term for term, what the smallest reference implementation we
+/// studied computes -- and that one is a 3000-Elo engine with TWENTY parameter
+/// fields. Which settles the question of whether we are short of features.
+///
+///   material and piece-square tables
+///   isolated, doubled and passed pawns
+///   bishop pair
+///   rook on an open or half-open file
+///   knight/bishop/rook/queen mobility
+///   three threats: pawn on a minor, pawn on a major, minor on a major
+///   king danger: attack units weighted per attacking piece, through a curve
+///   tempo
+///   a scale for drawn-ish endings
+///
+/// Term for term matters. The first cut of this list had rook threats, four
+/// safe-check terms and the weak king ring switched on because they FELT
+/// basic. None of them is in the reference. A base that is "roughly" the
+/// reference measures nothing: whatever it wins or loses could be the four
+/// extra terms as easily as the ones being tested.
+///
+/// Off does NOT mean deleted. The term still runs; its weights are forced to
+/// zero, which for every additive term is exactly no contribution. The code,
+/// the extractor slot and the tuner column all stay, so switching one back on
+/// is one bool -- and then it gets measured against the base, alone, which is
+/// the thing that has never been done.
+///
+/// Two families are deliberately NOT switchable:
+///   - material and the piece-square tables, which are not in this vector;
+///   - `scale_*`, which is not additive. Zeroing `scale_fallback_base` sets
+///     the endgame scale to zero and deletes the endgame, rather than
+///     neutralising a term. Its neutral value is SCALE_NORMAL, not 0, so it
+///     stays on and is treated as part of the chain.
+///
+/// Override at runtime with `KESTREL_FEATURES=+king_tropism,-tempo` (a bare
+/// `all` or `base` sets the starting point). One at a time, and measure.
+const FEATURES: &[(&str, bool)] = &[
+    // --- base: on ---
+    ("isolated_pawn", true),
+    ("doubled_pawn", true),
+    ("passed_pawn", true),
+    // 2026-08-03: passed-pawn cluster, on. A reference engine we studied
+    // names the equivalent fields almost identically (candidate passer, our/
+    // their passer proximity, defended push, slider behind) -- present in
+    // more than one of the references, absent only from the minimal base.
+    ("candidate_passer", true),
+    ("defended_pawn", true),
+    ("our_passer_proximity", true),
+    ("their_passer_proximity", true),
+    ("passer_defended_push", true),
+    ("passer_slider_behind", true),
+    ("passer_outside", true),
+    ("bishop_pair", true),
+    ("rook_open", true),
+    ("mobility_knight", true),
+    ("mobility_bishop", true),
+    ("mobility_rook", true),
+    ("mobility_queen", true),
+    ("threat_by_pawn", true),
+    ("threat_by_knight", true),
+    ("threat_by_bishop", true),
+    ("king_attacker_weight", true),
+    ("king_attacks", true),
+    // 2026-08-03: king-safety cluster, on. Two references studied both have
+    // richer king danger than the minimal base -- safe/unsafe checks, a weak-
+    // ring penalty -- and an old note in this file already flagged the gap:
+    // king safety used to move a stronger hand-crafted evaluation's number
+    // more than twice as much as it moved ours.
+    ("weak_king_ring", true),
+    ("safe_knight_check", true),
+    ("safe_bishop_check", true),
+    ("safe_rook_check", true),
+    ("safe_queen_check", true),
+    ("tempo", true),
+    // Not a feature -- the multiplicative tail. Neutral is not zero.
+    ("scale_fallback_base", true),
+    ("scale_fallback_per_pawn", true),
+    ("scale_ocb_bishops_only", true),
+    ("scale_ocb_one_knight", true),
+    ("scale_ocb_one_rook", true),
+
+    // --- ours alone, or present in the bigger references only: off ---
+    // 2026-08-03: everything below that already has a non-zero default
+    // weight, on. `kestrel features` prints |soma| per field -- five were
+    // sitting at exactly 0 (imbalance, bishop_outpost, bishop_trapped,
+    // rook_trapped, tornado_locked, still off below), meaning nobody has
+    // ever fitted them; turning those on would add a term with no
+    // calibration behind it at all, indistinguishable from noise.
+    // Everything with a real number stays off ONLY until it is measured,
+    // not because it has nothing to measure.
+    ("backward_pawn", true),
+    ("backward_exposed", true),
+    ("isolated_exposed", true),
+    ("bishop_pawns", true),
+    ("blocked_pawns", true),
+    ("pawn_phalanx", true),
+    ("stonewall", true),
+    ("stonewall_bad_bishop", true),
+    ("stonewall_outpost", true),
+    ("imbalance", false),
+    ("knight_outpost", true),
+    ("bishop_outpost", false),
+    ("bishop_trapped", false),
+    ("rook_trapped", false),
+    ("rook_on_seventh", true),
+    ("long_diag_bishop", true),
+    ("minor_behind_pawn", true),
+    ("space", true),
+    ("hanging", true),
+    ("push_threat", true),
+    ("restricted_squares", true),
+    ("knight_hit_queen", true),
+    ("bishop_hit_queen", true),
+    ("rook_hit_queen", true),
+    ("threat_by_rook", true),
+    ("threat_by_queen", true),
+    ("threat_by_king", true),
+    ("king_tropism", true),
+    ("king_aim", true),
+    ("king_battery", true),
+    ("king_flank_attacks", true),
+    ("king_flank_defenses", true),
+    ("pawn_shelter", true),
+    ("shelter_open", true),
+    ("pawn_tornado", true),
+    ("tornado_locked", false),
+    ("uncastled_king_has_rights", true),
+    ("uncastled_king_no_rights", true),
+    ("complexity_total_pawns", true),
+    ("complexity_pawn_flanks", true),
+    ("complexity_pawn_endgame", true),
+    ("complexity_adjustment", true),
+];
+
+/// The switch state, defaults plus whatever `KESTREL_FEATURES` says.
+///
+/// Read once. A feature turning on midway through a game would make two
+/// searches of the same position disagree for no reason the log could show.
+fn feature_state() -> &'static std::collections::HashMap<&'static str, bool> {
+    static S: OnceLock<std::collections::HashMap<&'static str, bool>> = OnceLock::new();
+    S.get_or_init(|| {
+        let mut m: std::collections::HashMap<&'static str, bool> =
+            FEATURES.iter().copied().collect();
+        if let Ok(spec) = std::env::var("KESTREL_FEATURES") {
+            for tok in spec.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+                match tok {
+                    "all" => m.values_mut().for_each(|v| *v = true),
+                    "base" => m = FEATURES.iter().copied().collect(),
+                    "none" => m.values_mut().for_each(|v| *v = false),
+                    _ => {
+                        let (on, name) = match tok.as_bytes()[0] {
+                            b'+' => (true, &tok[1..]),
+                            b'-' => (false, &tok[1..]),
+                            _ => (true, tok),
+                        };
+                        // Look the name up in the table so the key stays
+                        // 'static, and so a typo is caught instead of
+                        // silently creating an entry nothing reads.
+                        match FEATURES.iter().find(|(n, _)| *n == name) {
+                            Some((n, _)) => { m.insert(n, on); }
+                            None => eprintln!("KESTREL_FEATURES: no such feature '{}' -- ignoring", name),
+                        }
+                    }
+                }
+            }
+        }
+        m
+    })
+}
+
+/// True if `name` contributes. Unknown names count as on: a term whose weights
+/// are not in this vector is not something a switch can reach anyway.
+pub fn feature_on(name: &str) -> bool {
+    feature_state().get(name).copied().unwrap_or(true)
+}
+
+/// Zero the weights of every switched-off feature.
+///
+/// Applied once per weight set, on the cold path, so the search never pays for
+/// it. Additive terms with zero weights contribute zero, which is what off
+/// means; the non-additive `scale_*` block is on by construction above.
+fn gate(w: &Weights) -> Weights {
+    let mut v = w.to_vec();
+    let names = w.field_names();
+    debug_assert_eq!(v.len(), names.len(), "field_names out of step with to_vec");
+    for (i, n) in names.iter().enumerate() {
+        if !feature_on(n) {
+            v[i] = 0;
+        }
+    }
+    w.from_vec(&v)
 }
 
 fn field_family(name: &str) -> Option<&'static str> {
@@ -2330,6 +2622,24 @@ fn field_family(name: &str) -> Option<&'static str> {
             "uncastled_king_has_rights" => Some("king"),
             "uncastled_king_no_rights" => Some("king"),
             "weak_king_ring" => Some("king"),
+            "blocked_pawns" => Some("pawns"),
+            "complexity_adjustment" => Some("complexity"),
+            "complexity_pawn_endgame" => Some("complexity"),
+            "complexity_pawn_flanks" => Some("complexity"),
+            "complexity_total_pawns" => Some("complexity"),
+            "hanging" => Some("threats"),
+            "king_aim" => Some("king"),
+            "king_battery" => Some("king"),
+            "king_tropism" => Some("king"),
+            "scale_fallback_base" => Some("scale"),
+            "scale_fallback_per_pawn" => Some("scale"),
+            "scale_ocb_bishops_only" => Some("scale"),
+            "scale_ocb_one_knight" => Some("scale"),
+            "scale_ocb_one_rook" => Some("scale"),
+            "space" => Some("pieces"),
+            "stonewall" => Some("pawns"),
+            "stonewall_bad_bishop" => Some("pawns"),
+            "stonewall_outpost" => Some("pieces"),
             _ => None,
     }
 }
@@ -2476,7 +2786,28 @@ impl Weights {
 /// calibration but noise-fitting, and a search this wide finds and exploits
 /// exactly that kind of mirage. These boundaries are set so each bucket holds
 /// a comparable share: 23% / 28% / 29% / 19%.
-pub const NUM_BUCKETS: usize = 8;
+/// UM bucket.
+///
+/// Eram oito. A conta que os condenou: uma referencia pequena que estudamos
+/// tem ~1867 parametros ao todo, num conjunto so'; nos tinhamos 1551 x 8 =
+/// 12408. Sete vezes mais parametros E oito vezes menos dados por parametro --
+/// somando, cada peso nosso via cerca de CINQUENTA vezes menos dados que o
+/// equivalente dela.
+///
+/// E' a explicacao medida da atenuacao: com 771 termos posicionais o nosso
+/// ajuste explicava MENOS que 32 neuronios cegos nos mesmos dados (validacao
+/// 0.003961 contra 0.003641). Nao era o modelo ser pobre -- era cada peso nao
+/// ter dados que cheguem para se determinar, e o ajuste compensar encolhendo o
+/// material, que e' o que produzia dama a 4-6 peoes em todas as formas.
+///
+/// Duas referencias estudadas confirmam a direccao: uma usa DOIS buckets, a
+/// outra UM. Nenhuma usa oito.
+///
+/// A nota abaixo, sobre os limites escolhidos para cada bucket ter uma fatia
+/// comparavel, continua correcta e continua a ser a razao pela qual as
+/// fronteiras nao eram uniformes -- fica para quando houver dados para os
+/// sustentar.
+pub const NUM_BUCKETS: usize = 1;
 
 /// Particao alternativa POR PECAS (KESTREL_BUCKET_PECAS=1), a que os
 /// motores com NNUE usam: (npecas-1)/4, oito baldes. Existe para a comparacao ser feita
@@ -2496,7 +2827,39 @@ fn particao_por_pecas() -> bool {
     *P.get_or_init(|| std::env::var_os("KESTREL_BUCKET_PECAS").is_some())
 }
 
+/// A particao por contagem de PEOES, em oito faixas, independente de quantos
+/// conjuntos de pesos a avaliacao tem.
+///
+/// Existe separada porque a calibracao de vitoria/empate/derrota depende da
+/// contagem de peoes -- um final com poucos peoes empata muito mais que um
+/// tabuleiro cheio, e nenhum divisor unico exprime isso -- enquanto o numero de
+/// conjuntos de PESOS e' outra decisao, e passou de oito para um. Estavam
+/// acopladas por acaso, atraves de NUM_BUCKETS.
+pub const WDL_BUCKETS: usize = 8;
+
+pub fn wdl_bucket_of(board: &Board) -> usize {
+    let pawns = crate::bitboard::count(
+        board.pieces[Color::White.idx()][PieceType::Pawn.idx()]
+            | board.pieces[Color::Black.idx()][PieceType::Pawn.idx()],
+    );
+    match pawns {
+        0..=3 => 0,
+        4..=6 => 1,
+        7..=8 => 2,
+        9 => 3,
+        10..=11 => 4,
+        12 => 5,
+        13 => 6,
+        _ => 7,
+    }
+}
+
 pub fn bucket_of(board: &Board) -> usize {
+    // Com um conjunto so', nao ha' bucket a escolher. Sem isto a particao por
+    // peoes continuava a devolver 0..7 e a indexar uma tabela de um elemento.
+    if NUM_BUCKETS == 1 {
+        return 0;
+    }
     if particao_por_pecas() {
         return bucket_por_pecas(board);
     }
@@ -2614,7 +2977,7 @@ pub fn weights_for(board: &Board) -> &'static Weights {
                         NUM_BUCKETS, dim, path
                     );
                     return (0..NUM_BUCKETS)
-                        .map(|b| base.from_vec(&v[b * stride..b * stride + dim]))
+                        .map(|b| gate(&base.from_vec(&v[b * stride..b * stride + dim])))
                         .collect();
                 }
                 Err(e) => eprintln!("KESTREL_BUCKET_WEIGHTS: cannot read {}: {} -- ignoring", path, e),
@@ -2674,7 +3037,7 @@ pub fn weights_for(board: &Board) -> &'static Weights {
                             v[*i] = *val;
                         }
                     }
-                    base.from_vec(&v)
+                    gate(&base.from_vec(&v))
                 })
                 .collect::<Vec<Weights>>()
         };
@@ -2691,11 +3054,11 @@ pub fn weights_for(board: &Board) -> &'static Weights {
         // mechanism structurally present and practically inert: whatever the
         // profile said about bucket 7 was applied to bucket 0 as well.
         let scaled = SCALED_BUCKETS
-            .get_or_init(|| (0..NUM_BUCKETS).map(scaled_weights_for).collect());
+            .get_or_init(|| (0..NUM_BUCKETS).map(|b| gate(&scaled_weights_for(b))).collect());
         return &scaled[bucket_of(board)];
     }
     static PLAIN: OnceLock<Vec<Weights>> = OnceLock::new();
-    &PLAIN.get_or_init(|| vec![default_weights().clone(); NUM_BUCKETS])[bucket_of(board)]
+    &PLAIN.get_or_init(|| vec![gate(default_weights()); NUM_BUCKETS])[bucket_of(board)]
     }
 }
 
@@ -2816,7 +3179,75 @@ pub fn default_weights() -> &'static Weights {
         // toca nos campos do Weights presentes no to_vec (mobilidade/
         // threats/pawn-structure/king-safety weights) -- material/PST e
         // king_danger_table ficam das consts.
-        let w = Weights::default().from_vec(&TUNED_V46);
+        let mut w = Weights::default().from_vec(&TUNED_V46);
+        // TUNED_V46 is a flat 669-value vector from an old hand-tuning run,
+        // and `from_vec` overwrites every field it reaches -- including
+        // mobility, with whatever that run left there. Editing 669 raw
+        // indices to change four fields risks miscounting an offset and
+        // corrupting a field nowhere near the one intended. Setting the
+        // fields directly, after the vector is applied, cannot make that
+        // mistake: it either compiles against the right field name or it
+        // does not compile at all.
+        w.mobility_knight = MOBILITY_KNIGHT;
+        w.mobility_bishop = MOBILITY_BISHOP;
+        w.mobility_rook = MOBILITY_ROOK;
+        w.mobility_queen = MOBILITY_QUEEN;
+        // 2026-08-03, segunda tentativa: a mesma mistura Sirius+Berserk de
+        // 39 campos que perdeu 0.42 contra o build so'-mobilidade da altura
+        // -- mas dessa vez por cima de uma PSQT com media NAO-zero (o
+        // problema que se corrigiu depois, recentrando PSQT+atomicas). Sem
+        // saber se a perda vinha da mistura em si ou de estar montada sobre
+        // essa base torta, remedir aqui, sobre a base corrigida, e' o que
+        // decide qual das duas foi.
+    w.bishop_pair = (22, 75);
+    w.long_diag_bishop = (17, 14);
+    w.minor_behind_pawn = (3, 11);
+    w.knight_outpost = (14, 18);
+    w.rook_open = [(28, 8), (17, 2)];
+    w.tempo = (24, 20);
+    w.isolated_pawn = [(-3, 0), (-2, -12), (-8, -7), (-6, -12)];
+    w.doubled_pawn = [(6, -43), (8, -38), (3, -29), (-1, -20)];
+    w.isolated_exposed = (-5, -8);
+    w.backward_exposed = (-12, -11);
+    w.backward_pawn = (-5, -9);
+    w.pawn_phalanx = [(0, 0), (44, 19), (19, 19), (14, 11), (23, 18), (37, 68), (53, 89), (0, 0)];
+    w.defended_pawn = [(5, 5), (5, 5), (13, 9), (10, 10), (14, 17), (24, 34), (41, 65), (5, 5)];
+    w.our_passer_proximity = [(29, 69), (39, 53), (12, 49), (-7, 42), (-5, 29), (-2, 22), (5, 16), (-2, 21)];
+    w.their_passer_proximity = [(-36, 21), (-3, 12), (9, 12), (7, 25), (2, 42), (3, 50), (6, 52), (5, 45)];
+    w.passer_defended_push = [(0, 0), (34, 121), (6, 69), (8, 26), (11, 14), (17, 16), (64, 171), (6, 69)];
+    w.passer_slider_behind = [(13, -55), (13, -55), (13, -55), (0, -61), (1, -69), (0, -77), (17, -102), (13, -55)];
+    w.bishop_pawns = [(6, -2), (2, 3), (1, 2), (-1, -1), (-3, -3), (-4, -7), (-6, -11)];
+    w.candidate_passer = [[(0, 0), (-12, -6), (59, 74), (3, 38), (1, 41), (5, 61), (-18, 6), (0, 0)], [(0, 0), (-8, -6), (58, 85), (1, 50), (-3, 48), (7, 69), (-18, 6), (0, 0)]];
+    w.passed_pawn = [[[(0, 0), (56, 92), (18, 92), (-13, 42), (-14, 51), (5, 92), (52, 134), (0, 0)], [(0, 0), (56, 92), (18, 92), (-9, 36), (-10, 32), (5, 52), (24, 61), (0, 0)]], [[(0, 0), (56, 92), (18, 92), (-10, 36), (-12, 34), (4, 51), (10, 42), (0, 0)], [(0, 0), (56, 92), (18, 92), (-10, 30), (-11, 26), (-2, 40), (-4, 23), (0, 0)]]];
+    w.king_attacker_weight = [(54, -2), (22, -2), (22, -7), (4, -9)];
+    w.king_attacks = (7, 0);
+    w.weak_king_ring = (5, 0);
+    w.safe_knight_check = (98, 1);
+    w.safe_bishop_check = (66, 15);
+    w.safe_rook_check = (104, 8);
+    w.safe_queen_check = (61, 16);
+    w.king_flank_attacks = [(14, -3), (4, 0)];
+    w.king_flank_defenses = [(-9, 0), (-7, 2)];
+    w.threat_by_pawn = [[(32, 6), (72, 36), (68, 51), (72, 40), (64, 27), (36, 15)], [(32, 6), (72, 36), (68, 51), (72, 40), (64, 27), (36, 15)]];
+    w.threat_by_king = [(26, 23), (23, 33), (56, 30), (48, 18), (7, 14), (7, 14)];
+    w.knight_hit_queen = (7, 2);
+    w.bishop_hit_queen = (16, 15);
+    w.rook_hit_queen = (18, 0);
+    w.push_threat = (15, 18);
+    w.restricted_squares = (2, 3);
+    w.complexity_pawn_flanks = 127;
+    w.complexity_pawn_endgame = 123;
+    w.complexity_adjustment = -208;
+        // 2026-08-03: tried replacing every other switched-on positional
+        // field with a Sirius/Berserk blend in one batch (39 fields, several
+        // needing an approximate broadcast for mismatched array lengths) --
+        // measured a real loss (-0.42 win rate over ~190 games against the
+        // RFP-only build). Reverted, all of it, rather than picking through
+        // 39 fields to find which ones were the problem: the same lesson as
+        // RFP applies here too, on a bigger scale -- a big batch of
+        // reference-sourced numbers, several already approximate, is not a
+        // clean experiment, and losing tells you the batch was wrong
+        // somewhere without saying where.
         // King-safety scale, for measuring how much this engine should lean
         // on king safety at all. Comparing our evaluation against a stronger
         // hand-crafted one term by term (2026-07-26) showed every category
@@ -2962,157 +3393,96 @@ impl Weights {
     /// out, so it cannot drift from the vector it describes -- a families list
     /// that is one entry out of step does not fail, it scales the wrong terms
     /// and reports whatever those happen to do.
+    /// A familia de cada escalar, DERIVADA de `field_names`. Duas listas em
+    /// paralelo foi como se chegou a ter uma com 579 entradas e outra com 771.
     pub fn field_families(&self) -> Vec<&'static str> {
-        let mut f: Vec<&'static str> = Vec::with_capacity(512);
-        // Macros, not closures: three closures capturing the same Vec mutably
-        // cannot coexist, and splitting them into separate scopes would make
-        // the generated body harder to keep in step with `to_vec`.
-        macro_rules! two { ($n:expr) => {{ let g = family_of($n); f.push(g); f.push(g); }} }
-        macro_rules! one { ($n:expr) => {{ f.push(family_of($n)); }} }
-        macro_rules! many {
-            ($n:expr, $len:expr) => {{
-                let g = family_of($n);
-                for _ in 0..$len { f.push(g); f.push(g); }
-            }}
-        }
-        two!("bishop_pair");
-        two!("long_diag_bishop");
-        two!("minor_behind_pawn");
-        two!("knight_outpost");
-        many!("rook_open", self.rook_open.len());
-        two!("rook_on_seventh");
-        two!("tempo");
-        many!("mobility_knight", self.mobility_knight.len());
-        many!("mobility_bishop", self.mobility_bishop.len());
-        many!("mobility_rook", self.mobility_rook.len());
-        many!("mobility_queen", self.mobility_queen.len());
-        many!("king_attacker_weight", self.king_attacker_weight.len());
-        two!("king_attacks");
-        two!("safe_knight_check");
-        two!("safe_bishop_check");
-        two!("safe_rook_check");
-        two!("safe_queen_check");
-        many!("pawn_shelter", self.pawn_shelter.len());
-        two!("shelter_open");
-        many!("pawn_tornado", self.pawn_tornado.len());
-        many!("threat_by_king", self.threat_by_king.len());
-        two!("knight_hit_queen");
-        two!("bishop_hit_queen");
-        two!("rook_hit_queen");
-        two!("push_threat");
-        two!("restricted_squares");
-        many!("pawn_phalanx", self.pawn_phalanx.len());
-        many!("defended_pawn", self.defended_pawn.len());
-        many!("isolated_pawn", self.isolated_pawn.len());
-        many!("doubled_pawn", self.doubled_pawn.len());
-        two!("isolated_exposed");
-        two!("backward_exposed");
-        many!("our_passer_proximity", self.our_passer_proximity.len());
-        many!("their_passer_proximity", self.their_passer_proximity.len());
-        many!("passer_defended_push", self.passer_defended_push.len());
-        many!("passer_slider_behind", self.passer_slider_behind.len());
-        two!("backward_pawn");
-        many!("bishop_pawns", self.bishop_pawns.len());
-        two!("weak_king_ring");
-        many!("king_flank_attacks", self.king_flank_attacks.len());
-        many!("king_flank_defenses", self.king_flank_defenses.len());
-        two!("uncastled_king_no_rights");
-        two!("uncastled_king_has_rights");
-        one!("scale_ocb_bishops_only");
-        one!("scale_ocb_one_rook");
-        one!("scale_ocb_one_knight");
-        one!("scale_fallback_base");
-        one!("scale_fallback_per_pawn");
-        one!("complexity_total_pawns");
-        one!("complexity_pawn_flanks");
-        one!("complexity_pawn_endgame");
-        one!("complexity_adjustment");
-        two!("stonewall");
-        two!("stonewall_outpost");
-        two!("stonewall_bad_bishop");
-        many!("imbalance", 25);
-        many!("tornado_locked", 4);
-        two!("passer_outside");
-        two!("bishop_trapped");
-        two!("rook_trapped");
-        two!("bishop_outpost");
-        f
+        self.field_names().iter().map(|n| family_of(n)).collect()
     }
 
+
+    /// GERADA da ordem do `to_vec`, campo a campo. Foi escrita a mao e
+    /// divergiu -- 579 nomes contra 771 pesos -- e a partir do primeiro em
+    /// falta todos os nomes ficavam desfasados dos pesos. O `raiox` zerava
+    /// um peso e imprimia o nome de outro, e diagnosticos inteiros da
+    /// avaliacao foram feitos em cima disso.
+    ///
+    /// `checkweights` verifica o alinhamento e diz alto se voltar a partir.
     pub fn field_names(&self) -> Vec<&'static str> {
-        let mut f: Vec<&'static str> = Vec::with_capacity(512);
-        // Macros, not closures: three closures capturing the same Vec mutably
-        // cannot coexist, and splitting them into separate scopes would make
-        // the generated body harder to keep in step with `to_vec`.
-        macro_rules! two { ($n:expr) => {{ f.push($n); f.push($n); }} }
-        macro_rules! one { ($n:expr) => {{ f.push($n); }} }
-        macro_rules! many {
-            ($n:expr, $len:expr) => {{
-                let g = family_of($n);
-                for _ in 0..$len { f.push(g); f.push(g); }
-            }}
-        }
-        two!("bishop_pair");
-        two!("long_diag_bishop");
-        two!("minor_behind_pawn");
-        two!("knight_outpost");
-        many!("rook_open", self.rook_open.len());
-        two!("rook_on_seventh");
-        two!("tempo");
-        many!("mobility_knight", self.mobility_knight.len());
-        many!("mobility_bishop", self.mobility_bishop.len());
-        many!("mobility_rook", self.mobility_rook.len());
-        many!("mobility_queen", self.mobility_queen.len());
-        many!("king_attacker_weight", self.king_attacker_weight.len());
-        two!("king_attacks");
-        two!("safe_knight_check");
-        two!("safe_bishop_check");
-        two!("safe_rook_check");
-        two!("safe_queen_check");
-        many!("pawn_shelter", self.pawn_shelter.len());
-        two!("shelter_open");
-        many!("pawn_tornado", self.pawn_tornado.len());
-        many!("threat_by_king", self.threat_by_king.len());
-        two!("knight_hit_queen");
-        two!("bishop_hit_queen");
-        two!("rook_hit_queen");
-        two!("push_threat");
-        two!("restricted_squares");
-        many!("pawn_phalanx", self.pawn_phalanx.len());
-        many!("defended_pawn", self.defended_pawn.len());
-        many!("isolated_pawn", self.isolated_pawn.len());
-        many!("doubled_pawn", self.doubled_pawn.len());
-        two!("isolated_exposed");
-        two!("backward_exposed");
-        many!("our_passer_proximity", self.our_passer_proximity.len());
-        many!("their_passer_proximity", self.their_passer_proximity.len());
-        many!("passer_defended_push", self.passer_defended_push.len());
-        many!("passer_slider_behind", self.passer_slider_behind.len());
-        two!("backward_pawn");
-        many!("bishop_pawns", self.bishop_pawns.len());
-        two!("weak_king_ring");
-        many!("king_flank_attacks", self.king_flank_attacks.len());
-        many!("king_flank_defenses", self.king_flank_defenses.len());
-        two!("uncastled_king_no_rights");
-        two!("uncastled_king_has_rights");
-        one!("scale_ocb_bishops_only");
-        one!("scale_ocb_one_rook");
-        one!("scale_ocb_one_knight");
-        one!("scale_fallback_base");
-        one!("scale_fallback_per_pawn");
-        one!("complexity_total_pawns");
-        one!("complexity_pawn_flanks");
-        one!("complexity_pawn_endgame");
-        one!("complexity_adjustment");
-        two!("stonewall");
-        two!("stonewall_outpost");
-        two!("stonewall_bad_bishop");
-        many!("imbalance", 25);
-        many!("tornado_locked", 4);
-        two!("passer_outside");
-        two!("bishop_trapped");
-        two!("rook_trapped");
-        two!("bishop_outpost");
+        let mut f: Vec<&'static str> = Vec::with_capacity(1024);
+        for _ in 0..2 { f.push("bishop_pair"); }
+        for _ in 0..2 { f.push("long_diag_bishop"); }
+        for _ in 0..2 { f.push("minor_behind_pawn"); }
+        for _ in 0..2 { f.push("knight_outpost"); }
+        for _ in 0..4 { f.push("rook_open"); }
+        for _ in 0..2 { f.push("rook_on_seventh"); }
+        for _ in 0..2 { f.push("tempo"); }
+        for _ in 0..56 { f.push("mobility_knight"); }
+        for _ in 0..56 { f.push("mobility_bishop"); }
+        for _ in 0..56 { f.push("mobility_rook"); }
+        for _ in 0..56 { f.push("mobility_queen"); }
+        for _ in 0..8 { f.push("king_attacker_weight"); }
+        for _ in 0..2 { f.push("king_attacks"); }
+        for _ in 0..2 { f.push("safe_knight_check"); }
+        for _ in 0..2 { f.push("safe_bishop_check"); }
+        for _ in 0..2 { f.push("safe_rook_check"); }
+        for _ in 0..2 { f.push("safe_queen_check"); }
+        for _ in 0..8 { f.push("pawn_shelter"); }
+        for _ in 0..2 { f.push("shelter_open"); }
+        for _ in 0..8 { f.push("pawn_tornado"); }
+        for _ in 0..24 { f.push("threat_by_pawn"); }
+        for _ in 0..24 { f.push("threat_by_knight"); }
+        for _ in 0..24 { f.push("threat_by_bishop"); }
+        for _ in 0..24 { f.push("threat_by_rook"); }
+        for _ in 0..24 { f.push("threat_by_queen"); }
+        for _ in 0..12 { f.push("threat_by_king"); }
+        for _ in 0..2 { f.push("knight_hit_queen"); }
+        for _ in 0..2 { f.push("bishop_hit_queen"); }
+        for _ in 0..2 { f.push("rook_hit_queen"); }
+        for _ in 0..2 { f.push("push_threat"); }
+        for _ in 0..2 { f.push("restricted_squares"); }
+        for _ in 0..16 { f.push("pawn_phalanx"); }
+        for _ in 0..16 { f.push("defended_pawn"); }
+        for _ in 0..8 { f.push("isolated_pawn"); }
+        for _ in 0..8 { f.push("doubled_pawn"); }
+        for _ in 0..2 { f.push("isolated_exposed"); }
+        for _ in 0..2 { f.push("backward_exposed"); }
+        for _ in 0..64 { f.push("passed_pawn"); }
+        for _ in 0..16 { f.push("our_passer_proximity"); }
+        for _ in 0..16 { f.push("their_passer_proximity"); }
+        for _ in 0..16 { f.push("passer_defended_push"); }
+        for _ in 0..16 { f.push("passer_slider_behind"); }
+        for _ in 0..2 { f.push("backward_pawn"); }
+        for _ in 0..32 { f.push("candidate_passer"); }
+        for _ in 0..14 { f.push("bishop_pawns"); }
+        for _ in 0..2 { f.push("weak_king_ring"); }
+        for _ in 0..4 { f.push("king_flank_attacks"); }
+        for _ in 0..4 { f.push("king_flank_defenses"); }
+        for _ in 0..2 { f.push("uncastled_king_no_rights"); }
+        for _ in 0..2 { f.push("uncastled_king_has_rights"); }
+        for _ in 0..1 { f.push("scale_ocb_bishops_only"); }
+        for _ in 0..1 { f.push("scale_ocb_one_rook"); }
+        for _ in 0..1 { f.push("scale_ocb_one_knight"); }
+        for _ in 0..1 { f.push("scale_fallback_base"); }
+        for _ in 0..1 { f.push("scale_fallback_per_pawn"); }
+        for _ in 0..1 { f.push("complexity_total_pawns"); }
+        for _ in 0..1 { f.push("complexity_pawn_flanks"); }
+        for _ in 0..1 { f.push("complexity_pawn_endgame"); }
+        for _ in 0..1 { f.push("complexity_adjustment"); }
+        for _ in 0..2 { f.push("stonewall"); }
+        for _ in 0..2 { f.push("stonewall_outpost"); }
+        for _ in 0..2 { f.push("stonewall_bad_bishop"); }
+        for _ in 0..10 { f.push("hanging"); }
+        for _ in 0..8 { f.push("king_tropism"); }
+        for _ in 0..2 { f.push("space"); }
+        for _ in 0..2 { f.push("blocked_pawns"); }
+        for _ in 0..6 { f.push("king_aim"); }
+        for _ in 0..2 { f.push("king_battery"); }
+        for _ in 0..50 { f.push("imbalance"); }
+        for _ in 0..8 { f.push("tornado_locked"); }
+        for _ in 0..2 { f.push("passer_outside"); }
+        for _ in 0..2 { f.push("bishop_trapped"); }
+        for _ in 0..2 { f.push("rook_trapped"); }
+        for _ in 0..2 { f.push("bishop_outpost"); }
         f
     }
 
@@ -4503,6 +4873,23 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
                 if let Some((from, _)) =
                     crate::search::see::least_valuable_attacker(board, atk_bb, victim.opp())
                 {
+                    // The same blind spot as an absolute pin: this whole
+                    // term only looks at pseudo-attacks, so a piece that
+                    // cannot legally make the capture (its own king would
+                    // be left in check) still counts as a threat. Found
+                    // by hand in a real loss -- a pawn "attacking" a
+                    // queen along a diagonal while pinned to its own king
+                    // on the file behind it, worth several hundred
+                    // centipawns of a threat that was never there. SEE
+                    // itself has no king on the board to check against;
+                    // the fix has to sit here, one level up, where the
+                    // king is known.
+                    let atkr_color = victim.opp();
+                    let king_sq = board.king_sq(atkr_color);
+                    let pinned = crate::movegen::compute_pinned(board, a, atkr_color, king_sq);
+                    if crate::bitboard::bb(from) & pinned != 0 && !on_king_ray(king_sq, from, sq) {
+                        continue;
+                    }
                     let mv = crate::moves::Move {
                         from,
                         to: sq,
@@ -4516,12 +4903,17 @@ pub fn positional_terms(board: &Board, w: &Weights) -> i32 {
                     if gain > worst {
                         worst = gain;
                         worst_pt = pt;
+                        if debug_see() {
+                            eprintln!(
+                                "debug: candidato worst={gain} peca={worst_pt:?} vitima_sq={sq} atacante_sq={from} vitima_cor={victim:?}"
+                            );
+                        }
                     }
                 }
             }
         }
         if worst > 0 && debug_see() {
-            eprintln!("debug: worst SEE = {worst}");
+            eprintln!("debug: worst SEE = {worst} (peca={worst_pt:?})");
         }
         if worst > 0 {
             // Fraccao, nao o valor inteiro: ha xeques intermedios, contra-jogo
@@ -4845,6 +5237,34 @@ static EVAL_MODE_MATERIAL_ONLY: OnceLock<bool> = OnceLock::new();
 /// Read once. `env::var_os` on every evaluation that finds a hanging piece is
 /// a syscall-shaped cost in the hottest loop the engine has.
 static DEBUG_SEE: OnceLock<bool> = OnceLock::new();
+/// Whether `to` lies on the same ray out of `king_sq` as `from` does --
+/// the set of squares a piece pinned to `king_sq` through `from` may
+/// still legally move to (the pinner's square, or anywhere between).
+/// Three collinear points aren't enough on their own: (king, from, to)
+/// can be collinear with `to` on the OPPOSITE side of the king from
+/// `from`, which is a different line through the same square, not the
+/// pin ray. Matching the direction, not just the line, rules that out.
+fn on_king_ray(king_sq: Square, from: Square, to: Square) -> bool {
+    let (kf, kr) = (king_sq as i32 % 8, king_sq as i32 / 8);
+    let (ff, fr) = (from as i32 % 8, from as i32 / 8);
+    let (tf, tr) = (to as i32 % 8, to as i32 / 8);
+    let (dff, dfr) = (ff - kf, fr - kr);
+    let (dtf, dtr) = (tf - kf, tr - kr);
+    let dir = |df: i32, dr: i32| -> Option<(i32, i32)> {
+        if df == 0 && dr == 0 {
+            None
+        } else if df == 0 || dr == 0 || df.abs() == dr.abs() {
+            Some((df.signum(), dr.signum()))
+        } else {
+            None
+        }
+    };
+    match (dir(dff, dfr), dir(dtf, dtr)) {
+        (Some(d1), Some(d2)) => d1 == d2,
+        _ => false,
+    }
+}
+
 /// Which sides the hanging-piece term looks at, and how much each counts.
 ///
 /// By default only the side that does NOT have the move, at full weight --
@@ -5012,6 +5432,7 @@ fn evaluate_sem_cache(board: &Board) -> i32 {
     } else {
         v
     };
+    let v = strong_side_pawn_scale(board, v);
     // Added last, so the scaling that corrects how loud the evaluation is does
     // not also scale a tie-break that is not part of the position's worth --
     // and turned to the side to move first, which is what `evaluate` returns
@@ -5070,12 +5491,12 @@ fn evaluate_sem_cache(board: &Board) -> i32 {
 /// partition and applying on another is a mistake this project has already made
 /// once, in the feature extractor.
 pub fn win_draw_loss(board: &Board, eval_cp: i32) -> (i32, i32, i32) {
-    const DIVISOR: [i32; NUM_BUCKETS] = [433, 548, 631, 694, 782, 987, 1042, 1564];
+    const DIVISOR: [i32; WDL_BUCKETS] = [433, 548, 631, 694, 782, 987, 1042, 1564];
     // Draw rate at level, per bucket, falling as the position leaves level.
     // Endgames with few pawns draw far more often than a full board does, which
     // no single number can express either.
-    const DRAW_AT_LEVEL: [i32; NUM_BUCKETS] = [620, 480, 430, 400, 370, 330, 310, 250];
-    let b = bucket_of(board);
+    const DRAW_AT_LEVEL: [i32; WDL_BUCKETS] = [620, 480, 430, 400, 370, 330, 310, 250];
+    let b = wdl_bucket_of(board);
     let d = DIVISOR[b] as f64;
     let x = eval_cp as f64 / d;
     let score = 1.0 / (1.0 + 10f64.powf(-x));
@@ -5086,6 +5507,52 @@ pub fn win_draw_loss(board: &Board, eval_cp: i32) -> (i32, i32, i32) {
     let w = ((score - draw / 2.0) * 1000.0).round() as i32;
     let dr = (draw * 1000.0).round() as i32;
     (w.clamp(0, 1000), dr.clamp(0, 1000), (1000 - w - dr).clamp(0, 1000))
+}
+
+/// The endgame scale, keyed on the STRONG SIDE's pawn count.
+///
+/// 2026-08-03: replaces `material_bucket_scale`, not the idea of a scale --
+/// three reference engines were read on this exact point (see that
+/// function's own history) and none goes without one. What was wrong was the
+/// key: total piece count on both sides, when what the two references that
+/// keep a general-purpose fallback (past their narrow opposite-bishop /
+/// known-endgame handlers) actually measure is the PAWN COUNT OF WHICHEVER
+/// SIDE IS AHEAD. Fewer pawns for the side that is winning means fewer
+/// targets, fewer ways to make progress, more drawing chances -- that is
+/// what should shrink the evaluation, not "the board in general has fewer
+/// pieces on it".
+///
+/// The two references disagree on shape (one linear and able to INFLATE past
+/// 100% with plentiful pawns, one quadratic and capped at 100%) and on where
+/// it applies (only to the endgame half before tapering, or to the already-
+/// tapered total). Ours tapers each term as it is computed, so by the time a
+/// single `raw` number exists here mg and eg are already merged -- there is
+/// no separate eg component left to scale on its own without a much bigger
+/// change to how positional_terms works. Scaling the tapered total, the way
+/// the quadratic reference does, is what the current architecture can do
+/// without that rewrite.
+///
+/// The shape is the quadratic one, not the inflating linear one: everything
+/// measured this session has been us OVER-stating an advantage, never
+/// under-stating one in a pawn-rich endgame, so adding a mechanism that can
+/// push the evaluation UP past its already-computed value is a claim with no
+/// evidence behind it yet. A shrink-only floor is the conservative choice
+/// until a measurement says the evaluation is ever too quiet with pawns on
+/// the board.
+///
+/// `1000 - 8*(8-pawns)^2`, floored at 500 (half strength with no pawns at
+/// all for the stronger side) -- close to the quadratic reference's own
+/// numbers (128 max, floor 64, i.e. 50%) without pretending to more
+/// precision than a hand-picked constant deserves.
+pub fn strong_side_pawn_scale(board: &Board, v: i32) -> i32 {
+    if v == 0 {
+        return v;
+    }
+    let forte = if v > 0 { Color::White } else { Color::Black };
+    let peoes = count(board.pieces[forte.idx()][PieceType::Pawn.idx()]) as i32;
+    let faltam = (8 - peoes).max(0);
+    let escala = (1000 - 8 * faltam * faltam).max(500);
+    v * escala / 1000
 }
 
 pub fn material_bucket_scale(board: &Board, v: i32) -> i32 {
@@ -5417,15 +5884,23 @@ pub fn positional_terms_signed(board: &Board) -> i32 {
 /// A nossa constante vem da relacao `normalizado = k * bruto`, com o k medido
 /// por `medek` contra 200 mil posicoes com rotulos de um motor forte:
 /// k=0.4136,
-/// logo N = 100/k = 242. Antes disto a posicao inicial reportava 83 quando o
-/// motor de referencia reporta 28, e a startpos depois de e4 dava 103 -- tres
-/// vezes o que vale.
-// 242 dos dois lados ate' a escala do binario COMPLETO ser medida. O K=402
-// que o afinador reporta e' do modelo linear dele -- nao inclui a complexidade
-// nem a curva do rei, que o motor soma por cima e o ajuste nunca viu.
-pub const NORMALIZA_PARA_PEAO: i32 = 242;
-
+/// logo N = 100/k = 242.
+///
+/// 2026-08-03: removed. Three reference engines were read specifically on
+/// this point -- none has a separate divisor between the internal number and
+/// the reported cp. The tapered sum THAT COMES OUT OF THE TUNER is the cp;
+/// there is no "internal units" distinct from "what gets shown". An engine
+/// that needs a cosmetic divisor for the UCI number to look reasonable is
+/// saying its weights are not calibrated to the scale the formula assumes --
+/// and a separate divisor never fixes that, it just hides the symptom in the
+/// number on screen without touching what the search actually uses (this
+/// function was never called from `evaluate()`; only from the UCI
+/// "eval"/"evalbreak"/"evalraw" commands and whatever reports "score cp" to
+/// a GUI).
+///
+/// Identity until the weights are recalibrated directly against the final
+/// formula, which is what all the reference engines studied do.
 #[inline]
 pub fn score_normalizado(interno: i32) -> i32 {
-    interno * 100 / NORMALIZA_PARA_PEAO
+    interno
 }

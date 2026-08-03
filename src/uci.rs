@@ -844,6 +844,11 @@ impl Engine {
     }
 
     fn cmd_go(&mut self, tokens: &[&str], out: &mut impl Write) {
+        // Once per real move, not once per node and not once per Lazy SMP
+        // thread (which would be several times per move) -- this is the one
+        // place in the whole engine a real "go" from a real game always
+        // passes through, book and tablebase answers included.
+        self.tt.increase_gen();
         let mut wtime = 0i64;
         let mut btime = 0i64;
         let mut winc = 0i64;
@@ -1877,6 +1882,42 @@ impl Engine {
                     self.cmd_go(&tokens[1..], &mut out);
                 }
                 "stop" => {}
+                "evalraw" => {
+                    // O numero pelado, na perspectiva do LADO A JOGAR --
+                    // a mesma convencao usada por outros motores UCI, para
+                    // comparadores automaticos poderem ler uma linha sem
+                    // parsear tabela nenhuma.
+                    //
+                    // `evaluate()` JA devolve o lado a jogar (e' o que a
+                    // busca precisa). O comando "eval"/"evalbreak" acima
+                    // fez de proposito o flip inverso para mostrar sempre
+                    // do lado das brancas -- daqui NAO se copia esse flip,
+                    // ou fica-se com o dobro dele, que e' voltar ao ponto
+                    // de partida disfarcado de resposta.
+                    let b = &self.board;
+                    let seen = crate::eval::evaluate(b);
+                    let _ = writeln!(out, "{}", crate::eval::score_normalizado(seen));
+                }
+                "margins" => {
+                    // A tabela [5] do raiox, mas dentro da sessao UCI --
+                    // `raiox` corre num processo novo, sem nenhum
+                    // `setoption` anterior. Aqui le-se `search_params()`,
+                    // que reflecte PARAM_OVERRIDES, portanto:
+                    //   setoption name rfp_base value 85
+                    //   setoption name rfp_step value 7
+                    //   margins
+                    // mostra a curva JA com o override, sem recompilar
+                    // nem lancar um SPRT so' para ver o formato da curva.
+                    let sp = crate::search::search_params();
+                    let b = &self.board;
+                    let seen = crate::eval::evaluate(b);
+                    let _ = writeln!(out, "eval do lado a jogar {:>8}", seen);
+                    let _ = writeln!(out, "{:<4} {:>10} {:>12}", "prof", "RFP margem", "eval-RFP");
+                    for d in [1, 2, 3, 4, 6, 8] {
+                        let m = (sp.rfp_step * d * d / 2 - sp.rfp_step * d / 2 + sp.rfp_base * d).max(20);
+                        let _ = writeln!(out, "{:<4} {:>10} {:>12}", d, m, seen - m);
+                    }
+                }
                 "eval" | "evalbreak" => {
                     // Robust breakdown via to_vec/from_vec index ranges (no
                     // per-field typing). Contribution of a range = positional
@@ -1952,9 +1993,18 @@ impl Engine {
                         // tudo, ligado por omissao. Vale ate' 15% da avaliacao
                         // inteira e nao aparecia em nenhum diagnostico.
                         let antes_mb = escalado + corr;
-                        let previsto = crate::eval::material_bucket_scale(b, antes_mb);
-                        let _ = writeln!(out, "    escala por material           {:>7}   ({:+.1}%)",
-                                         previsto - antes_mb, pct(previsto - antes_mb, antes_mb));
+                        let previsto = if crate::eval::material_buckets_on() {
+                            crate::eval::material_bucket_scale(b, antes_mb)
+                        } else {
+                            antes_mb
+                        };
+                        let _ = writeln!(out, "    escala por material           {:>7}   ({:+.1}%){}",
+                                         previsto - antes_mb, pct(previsto - antes_mb, antes_mb),
+                                         if crate::eval::material_buckets_on() { "" } else { "  (desligado por defeito)" });
+                        let apos_pawn = crate::eval::strong_side_pawn_scale(b, previsto);
+                        let _ = writeln!(out, "    escala por peoes do lado forte {:>6}   ({:+.1}%)",
+                                         apos_pawn - previsto, pct(apos_pawn - previsto, previsto));
+                        let previsto = apos_pawn;
                         let _ = writeln!(out, "    = previsto pela formula       {:>7}", previsto);
                         let _ = writeln!(out, "    = o que a BUSCA ve            {:>7}", seen);
                         if previsto != seen {

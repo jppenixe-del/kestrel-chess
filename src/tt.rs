@@ -46,14 +46,47 @@ pub struct TtEntry {
 /// of returning garbage. This is what lets the table be shared and
 /// lock-free under Lazy SMP -- no locks, so no contention between search
 /// threads.
+///
+/// `gen` is a separate atomic byte rather than a few more bits stolen from
+/// `data`. `data` is already packed to 61 of 64 bits (see the layout note
+/// below) -- fitting a generation in the 3 that are left means a cycle of
+/// 8, which wraps within a single long game and starts confusing recent
+/// entries for stale ones. A whole byte costs a little more memory per
+/// slot and buys a cycle of 256, which does not wrap inside any game this
+/// engine will play.
 struct TtSlot {
     key_xor_data: AtomicU64,
     data: AtomicU64,
+    gen: std::sync::atomic::AtomicU8,
 }
 
+/// 2026-08-03: this table used to be one slot per index, always-replace,
+/// no generation at all. Two references were read specifically on this
+/// point and both do the same thing, just with different constants: a
+/// small bucket (3-4 entries) per index, a generation counter incremented
+/// once per real move (not per node), and a replacement rule that picks
+/// the WORST entry in the bucket by `depth - penalty * how_stale`, so a
+/// shallow entry from three moves ago loses to a fresh one before a deep
+/// entry from one move ago does.
+///
+/// Always-replace was not an oversight -- a bucketed, aged version was
+/// built and measured against it before, and lost by 35-45% on node-count-
+/// to-fixed-depth. That comparison was flagged as unsound in the same
+/// commit that measured it (wrong metric for this project, and the table
+/// under test was silently half the size it was asked for) and was never
+/// re-run. This is that re-run, at the size actually requested, and judged
+/// on games rather than nodes to a fixed depth.
+const BUCKET: usize = 3;
+/// Quality lost per generation of staleness. Berserk uses 4, Sirius uses 2
+/// (out of a 32-generation cycle instead of this table's 256) -- picked 3
+/// here as a genuine middle value pending a real measurement, not because
+/// splitting the difference is principled on its own.
+const STALE_PENALTY: i32 = 3;
+
 pub struct TranspositionTable {
-    slots: Vec<TtSlot>,
+    slots: Vec<[TtSlot; BUCKET]>,
     mask: usize,
+    current_gen: std::sync::atomic::AtomicU8,
 }
 
 fn encode_move(mv: Option<Move>) -> u64 {
@@ -120,24 +153,15 @@ fn decode_move(bits: u64) -> Option<Move> {
 //   bits 45..61  static_eval16 (16 bits, signed -- cached full eval)
 //   bits 61..64  unused        ( 3 bits free)
 //
-// TT structure note. This is a single-slot, always-replace table. A 4-way
-// set-associative cluster with generation aging was implemented and measured
-// against it across 6 positions, and regressed node-count-to-fixed-depth by
-// 35-45%, which is why the simple design stayed.
-//
-// That comparison is NOT settled, for two reasons found on 2026-07-25, and
-// both cut in favour of re-running it rather than trusting it:
-//   1. It was scored on node-count-to-fixed-depth. This project has since
-//      learned not to trust that metric for tuning decisions (it proved
-//      chaotic and non-monotonic when used on the SEE margins). What decides
-//      a replacement policy is strength at fixed TIME, over real games.
-//   2. It ran at what were believed to be 16MB and 64MB tables -- but the
-//      sizing bug fixed below meant those were really 8MB and 32MB. Table
-//      size is exactly the variable that governs how much replacement policy
-//      matters: the smaller the table, the more eviction hurts. The buckets
-//      were judged in the conditions least favourable to them.
-// So: re-measure at true sizes, over games, before concluding either way.
-// Nothing here is settled by authority -- only by measurement on our tree.
+// TT structure note. This WAS a single-slot, always-replace table -- no
+// generation, no bucket. A 4-way set-associative cluster with generation
+// aging was tried once and measured worse, but that comparison was flagged
+// the same day as unsound (wrong metric, and the table under test was
+// silently half its requested size) and the promised re-run never
+// happened. This file is that re-run: a 3-way bucket, a real generation
+// counter (`TranspositionTable::increase_gen`, `TtSlot::gen`), judged on
+// games at the sizes actually requested rather than nodes to a fixed
+// depth. See the struct-level doc comments below for the design itself.
 fn encode_data(depth: i32, score: i32, bound: Bound, best: Option<Move>, pv: bool, static_eval: i16) -> u64 {
     let mv_bits = encode_move(best);
     let score16 = (score.clamp(i16::MIN as i32, i16::MAX as i32) as i16 as u16) as u64;
@@ -169,10 +193,11 @@ fn decode_data(data: u64) -> (i32, i32, Bound, Option<Move>, bool, i16) {
 impl TranspositionTable {
     pub fn new(mb: usize) -> Self {
         let bytes = mb * 1024 * 1024;
-        let slot_size = std::mem::size_of::<TtSlot>();
-        // The index is masked, so the slot count must be a power of two, and
-        // it must not exceed what was asked for. Round DOWN to the previous
-        // power of two -- which, when the count already IS one, keeps it.
+        let bucket_size = std::mem::size_of::<[TtSlot; BUCKET]>();
+        // The index is masked, so the bucket count must be a power of two,
+        // and it must not exceed what was asked for. Round DOWN to the
+        // previous power of two -- which, when the count already IS one,
+        // keeps it.
         //
         // 2026-07-25: this used to be `next_power_of_two() / 2`, meaning that
         // whenever the requested size divided into an exact power of two --
@@ -180,50 +205,106 @@ impl TranspositionTable {
         // powers of two -- the table was silently halved. `Hash=32` built a
         // 16MB table. Every measurement ever taken on this engine at a given
         // Hash value was really taken at half of it.
-        let requested = (bytes / slot_size).max(1024);
+        let requested = (bytes / bucket_size).max(1024);
         let count = 1usize << requested.ilog2();
         let mut slots = Vec::with_capacity(count);
         for _ in 0..count {
-            slots.push(TtSlot { key_xor_data: AtomicU64::new(0), data: AtomicU64::new(0) });
+            slots.push(std::array::from_fn(|_| TtSlot {
+                key_xor_data: AtomicU64::new(0),
+                data: AtomicU64::new(0),
+                gen: std::sync::atomic::AtomicU8::new(0),
+            }));
         }
-        TranspositionTable { slots, mask: count - 1 }
+        TranspositionTable { slots, mask: count - 1, current_gen: std::sync::atomic::AtomicU8::new(0) }
+    }
+
+    /// Once per real move (see the call site in `cmd_go`), not once per
+    /// node. Wraps at 256 -- staleness in `replace_index` is computed as a
+    /// wrapping difference, the same way both references handle their own
+    /// (smaller) cycles, so the wrap itself never confuses old for new.
+    pub fn increase_gen(&self) {
+        self.current_gen.fetch_add(1, Ordering::Relaxed);
     }
 
     #[inline]
     pub fn probe(&self, key: u64) -> Option<TtEntry> {
         let idx = (key as usize) & self.mask;
-        let slot = &self.slots[idx];
-        let data = slot.data.load(Ordering::Relaxed);
-        let key_xor = slot.key_xor_data.load(Ordering::Relaxed);
-        if key_xor ^ data != key {
-            return None;
+        let bucket = &self.slots[idx];
+        let gen = self.current_gen.load(Ordering::Relaxed);
+        for slot in bucket {
+            let data = slot.data.load(Ordering::Relaxed);
+            let key_xor = slot.key_xor_data.load(Ordering::Relaxed);
+            if key_xor ^ data != key {
+                continue;
+            }
+            // A read is also evidence this entry still matters. Refreshing
+            // its generation here protects a position the search keeps
+            // transposing back into, even on a ply that only reads it and
+            // never has reason to store over it -- the idea a second
+            // reference's TT has that the first one's does not.
+            slot.gen.store(gen, Ordering::Relaxed);
+            let (depth, score, bound, best, pv, static_eval) = decode_data(data);
+            return Some(TtEntry { key, depth, score, bound, best, pv, static_eval });
         }
-        let (depth, score, bound, best, pv, static_eval) = decode_data(data);
-        Some(TtEntry { key, depth, score, bound, best, pv, static_eval })
+        None
+    }
+
+    /// Which of the `BUCKET` slots to write into: an exact key match if one
+    /// exists (so a re-store of the same position updates in place rather
+    /// than duplicating across the bucket), otherwise the slot with the
+    /// lowest `depth - STALE_PENALTY * staleness` -- the shallowest entry
+    /// that has also gone the longest without being touched, ahead of a
+    /// deep entry from a couple of moves ago.
+    #[inline]
+    fn replace_index(bucket: &[TtSlot; BUCKET], key: u64, gen: u8) -> usize {
+        let mut best_idx = 0;
+        let mut best_quality = i32::MAX;
+        for (i, slot) in bucket.iter().enumerate() {
+            let data = slot.data.load(Ordering::Relaxed);
+            let key_xor = slot.key_xor_data.load(Ordering::Relaxed);
+            if key_xor ^ data == key {
+                return i;
+            }
+            let depth = ((data >> 34) & 0xFF) as u8 as i8 as i32;
+            let slot_gen = slot.gen.load(Ordering::Relaxed);
+            let staleness = gen.wrapping_sub(slot_gen) as i32;
+            let quality = depth - STALE_PENALTY * staleness;
+            if quality < best_quality {
+                best_quality = quality;
+                best_idx = i;
+            }
+        }
+        best_idx
     }
 
     /// Takes `&self`, not `&mut self` -- entries are updated via atomics,
     /// so many search threads can call this concurrently on the SAME
     /// shared table (the whole point of Lazy SMP: independent threads,
-    /// one shared TT, no locks).
+    /// one shared TT, no locks). The bucket scan in `replace_index` races
+    /// benignly under that concurrency -- two threads can pick the same
+    /// slot, or one can act on a staleness reading that changes a moment
+    /// later -- the same tolerance every bucketed lock-free TT accepts,
+    /// and each slot's own write is still atomic and torn-read-safe.
     #[inline]
     pub fn store(&self, key: u64, depth: i32, score: i32, bound: Bound, best: Option<Move>, pv: bool, static_eval: i16) {
         let data = encode_data(depth, score, bound, best, pv, static_eval);
         let idx = (key as usize) & self.mask;
-        let slot = &self.slots[idx];
-        // Always-replace: keeps the most recent (and, under iterative
-        // deepening, usually the deepest-so-far) information in every slot.
-        // It measured better than a 4-way bucket here, but see the "TT
-        // structure note" above encode_data for why that comparison is worth
-        // re-running rather than treating as settled.
+        let bucket = &self.slots[idx];
+        let gen = self.current_gen.load(Ordering::Relaxed);
+        let slot = &bucket[Self::replace_index(bucket, key, gen)];
         slot.data.store(data, Ordering::Relaxed);
         slot.key_xor_data.store(key ^ data, Ordering::Relaxed);
+        slot.gen.store(gen, Ordering::Relaxed);
     }
 
     pub fn clear(&self) {
-        for slot in &self.slots {
-            slot.data.store(0, Ordering::Relaxed);
-            slot.key_xor_data.store(0, Ordering::Relaxed);
+        self.current_gen.store(0, Ordering::Relaxed);
+        for bucket in &self.slots {
+            for slot in bucket {
+                slot.data.store(0, Ordering::Relaxed);
+                slot.key_xor_data.store(0, Ordering::Relaxed);
+                slot.gen.store(0, Ordering::Relaxed);
+            }
         }
     }
 }

@@ -334,6 +334,18 @@ impl DepthMargin {
 
 #[derive(Clone, Copy)]
 pub struct SearchParams {
+    /// RFP margin, quadratic in depth: `step*d*d/2 - step*d/2 + base*d`.
+    /// 2026-08-03: adopted from a reference engine's own RFP wholesale --
+    /// not just the numbers, the SHAPE. That reference does not split on
+    /// `improving` and has none of the three modulators below; one curve,
+    /// unconditional. `rfp_base`/`rfp_step` are close to identical to its
+    /// own constants (65 and 5). The three modulators and the old linear
+    /// `rfp_improving`/`rfp_not_improving` pair stay in the struct --
+    /// removing fields would shift every index after them in `to_vec` and
+    /// break unrelated UCI tuning options -- but RFP itself no longer reads
+    /// them.
+    pub rfp_base: i32,
+    pub rfp_step: i32,
     /// Extra margin per depth when the opponent has a capture that wins
     /// material outright. See the note at the RFP block.
     pub rfp_opp_easy_capture: i32,
@@ -448,12 +460,18 @@ impl Default for SearchParams {
         // discarded for lack of a positive delta ("os testes sao so'
         // para verificar, e' sempre para implementar").
         SearchParams {
-            // Starting points, not tuned values: this engine's tree is not
-            // the one these signals were measured on. They are exposed by
-            // name so they can be swept without a rebuild.
-            rfp_opp_easy_capture: 34,
-            rfp_opp_worsening: 26,
-            rfp_hist_divisor: 615,
+            // Close to identical to a reference engine's own constants (65
+            // and 5) -- see the field doc comment for why the shape, not
+            // just the numbers, was adopted.
+            rfp_base: 65,
+            rfp_step: 5,
+            // Reasoned from this engine's own history scale (see the note
+            // at the RFP block), not copied. Starting points, not tuned
+            // values -- exposed by name so they can be swept without a
+            // rebuild.
+            rfp_opp_easy_capture: 15,
+            rfp_opp_worsening: 12,
+            rfp_hist_divisor: 150,
             hist_beta_margin: 46,
             hist_pruning_max_depth: 4,
             triple_ext_margin: 155,
@@ -467,6 +485,23 @@ impl Default for SearchParams {
             hist_malus_offset: -44,
             hist_malus_max: 992,
             lmr_hist_divisor: 36000,
+            // 2026-08-03: tried lowering these to a reference's raw base
+            // slope (26/85) and measured a real loss (-102 Elo, LOS 0.6%).
+            // Reading the reference's own formula afterward explained why:
+            // its base slope is modulated by three more terms (an easy-
+            // capture bonus, an opponent-worsening discount, a history
+            // term) that this engine already has too -- `rfp_opp_easy_
+            // capture`, `rfp_opp_worsening`, `rfp_hist_divisor` above, added
+            // in an earlier session by reading the same reference. Those
+            // three were tuned TOGETHER with these slopes at 50/159. Taking
+            // just the base slope from the reference and leaving the three
+            // modulating terms at values tuned for a different base broke
+            // the coherence of an already-adapted formula. These two fields
+            // are dead code now regardless -- the RFP block below reads
+            // `rfp_base`/`rfp_step` (a different reference's simpler,
+            // unconditional curve, which measured a real win, +46 Elo).
+            // Left at the values the modulated formula was last tuned
+            // around, in case a future measurement wants that shape back.
             rfp_improving: DepthMargin { base: 0, slope: 50 },
             rfp_not_improving: DepthMargin { base: 0, slope: 159 },
             razor_base: 629,
@@ -558,6 +593,8 @@ impl SearchParams {
             self.hist_malus_offset,
             self.hist_malus_max,
             self.lmr_hist_divisor,
+            self.rfp_base,
+            self.rfp_step,
         ]
     }
     pub fn from_vec(v: &[i32]) -> Self {
@@ -605,6 +642,8 @@ impl SearchParams {
             hist_malus_offset: v[46],
             hist_malus_max: v[47],
             lmr_hist_divisor: v[48],
+            rfp_base: v[49],
+            rfp_step: v[50],
         }
     }
 }
@@ -617,7 +656,7 @@ impl SearchParams {
 /// Generated from `to_vec`, never hand-written. A list that drifts out of
 /// order does not fail: it quietly sets the wrong parameter, and the sweep
 /// reports whatever that other parameter happens to do.
-pub const PARAM_NAMES: [&str; 49] = [
+pub const PARAM_NAMES: [&str; 51] = [
     "rfp_improving_base",
     "rfp_improving_slope",
     "rfp_not_improving_base",
@@ -667,6 +706,8 @@ pub const PARAM_NAMES: [&str; 49] = [
     "hist_malus_offset",
     "hist_malus_max",
     "lmr_hist_divisor",
+    "rfp_base",
+    "rfp_step",
 ];
 
 /// Overrides applied on top of the defaults, set over UCI before the first
@@ -1591,21 +1632,6 @@ impl<'a> Searcher<'a> {
             != 0
     }
 
-    fn mvv_lva(&self, board: &Board, mv: &Move) -> i32 {
-        if !mv.is_capture() {
-            return 0;
-        }
-        let victim = board.piece_at(mv.to).map(|(pt, _)| pt.value()).unwrap_or(100); // en passant = peao
-        let attacker = board.piece_at(mv.from).map(|(pt, _)| pt.value()).unwrap_or(0);
-        victim * 16 - attacker
-    }
-
-    /// Todas as pecas (ambas as cores) que atacam `sq` dada uma
-    /// ocupacao HIPOTETICA `occ` (nao necessariamente `board.occ_all`
-    /// -- usado pelo SEE para simular a troca a medida que remove
-    /// pecas). Ataques de peao usam a tabela do lado CONTRARIO (truque
-    /// classico: "que casas atacaria um peao preto aqui" = "que peoes
-    /// brancos atacam aqui", por simetria do padrao diagonal).
     /// Does the opponent have a threat that wins material outright?
     ///
     /// Not "is anything attacked" -- specifically a piece of ours attacked by
@@ -1669,9 +1695,21 @@ impl<'a> Searcher<'a> {
         false
     }
 
+    fn mvv_lva(&self, board: &Board, mv: &Move) -> i32 {
+        if !mv.is_capture() {
+            return 0;
+        }
+        let victim = board.piece_at(mv.to).map(|(pt, _)| pt.value()).unwrap_or(100); // en passant = peao
+        let attacker = board.piece_at(mv.from).map(|(pt, _)| pt.value()).unwrap_or(0);
+        victim * 16 - attacker
+    }
 
-
-
+    /// Todas as pecas (ambas as cores) que atacam `sq` dada uma
+    /// ocupacao HIPOTETICA `occ` (nao necessariamente `board.occ_all`
+    /// -- usado pelo SEE para simular a troca a medida que remove
+    /// pecas). Ataques de peao usam a tabela do lado CONTRARIO (truque
+    /// classico: "que casas atacaria um peao preto aqui" = "que peoes
+    /// brancos atacam aqui", por simetria do padrao diagonal).
 
 
 
@@ -2368,8 +2406,26 @@ impl<'a> Searcher<'a> {
             && ply >= 2
             && raw_static_eval > self.static_evals[ply - 2];
 
-        // Reverse futility pruning -- scaled by `improving` so we prune
-        // more when we're winning (position better than 2 plies ago).
+        // Reverse futility pruning -- the quadratic curve that measured a
+        // real win (+46 Elo, see the note this replaced), now with three
+        // contextual nudges added back on top of THAT curve rather than a
+        // different one.
+        //
+        // 2026-08-03: many strong engines modulate this margin by roughly
+        // this trio -- an opponent capture in the air, an opponent trend,
+        // continuation history -- and that is real evidence the idea earns
+        // its keep, not just that one engine happened to like it. The
+        // earlier attempt to test it here was not a fair test of the idea:
+        // it mixed a reference's base slope with THIS engine's old
+        // modulator constants (34/26/615), values nobody had tuned for that
+        // base, and lost. This time the modulators are reasoned from what
+        // this engine's own history actually produces (`hist_bonus_max` =
+        // 2121, `hist_malus_max` = -992), not copied from any reference:
+        // divisor 150 caps the history nudge around +/-14 at the extremes,
+        // small next to a depth-1 base of 65; the easy-capture bonus (15)
+        // and the worsening discount (12) are each roughly a fifth of that
+        // same base -- present, not dominant. A hypothesis with its own
+        // reasoning behind the numbers, to be measured on its own result.
         if !is_pv
             && !in_check
             && ply > 0
@@ -2377,20 +2433,7 @@ impl<'a> Searcher<'a> {
             && beta.abs() < MATE_SCORE - MAX_PLY as i32
         {
             let sp = search_params();
-            let mut margin = if improving { sp.rfp_improving.at(depth) } else { sp.rfp_not_improving.at(depth) };
-
-            // Three qualitative adjustments, replacing a flat margin.
-            //
-            // The margin answers "are we far enough ahead to skip this node
-            // without looking". A fixed number answers it from the evaluation
-            // alone, and the evaluation is exactly what does not know whether
-            // something is about to happen. Measured against a reference, its
-            // margins are modulated by all three of these and ours by none --
-            // and while every individual pruning mechanism here measured
-            // normal, the reference reaches two to three plies deeper on the
-            // same node budget. Depth like that does not come from one
-            // mechanism being broken; it comes from every decision being a
-            // little better informed.
+            let mut margin = sp.rfp_step * depth * depth / 2 - sp.rfp_step * depth / 2 + sp.rfp_base * depth;
 
             // The opponent has a piece of ours attacked by a cheaper piece.
             // Material is about to change hands and the static evaluation
@@ -2399,19 +2442,15 @@ impl<'a> Searcher<'a> {
                 margin += sp.rfp_opp_easy_capture * depth;
             }
 
-            // The opponent's position got worse over the last ply -- our
-            // evaluation now is better than the mirror of theirs a ply ago.
-            // Someone losing ground is less likely to have a refutation
-            // waiting, so lower the bar.
+            // The opponent's position got worse over the last ply. Someone
+            // losing ground is less likely to have a refutation waiting.
             if ply > 0 && self.static_evals[ply - 1] != 0
                 && raw_static_eval > -self.static_evals[ply - 1] + 1
             {
                 margin -= sp.rfp_opp_worsening;
             }
 
-            // The move that led here had a good history score. A move this
-            // search has repeatedly found useful is more likely to be part of
-            // something real, so the node earns a look.
+            // The move that led here had a good history score.
             if let Some((pt, to)) = self.ply_last_move[ply] {
                 let prev_hist = self.cont_hist_score(pt, to, ply);
                 margin += prev_hist / sp.rfp_hist_divisor.max(1);
@@ -2423,7 +2462,6 @@ impl<'a> Searcher<'a> {
                 return static_eval - margin;
             }
         }
-
         // Null-move pruning: se mesmo passando a vez ao adversario ainda
         // ficamos >= beta numa busca reduzida, a posicao e' tao boa que
         // podemos cortar ja'. Condicoes de seguranca:

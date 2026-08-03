@@ -20,9 +20,9 @@
 //! two paths did not land on 50%, and material set at runtime does not even
 //! reach the evaluation -- the precomputed contribution table is built once.
 
-use crate::eval::NUM_BUCKETS;
 
-pub const PSQT_MG: [[[i32; 64]; 6]; NUM_BUCKETS] = [
+
+pub const PSQT_MG: [[[i32; 64]; 6]; 8] = [
     [
         [
                 0,     0,     0,     0,     0,     0,     0,     0,
@@ -521,7 +521,7 @@ pub const PSQT_MG: [[[i32; 64]; 6]; NUM_BUCKETS] = [
     ]
 ];
 
-pub const PSQT_EG: [[[i32; 64]; 6]; NUM_BUCKETS] = [
+pub const PSQT_EG: [[[i32; 64]; 6]; 8] = [
     [
         [
                 0,     0,     0,     0,     0,     0,     0,     0,
