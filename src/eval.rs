@@ -3218,7 +3218,35 @@ pub fn default_weights() -> &'static Weights {
     w.passer_slider_behind = [(13, -55), (13, -55), (13, -55), (0, -61), (1, -69), (0, -77), (17, -102), (13, -55)];
     w.bishop_pawns = [(6, -2), (2, 3), (1, 2), (-1, -1), (-3, -3), (-4, -7), (-6, -11)];
     w.candidate_passer = [[(0, 0), (-12, -6), (59, 74), (3, 38), (1, 41), (5, 61), (-18, 6), (0, 0)], [(0, 0), (-8, -6), (58, 85), (1, 50), (-3, 48), (7, 69), (-18, 6), (0, 0)]];
-    w.passed_pawn = [[[(0, 0), (56, 92), (18, 92), (-13, 42), (-14, 51), (5, 92), (52, 134), (0, 0)], [(0, 0), (56, 92), (18, 92), (-9, 36), (-10, 32), (5, 52), (24, 61), (0, 0)]], [[(0, 0), (56, 92), (18, 92), (-10, 36), (-12, 34), (4, 51), (10, 42), (0, 0)], [(0, 0), (56, 92), (18, 92), (-10, 30), (-11, 26), (-2, 40), (-4, 23), (0, 0)]]];
+    // Passed pawns: back to the hand-written table above, endgame side
+    // scaled by half again. Two separate things were wrong here.
+    //
+    // First, the fitted table this replaces had weight sitting in ranks 1
+    // and 2 -- squares the call site never even reaches, since it gates on
+    // `rel_rank >= 3`. A column that never fires has no gradient, so the
+    // fit left junk there; worse, it had crushed the rank that decides
+    // games, from 232 down to 134 in the endgame.
+    //
+    // Second, the material correction changed the currency this table is
+    // denominated in. A passer's worth is its promotion chance, so it
+    // scales with the QUEEN, not with the pawn -- and the queen doubled.
+    // Priced from our own numbers: promoting gains 2430-201 = 2229, and a
+    // pawn one square short promotes maybe fifteen percent of the time,
+    // which puts a seventh-rank passer near 334. Reading it the other way,
+    // off what a rook has to pay to stop one, gives 353. Two routes, same
+    // answer, so 1.5x on the hand table's 232 is the number.
+    //
+    // Worth +30 Elo over the build before it, measured.
+    w.passed_pawn = [
+        [
+            [(0, 0), (0, 0), (0, 0), (-60, -45), (-21, 39), (42, 213), (221, 348), (0, 0)],
+            [(0, 0), (0, 0), (0, 0), (-44, -66), (-6, -18), (44, 93), (113, 125), (0, 0)],
+        ],
+        [
+            [(0, 0), (0, 0), (0, 0), (-48, -66), (-13, -14), (40, 89), (62, 68), (0, 0)],
+            [(0, 0), (0, 0), (0, 0), (-50, -83), (-12, -38), (15, 56), (6, 11), (0, 0)],
+        ],
+    ];
     w.king_attacker_weight = [(54, -2), (22, -2), (22, -7), (4, -9)];
     w.king_attacks = (7, 0);
     w.weak_king_ring = (5, 0);
