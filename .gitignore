@@ -1,8 +1,13 @@
 /target
 
-# Working journal and tuning artefacts: these name the external tools and
-# reference engines used to measure this engine, which do not belong in the
-# published repository. Kept on disk, out of version control.
+# Working journal and tuning artefacts. Kept on disk, out of version control:
+# they are scratch output of a measurement run, not part of the engine, and
+# they go stale the moment the next run starts.
+#
+# They used to be ignored for a second reason -- that they named the reference
+# engines used for measurement -- and that reason is void. Those names are now
+# in NOTICES.md on purpose: naming what you read is what makes an independent
+# implementation checkable, and hiding it achieved the opposite.
 NOTAS_PROXIMA_SESSAO.md
 dataset_*.epd
 tuned_*.txt

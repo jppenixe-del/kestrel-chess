@@ -95,6 +95,18 @@ Three things are easy to treat as "just data" and are not:
 Where this project introduces bucketed inputs or output buckets, the layouts are
 computed here from a stated rule, not transcribed.
 
+## Artwork
+
+The logo and the banner in `assets/` were generated with Google Gemini from
+prompts written for this project, and then assembled here.
+
+This is recorded for the same reason everything else on this page is: someone
+looking at the mark should be able to find out where it came from without
+having to ask. Google's terms place no attribution requirement on the images
+themselves, so this note is not a licence obligation being discharged. It is
+simply true, and a credits page that lists only the obligations is not a
+credits page.
+
 ## Reporting a problem
 
 If you believe anything here is inaccurate or that this project contains code
