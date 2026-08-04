@@ -2,7 +2,7 @@ use crate::attacks::{bishop_attacks, rook_attacks, Attacks};
 use crate::bitboard::{bb, Bitboard};
 use crate::board::Board;
 use crate::book::{encode_move, Book};
-use crate::eval::evaluate;
+use crate::evaluation::evaluate;
 use crate::movegen::generate_legal;
 use crate::moves::{Move, MoveFlag};
 use crate::tt::{Bound, TranspositionTable};
@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 /// env var replaces that with a reproducible single-binary comparison.
 static LMR_TABLE: OnceLock<[[i32; 64]; 64]> = OnceLock::new();
 
-/// Same reasoning as `eval::warmup`: build the search-side globals before
+/// Same reasoning as `evaluation::warmup`: build the search-side globals before
 /// the clock matters, not inside the first search.
 pub fn warmup() {
     let _ = lmr_table();
@@ -1937,7 +1937,7 @@ impl<'a> Searcher<'a> {
     }
 
     fn quiescence(&mut self, board: &mut Board, alpha: i32, beta: i32, ply: usize) -> i32 {
-        let stand_pat = crate::eval::evaluate_fast(board);
+        let stand_pat = crate::evaluation::evaluate_fast(board);
         self.quiescence_from(board, alpha, beta, ply, stand_pat)
     }
 
@@ -1949,7 +1949,7 @@ impl<'a> Searcher<'a> {
     /// search (negamax calls quiescence()/quiescence_from(), unchanged)
     /// -- purely additive, zero behavior change for the live engine.
     pub fn quiescence_leaf(&mut self, board: &mut Board, alpha: i32, beta: i32, ply: usize) -> (i32, Board) {
-        let stand_pat = crate::eval::evaluate_fast(board);
+        let stand_pat = crate::evaluation::evaluate_fast(board);
         self.quiescence_leaf_from(board, alpha, beta, ply, stand_pat)
     }
 
@@ -2194,7 +2194,7 @@ impl<'a> Searcher<'a> {
         // quiescence_from() already has the equivalent guard; negamax
         // didn't.
         if ply >= MAX_PLY - 1 {
-            return crate::eval::evaluate_fast(board);
+            return crate::evaluation::evaluate_fast(board);
         }
 
         let mut beta = beta;
@@ -2386,7 +2386,7 @@ impl<'a> Searcher<'a> {
         } else if let Some(e) = tt_entry_captured.filter(|e| e.static_eval != crate::tt::TT_EVAL_NONE) {
             e.static_eval as i32
         } else {
-            crate::eval::evaluate(board)
+            crate::evaluation::evaluate(board)
         };
         // Corrected version (see corr_hist) used for pruning-margin
         // decisions below; the raw value is what improving/static_evals
@@ -3650,7 +3650,7 @@ impl<'a> Searcher<'a> {
                         let mate_in = (MATE_SCORE - rs.abs() + 1) / 2;
                         format!("mate {}", if rs > 0 { mate_in } else { -mate_in })
                     } else {
-                        format!("cp {}", crate::eval::score_normalizado(rs))
+                        format!("cp {}", crate::evaluation::score_normalizado(rs))
                     };
                     // The same number as chances of winning, drawing, losing.
                     //
@@ -3661,7 +3661,7 @@ impl<'a> Searcher<'a> {
                     // ending and 60% in an opening, and a client deciding
                     // whether to offer a draw on centipawns is reading a ruler
                     // whose marks move. This is what it should read instead.
-                    let (w, d, l) = crate::eval::win_draw_loss(board, rs);
+                    let (w, d, l) = crate::evaluation::win_draw_loss(rs);
                     println!(
                         "info depth {} multipv 1 score {} wdl {} {} {} nodes {} nps {} time {} pv {}",
                         depth, score_str, w, d, l, self.nodes, nps, ms, pv_str.join(" ")

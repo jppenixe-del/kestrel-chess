@@ -19,33 +19,34 @@ pub fn perft(board: &mut Board, depth: u32, atk: &Attacks) -> u64 {
     nodes
 }
 
-/// Como perft(), mas em cada no' compara os acumuladores incrementais
-/// (mg_score/eg_score/phase, mantidos por add_piece/remove_piece) contra
-/// um recalculo do zero -- apanha qualquer divergencia (roque, en passant,
-/// promocao, promocao+captura) em vez de confiar so' na inspecao do
-/// codigo. Devolve o numero de nos visitados e o numero de discrepancias
-/// encontradas (deve ser sempre 0).
+/// Like perft(), but at every node it compares the network's incrementally
+/// updated accumulator against one rebuilt from scratch.
+///
+/// This is the test that catches a castling rook that was moved without
+/// telling the accumulator, an en-passant capture removed from the wrong
+/// square, or a promotion that added the pawn back instead of the queen. Those
+/// are exactly the bugs that never show up in a normal game until they decide
+/// one, because the evaluation stays plausible while being wrong.
+///
+/// It replaces the same check that used to guard the hand-written
+/// evaluation's incremental score. The evaluation changed; the class of bug
+/// did not.
 pub fn verify_incremental_eval(board: &mut Board, depth: u32, atk: &Attacks) -> (u64, u64) {
-    let mut fresh = board.clone();
-    fresh.recompute_eval_accumulators();
     let mut mismatches = 0u64;
-    // Os acumuladores por bucket entram na mesma rede: um erro de sinal ou
-    // uma casa esquecida num deles rebenta aqui, e nao numa partida.
-    for b in 0..crate::eval::NUM_BUCKETS {
-        if fresh.psqt_bucket[b] != board.psqt_bucket[b] {
+    if let (Some(net), Some(acc)) = (crate::nnue::rede(), board.acc.as_ref()) {
+        let fresco = crate::nnue::Accumulator::fresh(net, board);
+        if fresco.white != acc.white || fresco.black != acc.black {
             mismatches += 1;
-            eprintln!("MISMATCH BUCKET {} fen={} incremental={:?} fresh={:?}",
-                      b, board.to_fen(), board.psqt_bucket[b], fresh.psqt_bucket[b]);
-            break;
+            eprintln!("MISMATCH acumulador fen={}", board.to_fen());
         }
     }
-    if fresh.mg_score != board.mg_score || fresh.eg_score != board.eg_score || fresh.phase != board.phase {
+    if board.phase != {
+        let mut f = board.clone();
+        f.recompute_eval_accumulators();
+        f.phase
+    } {
         mismatches += 1;
-        eprintln!(
-            "MISMATCH fen={} incremental=({},{},{}) fresh=({},{},{})",
-            board.to_fen(), board.mg_score, board.eg_score, board.phase,
-            fresh.mg_score, fresh.eg_score, fresh.phase
-        );
+        eprintln!("MISMATCH fase fen={}", board.to_fen());
     }
     if depth == 0 {
         return (1, mismatches);

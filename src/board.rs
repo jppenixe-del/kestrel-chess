@@ -14,6 +14,15 @@ pub struct Board {
     pub occ_color: [Bitboard; 2],
     pub occ_all: Bitboard,
     pub side: Color,
+    /// The network's accumulator, carried with the position.
+    ///
+    /// Here rather than in the searcher because every path that changes a
+    /// piece already goes through `add_piece`/`remove_piece` -- putting it
+    /// anywhere else would mean finding and patching castling, en passant and
+    /// promotion separately, and one missed case is an evaluation that is
+    /// silently wrong only in rare positions. `None` until a network is
+    /// loaded, so the hand-written evaluation costs nothing for it.
+    pub acc: Option<Box<crate::nnue::Accumulator>>,
     pub castling: u8,
     pub ep_square: Square,
     pub halfmove: u32,
@@ -23,8 +32,6 @@ pub struct Board {
     // mantidos por add_piece()/remove_piece() em vez de recalculados do
     // zero a cada chamada a evaluate(). `phase` conta so' pecas maiores
     // (ver eval::PHASE_INC), nao inclui peoes.
-    pub mg_score: i32,
-    pub eg_score: i32,
     /// O mesmo, mas com as PSQT lidas do ponto de vista de "o rei desta cor
     /// esta' no flanco do rei". Indexado [cor][flanco].
     ///
@@ -33,14 +40,12 @@ pub struct Board {
     /// coluna e mudaria TODAS as pecas de uma vez, o que mataria o
     /// incremental. Mantendo as duas leituras sempre actualizadas, um lance de
     /// rei nao custa nada: e' so' passar a ler a outra.
-    pub psqt_por_flanco: [[(i32, i32); 2]; 2],
     /// Um acumulador por bucket de contagem de peoes. Mantidos os oito em
     /// paralelo: assim um lance que mude o bucket -- uma captura de peao --
     /// nao custa nada, e' so' passar a ler outro indice.
     ///
     /// O ciclo de oito e' desenrolado pelo compilador e os arrays cabem na
     /// cache L1; o custo medido esta' na nota do commit.
-    pub psqt_bucket: [(i32, i32); crate::eval::NUM_BUCKETS],
     pub phase: i32,
     // Mailbox O(1) -- piece_at() fazia uma varredura ate' 12 bitboards
     // (2 cores x 6 tipos) a cada chamada; era uma fatia real do tempo
@@ -58,8 +63,6 @@ pub struct Undo {
     // Snapshot inteiro (nao deltas) -- restaurar em unmake_move() e'
     // sempre correcto por construcao, sem precisar de reverter cada
     // captura/promocao/roque individualmente.
-    pub mg_score: i32,
-    pub eg_score: i32,
     pub phase: i32,
 }
 
@@ -134,20 +137,22 @@ impl Board {
             pieces,
             occ_color: [0, 0],
             occ_all: 0,
+            acc: None,
             side,
             castling,
             ep_square,
             halfmove,
             fullmove,
-            mg_score: 0,
-            eg_score: 0,
-            psqt_por_flanco: [[(0, 0); 2]; 2],
-            psqt_bucket: [(0, 0); crate::eval::NUM_BUCKETS],
             phase: 0,
             mailbox,
         };
         b.recompute_occ();
         b.recompute_eval_accumulators();
+        // Built once here, from the finished position. Every later change goes
+        // through add_piece/remove_piece and updates it a piece at a time.
+        if let Some(net) = crate::nnue::rede() {
+            b.acc = Some(Box::new(crate::nnue::Accumulator::fresh(net, &b)));
+        }
         b
     }
 
@@ -184,35 +189,19 @@ impl Board {
     /// add_piece()/remove_piece() mantem os campos correctos
     /// incrementalmente.
     pub fn recompute_eval_accumulators(&mut self) {
-        self.mg_score = 0;
-        self.eg_score = 0;
         self.phase = 0;
-        self.psqt_por_flanco = [[(0, 0); 2]; 2];
-        self.psqt_bucket = [(0, 0); crate::eval::NUM_BUCKETS];
         for c in [Color::White, Color::Black] {
             for pt in ALL_PIECES {
                 let mut bbp = self.pieces[c.idx()][pt.idx()];
                 while bbp != 0 {
                     let s = bbp.trailing_zeros() as Square;
                     bbp &= bbp - 1;
-                    let (mg, eg, ph) = crate::eval::piece_contribution(pt, c, s);
-                    self.mg_score += mg;
-                    self.eg_score += eg;
+                    let ph = pt.phase_inc();
                     self.phase += ph;
                     // Os acumuladores novos tem de ser preenchidos AQUI
                     // tambem, senao o recalculo do zero da' zeros e a
                     // verificacao acusa uma divergencia que nao existe --
                     // ou pior, deixa de acusar as que existem.
-                    for fl in 0..2 {
-                        let (m, e, _) = crate::eval::piece_contribution_flanco(pt, c, s, fl == 1);
-                        self.psqt_por_flanco[c.idx()][fl].0 += m;
-                        self.psqt_por_flanco[c.idx()][fl].1 += e;
-                    }
-                    for b in 0..crate::eval::NUM_BUCKETS {
-                        let (m, e, _) = crate::eval::piece_contribution_bucket(pt, c, s, b);
-                        self.psqt_bucket[b].0 += m;
-                        self.psqt_bucket[b].1 += e;
-                    }
                 }
             }
         }
@@ -264,27 +253,16 @@ impl Board {
         self.occ_color[c.idx()] &= !bb(s);
         self.occ_all &= !bb(s);
         self.mailbox[s as usize] = None;
-        let (mg, eg, ph) = crate::eval::piece_contribution(pt, c, s);
-        self.mg_score -= mg;
-        self.eg_score -= eg;
+        let ph = pt.phase_inc();
+        if let (Some(a), Some(net)) = (self.acc.as_mut(), crate::nnue::rede()) {
+            a.remove(net, c, pt, s);
+        }
         // Os acumuladores por flanco so' sao LIDOS com a feature `psqtmirror`
         // ligada (ver `material_pst_white`). Sem ela isto era trabalho morto
         // pago em cada peca colocada ou retirada, ou seja, em cada lance da
         // busca -- duas consultas de tabela por peca para um valor que
         // ninguem consultava. Sendo uma const de compilacao, com a feature
         // desligada o compilador apaga o bloco por inteiro.
-        if crate::eval::PSQT_ESPELHO_REI {
-            for fl in 0..2 {
-                let (m, e, _) = crate::eval::piece_contribution_flanco(pt, c, s, fl == 1);
-                self.psqt_por_flanco[c.idx()][fl].0 -= m;
-                self.psqt_por_flanco[c.idx()][fl].1 -= e;
-            }
-        }
-        for b in 0..crate::eval::NUM_BUCKETS {
-            let (m, e, _) = crate::eval::piece_contribution_bucket(pt, c, s, b);
-            self.psqt_bucket[b].0 -= m;
-            self.psqt_bucket[b].1 -= e;
-        }
         self.phase -= ph;
     }
     fn add_piece(&mut self, pt: PieceType, c: Color, s: Square) {
@@ -292,27 +270,16 @@ impl Board {
         self.occ_color[c.idx()] |= bb(s);
         self.occ_all |= bb(s);
         self.mailbox[s as usize] = Some((pt, c));
-        let (mg, eg, ph) = crate::eval::piece_contribution(pt, c, s);
-        self.mg_score += mg;
-        self.eg_score += eg;
+        let ph = pt.phase_inc();
+        if let (Some(a), Some(net)) = (self.acc.as_mut(), crate::nnue::rede()) {
+            a.add(net, c, pt, s);
+        }
         // Os acumuladores por flanco so' sao LIDOS com a feature `psqtmirror`
         // ligada (ver `material_pst_white`). Sem ela isto era trabalho morto
         // pago em cada peca colocada ou retirada, ou seja, em cada lance da
         // busca -- duas consultas de tabela por peca para um valor que
         // ninguem consultava. Sendo uma const de compilacao, com a feature
         // desligada o compilador apaga o bloco por inteiro.
-        if crate::eval::PSQT_ESPELHO_REI {
-            for fl in 0..2 {
-                let (m, e, _) = crate::eval::piece_contribution_flanco(pt, c, s, fl == 1);
-                self.psqt_por_flanco[c.idx()][fl].0 += m;
-                self.psqt_por_flanco[c.idx()][fl].1 += e;
-            }
-        }
-        for b in 0..crate::eval::NUM_BUCKETS {
-            let (m, e, _) = crate::eval::piece_contribution_bucket(pt, c, s, b);
-            self.psqt_bucket[b].0 += m;
-            self.psqt_bucket[b].1 += e;
-        }
         self.phase += ph;
     }
 
@@ -334,8 +301,6 @@ impl Board {
             castling: self.castling,
             ep_square: self.ep_square,
             halfmove: self.halfmove,
-            mg_score: self.mg_score,
-            eg_score: self.eg_score,
             phase: self.phase,
         };
 
@@ -408,7 +373,55 @@ impl Board {
         }
 
         self.side = them;
+        // A king that crossed a bucket boundary invalidates every feature for
+        // its own perspective: the same piece on the same square is a
+        // different input number now. Everything above updated the
+        // accumulator under the OLD bucket, so that perspective has to be
+        // rebuilt -- but from the cache, not from nothing. See CacheRefresh.
+        self.corrige_bucket();
         undo
+    }
+
+    /// Rebuild a perspective whose king changed bucket, through the cache.
+    ///
+    /// Cheap to call and cheap to skip: with an unbucketed network it returns
+    /// immediately, and with a bucketed one it does nothing unless a boundary
+    /// was actually crossed -- measured at 16.5% of all moves, which is why it
+    /// goes through the cache rather than rebuilding from the bias.
+    fn corrige_bucket(&mut self) {
+        let net = match crate::nnue::rede() {
+            Some(n) if n.buckets > 1 => n,
+            _ => return,
+        };
+        // Read everything the refresh needs BEFORE taking the accumulator,
+        // because the accumulator lives inside the same struct. Rust says so
+        // and it is right to: reading the board through a stale copy taken
+        // around a mutable borrow is how an accumulator ends up describing a
+        // position that no longer exists.
+        let pecas = self.pieces;
+        let rb = self.king_sq(Color::White);
+        let rp = self.king_sq(Color::Black);
+        let quer = [
+            crate::nnue::bucket_do_rei_de(self, Color::White),
+            crate::nnue::bucket_do_rei_de(self, Color::Black),
+        ];
+        let acc = match self.acc.as_mut() {
+            Some(a) => a,
+            None => return,
+        };
+        for cor in [Color::White, Color::Black] {
+            let quer = quer[cor.idx()];
+            if acc.bucket[cor.idx()] == quer {
+                continue;
+            }
+            acc.bucket[cor.idx()] = quer;
+            let destino: &mut [i16; crate::nnue::HIDDEN] = if cor == Color::White {
+                &mut acc.white
+            } else {
+                &mut acc.black
+            };
+            crate::nnue::com_cache(|c| c.refresca(net, pecas, rb, rp, cor, quer, destino));
+        }
     }
 
     /// Passa a vez ao adversario sem mover peca (para null-move pruning).
@@ -468,8 +481,6 @@ impl Board {
         // Restauro explicito (nao so' confiar nos remove/add_piece acima
         // se cancelarem exactamente): garante correccao mesmo que algum
         // caso futuro deixe de espelhar make_move perfeitamente.
-        self.mg_score = undo.mg_score;
-        self.eg_score = undo.eg_score;
         self.phase = undo.phase;
     }
 
