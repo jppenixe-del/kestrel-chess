@@ -188,7 +188,109 @@ def constroi_banner(falcao, W=1920, H=1080):
     return img
 
 
+def encontra_marca(a):
+    """Locate the generator's signature star, or return None.
+
+    Found rather than hard-coded, because every regenerated banner puts it
+    somewhere slightly different and a hand-measured coordinate silently stops
+    covering anything the moment the artwork changes -- leaving the mark in the
+    published image with the script still reporting success.
+
+    It is identified by being the one thing in that corner that is both bright
+    and colourless: the artwork there is either near-black or strongly orange,
+    so "light and neutral" picks out the star and nothing else.
+    """
+    alt, larg = a.shape[:2]
+    mx, mn = a.max(axis=2), a.min(axis=2)
+    alvo = (mx > 90) & ((mx - mn) < 30)
+    alvo[: int(alt * 0.6), :] = False        # so o terco de baixo
+    alvo[:, : int(larg * 0.6)] = False       # so a direita
+    ys, xs = np.nonzero(alvo)
+    if len(xs) < 40:
+        return None
+
+    # Trim to the compact cluster before measuring it. The lettering has white
+    # cores that also read as bright and neutral, and taken together with the
+    # star they gave a centre between the two and a radius of 247 pixels --
+    # a "mark" a quarter of the frame wide. The median survives that; the mean
+    # and the bounding box do not.
+    for _ in range(4):
+        mx_, my_ = np.median(xs), np.median(ys)
+        perto = (np.abs(xs - mx_) < 90) & (np.abs(ys - my_) < 90)
+        if perto.sum() < 40:
+            break
+        xs, ys = xs[perto], ys[perto]
+
+    raio = max(xs.max() - xs.min(), ys.max() - ys.min()) / 2
+    if raio > 120:
+        return None
+    return int(np.median(xs)), int(np.median(ys)), raio
+
+
+def apaga_marca(a, cx, cy, raio, desloca):
+    """Paint out a mark by borrowing texture from beside it.
+
+    The generator signs its work with a small star in a corner. Darkening it
+    would leave a smudge, because it sits on the chessboard texture rather than
+    on flat black, and the eye finds a missing square faster than it finds a
+    star. Copying the same image shifted sideways brings that texture with it,
+    so the board keeps running through where the mark was.
+
+    The weight goes to 1 well before the edge of the disc: feathering that
+    starts at the centre leaves the outline of what was removed, which is how
+    the first attempt still showed a ghost of the star.
+    """
+    yy, xx = np.mgrid[0:a.shape[0], 0:a.shape[1]]
+    dist = np.sqrt(((xx - cx) / raio) ** 2 + ((yy - cy) / raio) ** 2)
+    peso = np.clip((1.0 - dist) * 2.2, 0, 1)[:, :, None]
+    return a * (1 - peso) + np.roll(a, desloca, axis=1) * peso
+
+
+def retoca_banner(origem, W=1920, H=1080):
+    """Finish the generated banner: remove the signature, set the type.
+
+    The generator cannot spell -- an earlier version of this artwork came back
+    reading "writen in Rust" and "thrat features" -- so it is asked for the
+    picture only and the words are set here, where they can be corrected and
+    where they stay sharp at any size. The big KESTREL is left alone: there the
+    letters are artwork, not text.
+    """
+    a = np.asarray(Image.open(origem).convert("RGB")).astype(np.float32)
+    marca = encontra_marca(a)
+    if marca:
+        cx, cy, r = marca
+        print(f"  marca do gerador em ({cx}, {cy}), raio {r:.0f} -- apagada")
+        a = apaga_marca(a, cx, cy, raio=r * 2.4, desloca=130)
+    else:
+        print("  sem marca do gerador a apagar")
+
+    # A gentle lift of the dark under the type. Not to hide anything -- there
+    # is nothing left to hide -- but so the words sit on something quiet
+    # instead of on the middle of a chessboard.
+    y = np.arange(a.shape[0])[:, None, None].astype(np.float32)
+    a = a * (1 - np.clip((y - 850) / 260.0, 0, 1) ** 1.2 * 0.55)
+    img = Image.fromarray(a.astype(np.uint8)).convert("RGBA")
+
+    d = ImageDraw.Draw(img)
+    f1 = fonte(["Roboto-Regular"], 52)
+    f2 = fonte(["Roboto-Light", "Roboto-Regular"], 40)
+    for texto, f, cor, yy in [
+        ("A chess engine, written in Rust", f1, (238, 176, 100), 930),
+        ("Neural evaluation with threat features", f2, (156, 134, 110), 1010),
+    ]:
+        x = 1330 - largura(d, texto, f, 2) / 2
+        escreve(d, (x, yy), texto, f, cor, espaco=2)
+
+    # The source is 1.792 wide, not 1.778. Trim the width rather than the
+    # height: there is spare background at the sides and none under the bird.
+    novo_w = int(round(img.size[1] * 16 / 9))
+    corte = (img.size[0] - novo_w) // 2
+    img = img.crop((corte, 0, corte + novo_w, img.size[1]))
+    return img.resize((W, H), Image.LANCZOS).convert("RGB")
+
+
 def main():
+    banner_art = os.path.join(AQUI, "banner-source.webp")
     origem = sys.argv[1] if len(sys.argv) > 1 else os.path.join(AQUI, "falcon-source.webp")
     if not os.path.exists(origem):
         sys.exit(f"nao encontro a arte de origem: {origem}")
@@ -201,8 +303,15 @@ def main():
         constroi_logo(falcao, lado).save(os.path.join(AQUI, nome))
         print(f"{nome:<15} {lado}x{lado}")
 
-    constroi_banner(falcao).save(os.path.join(AQUI, "banner.png"))
-    print("banner.png      1920x1080")
+    # The generated banner wins when there is one. `constroi_banner` stays as
+    # the fallback that needs nothing but the bird, so the repository can
+    # still be rebuilt from the falcon alone.
+    if os.path.exists(banner_art):
+        retoca_banner(banner_art).save(os.path.join(AQUI, "banner.png"))
+        print("banner.png      1920x1080  (arte gerada, texto refeito)")
+    else:
+        constroi_banner(falcao).save(os.path.join(AQUI, "banner.png"))
+        print("banner.png      1920x1080  (composto a partir do falcao)")
 
 
 if __name__ == "__main__":
