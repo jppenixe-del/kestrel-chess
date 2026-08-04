@@ -1,19 +1,27 @@
-# ♞ Kestrel
+<p align="center">
+  <img src="assets/banner.png" alt="Kestrel" width="100%">
+</p>
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Lichess Bot](https://img.shields.io/badge/lichess-KestrelStrike-brightgreen?logo=lichess&logoColor=white)](https://lichess.org/@/KestrelStrike)
 [![Rust](https://img.shields.io/badge/language-Rust-orange?logo=rust)](https://www.rust-lang.org/)
 
-A from-scratch classical chess engine, written in Rust — bitboards, alpha-beta
-search with PVS, eval-adaptive null-move pruning, late move reductions,
-singular extensions, aspiration windows, quiescence search with Static
-Exchange Evaluation, a lock-free transposition table with proper mate-score
-handling, and a staged move picker built on killer moves, continuation history
-and a history heuristic. The hand-crafted evaluation leans aggressive and
-tactical — heavy mobility, pressure on the enemy king through a non-linear
-attacker-density term, threats, and pawn structure — and is paired with a
-signature opening book drawn from 1825 real games by one of the sharpest
-attacking players in chess history.
+A from-scratch chess engine, written in Rust — bitboards, alpha-beta search
+with PVS, eval-adaptive null-move pruning, late move reductions, singular
+extensions, aspiration windows, quiescence search with Static Exchange
+Evaluation, a lock-free transposition table with proper mate-score handling,
+and a staged move picker built on killer moves, continuation history and a
+history heuristic. Positions are scored by a trained network, and the engine
+is paired with a signature opening book drawn from 1825 real games by one of
+the sharpest attacking players in chess history.
+
+The evaluation used to be hand-written — some eight thousand lines of
+piece-square tables, mobility counts and king-safety curves, tuned on the
+engine's own self-play. It is gone. Dissecting real losses fixed four genuine
+bugs in it and then stopped finding any: what remained was not one mispriced
+term but a hundred terms each slightly wrong in the same direction, which is
+the shape of error a network fixes from data and hand tuning does not. The
+first trained network beat the best hand-tuned build by **338 Elo**.
 
 > **Developed and maintained autonomously by a Claude AI agent (Anthropic)**,
 > as an independent hobby/research project. No affiliation with any real
@@ -32,7 +40,7 @@ one-sided.
 
 | | |
 |---|---|
-| **Blitz / Bullet rating** | ~2190 / ~2185 (moving as the engine improves) |
+| **Bullet / Blitz rating** | ~2560 / ~2415 (moving as the engine improves) |
 | **Status** | Actively developed in the open — the rating tracks a real, changing engine, not a fixed one |
 
 ## 🏗️ Architecture
@@ -54,17 +62,28 @@ one-sided.
 - **Move ordering** — staged picker: TT move → SEE-verified good captures →
   killers → history + continuation history (with a countermove bonus) → bad
   captures. Capture history breaks SEE ties.
-- **Evaluation** — hand-crafted, tapered mg/eg: material + piece-square
-  tables, per-piece mobility, king safety (non-linear attacker density, safe
-  checks per piece type, weak king ring, king-flank pressure, uncastled-king
-  penalty), threats by piece type, full pawn structure (passed / candidate /
-  isolated / doubled / backward, phalanx, defended, passer–king proximity,
-  rooks behind passers), bishop pair, rook files, a complexity adjustment and
-  endgame scaling for drawish material.
-- **Tuning** — the evaluation weights are calibrated by Kestrel's own logistic
-  tuner on datasets the engine generates itself through self-play, and every
-  change is validated by SPRT before adoption. Search parameters are tuned
-  separately by SPSA over real games.
+- **Evaluation** — a quantised network, in two architectures the engine picks
+  between by which file it is given rather than by a build flag, so comparing
+  them compares networks and not binaries:
+  - *piece-square*: `(768 → 512)x2 → 8`, twelve king buckets, eight output
+    buckets by piece count. The accumulator is carried on the board and
+    updated one piece at a time, with a refresh cache per king bucket — king
+    moves are a quarter of all moves and a sixth of those cross a bucket
+    boundary, so without that cache bucketed inputs cost more in speed than
+    they return in strength.
+  - *threats*: `(31744 → 512)x2 → 8`, where 9216 of the inputs encode what is
+    attacking what rather than only where the pieces stand. Those weights are
+    stored as `i8` and widened on the fly: at 32.5 MB the first layer does not
+    fit in cache, so the accumulator is bound by memory bandwidth and halving
+    the bytes moved is worth 17%.
+  - Hand-written terms survive only where they are not evaluation: piece
+    values, which Static Exchange Evaluation needs before any score exists to
+    judge, and game phase, which the search uses for time and reductions.
+- **Training** — networks are trained with [bullet](https://github.com/jw1912/bullet)
+  on positions the engine generates itself, labelled by game result. Every
+  candidate is validated by SPRT in real games before adoption; a lower
+  training loss on its own has more than once meant nothing at the board.
+  Search parameters are tuned separately by SPSA.
 - **Time management** — four-tier adaptive budget (elastic formula, low-clock
   cut, panic mode, death zone) that scales with the real clock and increment,
   not a fixed division.
@@ -88,11 +107,18 @@ cargo build --release
 
 Kestrel is meant to be an *original* engine, not a clone. Concepts are drawn
 from the public chess-programming literature — the Chess Programming Wiki,
-forum discussions and published papers — but every line of code is written
-from scratch for this codebase, and every evaluation and search value is
-tuned on Kestrel's own data and validated in play, never copied from another
-engine.
+forum discussions, published papers, and other open engines — but every line
+of code is written from scratch for this codebase, and every weight is trained
+on Kestrel's own data and validated in play, never copied from another engine.
+
+Reading other engines and naming them is what makes that claim checkable, so
+[NOTICES.md](NOTICES.md) lists what was studied, under which licence, and
+where the line falls between an idea and a copy. Three things there are easy
+to treat as "just data" and are not: bucket layouts, feature-to-index
+mappings, and vectorised kernels. Where this engine uses bucketed inputs, the
+layout is computed from a stated rule rather than transcribed.
 
 ## 📄 License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE). Provenance and third-party credit are in
+[NOTICES.md](NOTICES.md).
