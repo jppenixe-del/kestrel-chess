@@ -1,0 +1,130 @@
+//! Position evaluation.
+//!
+//! Every score the search sees comes from the network. There is no
+//! hand-written term left: no piece-square tables, no mobility counts, no king
+//! safety curve, no tuned weight vector. That is a deliberate deletion, not an
+//! omission -- a day of measurement showed the remaining error in the
+//! hand-written evaluation was not any one mispriced term but a hundred terms
+//! each slightly wrong in the same direction, which is precisely the shape of
+//! error a network fixes from data and hand tuning does not.
+//!
+//! What stayed behind, and why it is not evaluation:
+//!
+//! - `PieceType::value()` in `types.rs` -- static exchange evaluation and move
+//!   ordering need to know a rook outranks a knight. That is a comparison of
+//!   pieces, not a judgement about a position, and it is used before any score
+//!   exists to judge.
+//! - `Board::phase` -- the search uses it for time and reduction decisions,
+//!   not to interpolate anything.
+//!
+//! The network is loaded from `KESTREL_NNUE`. With no network the engine
+//! cannot evaluate at all and says so loudly rather than quietly playing at
+//! random: there is no fallback evaluation to hide behind any more, and a
+//! silent zero would look like a drawn position from every square on the
+//! board.
+
+use crate::board::Board;
+
+/// Score for the side to move.
+pub fn evaluate(board: &Board) -> i32 {
+    // The threats network takes precedence when one is loaded. Chosen by which
+    // file the caller supplied rather than by a build flag, so comparing the
+    // two architectures compares two networks and not two binaries.
+    if let Some(net) = crate::nnue_threats::rede() {
+        return crate::nnue_threats::evaluate(net, board);
+    }
+    let net = match crate::nnue::rede() {
+        Some(n) => n,
+        None => {
+            sem_rede();
+            return 0;
+        }
+    };
+    match board.acc.as_ref() {
+        // The accumulator the position carries, kept up to date one piece at a
+        // time by make_move. Rebuilding it here would make every node pay for
+        // all thirty-two pieces -- measured, that is slower than the
+        // hand-written evaluation was by more than an order of magnitude.
+        Some(acc) => crate::nnue::evaluate(net, acc, board.side, crate::nnue::output_bucket(net, board)),
+        None => crate::nnue::evaluate_board(net, board),
+    }
+}
+
+/// The same score. Kept as a separate name because the search calls it from
+/// the paths where it used to matter that the evaluation was the cheap one --
+/// quiescence stand-pat and the pruning margins. With a network there is only
+/// one evaluation and it is already cheap, so the distinction is now a
+/// courtesy to the call sites rather than two different functions.
+#[inline]
+pub fn evaluate_fast(board: &Board) -> i32 {
+    evaluate(board)
+}
+
+/// Said once, on the first evaluation with no network loaded.
+///
+/// Loudly, and every path that could evaluate goes through here: an engine
+/// that returns zero for every position looks like it thinks the game is drawn
+/// rather than like it is broken, and that is the kind of failure that costs a
+/// session before anyone works out what happened.
+fn sem_rede() {
+    static AVISADO: std::sync::Once = std::sync::Once::new();
+    AVISADO.call_once(|| {
+        eprintln!(
+            "ERRO: nenhuma rede carregada. Define KESTREL_NNUE=<ficheiro.bin>. \
+             Sem rede o motor nao sabe avaliar nada."
+        );
+    });
+}
+
+/// Win/draw/loss estimate from a score, for the `wdl` field the UCI protocol
+/// reports.
+///
+/// A logistic on the score. The scale is the same one the network was trained
+/// against, which is what makes this meaningful rather than decorative: the
+/// training target was a win probability put through a sigmoid at this scale,
+/// so inverting it recovers the probability the network was actually fitted
+/// to.
+pub fn win_draw_loss(score: i32) -> (i32, i32, i32) {
+    const ESCALA: f64 = 400.0;
+    let w = 1.0 / (1.0 + (-(score as f64) / ESCALA).exp());
+    let l = 1.0 / (1.0 + ((score as f64) / ESCALA).exp());
+    // Draws are what is left. Modelling them separately needs a second fitted
+    // curve and the number is reported, not searched on.
+    let d = (1.0 - w - l).max(0.0);
+    let total = w + d + l;
+    (
+        (1000.0 * w / total).round() as i32,
+        (1000.0 * d / total).round() as i32,
+        (1000.0 * l / total).round() as i32,
+    )
+}
+
+/// The engine's internal score is already in centipawns, so this is the
+/// identity. Kept as a named function because the UCI layer calls it wherever
+/// a score crosses the protocol boundary: when the network's output scale is
+/// next changed, this is the one place that has to know.
+#[inline]
+pub fn score_normalizado(interno: i32) -> i32 {
+    interno
+}
+
+/// Build the globals before the first search rather than during it.
+///
+/// The attack tables and the network are both built lazily, and paying for
+/// them inside the first `go` shows up as a move that took most of a second to
+/// think about nothing. This is called once when the engine starts.
+pub fn warmup() {
+    let _ = atk();
+    let _ = crate::nnue::rede();
+}
+
+/// The attack tables, built once.
+///
+/// They live here rather than in the network module because move generation
+/// and the search need them too -- they are geometry, not evaluation, and they
+/// outlast every scoring scheme the engine has had.
+static ATTACKS: std::sync::OnceLock<crate::attacks::Attacks> = std::sync::OnceLock::new();
+
+pub fn atk() -> &'static crate::attacks::Attacks {
+    ATTACKS.get_or_init(crate::attacks::Attacks::new)
+}

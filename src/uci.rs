@@ -661,7 +661,7 @@ impl Engine {
         let zob = Zobrist::new();
         let style_book = crate::book::Book::load(&default_style_book_path()).ok();
         // Build every lazily-initialised global now, while no clock is
-        // running -- see eval::warmup().
+        // running -- see evaluation::warmup().
         // Profile before warm-up: warm-up evaluates a position, which seals
         // the lazily-built tables, so anything the profile sets has to be in
         // place first.
@@ -672,13 +672,7 @@ impl Engine {
             HEATMAP_PLIES.store(n, std::sync::atomic::Ordering::Relaxed);
             eprintln!("modo heatmap: sem busca, {} ply(s) de avaliacao estatica", n);
         }
-        if let Ok(path) = std::env::var("KESTREL_PROFILE") {
-            match crate::eval::load_profile(&path) {
-                Ok(n) => eprintln!("perfil: {} valores carregados de {}", n, path),
-                Err(e) => eprintln!("perfil: nao consegui ler {} -- {}", path, e),
-            }
-        }
-        crate::eval::warmup();
+        crate::evaluation::warmup();
         crate::search::warmup();
         Engine {
             board: Board::startpos(),
@@ -1051,7 +1045,7 @@ impl Engine {
                 let mut best_r: Option<(crate::moves::Move, i32)> = None;
                 for r in &his {
                     let u2 = self.board.make_move(r);
-                    let v = -crate::eval::evaluate(&self.board);
+                    let v = -crate::evaluation::evaluate(&self.board);
                     self.board.unmake_move(r, &u2);
                     if best_r.map_or(true, |(_, b)| v > b) {
                         best_r = Some((*r, v));
@@ -1094,7 +1088,7 @@ impl Engine {
                     // Threat-aware, at one ply of cost. The static value of
                     // our move, minus what he still threatens if we did not
                     // deal with it.
-                    let base = -crate::eval::evaluate(&self.board);
+                    let base = -crate::evaluation::evaluate(&self.board);
                     if threat_survives {
                         base.saturating_sub(idle.map_or(0, |i| (base - i).max(0)))
                     } else {
@@ -1107,7 +1101,7 @@ impl Engine {
                         // that throws the whole game away.
                         -terminal_value(&self.board, &self.atk)
                     } else {
-                        -crate::eval::evaluate(&self.board)
+                        -crate::evaluation::evaluate(&self.board)
                     }
                 } else {
                     let replies = crate::movegen::generate_legal(&mut self.board, &self.atk);
@@ -1125,7 +1119,7 @@ impl Engine {
                                 // stalemates us out of a won game.
                                 -terminal_value(&self.board, &self.atk)
                             } else {
-                                -crate::eval::evaluate(&self.board)
+                                -crate::evaluation::evaluate(&self.board)
                             };
                             self.board.unmake_move(r, &u2);
                             if v > his_best {
@@ -1357,7 +1351,7 @@ impl Engine {
                 let mate_in = ((MATE_SCORE - score.abs() + 1) / 2).max(1);
                 format!("mate {}", if score > 0 { mate_in } else { -mate_in })
             } else {
-                format!("cp {}", crate::eval::score_normalizado(score))
+                format!("cp {}", crate::evaluation::score_normalizado(score))
             };
             match best {
                 Some(mv) => {
@@ -1429,6 +1423,12 @@ impl Engine {
         });
         match final_move {
             Some(mv) => {
+                if std::env::var_os("KESTREL_CONTA_MEXIDAS").is_some() {
+                    let m = crate::nnue_threats::MEXIDAS.load(std::sync::atomic::Ordering::Relaxed);
+                    let c = crate::nnue_threats::CHAMADAS.load(std::sync::atomic::Ordering::Relaxed);
+                    eprintln!("mexidas por avaliacao: {:.1} ({} em {} chamadas)",
+                              m as f64 / c.max(1) as f64, m, c);
+                }
                 let _ = writeln!(out, "bestmove {}", mv.to_uci());
             }
             None => {
@@ -1753,30 +1753,6 @@ impl Engine {
                             n, d, lo, hi
                         );
                     }
-                    // The king-safety weights, by name. They are the largest
-                    // block in the evaluation and the only one the gradient
-                    // fit is structurally unable to move, so the only way to
-                    // calibrate them is a tuner that plays games -- and a
-                    // tuner cannot drive what the engine does not announce.
-                    {
-                        let w = crate::eval::default_weights();
-                        let v = w.to_vec();
-                        let names = w.field_names();
-                        for i in crate::eval::king_field_indices() {
-                            let d = v[i];
-                            let band = (d.abs()).max(10);
-                            let lo = if d < 0 { d - band } else { (d - band).max(0) };
-                            let _ = writeln!(
-                                out,
-                                "option name ev_{}_{} type spin default {} min {} max {}",
-                                // `field_names()` is SHORTER than `to_vec()`
-                                // (525 against 771) -- they have drifted apart.
-                                // The index is the identity; the name is a
-                                // convenience, so fall back rather than panic.
-                                names.get(i).copied().unwrap_or("w"), i, d, lo, d + band
-                            );
-                        }
-                    }
                     let _ = writeln!(out, "uciok");
                     let _ = out.flush();
                 }
@@ -1823,7 +1799,6 @@ impl Engine {
                         let idx = tokens[2].rsplit('_').next().and_then(|x| x.parse::<usize>().ok());
                         let val = tokens[4].parse::<i32>().ok();
                         match (idx, val) {
-                            (Some(i), Some(v)) if crate::eval::set_eval_index(i, v) => {}
                             _ => {
                                 let _ = writeln!(out, "info string unknown eval weight {}", tokens[2]);
                                 let _ = out.flush();
@@ -1853,11 +1828,6 @@ impl Engine {
                             // "is this one number right".
                             let fam = tokens[2].strip_prefix("scale_");
                             if !crate::search::set_param(tokens[2], v)
-                                && !crate::eval::set_material(tokens[2], v)
-                                && !fam.map_or(false, |f| crate::eval::set_family_scale(f, None, v))
-                                && !tokens[2]
-                                    .strip_prefix("psqt_")
-                                    .map_or(false, |p| crate::eval::set_psqt_scale(p, None, v))
                             {
                                 eprintln!("setoption: unknown parameter '{}'", tokens[2]);
                             }
@@ -1895,126 +1865,8 @@ impl Engine {
                     // ou fica-se com o dobro dele, que e' voltar ao ponto
                     // de partida disfarcado de resposta.
                     let b = &self.board;
-                    let seen = crate::eval::evaluate(b);
-                    let _ = writeln!(out, "{}", crate::eval::score_normalizado(seen));
-                }
-                "margins" => {
-                    // A tabela [5] do raiox, mas dentro da sessao UCI --
-                    // `raiox` corre num processo novo, sem nenhum
-                    // `setoption` anterior. Aqui le-se `search_params()`,
-                    // que reflecte PARAM_OVERRIDES, portanto:
-                    //   setoption name rfp_base value 85
-                    //   setoption name rfp_step value 7
-                    //   margins
-                    // mostra a curva JA com o override, sem recompilar
-                    // nem lancar um SPRT so' para ver o formato da curva.
-                    let sp = crate::search::search_params();
-                    let b = &self.board;
-                    let seen = crate::eval::evaluate(b);
-                    let _ = writeln!(out, "eval do lado a jogar {:>8}", seen);
-                    let _ = writeln!(out, "{:<4} {:>10} {:>12}", "prof", "RFP margem", "eval-RFP");
-                    for d in [1, 2, 3, 4, 6, 8] {
-                        let m = (sp.rfp_step * d * d / 2 - sp.rfp_step * d / 2 + sp.rfp_base * d).max(20);
-                        let _ = writeln!(out, "{:<4} {:>10} {:>12}", d, m, seen - m);
-                    }
-                }
-                "eval" | "evalbreak" => {
-                    // Robust breakdown via to_vec/from_vec index ranges (no
-                    // per-field typing). Contribution of a range = positional
-                    // with that range zeroed, subtracted from full positional.
-                    let b = &self.board;
-                    // The set this position's phase actually uses. Reading
-                    // default_weights() here reported numbers the engine was
-                    // not playing with the moment buckets arrived -- a
-                    // diagnostic that lies is worse than none.
-                    let full = crate::eval::weights_for(b);
-                    let mat = crate::eval::material_pst_white(b);
-                    let pos = crate::eval::positional_terms(b, full);
-                    let base = full.to_vec();
-                    let contrib = |lo: usize, hi: usize| -> i32 {
-                        let mut v = base.clone();
-                        for i in lo..hi.min(v.len()) { v[i] = 0; }
-                        pos - crate::eval::positional_terms(b, &full.from_vec(&v))
-                    };
-                    // to_vec order: pieces 0..16, mobility 16..240,
-                    // king(attackers/checks/shelter/storm) 240..276,
-                    // rest(threats+pawn-structure+passers) 276..end
-                    let pieces = contrib(0, 16);
-                    let mobility = contrib(16, 240);
-                    // King safety is not read off by zeroing a slice of the
-                    // weight vector any more: part of it lives outside that
-                    // vector, so a slice leaves inputs behind and the leftover
-                    // still feeds the danger curve. Silence the whole block
-                    // instead and take the difference, which is exact.
-                    let king = pos - crate::eval::positional_terms(b, &full.with_king_silenced());
-                    // Whatever the remaining ranges do not account for. Taken
-                    // as a remainder so the four numbers always add up to
-                    // `positional`, however the blocks are computed.
-                    let rest = pos - pieces - mobility - king;
-                    // The number the SEARCH sees, not the one the parts add
-                    // up to. `evaluate` applies the endgame scale and the
-                    // material-bucket correction on top of these components,
-                    // and reporting the sum without them made this command
-                    // disagree with the engine it is supposed to explain --
-                    // a diagnostic that lies is worse than no diagnostic.
-                    let seen = {
-                        let v = crate::eval::evaluate(b);
-                        if b.side == crate::types::Color::White { v } else { -v }
-                    };
-                    // O total sai normalizado (centipeoes comparaveis com
-                    // outros motores); o interno fica ao lado porque e' nele
-                    // que a busca e as margens de poda trabalham.
-                    let _ = writeln!(out, "eval(white) total={}cp  [interno={}]  bruto={}  material_pst={}  positional={}",
-                                     crate::eval::score_normalizado(seen), seen, mat + pos, mat, pos);
-                    let _ = writeln!(out, "  pieces={} mobility={} king={} threats+pawns={}", pieces, mobility, king, rest);
-                    // O CIRCUITO: cada etapa entre os termos crus e o numero
-                    // que a busca ve. Sem isto o comando mostra as pontas e
-                    // esconde onde o valor se perde -- e o valor perde-se
-                    // sempre no meio, nao nas pontas.
-                    {
-                        let w = crate::eval::weights_for(b);
-                        let bruto = mat + pos;
-                        let cx = crate::eval::complexity_adjustment(b, bruto, w);
-                        let apos_cx = bruto + cx;
-                        let escalado = crate::eval::scale_endgame(b, apos_cx, w);
-                        let corr = crate::eval::psqt_bucket_correction(b);
-                        let pct = |x: i32, base: i32| if base == 0 { 0.0 } else { 100.0 * x as f64 / base as f64 };
-                        let _ = writeln!(out, "  --- circuito (tudo em unidades INTERNAS) ---");
-                        let _ = writeln!(out, "    bruto (material+posicional)   {:>7}", bruto);
-                        let _ = writeln!(out, "    complexidade                  {:>7}   ({:+.1}%)", cx, pct(cx, bruto));
-                        let _ = writeln!(out, "    apos complexidade             {:>7}", apos_cx);
-                        let _ = writeln!(out, "    escala de final               {:>7}   ({:+.1}%)", escalado - apos_cx, pct(escalado - apos_cx, apos_cx));
-                        let _ = writeln!(out, "    correccao de bucket           {:>7}", corr);
-                        // A conta tem de FECHAR. Se nao fechar, ha uma etapa
-                        // que nao esta listada -- e uma etapa escondida e' onde
-                        // o valor se perde sem ninguem dar por ela.
-                        // A ULTIMA etapa, e a que nao estava em lado nenhum:
-                        // um factor por contagem de pecas aplicado DEPOIS de
-                        // tudo, ligado por omissao. Vale ate' 15% da avaliacao
-                        // inteira e nao aparecia em nenhum diagnostico.
-                        let antes_mb = escalado + corr;
-                        let previsto = if crate::eval::material_buckets_on() {
-                            crate::eval::material_bucket_scale(b, antes_mb)
-                        } else {
-                            antes_mb
-                        };
-                        let _ = writeln!(out, "    escala por material           {:>7}   ({:+.1}%){}",
-                                         previsto - antes_mb, pct(previsto - antes_mb, antes_mb),
-                                         if crate::eval::material_buckets_on() { "" } else { "  (desligado por defeito)" });
-                        let apos_pawn = crate::eval::strong_side_pawn_scale(b, previsto);
-                        let _ = writeln!(out, "    escala por peoes do lado forte {:>6}   ({:+.1}%)",
-                                         apos_pawn - previsto, pct(apos_pawn - previsto, previsto));
-                        let previsto = apos_pawn;
-                        let _ = writeln!(out, "    = previsto pela formula       {:>7}", previsto);
-                        let _ = writeln!(out, "    = o que a BUSCA ve            {:>7}", seen);
-                        if previsto != seen {
-                            let _ = writeln!(out, "    !! FUGA NAO EXPLICADA         {:>7}   <- falta uma etapa nesta lista", seen - previsto);
-                        }
-                        let _ = writeln!(out, "    reportado (cosmetico, /{:.2})  {:>7}cp",
-                                         if seen != 0 { seen as f64 / crate::eval::score_normalizado(seen).max(1) as f64 } else { 1.0 },
-                                         crate::eval::score_normalizado(seen));
-                    }
-                    let _ = out.flush();
+                    let seen = crate::evaluation::evaluate(b);
+                    let _ = writeln!(out, "{}", crate::evaluation::score_normalizado(seen));
                 }
                 "quit" => break,
                 _ => {}

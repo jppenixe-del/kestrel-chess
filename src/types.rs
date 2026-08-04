@@ -92,6 +92,22 @@ impl PieceType {
         }
     }
 
+    /// How much this piece contributes to the game phase.
+    ///
+    /// Not evaluation: nothing here judges a position. The search uses phase
+    /// to decide how long to think and how hard to reduce, and it survived the
+    /// removal of the hand-written evaluation for that reason. Pawns count for
+    /// nothing -- the phase is about how much material is left to manoeuvre
+    /// with, and a board full of pawns with no pieces is an endgame.
+    pub fn phase_inc(self) -> i32 {
+        match self {
+            PieceType::Pawn | PieceType::King => 0,
+            PieceType::Knight | PieceType::Bishop => 1,
+            PieceType::Rook => 2,
+            PieceType::Queen => 4,
+        }
+    }
+
     pub fn value(self) -> i32 {
         match self {
             PieceType::Pawn => 100,

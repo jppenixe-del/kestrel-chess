@@ -4,24 +4,12 @@ mod bitboard;
 mod board;
 mod book;
 mod endgame;
-mod eval;
-#[cfg(all(feature = "fitted", not(feature = "widekingzone"), not(feature = "fittedquiet"), not(feature = "fittedsf80"), not(feature = "fittedciclo")))]
-pub mod fitted;
-mod fitted_psqt_b8;
-#[cfg(all(feature = "fitted", feature = "fittedciclo"))]
-#[path = "fitted_ciclo.rs"]
-pub mod fitted;
-#[cfg(all(feature = "fitted", feature = "fittedsf80"))]
-#[path = "fitted_sf80.rs"]
-pub mod fitted;
-#[cfg(all(feature = "fitted", feature = "fittedquiet"))]
-#[path = "fitted_quiet.rs"]
-pub mod fitted;
-#[cfg(all(feature = "fitted", feature = "widekingzone"))]
-#[path = "fitted_wkz.rs"]
-pub mod fitted;
 mod magic;
 mod movegen;
+mod nnue;
+mod features;
+mod nnue_threats;
+mod evaluation;
 mod moves;
 mod perft;
 mod search;
@@ -138,26 +126,6 @@ fn main() {
         lookup_book(&args[2], &args[3..].join(" "));
         return;
     }
-    if args.len() >= 2 && args[1] == "defaults" {
-        // What is already in the binary before any profile is read. Printed
-        // rather than documented by hand, because a hand-written list of
-        // compiled-in values is a list that goes stale silently -- and the
-        // whole point is that nobody should have to guess what the baseline
-        // is.
-        println!("# Valores JA COMPILADOS no binario (o baseline chama-se V3).");
-        println!("# Omitir uma chave preserva estes valores. Declarar 1000 APAGA-OS.");
-        println!("#");
-        for (i, f) in ["mobility", "king", "threats", "pawns", "pieces", "tempo"].iter().enumerate() {
-            println!("scale.{} {}", f, eval::FAMILY_DEFAULTS[i]);
-        }
-        for (i, p) in ["pawn", "knight", "bishop", "rook", "queen", "king"].iter().enumerate() {
-            println!("psqt_scale.{} {}", p, eval::PSQT_DEFAULTS[i]);
-        }
-        println!("#");
-        println!("# As tabelas PSQT tambem sao as do V3 -- ver `dumpmatpst`.");
-        println!("# Buckets: {} (por contagem de peoes)", eval::NUM_BUCKETS);
-        return;
-    }
     // SPSA config for an external tuning harness (OpenBench's format), the
     // same thing a reference engine's own search-params file does -- it
     // does not run its own SPSA either, it exports "name, int, default,
@@ -168,73 +136,9 @@ fn main() {
     // reusing the exact min/max band the UCI option listing already uses
     // (see the `option name ... type spin` loop) so the two never disagree
     // about a parameter's legal range.
-    if args.len() >= 2 && args[1] == "openbench" {
-        for (n, d) in crate::search::PARAM_NAMES
-            .iter()
-            .zip(crate::search::SearchParams::default().to_vec())
-        {
-            let band = d.abs().max(10);
-            let lo = if d < 0 { d - band } else { (d - band).max(0) };
-            let hi = d + band;
-            // Common OpenBench convention: step is a fraction of the
-            // range, not the raw band -- small enough that SPSA takes
-            // several steps to cross the interval instead of one.
-            let step = (band / 10).max(1);
-            println!("{}, int, {}, {}, {}, {}, 0.002", n, d, lo, hi, step);
-        }
-        return;
-    }
     // List the feature switches and what they cost, so "which of the 74 is
     // paying for this" has an answer that does not require reading eval.rs.
-    if args.len() >= 2 && args[1] == "features" {
-        let w = eval::default_weights();
-        let v = w.to_vec();
-        let nomes = w.field_names();
-        let fams = w.field_families();
-        let mut por_campo: Vec<(&str, &str, usize, bool, i64)> = Vec::new();
-        for (i, n) in nomes.iter().enumerate() {
-            match por_campo.last_mut() {
-                Some(e) if e.0 == *n => { e.2 += 1; e.4 += v[i].abs() as i64; }
-                _ => por_campo.push((n, fams[i], 1, eval::feature_on(n), v[i].abs() as i64)),
-            }
-        }
-        let (mut on, mut off) = (0usize, 0usize);
-        for (_, _, d, lig, _) in &por_campo { if *lig { on += d } else { off += d } }
-        println!("{:<28} {:<11} {:>5} {:>6}  {}", "campo", "familia", "pesos", "|soma|", "estado");
-        println!("{}", "-".repeat(66));
-        for grupo in [true, false] {
-            for (n, f, d, lig, mag) in &por_campo {
-                if *lig == grupo {
-                    println!("{:<28} {:<11} {:>5} {:>6}  {}", n, f, d, mag,
-                             if *lig { "ON" } else { "off" });
-                }
-            }
-            println!();
-        }
-        println!("{} ligados / {} desligados de {} escalares posicionais", on, off, v.len());
-        println!("material e PSQT estao sempre ligados (nao estao neste vector)");
-        println!("KESTREL_FEATURES=+nome,-nome  |  all  |  base  |  none");
-        return;
-    }
 
-    if args.len() >= 2 && args[1] == "checkweights" {
-        check_weights_roundtrip();
-        return;
-    }
-    if args.len() >= 2 && args[1] == "checkmatpst" {
-        check_matpst_features();
-        return;
-    }
-    if args.len() >= 3 && args[1] == "dumpweights" {
-        // Current tunable weights, comma separated -- the starting point for
-        // an external tuner, so a fit begins from what the engine already
-        // believes rather than from nothing.
-        let v = eval::default_weights().to_vec();
-        let text: Vec<String> = v.iter().map(|x| x.to_string()).collect();
-        std::fs::write(&args[2], text.join(",")).expect("nao consegui escrever");
-        println!("wrote {} weights to {}", v.len(), args[2]);
-        return;
-    }
     // The full starting vector, in exactly the layout the extractor emits.
     //
     // Two tuning runs were lost to this. The positional block came from
@@ -249,207 +153,6 @@ fn main() {
     //   dim positional | MAT_PST_DIM material and PST | 1 bias
     // per bucket. If the file and the .bin come from the same executable they
     // cannot disagree.
-    if args.len() >= 3 && args[1] == "initvec" {
-        let b = board::Board::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
-        let w = eval::weights_for(&b);
-        let pos = w.to_vec();
-        let mat = eval::material_pst_current_vec();
-        assert_eq!(mat.len(), eval::MAT_PST_DIM, "material/PST block is the wrong width");
-        let mut out: Vec<i32> = Vec::with_capacity((pos.len() + mat.len() + 1) * eval::NUM_BUCKETS);
-        for _ in 0..eval::NUM_BUCKETS {
-            out.extend_from_slice(&pos);
-            out.extend_from_slice(&mat);
-            out.push(0); // bias
-        }
-        let text: Vec<String> = out.iter().map(|x| x.to_string()).collect();
-        std::fs::write(&args[2], text.join(",")).expect("nao consegui escrever");
-        let off = w.field_names().iter().filter(|n| !eval::feature_on(n)).count();
-        println!("wrote {} values to {} ({} buckets x [{} positional | {} mat/PST | 1 bias])",
-                 out.len(), args[2], eval::NUM_BUCKETS, pos.len(), mat.len());
-        println!("  {} positional weights are switched off and are zero here", off);
-        return;
-    }
-    if args.len() >= 3 && args[1] == "dumpmatpst" {
-        // Current material and piece-square values, in the order the
-        // extractor emits their features.
-        let v = eval::material_pst_current_vec();
-        let text: Vec<String> = v.iter().map(|x| x.to_string()).collect();
-        std::fs::write(&args[2], text.join(",")).expect("nao consegui escrever");
-        println!("wrote {} material/PST values to {}", v.len(), args[2]);
-        return;
-    }
-    if args.len() >= 3 && args[1] == "flatbuckets" {
-        // Per-bucket weights for flat mode: each bucket gets the value the
-        // taper would produce in the MIDDLE of that bucket's phase range.
-        //
-        // That makes the flat model start as a staircase approximation of the
-        // line it replaces -- same evaluation to within the width of a step,
-        // so switching modes is not itself a strength change. What it buys is
-        // that the eight steps are then free to move independently, which a
-        // line cannot do. Starting anywhere else would confuse "buckets are
-        // better" with "these particular numbers are better".
-        let base = eval::default_weights().to_vec();
-        let n = base.len() / 2;
-        let mut out: Vec<i32> = Vec::with_capacity(base.len() * eval::NUM_BUCKETS);
-        for b in 0..eval::NUM_BUCKETS {
-            // Bucket 0 is the opening, so its phase is high. Take the middle
-            // of the bucket, in the same units the taper uses.
-            let frac = (b as f64 + 0.5) / eval::NUM_BUCKETS as f64;   // 0 = opening
-            let phase = ((1.0 - frac) * eval::MAX_PHASE_PUB as f64).round() as i32;
-            for i in 0..n {
-                let (mg, eg) = (base[2 * i], base[2 * i + 1]);
-                let v = (mg * phase + eg * (eval::MAX_PHASE_PUB - phase)) / eval::MAX_PHASE_PUB;
-                // Flat mode reads the first of each pair; the second is never
-                // consulted, but is written equal so the file stays readable
-                // by anything that still expects pairs.
-                out.push(v);
-                out.push(v);
-            }
-        }
-        let text: Vec<String> = out.iter().map(|x| x.to_string()).collect();
-        std::fs::write(&args[2], text.join(",")).expect("nao consegui escrever");
-        println!("wrote {} values ({} buckets x {}) to {}", out.len(), eval::NUM_BUCKETS, base.len(), args[2]);
-        return;
-    }
-    if args.len() >= 3 && args[1] == "wdl" {
-        // wdl "<fen>" [eval_cp ...] -- the win/draw/loss curve for a position.
-        //
-        // A diagnostic for the unit itself, not for a position. The evaluation's
-        // centipawn is not a fixed quantity: the scale that turns it into a
-        // score runs from 433 with three pawns on the board to 1564 with a full
-        // one, fitted on 220,000 real results. Printing the curve is how anyone
-        // checks that claim without taking it on trust.
-        let fen = args[2].clone();
-        let board = Board::from_fen(&fen);
-        let evals: Vec<i32> = if args.len() > 3 {
-            args[3..].iter().filter_map(|a| a.parse().ok()).collect()
-        } else {
-            vec![-1600, -800, -400, -200, -100, -50, 0, 50, 100, 200, 400, 800, 1600]
-        };
-        println!("bucket {} ({} peoes)", eval::bucket_of(&board),
-                 (board.pieces[0][0] | board.pieces[1][0]).count_ones());
-        println!("{:>8}  {:>6} {:>6} {:>6}   {:>7}", "eval", "vit", "emp", "der", "score");
-        for e in evals {
-            let (w, d, l) = eval::win_draw_loss(&board, e);
-            println!("{:>8}  {:>6} {:>6} {:>6}   {:>6.1}%", e, w, d, l,
-                     (w as f64 + d as f64 / 2.0) / 10.0);
-        }
-        return;
-    }
-    if args.len() >= 2 && args[1] == "searchparams" {
-        // Name and value of every search parameter, in the order to_vec writes
-        // them. Without this a sweep has to count offsets by hand against the
-        // Default impl, which is how a whole afternoon of parameter work was
-        // silently applied to the wrong fields once already.
-        //
-        // With an argument, multiplies the parameters carried in EVALUATION
-        // units by that factor, in per mille, and prints the vector ready for
-        // KESTREL_SEARCH_PARAMS. Those margins are compared against scores, so
-        // when the evaluation's scale changes they stop meaning what they were
-        // calibrated to mean -- and the fitted weight set evaluates 1.45x
-        // louder than the set it replaced.
-        let v = search::SearchParams::default().to_vec();
-        let scale: i32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1000);
-        // No argument lists names and values; ANY argument prints the vector,
-        // 1000 included -- a scale of 1000 is the identity and is exactly what
-        // the baseline side of an A/B needs, so that both engines take the same
-        // code path and the comparison is the parameters and nothing else.
-        if args.get(2).is_none() {
-            for (n, x) in search::PARAM_NAMES.iter().zip(v.iter()) {
-                let unit = if search::param_in_eval_units(n) { "  [eval units]" } else { "" };
-                println!("{:34} {}{}", n, x, unit);
-            }
-            return;
-        }
-        let out: Vec<String> = search::PARAM_NAMES
-            .iter()
-            .zip(v.iter())
-            .map(|(n, x)| {
-                if search::param_in_eval_units(n) { (*x as i64 * scale as i64 / 1000).to_string() }
-                else { x.to_string() }
-            })
-            .collect();
-        println!("{}", out.join(","));
-        return;
-    }
-    if args.len() >= 3 && args[1] == "tunestart" {
-        // The engine's own weights, laid out exactly as `gpuextract` lays out
-        // its features: per bucket, the positional block, then material and
-        // piece-square, then the bias.
-        //
-        // A fit needs this as its starting point, and the first one did not
-        // have it: started from zeros, it produced a pawn worth 330 in the
-        // opening and 69 in the endgame -- chess upside down, and the known
-        // signature of Material and PSQT being collinear. On the blunder suite
-        // the result cost sixteen positions against the weights it replaced.
-        //
-        // Started from here instead, epoch zero IS the current engine, so a
-        // fit that finds nothing changes nothing, and every move away from it
-        // is a move the data paid for.
-        let dim = eval::default_weights().to_vec().len();
-        let mat = eval::material_pst_current_vec();
-        let mut out: Vec<i32> = Vec::with_capacity((dim + mat.len() + 1) * eval::NUM_BUCKETS);
-        for b in 0..eval::NUM_BUCKETS {
-            out.extend(eval::effective_weights_for_bucket(b).to_vec());
-            out.extend(mat.iter().copied());
-            out.push(1); // the bias feature is the term itself, at weight one
-        }
-        let text: Vec<String> = out.iter().map(|x| x.to_string()).collect();
-        std::fs::write(&args[2], text.join(",")).expect("nao consegui escrever");
-        println!(
-            "wrote {} values ({} buckets x {} = {} positional + {} material/PST + 1 bias) to {}",
-            out.len(), eval::NUM_BUCKETS, dim + mat.len() + 1, dim, mat.len(), args[2]
-        );
-        return;
-    }
-    if args.len() >= 3 && args[1] == "evaltrace" {
-        // Which evaluation terms fired in this position, and by how much.
-        //
-        // The breakdown command answers "how much came from king safety";
-        // this answers "which weights actually did anything here". Same
-        // probing the feature extractor uses: set one weight, evaluate,
-        // subtract. A term with a zero feature never applied to this
-        // position at all -- which is the first thing worth knowing when a
-        // game was lost and the question is where the evaluation went wrong.
-        //
-        // Contributions are the feature times the weight in force, so the
-        // list is in centipawns of actual effect, not in units of anything.
-        let fen = args[2..].join(" ");
-        let board = Board::from_fen(&fen);
-        let default = eval::default_weights().clone();
-        let base_vec = default.to_vec();
-        let dim = base_vec.len();
-        let mut probe = vec![0i32; dim];
-        let w_zero = default.from_vec(&probe);
-        let zero_base = eval::positional_terms(&board, &w_zero);
-        let mult = 10 * eval::MAX_PHASE_PUB;
-
-        let mut fired: Vec<(usize, i32, f64)> = Vec::new();
-        for i in 0..dim {
-            probe[i] = mult;
-            let w = default.from_vec(&probe);
-            let v = eval::positional_terms(&board, &w) - zero_base;
-            probe[i] = 0;
-            if v != 0 {
-                let contrib = base_vec[i] as f64 * v as f64 / mult as f64;
-                fired.push((i, base_vec[i], contrib));
-            }
-        }
-        fired.sort_by(|a, b| b.2.abs().partial_cmp(&a.2.abs()).unwrap());
-        println!("position: {}", fen);
-        println!("{} of {} weights fired here", fired.len(), dim);
-        println!("{:>6}  {:>8}  {:>10}", "index", "weight", "cp");
-        for (i, w, c) in fired.iter().take(40) {
-            println!("{:>6}  {:>8}  {:>10.1}", i, w, c);
-        }
-        let total: f64 = fired.iter().map(|(_, _, c)| c).sum();
-        println!("sum of fired contributions: {:.1} cp (white's point of view)", total);
-        return;
-    }
-    if args.len() >= 3 && args[1] == "linprobe" {
-        linearity_probe(&args[2]);
-        return;
-    }
     // Converte o formato .data2 (registos de 112 bytes com BITBOARDS e
     // rotulos de um motor forte) para o `FEN<TAB>resultado` que o gpuextract le.
     //
@@ -487,147 +190,6 @@ fn main() {
     // sobrepoem a eles, a interpolacao, e o que sobra no fim.
     //
     //   raiox "<fen>"
-    if args.len() >= 2 && args[1] == "kingcurve" {
-        let (lin, quad) = eval::king_curve_params_pub();
-        println!("{} {}", lin, quad);
-        return;
-    }
-    if args.len() >= 2 && args[1] == "kingidx" {
-        // Os indices achatados do bloco do rei, para o afinador saber quais
-        // as colunas que tem de passar pela curva em vez de somar direito.
-        let idx = eval::king_field_indices();
-        println!("{}", idx.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(" "));
-        return;
-    }
-    if args.len() >= 3 && args[1] == "kinglin" {
-        kinglin(&args[2..].join(" "));
-        return;
-    }
-    if args.len() >= 3 && args[1] == "raiox" {
-        let fen = args[2..].join(" ");
-        let b = board::Board::from_fen(&fen);
-        let atk = attacks::Attacks::new();
-        let w = eval::weights_for(&b);
-        let bucket = eval::bucket_of(&b);
-        let fase = b.phase.min(24);
-        let nomes = ["peao", "cavalo", "bispo", "torre", "dama", "rei"];
-
-        println!("FEN  {}", fen);
-        println!("{}", "=".repeat(78));
-        println!("  a jogar {}   bucket {} (peoes)   fase {}/24   xeque {}",
-                 if b.side == types::Color::White { "brancas" } else { "pretas" },
-                 bucket, fase, b.in_check(b.side, &atk));
-
-        // ---------- 1. material e PSQT ----------
-        println!("\n  [1] MATERIAL + PSQT   (perspectiva das brancas)");
-        println!("      {:<8} {:>3} {:>3} {:>9} {:>9} {:>10}", "peca", "B", "P", "mg", "eg", "interp");
-        let (mut tmg, mut teg) = (0i32, 0i32);
-        for pt in 0..6 {
-            let (mut mg, mut eg) = (0i32, 0i32);
-            for c in 0..2 {
-                let mut bb = b.pieces[c][pt];
-                while bb != 0 {
-                    let sq = bb.trailing_zeros() as u8;
-                    bb &= bb - 1;
-                    let cor = if c == 0 { types::Color::White } else { types::Color::Black };
-                    let (m, e, _) = eval::piece_contribution(types::ALL_PIECES[pt], cor, sq);
-                    mg += m; eg += e;
-                }
-            }
-            tmg += mg; teg += eg;
-            if mg != 0 || eg != 0 {
-                println!("      {:<8} {:>3} {:>3} {:>9} {:>9} {:>10}", nomes[pt],
-                         b.pieces[0][pt].count_ones(), b.pieces[1][pt].count_ones(),
-                         mg, eg, (mg * fase + eg * (24 - fase)) / 24);
-            }
-        }
-        let mat = eval::material_pst_white(&b);
-        println!("      {:<8} {:>7} {:>9} {:>9} {:>10}  <- material_pst", "SOMA", "", tmg, teg, mat);
-
-        // ---------- 2. posicional, termo a termo ----------
-        let base = eval::positional_terms(&b, w);
-        let v = w.to_vec();
-        let nomes_campo = w.field_names();
-        let fams = w.field_families();
-        let mut vistos: Vec<&str> = Vec::new();
-        for n in nomes_campo.iter() { if !vistos.contains(n) { vistos.push(n); } }
-        let mut linhas: Vec<(i32, &str, &str)> = Vec::new();
-        for nome in vistos.iter() {
-            let mut vz = v.clone();
-            let mut fam = "";
-            for (k, nm) in nomes_campo.iter().enumerate() {
-                if nm == nome && k < vz.len() { vz[k] = 0; fam = fams[k]; }
-            }
-            let d = base - eval::positional_terms(&b, &w.from_vec(&vz));
-            if d != 0 { linhas.push((d, nome, fam)); }
-        }
-        linhas.sort_by_key(|(d, _, _)| -(d.abs()));
-        println!("\n  [2] POSICIONAL, TERMO A TERMO   (so' os que nao sao zero, por magnitude)");
-        for (d, nome, fam) in linhas.iter() {
-            println!("      {:<28} {:>7}   [{}]", nome, d, fam);
-        }
-        let soma: i32 = linhas.iter().map(|(d, _, _)| d).sum();
-        // Verificacao da propria ferramenta: se from_vec(to_vec(w)) nao for w,
-        // a sondagem parte de uma base errada e tudo o que ela diz e' invencao.
-        let ida_volta = eval::positional_terms(&b, &w.from_vec(&v));
-        if ida_volta != base {
-            println!("      !! from_vec(to_vec(w)) da {} em vez de {} -- a sondagem NAO e' de confianca",
-                     ida_volta, base);
-        }
-        let zero = eval::positional_terms(&b, &w.from_vec(&vec![0i32; v.len()]));
-        println!("      {:<28} {:>7}", "SOMA DOS TERMOS", soma);
-        println!("      {:<28} {:>7}   <- com TODOS os pesos a zero", "residuo sem pesos", zero);
-        println!("      {:<28} {:>7}   (nao-linearidade: {})", "TOTAL POSICIONAL", base, base - soma - zero);
-
-        // ---------- 3. multiplicadores ----------
-        println!("\n  [3] MULTIPLICADORES SOBRE OS TERMOS   (por-mil, 1000 = identidade)");
-        for f in ["mobility", "king", "threats", "pawns", "pieces", "tempo"] {
-            let e = eval::escala_familia(f, bucket);
-            println!("      familia {:<10} {:>5}{}", f, e, if e != 1000 { "   <- activo" } else { "" });
-        }
-        for pt in 0..6 {
-            let e = eval::escala_psqt(pt, bucket);
-            if e != 1000 { println!("      psqt {:<13} {:>5}   <- activo", nomes[pt], e); }
-        }
-
-        // ---------- 4. a cadeia, passo a passo ----------
-        println!("\n  [4] CADEIA ATE' AO NUMERO FINAL");
-        let pos_sig = eval::positional_terms_signed(&b);
-        let bruto = mat + pos_sig;
-        println!("      material_pst                     {:>8}", mat);
-        println!("      positional (com sinal do lado)   {:>8}", pos_sig);
-        println!("      = bruto                          {:>8}", bruto);
-        let cx = eval::complexity_adjustment(&b, bruto, w);
-        println!("      + complexity_adjustment          {:>8}   -> {}", cx, bruto + cx);
-        let esc = eval::scale_endgame(&b, bruto + cx, w);
-        println!("      x scale_endgame                  {:>8}   -> {}", esc - (bruto + cx), esc);
-        let pbc = eval::psqt_bucket_correction(&b);
-        println!("      + psqt_bucket_correction         {:>8}   -> {}", pbc, esc + pbc);
-        let mbs = if eval::material_buckets_on() { eval::material_bucket_scale(&b, esc + pbc) } else { esc + pbc };
-        println!("      x material_bucket_scale          {:>8}   -> {}{}", mbs - (esc + pbc), mbs,
-                 if eval::material_buckets_on() { "" } else { "   (desligado por defeito)" });
-        let sps = eval::strong_side_pawn_scale(&b, mbs);
-        println!("      x escala por peoes do lado forte {:>8}   -> {}", sps - mbs, sps);
-        let interno = { let e = eval::evaluate(&b); if b.side == types::Color::White { e } else { -e } };
-        println!("      INTERNO FINAL                    {:>8}{}", interno,
-                 if interno != sps { "   (resta o tempo/rule50)" } else { "" });
-        println!("      REPORTADO                        {:>8} cp   (identidade -- ver score_normalizado)",
-                 eval::score_normalizado(interno));
-
-        // ---------- 5. o que a busca faz com este numero ----------
-        println!("\n  [5] O QUE AS MARGENS DA BUSCA FAZEM COM ISTO");
-        let stm = if b.side == types::Color::White { interno } else { -interno };
-        println!("      eval do lado a jogar             {:>8}", stm);
-        let sp = search::search_params();
-        println!("      {:<4} {:>10} {:>12}", "prof", "RFP margem", "eval-RFP");
-        for d in [1, 2, 3, 4, 6, 8] {
-            let m = (sp.rfp_step * d * d / 2 - sp.rfp_step * d / 2 + sp.rfp_base * d).max(20);
-            println!("      {:<4} {:>10} {:>12}", d, m, stm - m);
-        }
-        println!("      (RFP corta quando eval - margem >= beta; com a avaliacao inflacionada");
-        println!("       a margem fica pequena face ao numero com que se compara)");
-        return;
-    }
 
     // `filtraquieto <in> <out> [best_move_col]` -- o filtro das duas referencias.
     //
@@ -649,226 +211,10 @@ fn main() {
     //
     // Sem a coluna do melhor lance nao se sabe se ELE e' tactico; nesse caso
     // cai-se no criterio da posicao, que e' mais agressivo e fica dito.
-    if args.len() >= 4 && args[1] == "filtraquieto" {
-        let atk = attacks::Attacks::new();
-        let txt = std::fs::read_to_string(&args[2]).expect("nao leu");
-        let mut out = std::io::BufWriter::new(std::fs::File::create(&args[3]).expect("nao criou"));
-        let col_mv: Option<usize> = args.get(4).and_then(|s| s.parse().ok());
-        // DESLIGADO por omissao, e nao por preguica: nenhum dos nossos conjuntos
-        // traz o numero de lance a serio. O do Lichess guarda FENs de quatro
-        // campos e quem os completa poe " 0 1"; o de auto-confronto tem seis
-        // campos mas com "0 1" em TODAS as linhas. Com 16, como a referencia
-        // usa, o filtro descarta 100% do conjunto -- medido, nos dois.
-        //
-        // A referencia pode usa-lo porque gera os dados e sabe o ply. Nos so' o
-        // poderemos usar quando o gerarmos tambem. Filtrar por um campo sem
-        // informacao parece funcionar e deita tudo fora em silencio.
-        let min_ply: usize = std::env::var("FQ_MIN_PLY").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
-        let min_pecas: u32 = std::env::var("FQ_MIN_PECAS").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
-        let (mut n, mut passou) = (0usize, 0usize);
-        let (mut fp, mut fpe, mut fx, mut ft) = (0usize, 0usize, 0usize, 0usize);
-        for linha in txt.lines() {
-            let campos: Vec<&str> = linha.split(|c| c == '\t' || c == '|').map(|x| x.trim()).collect();
-            let fen = match campos.first() { Some(f) if !f.is_empty() => *f, _ => continue };
-            n += 1;
-            let mut b = board::Board::from_fen(fen);
 
-            // O ply so' se aplica se o FEN o trouxer A SERIO. A base do Lichess
-            // guarda FENs de QUATRO campos -- posicao, lado, roque, en-passant --
-            // e quem os completa poe " 0 1" no fim. O numero de lance fica 1 em
-            // todas, e um filtro por ply descarta o conjunto inteiro sem dizer
-            // porque. Apanhado a correr: 100% fora por ply<16, e sem esta
-            // verificacao teria passado por um filtro a funcionar.
-            let campos_fen = fen.split_whitespace().count();
-            if campos_fen >= 6 {
-                let ply = fen.split_whitespace().nth(5)
-                    .and_then(|x| x.parse::<usize>().ok())
-                    .map(|m| m.saturating_sub(1) * 2).unwrap_or(min_ply);
-                if ply < min_ply { fp += 1; continue; }
-            }
 
-            if (b.occ_color[0] | b.occ_color[1]).count_ones() < min_pecas { fpe += 1; continue; }
-            if b.in_check(b.side, &atk) { fx += 1; continue; }
 
-            let moves = movegen::generate_legal(&mut b, &atk);
-            let taticas = match col_mv.and_then(|i| campos.get(i)) {
-                // O LANCE jogado: taticas = captura ou promocao.
-                Some(mv_txt) => moves.iter().find(|m| m.to_uci() == *mv_txt)
-                    .map(|m| m.is_capture() || m.promotion.is_some())
-                    .unwrap_or(false),
-                // Sem o lance: a posicao ter uma captura que ganha material.
-                None => moves.iter().any(|m| m.is_capture()
-                    && search::see::see(&atk, &b, m) > 0),
-            };
-            if taticas { ft += 1; continue; }
 
-            let _ = writeln!(out, "{}", linha);
-            passou += 1;
-        }
-        let pc = |x: usize| 100.0 * x as f64 / n.max(1) as f64;
-        println!("  {} linhas, {} quietas ({:.1}%)", n, passou, pc(passou));
-        println!("    fora por ply<{:<3}      {:6.1}%", min_ply, pc(fp));
-        println!("    fora por pecas<{:<3}    {:6.1}%", min_pecas, pc(fpe));
-        println!("    fora por xeque        {:6.1}%", pc(fx));
-        println!("    fora por tactica      {:6.1}%  ({})", pc(ft),
-                 if col_mv.is_some() { "lance jogado" } else { "captura disponivel" });
-        return;
-    }
-
-    if args.len() >= 3 && args[1] == "quietude" {
-        let atk = attacks::Attacks::new();
-        let txt = std::fs::read_to_string(&args[2]).expect("nao leu");
-        let limite: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(20000);
-        let (mut n, mut xeque, mut captura_boa, mut promo, mut extremo) = (0usize, 0, 0, 0, 0);
-        let mut melhor_ganho_total = 0i64;
-        for linha in txt.lines().take(limite) {
-            let mut it = linha.split('\t');
-            let fen = match it.next() { Some(f) => f, None => continue };
-            let alvo: f32 = it.next().and_then(|r| r.trim().parse().ok()).unwrap_or(0.5);
-            let mut b = board::Board::from_fen(fen);
-            n += 1;
-            if alvo < 0.02 || alvo > 0.98 { extremo += 1; }
-            if b.in_check(b.side, &atk) { xeque += 1; continue; }
-            let moves = movegen::generate_legal(&mut b, &atk);
-            let mut melhor = 0i32;
-            for mv in moves.iter() {
-                if mv.promotion.is_some() { promo += 1; break; }
-            }
-            for mv in moves.iter() {
-                if !mv.is_capture() { continue; }
-                let g = search::see::see(&atk, &b, mv);
-                if g > melhor { melhor = g; }
-            }
-            if melhor > 0 { captura_boa += 1; melhor_ganho_total += melhor as i64; }
-        }
-        let pc = |x: usize| 100.0 * x as f64 / n.max(1) as f64;
-        println!("{} posicoes analisadas", n);
-        println!("  em xeque                        : {:5.1}%", pc(xeque));
-        println!("  com captura que GANHA material  : {:5.1}%  (SEE > 0)", pc(captura_boa));
-        println!("  com promocao disponivel         : {:5.1}%", pc(promo));
-        println!("  rotulo extremo (<0.02 ou >0.98) : {:5.1}%", pc(extremo));
-        if captura_boa > 0 {
-            println!("  ganho medio quando ha' captura  : {} cp", melhor_ganho_total / captura_boa as i64);
-        }
-        println!("  --- NAO QUIETAS (xeque ou captura a ganhar): {:.1}% ---", pc(xeque + captura_boa));
-        return;
-    }
-
-    if args.len() >= 3 && args[1] == "medek" {
-        let txt = std::fs::read_to_string(&args[2]).expect("nao leu o ficheiro");
-        let mut evals: Vec<f64> = Vec::new();
-        let mut alvos: Vec<f64> = Vec::new();
-        for linha in txt.lines() {
-            let mut it = linha.split('\t');
-            let (fen, r) = match (it.next(), it.next()) { (Some(a), Some(b)) => (a, b), _ => continue };
-            let alvo: f64 = match r.trim().parse() { Ok(v) => v, Err(_) => continue };
-            let b = Board::from_fen(fen);
-            let e = eval::evaluate(&b);
-            let e_brancas = if b.side == types::Color::White { e as f64 } else { -(e as f64) };
-            evals.push(e_brancas);
-            alvos.push(alvo);
-        }
-        let erro = |k: f64| -> f64 {
-            let mut s = 0.0;
-            for (e, a) in evals.iter().zip(alvos.iter()) {
-                let p = 1.0 / (1.0 + 10f64.powf(-k * e / 400.0));
-                s += (a - p) * (a - p);
-            }
-            s / evals.len() as f64
-        };
-        // Varredura grosseira e depois refinamento, que chega para um escalar.
-        // A varredura grosseira comecava em 0.10, e o refinamento a seguir --
-        // passo 0.005 a encolher por 0.7 durante 40 iteracoes -- so' consegue
-        // afastar-se da soma da serie geometrica, uns 0.0167. Se o k real
-        // estiver abaixo de 0.10, fica PRESO no limite do que consegue
-        // alcancar: 0.10 - 0.0167 = 0.0833. Saiu esse numero, identico ate' a'
-        // quarta casa decimal, em tres conjuntos de dados completamente
-        // diferentes (abertura, meio-jogo, final) -- nao era o dado a falar,
-        // era o algoritmo a bater no proprio tecto.
-        let (mut melhor_k, mut melhor) = (1.0f64, f64::INFINITY);
-        let mut k = 0.001;
-        while k <= 5.0 {
-            let v = erro(k);
-            if v < melhor { melhor = v; melhor_k = k; }
-            k += if k < 0.20 { 0.001 } else { 0.02 };
-        }
-        let mut passo = melhor_k.max(0.05) * 0.3;
-        for _ in 0..60 {
-            for cand in [melhor_k - passo, melhor_k + passo] {
-                if cand > 0.0 { let v = erro(cand); if v < melhor { melhor = v; melhor_k = cand; } }
-            }
-            passo *= 0.8;
-        }
-        println!("{} posicoes", evals.len());
-        println!("k otimo = {:.4}   ->  K CLASSICO = {:.0}", melhor_k, 400.0 / melhor_k);
-        println!("erro quadratico medio = {:.6}", melhor);
-        println!("(NNUE usa K=400; k=1 seria estarmos na mesma escala)");
-        return;
-    }
-
-    if args.len() >= 4 && args[1] == "data2epd" {
-        use std::io::{Read, Write, BufWriter};
-        const R: usize = 112;
-        let quantas: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(8_000_000);
-        let passo: usize = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(1);
-        let mut f = std::fs::File::open(&args[2]).expect("nao abriu o .data2");
-        let total = f.metadata().map(|m| m.len() as usize / R).unwrap_or(0);
-        println!("{} registos no ficheiro; a escrever {} com passo {}", total, quantas, passo);
-        let saida = std::fs::File::create(&args[3]).expect("nao criou a saida");
-        let mut out = BufWriter::with_capacity(1 << 20, saida);
-        let mut buf = [0u8; R];
-        let mut escritas = 0usize;
-        let mut lidas = 0usize;
-        let mut saltados = 0usize;
-        while escritas < quantas {
-            if f.read_exact(&mut buf).is_err() { break; }
-            lidas += 1;
-            if passo > 1 && lidas % passo != 0 { continue; }
-            let mut b = Board::from_fen("8/8/8/8/8/8/8/8 w - - 0 1");
-            let mut ok = true;
-            for c in 0..2 {
-                for pt in 0..6 {
-                    let i = (c * 6 + pt) * 8;
-                    let bb = u64::from_le_bytes(buf[i..i + 8].try_into().unwrap());
-                    b.pieces[c][pt] = bb;
-                }
-            }
-            // Um rei de cada lado, senao o registo nao presta.
-            if b.pieces[0][5].count_ones() != 1 || b.pieces[1][5].count_ones() != 1 { ok = false; }
-            let stm = buf[96];
-            let wdl = f32::from_le_bytes(buf[104..108].try_into().unwrap());
-            if !ok || !wdl.is_finite() || !(0.0..=1.0).contains(&wdl) { saltados += 1; continue; }
-            b.side = if stm == 0 { types::Color::White } else { types::Color::Black };
-            b.castling = 0;
-            b.ep_square = 64;
-            b.recompute_occ();
-            b.rebuild_mailbox();
-            b.recompute_eval_accumulators();
-            // O wdl vem no ponto de vista de quem joga; o ajuste quer o das
-            // brancas.
-            let alvo = if b.side == types::Color::White { wdl } else { 1.0 - wdl };
-            writeln!(out, "{}\t{}", b.to_fen(), alvo).ok();
-            escritas += 1;
-        }
-        println!("escritas {} posicoes ({} registos saltados por invalidos)", escritas, saltados);
-        return;
-    }
-
-    if args.len() >= 4 && args[1] == "gpuextract" {
-        // gpuextract <dataset.epd> <out.bin> [max_positions] [buckets] [threads]
-        let maxp: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(usize::MAX);
-        let buckets: usize = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(1);
-        let threads: usize = args.get(6).and_then(|s| s.parse().ok())
-            .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4));
-        gpu_extract(&args[2], &args[3], maxp, buckets.max(1), threads);
-        return;
-    }
-    if args.len() >= 4 && args[1] == "tunepst" {
-        let iters: u32 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(8000);
-        let lr: f64 = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(1000.0);
-        tune_matpst(&args[2], &args[3], iters, lr);
-        return;
-    }
     if args.len() >= 4 && args[1] == "selfplay" {
         let num_games: u32 = args[2].parse().expect("num_games invalido");
         let out_path = &args[3];
@@ -896,181 +242,122 @@ fn main() {
         selfplay_datagen_tc(num_games, out_path, base_ms, inc_ms, threads);
         return;
     }
-    if args.len() >= 3 && args[1] == "psqtbuckets" {
-        // psqtbuckets <pesos.txt> [buckets_cobertos]  ex: "0,1,2,3,4"
+    if args.len() >= 4 && args[1] == "funde" {
+        // funde <quantised.bin> <saida.bin>
         //
-        // Os buckets NAO listados ficam com a tabela compilada. Um dataset so'
-        // de finais nao produz sinal nenhum para os buckets de muitos peoes, e
-        // escrever la' o que saiu do treino seria levar para o meio-jogo pesos
-        // aprendidos numa populacao que nao e' a dele.
-        let txt = std::fs::read_to_string(&args[2]).expect("nao consegui ler os pesos");
-        let v: Vec<i32> = txt.split(|c: char| c == ',' || c.is_whitespace())
-            .filter(|t| !t.is_empty())
-            .filter_map(|t| t.parse().ok()).collect();
-        let stride = v.len() / eval::NUM_BUCKETS;
-        let mut cobertos = [false; eval::NUM_BUCKETS];
-        if let Some(lista) = args.get(3) {
-            for t in lista.split(',') {
-                if let Ok(b) = t.trim().parse::<usize>() {
-                    if b < eval::NUM_BUCKETS { cobertos[b] = true; }
-                }
+        // NAO soma nada. O treinador ja' fundiu a factorizacao nos pesos
+        // reais antes de gravar -- os blocos dos buckets ja' trazem o fator
+        // comum incluido. O bloco virtual continua la' no ficheiro, mas e'
+        // residuo, nao parcela.
+        //
+        // Somei-o na mesma durante uma tarde. A rede carregava, jogava e
+        // perdia oitenta e oito jogos em oitenta e oito, com um desvio de
+        // ~350 centipeoes que NAO descia com o treino (358 aos dez
+        // superbatches, 385 aos vinte, 388 aos cinquenta) -- que e'
+        // precisamente a assinatura de um erro de leitura e nao de uma rede
+        // por treinar. Descartar o bloco: +6 onde o Stockfish diz +32.
+        // Somar o bloco: +388.
+        let cru = std::fs::read(&args[2]).expect("nao consegui ler");
+        let vals: Vec<i16> = cru.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect();
+        let bloco = nnue::INPUTS * nnue::HIDDEN;
+        let (cauda, blocos) = {
+            let mut r = None;
+            for ob in [8usize, 1] {
+                let c = nnue::HIDDEN + 2 * nnue::HIDDEN * ob + ob;
+                if vals.len() <= c { continue; }
+                let n = (vals.len() - c) / bloco;
+                if n >= 1 && (vals.len() - c) - n * bloco < 64 { r = Some((c, n)); break; }
             }
-        } else {
-            for c in cobertos.iter_mut() { *c = true; }
-        }
-        println!("psqtbuckets: {} valores, stride {}, cobertos {:?}", v.len(), stride, cobertos);
-        if !eval::psqt_buckets_de_vector(&v, stride, &cobertos) {
-            eprintln!("psqtbuckets: falhou (tamanho errado?)");
+            match r {
+                Some(v) => v,
+                None => { eprintln!("funde: forma desconhecida, {} valores", vals.len()); return; }
+            }
+        };
+        if blocos < 2 {
+            eprintln!("funde: {} bloco(s) -- nada a descartar", blocos);
             return;
         }
-        println!("psqtbuckets: carregadas");
+        let reais = blocos - 1;
+        let mut saida: Vec<i16> = Vec::with_capacity(reais * bloco + cauda);
+        saida.extend_from_slice(&vals[bloco..blocos * bloco]);
+        saida.extend_from_slice(&vals[blocos * bloco..blocos * bloco + cauda]);
+        let bytes: Vec<u8> = saida.iter().flat_map(|v| v.to_le_bytes()).collect();
+        nnue::escreve_com_cabecalho(&bytes, reais, &args[3]).expect("nao consegui escrever");
+        println!("limpa: {} blocos -> {} buckets reais (virtual descartado) -> {}", blocos, reais, args[3]);
         return;
     }
-    if args.len() >= 4 && args[1] == "rotula" {
-        // rotula <in.epd> <out.epd> [depth] [threads]
+    if args.len() >= 4 && args[1] == "selarede" {
+        // selarede <quantised.bin> <saida.bin> [buckets]
+        //
+        // Poe o nosso cabecalho a frente do dump cru do treinador, para o
+        // motor poder VERIFICAR a rede em vez de adivinhar a forma dela pelo
+        // tamanho do ficheiro.
+        let cru = std::fs::read(&args[2]).expect("nao consegui ler");
+        let buckets: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or_else(|| {
+            let cauda = nnue::HIDDEN + 2 * nnue::HIDDEN + 1;
+            let total = cru.len() / 2;
+            if total > cauda { ((total - cauda) / (nnue::INPUTS * nnue::HIDDEN)).max(1) } else { 1 }
+        });
+        nnue::escreve_com_cabecalho(&cru, buckets, &args[3]).expect("nao consegui escrever");
+        println!("selada: {} buckets, HIDDEN={} -> {}", buckets, nnue::HIDDEN, args[3]);
+        return;
+    }
+    if args.len() >= 2 && args[1] == "verificathreats" {
+        let net = match nnue_threats::rede() {
+            Some(n) => n,
+            None => { eprintln!("precisa de KESTREL_NNUE_THREATS"); return; }
+        };
+        // Uma SEQUENCIA de posicoes de um jogo real, nao posicoes soltas: o
+        // que se testa e' se o acumulador se desvia ao longo de dezenas de
+        // actualizacoes seguidas.
+        let ficheiro = args.get(2).map(|s| s.as_str()).unwrap_or("/root/kestrel_joao/blunders_big_v2.epd");
+        let fens: Vec<String> = std::fs::read_to_string(ficheiro)
+            .expect("nao consegui ler")
+            .lines()
+            .filter_map(|l| l.split('|').next().map(|f| f.trim().to_string()))
+            .filter(|f| !f.is_empty())
+            .collect();
+        let (n, e, m) = nnue_threats::verifica(net, &fens);
+        println!("threats: {} posicoes, {} divergencias, {:.1} features actualizadas por posicao", n, e, m);
+        return;
+    }
+    if args.len() >= 2 && args[1] == "verificacache" {
+        // A cache de refresh contra a reconstrucao do zero, em posicoes reais.
+        let net = match nnue::rede() {
+            Some(n) => n,
+            None => { eprintln!("precisa de KESTREL_NNUE"); return; }
+        };
+        let ficheiro = args.get(2).map(|s| s.as_str()).unwrap_or("/root/kestrel_joao/blunders_big_v2.epd");
+        let fens: Vec<String> = std::fs::read_to_string(ficheiro)
+            .expect("nao consegui ler")
+            .lines()
+            .filter_map(|l| l.split('|').next().map(|f| f.trim().to_string()))
+            .filter(|f| !f.is_empty())
+            .collect();
+        let (t, e) = nnue::verifica_cache(net, &fens);
+        println!("cache de refresh: {} verificacoes, {} erradas", t, e);
+        return;
+    }
+    if args.len() >= 4 && args[1] == "bulletdata" {
+        // bulletdata <in.epd> <out.txt> [depth] [threads]
+        //
+        // Turns `FEN<TAB>result` into the `FEN | score | result` the network
+        // trainer reads. The score is our own search, shallow: the label the
+        // net fits is a blend of the game result and this score, so the score
+        // only has to order positions sensibly, not be deep. Depth 8 over a
+        // million and a half positions is minutes; depth 16 would be hours and
+        // buys nothing the result label does not already carry.
         let d: i32 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(8);
         let t: usize = args.get(5).and_then(|s| s.parse().ok())
             .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4));
-        rotula_dataset(&args[2], &args[3], d, t);
-        return;
-    }
-    if args.len() >= 4 && args[1] == "resolvequiet" {
-        resolve_quiet_dataset(&args[2], &args[3]);
-        return;
-    }
-    if args.len() >= 4 && args[1] == "tunefast" {
-        let iters: u32 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(2000);
-        let lr: f64 = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(2.0);
-        tune_fast(&args[2], &args[3], iters, lr);
-        return;
-    }
-    if args.len() >= 4 && args[1] == "tune" {
-        let epochs: u32 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(20);
-        let lambda: f64 = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(0.0);
-        tune_weights(&args[2], &args[3], epochs, lambda);
-        return;
-    }
-    if args.len() >= 4 && args[1] == "tunestream" {
-        // streaming logistic tuner (RAM-constant, for large external binpack datasets):
-        //   tunestream <dataset.epd> <out.txt> [epochs] [lr] [chunk] [threads]
-        let epochs: u32 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(6);
-        let lr: f64 = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(2.0);
-        let chunk: usize = args.get(6).and_then(|s| s.parse().ok()).unwrap_or(50000);
-        let threads: usize = args.get(7).and_then(|s| s.parse().ok())
-            .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4));
-        tune_stream(&args[2], &args[3], epochs, lr, chunk, threads);
-        return;
-    }
-    if args.len() >= 4 && args[1] == "tuneking" {
-        // tuneking <dataset.epd> <out.txt> [max_positions] [threads]
-        let maxpos: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(300_000);
-        let threads: usize = args.get(5).and_then(|s| s.parse().ok())
-            .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4));
-        tune_king(&args[2], &args[3], maxpos, threads);
-        return;
-    }
-    if args.len() >= 4 && args[1] == "tunefull" {
-        // streaming logistic tuner over the FULL eval (material+PST AND
-        // positional together), same streaming/sparse mechanics as
-        // tunestream: tunefull <dataset.epd> <out.txt> [iters] [lr] [chunk] [threads]
-        let iters: u32 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(6);
-        let lr: f64 = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(2.0);
-        let chunk: usize = args.get(6).and_then(|s| s.parse().ok()).unwrap_or(50000);
-        let threads: usize = args.get(7).and_then(|s| s.parse().ok())
-            .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4));
-        tune_full(&args[2], &args[3], iters, lr, chunk, threads);
+        bullet_data(&args[2], &args[3], d, t);
         return;
     }
     let mut engine = uci::Engine::new();
     engine.run();
 }
 
-/// Debug helper: to_vec()/from_vec() must be exact inverses of each
-/// other (same field order both ways) -- checked once here instead of
-/// trusting it by inspection, since a mismatch would silently corrupt
-/// every tuning run without ever panicking on a length assert.
-fn check_weights_roundtrip() {
-    let original = eval::default_weights().clone();
-    let v = original.to_vec();
-    println!("flat vector length: {}", v.len());
-    // `field_names` TEM de acompanhar `to_vec`, escalar a escalar. Divergiram a
-    // 29/07 -- seis campos acrescentados ao vector e nao a lista -- e a partir
-    // do primeiro em falta todos os nomes ficam desfasados dos pesos. O `raiox`
-    // passou a zerar um peso e a imprimir o nome de outro, e diagnosticos
-    // inteiros da avaliacao foram feitos em cima disso.
-    {
-        let nn = original.field_names().len();
-        let nf = original.field_families().len();
-        if v.len() != nn || v.len() != nf {
-            println!("!! DESALINHADO: to_vec {} field_names {} field_families {}", v.len(), nn, nf);
-            println!("   o raiox e tudo o que indexa por nome estao a mentir");
-        } else {
-            println!("OK: field_names/field_families alinhados ({} escalares)", v.len());
-        }
-    }
-    if std::env::var("PRINT_DEFAULT_VEC").is_ok() {
-        let s: Vec<String> = v.iter().map(|x| x.to_string()).collect();
-        println!("{}", s.join(","));
-    }
-    let rebuilt = original.from_vec(&v);
-    let v2 = rebuilt.to_vec();
-    if v == v2 {
-        println!("OK: to_vec/from_vec round-trip matches ({} scalars)", v.len());
-    } else {
-        println!("MISMATCH: round-trip does not match!");
-        for (idx, (a, b)) in v.iter().zip(v2.iter()).enumerate() {
-            if a != b {
-                println!("  index {}: {} != {}", idx, a, b);
-            }
-        }
-    }
-    // Also confirm evaluate_with_weights(default) == evaluate() exactly
-    // on a handful of real positions (checks the struct itself, not
-    // just the vector round-trip).
-    let atk = Attacks::new();
-    let fens = [
-        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
-        "r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4",
-        "8/1p3Q1p/p3r3/2pk4/8/5K1P/Pb3PP1/7R b - - 0 30",
-    ];
-    for fen in fens {
-        let board = Board::from_fen(fen);
-        let a = eval::evaluate(&board);
-        let b = eval::evaluate_with_weights(&board, &original);
-        println!("fen ok={} eval()={} evaluate_with_weights(default)={}: {}", a == b, a, b, fen);
-    }
-    let _ = atk;
-}
 
-/// Valida que `material_pst_features` esta' correcta: para varias
-/// posicoes, `sum(feats[i] * material_pst_current_vec()[i])` tem de bater
-/// com `material_pst_white(board)` (a menos do arredondamento inteiro do
-/// taper). Se isto falhar, o tuner de material/PST esta' a extrair as
-/// features erradas e nao vale a pena correr.
-fn check_matpst_features() {
-    let cur = eval::material_pst_current_vec();
-    println!("MAT_PST_DIM = {}, current_vec len = {}", eval::MAT_PST_DIM, cur.len());
-    let fens = [
-        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
-        "r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4",
-        "8/1p3Q1p/p3r3/2pk4/8/5K1P/Pb3PP1/7R b - - 0 30",
-        "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
-        "8/8/8/4k3/8/4K3/4P3/8 w - - 0 1",
-    ];
-    let mut feats = vec![0f32; eval::MAT_PST_DIM];
-    let mut all_ok = true;
-    for fen in fens {
-        let board = Board::from_fen(fen);
-        eval::material_pst_features(&board, &mut feats);
-        let dot: f64 = feats.iter().zip(cur.iter()).map(|(&f, &v)| f as f64 * v as f64).sum();
-        let real = eval::material_pst_white(&board) as f64;
-        let diff = (dot - real).abs();
-        let ok = diff <= 1.5; // tolerancia do arredondamento inteiro do taper
-        if !ok { all_ok = false; }
-        println!("ok={} feat_dot={:.2} material_pst_white={:.0} diff={:.2}: {}", ok, dot, real, diff, fen);
-    }
-    println!("{}", if all_ok { "MATPST FEATURES OK" } else { "MATPST FEATURES ERRADAS -- nao tunar!" });
-}
 
 /// Dependency-free PRNG (same splitmix64 shape already used in
 /// zobrist.rs for key generation -- this project deliberately has zero
@@ -1610,183 +897,6 @@ fn play_one_selfplay_game_tc(
 /// scales exactly linearly with that field's value, which is what lets
 /// a single "unit contribution" per field be measured ONCE per
 /// position and then reused for every future gradient step.
-fn tune_fast(dataset_path: &str, out_path: &str, iters: u32, lr: f64) {
-    let text = std::fs::read_to_string(dataset_path).expect("nao consegui ler o dataset");
-    let mut boards: Vec<Board> = Vec::new();
-    let mut results: Vec<f64> = Vec::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let mut parts = line.split('\t');
-        let fen = parts.next().unwrap();
-        let res: f64 = parts.next().unwrap().parse().unwrap();
-        boards.push(Board::from_fen(fen));
-        results.push(res);
-    }
-    let n_pos = boards.len();
-    println!("dataset: {} positions", n_pos);
-
-    let default = eval::default_weights().clone();
-    let default_vec = default.to_vec();
-    let dim = default_vec.len();
-
-    // Find the flat indices king_attacker_weight/king_attacks occupy,
-    // by marking them with a sentinel and reading to_vec() back --
-    // avoids hardcoding offsets that would silently go stale if the
-    // struct's field order ever changes.
-    let mut sentinel = default.from_vec(&vec![0i32; dim]);
-    sentinel.king_attacker_weight = [(1, 1); 4];
-    sentinel.king_attacks = (1, 1);
-    sentinel.safe_knight_check = (1, 1);
-    sentinel.safe_bishop_check = (1, 1);
-    sentinel.safe_rook_check = (1, 1);
-    sentinel.safe_queen_check = (1, 1);
-    // 2026-07-26: king safety stopped being a linear sum. Shelter, storm,
-    // the weak-ring count and the flank counts now feed the same danger
-    // curve the attack units do, instead of being added straight to the
-    // score -- so a one-unit probe of any of them no longer measures that
-    // field's contribution, it measures a slope somewhere on a curve. Left
-    // off this list they would be tuned as if linear, quietly and wrongly.
-    sentinel.pawn_shelter = [(1, 1); 4];
-    sentinel.shelter_open = (1, 1);
-    sentinel.pawn_tornado = [(1, 1); 4];
-    sentinel.weak_king_ring = (1, 1);
-    sentinel.king_flank_attacks = [(1, 1); 2];
-    sentinel.king_flank_defenses = [(1, 1); 2];
-    let sentinel_vec = sentinel.to_vec();
-    let is_king_field: Vec<bool> = sentinel_vec.iter().map(|&x| x == 1).collect();
-    let king_field_count = is_king_field.iter().filter(|&&b| b).count();
-    println!("king-safety fields held fixed (nonlinear path, not tuned here): {}", king_field_count);
-
-    // w_king_only: every non-king field zeroed, king fields at their
-    // real default values -- the base point every linear probe is
-    // measured relative to.
-    let mut king_only_vec = vec![0i32; dim];
-    for i in 0..dim {
-        if is_king_field[i] {
-            king_only_vec[i] = default_vec[i];
-        }
-    }
-    let w_king_only = default.from_vec(&king_only_vec);
-
-    println!("extracting linear features ({} probes/position, {} positions)...", dim - king_field_count + 1, n_pos);
-    let t0 = std::time::Instant::now();
-    // Per position: bias (material + king-safety-only positional term,
-    // both in White's POV) and a feature vector (marginal contribution
-    // of each non-king field at value=1, White's POV).
-    let mut biases: Vec<f64> = Vec::with_capacity(n_pos);
-    let mut features: Vec<Vec<f32>> = Vec::with_capacity(n_pos);
-    let mut probe_vec = king_only_vec.clone();
-    for board in &boards {
-        let p_base = eval::positional_terms(board, &w_king_only);
-        let bias = eval::material_pst_white(board) as f64 + p_base as f64;
-        let mut f = vec![0f32; dim];
-        for i in 0..dim {
-            if is_king_field[i] {
-                continue;
-            }
-            probe_vec[i] = 1;
-            let w_probe = w_king_only.from_vec(&probe_vec);
-            let p_unit = eval::positional_terms(board, &w_probe);
-            f[i] = (p_unit - p_base) as f32;
-            probe_vec[i] = king_only_vec[i];
-        }
-        biases.push(bias);
-        features.push(f);
-    }
-    println!("feature extraction done in {:.1}s", t0.elapsed().as_secs_f64());
-
-    if std::env::var("TUNEFAST_DEBUG_CHECK").is_ok() {
-        for (i, board) in boards.iter().enumerate() {
-            let full = eval::evaluate_with_weights(board, &default);
-            let full_white = if board.side == types::Color::White { full } else { -full };
-            let mut e = biases[i];
-            for j in 0..dim {
-                if features[i][j] != 0.0 {
-                    e += default_vec[j] as f64 * features[i][j] as f64;
-                }
-            }
-            println!("pos {}: evaluate_with_weights(white)={}  linear_decomp={:.3}  diff={:.3}", i, full_white, e, full_white as f64 - e);
-        }
-    }
-
-    // Best sigmoid K for the default weights, same coarse scan as the
-    // slow tuner -- fixed for the rest of the run.
-    fn sigmoid(x: f64, k: f64) -> f64 {
-        1.0 / (1.0 + 10f64.powf(-k * x / 400.0))
-    }
-    let mut w: Vec<f64> = default_vec.iter().map(|&x| x as f64).collect();
-    let predict = |w: &[f64], i: usize| -> f64 {
-        let mut e = biases[i];
-        let f = &features[i];
-        for j in 0..dim {
-            if f[j] != 0.0 {
-                e += w[j] * f[j] as f64;
-            }
-        }
-        e
-    };
-    let mean_error = |w: &[f64], k: f64| -> f64 {
-        let mut sum = 0.0;
-        for i in 0..n_pos {
-            let d = results[i] - sigmoid(predict(w, i), k);
-            sum += d * d;
-        }
-        sum / n_pos as f64
-    };
-    let mut best_k = 1.0;
-    let mut best_k_err = f64::MAX;
-    let mut k = 0.2;
-    while k <= 3.0 {
-        let e = mean_error(&w, k);
-        if e < best_k_err {
-            best_k_err = e;
-            best_k = k;
-        }
-        k += 0.1;
-    }
-    println!("best K = {:.2}  (starting error = {:.6})", best_k, best_k_err);
-
-    let ln10 = std::f64::consts::LN_10;
-    let mut grad = vec![0f64; dim];
-    let t1 = std::time::Instant::now();
-    for iter in 0..iters {
-        for g in grad.iter_mut() {
-            *g = 0.0;
-        }
-        for i in 0..n_pos {
-            let pred_eval = predict(&w, i);
-            let s = sigmoid(pred_eval, best_k);
-            // d(loss)/d(eval) for loss=(result-sigmoid(eval))^2
-            let d_loss_d_eval = 2.0 * (s - results[i]) * (best_k * ln10 / 400.0) * s * (1.0 - s);
-            let f = &features[i];
-            for j in 0..dim {
-                if f[j] != 0.0 {
-                    grad[j] += d_loss_d_eval * f[j] as f64;
-                }
-            }
-        }
-        for j in 0..dim {
-            if is_king_field[j] {
-                continue;
-            }
-            w[j] -= lr * grad[j] / n_pos as f64;
-        }
-        if iter % 200 == 0 || iter == iters - 1 {
-            println!("iter {}: error={:.6}  ({:.2}s)", iter, mean_error(&w, best_k), t1.elapsed().as_secs_f64());
-        }
-    }
-
-    let final_err = mean_error(&w, best_k);
-    println!("final error: {:.6} (started {:.6}) in {:.2}s, {} iterations", final_err, best_k_err, t1.elapsed().as_secs_f64(), iters);
-
-    let out_vec: Vec<i32> = w.iter().map(|&x| x.round() as i32).collect();
-    let serialized: Vec<String> = out_vec.iter().map(|x| x.to_string()).collect();
-    std::fs::write(out_path, serialized.join(",")).expect("nao consegui escrever o output");
-    println!("wrote tuned weights ({} scalars) to {}", out_vec.len(), out_path);
-}
 
 /// Streaming logistic tuner: same linear model as `tune_fast`, but never
 /// holds the whole dataset (or its dense feature vectors) in RAM. Reads
@@ -1799,261 +909,10 @@ fn tune_fast(dataset_path: &str, out_path: &str, iters: u32, lr: f64) {
 /// (nonlinear KING_DANGER_TABLE path). Mini-batch updates mean a few
 /// epochs converge, so the expensive per-position probing is paid only a
 /// handful of times over the whole set.
-fn tune_stream(dataset_path: &str, out_path: &str, epochs: u32, lr: f64, chunk_size: usize, threads: usize) {
-    use std::fs::File;
-    use std::io::{BufRead, BufReader};
-
-    let default = eval::default_weights().clone();
-    let default_vec = default.to_vec();
-    let dim = default_vec.len();
-
-    // king-safety fields held fixed (same sentinel trick as tune_fast)
-    let mut sentinel = default.from_vec(&vec![0i32; dim]);
-    sentinel.king_attacker_weight = [(1, 1); 4];
-    sentinel.king_attacks = (1, 1);
-    sentinel.safe_knight_check = (1, 1);
-    sentinel.safe_bishop_check = (1, 1);
-    sentinel.safe_rook_check = (1, 1);
-    sentinel.safe_queen_check = (1, 1);
-    // 2026-07-26: king safety stopped being a linear sum. Shelter, storm,
-    // the weak-ring count and the flank counts now feed the same danger
-    // curve the attack units do, instead of being added straight to the
-    // score -- so a one-unit probe of any of them no longer measures that
-    // field's contribution, it measures a slope somewhere on a curve. Left
-    // off this list they would be tuned as if linear, quietly and wrongly.
-    sentinel.pawn_shelter = [(1, 1); 4];
-    sentinel.shelter_open = (1, 1);
-    sentinel.pawn_tornado = [(1, 1); 4];
-    sentinel.weak_king_ring = (1, 1);
-    sentinel.king_flank_attacks = [(1, 1); 2];
-    sentinel.king_flank_defenses = [(1, 1); 2];
-    let sentinel_vec = sentinel.to_vec();
-    let is_king_field: Vec<bool> = sentinel_vec.iter().map(|&x| x == 1).collect();
-    let king_field_count = is_king_field.iter().filter(|&&b| b).count();
-    let mut king_only_vec = vec![0i32; dim];
-    for i in 0..dim {
-        if is_king_field[i] {
-            king_only_vec[i] = default_vec[i];
-        }
-    }
-    let w_king_only = default.from_vec(&king_only_vec);
-    println!("tune_stream: dim={}, king fields fixed={}, chunk={}, threads={}", dim, king_field_count, chunk_size, threads);
-
-    // extract (bias, dense feature vec) for one board via linear probing
-    let extract = |board: &Board| -> (f64, Vec<f32>) {
-        let p_base = eval::positional_terms(board, &w_king_only);
-        let bias = eval::material_pst_white(board) as f64 + p_base as f64;
-        let mut f = vec![0f32; dim];
-        let mut probe_vec = king_only_vec.clone();
-        for i in 0..dim {
-            if is_king_field[i] {
-                continue;
-            }
-            probe_vec[i] = 1;
-            let w_probe = w_king_only.from_vec(&probe_vec);
-            f[i] = (eval::positional_terms(board, &w_probe) - p_base) as f32;
-            probe_vec[i] = king_only_vec[i];
-        }
-        (bias, f)
-    };
-
-    fn sigmoid(x: f64, k: f64) -> f64 {
-        1.0 / (1.0 + 10f64.powf(-k * x / 400.0))
-    }
-    let ln10 = 10f64.ln();
-
-    // fit K on a small sample (serial, quick)
-    let mut sample: Vec<(f64, Vec<f32>, f64)> = Vec::new();
-    {
-        let f = File::open(dataset_path).expect("abrir dataset");
-        for line in BufReader::new(f).lines().take(30000) {
-            let line = line.unwrap();
-            let l = line.trim();
-            if l.is_empty() { continue; }
-            let mut parts = l.split('\t');
-            let fen = parts.next().unwrap();
-            let target: f64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0.5);
-            let board = Board::from_fen(fen);
-            let (bias, feats) = extract(&board);
-            sample.push((bias, feats, target));
-        }
-    }
-    let w0: Vec<f64> = default_vec.iter().map(|&x| x as f64).collect();
-    let sample_err = |k: f64| -> f64 {
-        let mut s = 0.0;
-        for (bias, feats, target) in &sample {
-            let mut pred = *bias;
-            for j in 0..dim { pred += w0[j] * feats[j] as f64; }
-            let d = target - sigmoid(pred, k);
-            s += d * d;
-        }
-        s / sample.len() as f64
-    };
-    let mut best_k = 1.0;
-    let mut best_e = f64::MAX;
-    let mut k = 0.4;
-    while k <= 3.0 {
-        let e = sample_err(k);
-        if e < best_e { best_e = e; best_k = k; }
-        k += 0.1;
-    }
-    println!("fit K = {:.2} (sample error {:.6}, {} sample positions)", best_k, best_e, sample.len());
-
-    let t0 = std::time::Instant::now();
-
-    // PHASE 1: extract SPARSE features once (stream from disk in chunks,
-    // extract in parallel). cache: (bias, [(idx,val)], target). Sparse, so
-    // millions of positions fit in RAM (dense 669/pos would not). The
-    // expensive probing is paid exactly once for the whole set.
-    println!("extracting sparse features (parallel, {} threads)...", threads);
-    let mut cache: Vec<(f64, Vec<(u16, f32)>, f64)> = Vec::new();
-    {
-        let file = File::open(dataset_path).expect("abrir dataset");
-        let mut reader = BufReader::new(file);
-        let mut raw: Vec<(Board, f64)> = Vec::with_capacity(chunk_size);
-        let mut line = String::new();
-        let extract_chunk = |raw: &[(Board, f64)], cache: &mut Vec<(f64, Vec<(u16, f32)>, f64)>| {
-            let n = raw.len();
-            if n == 0 { return; }
-            let kf = &is_king_field;
-            let kov = &king_only_vec;
-            let wko = &w_king_only;
-            let parts: Vec<Vec<(f64, Vec<(u16, f32)>, f64)>> = std::thread::scope(|scope| {
-                let per = (n + threads - 1) / threads;
-                let mut handles = Vec::new();
-                for t in 0..threads {
-                    let start = t * per;
-                    let end = ((t + 1) * per).min(n);
-                    if start >= end { continue; }
-                    let slice = &raw[start..end];
-                    handles.push(scope.spawn(move || {
-                        let mut out = Vec::with_capacity(slice.len());
-                        let mut probe_vec = kov.clone();
-                        for (board, target) in slice {
-                            let p_base = eval::positional_terms(board, wko);
-                            let bias = eval::material_pst_white(board) as f64 + p_base as f64;
-                            let mut sp: Vec<(u16, f32)> = Vec::new();
-                            for i in 0..dim {
-                                if kf[i] { continue; }
-                                probe_vec[i] = 1;
-                                let fi = (eval::positional_terms(board, &wko.from_vec(&probe_vec)) - p_base) as f32;
-                                probe_vec[i] = kov[i];
-                                if fi != 0.0 { sp.push((i as u16, fi)); }
-                            }
-                            out.push((bias, sp, *target));
-                        }
-                        out
-                    }));
-                }
-                handles.into_iter().map(|h| h.join().unwrap()).collect()
-            });
-            for p in parts { cache.extend(p); }
-        };
-        let mut more = true;
-        while more {
-            line.clear();
-            let nread = reader.read_line(&mut line).expect("read");
-            if nread == 0 {
-                more = false;
-            } else {
-                let l = line.trim();
-                if !l.is_empty() {
-                    let mut ps = l.split('\t');
-                    let fen = ps.next().unwrap();
-                    let target: f64 = ps.next().and_then(|s| s.parse().ok()).unwrap_or(0.5);
-                    raw.push((Board::from_fen(fen), target));
-                }
-            }
-            if raw.len() >= chunk_size || (!more && !raw.is_empty()) {
-                let before = cache.len();
-                extract_chunk(&raw, &mut cache);
-                raw.clear();
-                if cache.len() / 500000 != before / 500000 {
-                    println!("  extracted {} positions ({:.1}s)...", cache.len(), t0.elapsed().as_secs_f64());
-                }
-            }
-        }
-    }
-    let n_pos = cache.len();
-    println!("sparse feature extraction done: {} positions in {:.1}s", n_pos, t0.elapsed().as_secs_f64());
-    if n_pos == 0 { eprintln!("dataset vazio"); return; }
-
-    // PHASE 2: fast full-batch gradient iterations over the sparse cache.
-    let mut w: Vec<f64> = default_vec.iter().map(|&x| x as f64).collect();
-    // Mean-centering (pinagem) of the mobility tables: fix each table's MEAN
-    // at its init, leaving only the relative SHAPE between slots free. Without
-    // it the mobility tables are collinear with the (fixed) material -- the
-    // sum-of-buckets vector equals the material column -- so the gradient
-    // drifts the table mean (a known collinearity lesson). Default on;
-    // KESTREL_TUNE_MEANCENTER=0 disables it for A/B comparison.
-    let meancenter = std::env::var("KESTREL_TUNE_MEANCENTER").map(|v| v != "0").unwrap_or(true);
-    // (to_vec offset, used-slot count) per mobility table: knight/bishop/rook/queen
-    let mob_tables: [(usize, usize); 4] = [(16, 9), (72, 14), (128, 15), (184, 28)];
-    println!("mean-centering mobility tables: {}", meancenter);
-    for iter in 0..epochs {
-        let w_ref = &w;
-        let (grad, loss) = std::thread::scope(|scope| {
-            let per = (n_pos + threads - 1) / threads;
-            let mut handles = Vec::new();
-            for t in 0..threads {
-                let start = t * per;
-                let end = ((t + 1) * per).min(n_pos);
-                if start >= end { continue; }
-                let slice = &cache[start..end];
-                handles.push(scope.spawn(move || {
-                    let mut g = vec![0f64; dim];
-                    let mut ls = 0.0f64;
-                    for (bias, sp, target) in slice {
-                        let mut pred = *bias;
-                        for &(idx, val) in sp { pred += w_ref[idx as usize] * val as f64; }
-                        let sv = sigmoid(pred, best_k);
-                        let d = target - sv;
-                        ls += d * d;
-                        let dloss = 2.0 * (sv - target) * (best_k * ln10 / 400.0) * sv * (1.0 - sv);
-                        for &(idx, val) in sp { g[idx as usize] += dloss * val as f64; }
-                    }
-                    (g, ls)
-                }));
-            }
-            let mut tg = vec![0f64; dim];
-            let mut tl = 0.0f64;
-            for h in handles {
-                let (g, l) = h.join().unwrap();
-                for i in 0..dim { tg[i] += g[i]; }
-                tl += l;
-            }
-            (tg, tl)
-        });
-        let mut grad = grad;
-        if meancenter {
-            for &(off, n) in &mob_tables {
-                let mg_mean: f64 = (0..n).map(|i| grad[off + 2 * i]).sum::<f64>() / n as f64;
-                let eg_mean: f64 = (0..n).map(|i| grad[off + 2 * i + 1]).sum::<f64>() / n as f64;
-                for i in 0..n {
-                    grad[off + 2 * i] -= mg_mean;
-                    grad[off + 2 * i + 1] -= eg_mean;
-                }
-            }
-        }
-        for j in 0..dim {
-            if !is_king_field[j] {
-                w[j] -= lr * grad[j] / n_pos as f64;
-            }
-        }
-        if iter % 100 == 0 || iter == epochs - 1 {
-            println!("iter {}: mean loss {:.6} ({:.1}s)", iter, loss / n_pos as f64, t0.elapsed().as_secs_f64());
-        }
-    }
-
-    let out_vec: Vec<i32> = w.iter().map(|&x| x.round() as i32).collect();
-    let serialized: Vec<String> = out_vec.iter().map(|x| x.to_string()).collect();
-    std::fs::write(out_path, serialized.join(",")).expect("escrever output");
-    println!("wrote {} tuned scalars to {}", out_vec.len(), out_path);
-}
 
 /// Full-eval streaming logistic tuner: same streaming/sparse-cache/
 /// thread::scope/sigmoid/fit-K mechanics as `tune_stream` above, but
-/// tunes MATERIAL + PST (`eval::material_pst_features`, 780 scalars)
+/// (removido com o HCE)
 /// TOGETHER with the positional weights instead of holding
 /// material/PST fixed as consts. Why this exists: `tune_stream` keeps
 /// material/PST fixed as a deliberate anchor (see `tune_matpst`'s doc
@@ -2086,387 +945,6 @@ fn tune_stream(dataset_path: &str, out_path: &str, epochs: u32, lr: f64, chunk_s
 /// `<out_path>` (consumed the same way `tune_stream`'s output already
 /// is, as `TUNED_R5`) -- both plain CSV of ints, same format every
 /// other tuner here already writes.
-fn tune_full(dataset_path: &str, out_path: &str, epochs: u32, lr: f64, chunk_size: usize, threads: usize) {
-    use std::fs::File;
-    use std::io::{BufRead, BufReader};
-
-    let mat_dim = eval::MAT_PST_DIM; // 780
-    let mat_init: Vec<i32> = eval::material_pst_current_vec();
-    assert_eq!(mat_init.len(), mat_dim, "material_pst_current_vec() length mismatch");
-
-    let default = eval::default_weights().clone();
-    let default_vec = default.to_vec();
-    let pos_dim = default_vec.len();
-    let total_dim = mat_dim + pos_dim;
-    assert!(total_dim <= u16::MAX as usize, "flat index no longer fits u16 -- widen the sparse cache index type");
-
-    // king-safety fields held fixed (same sentinel trick as tune_stream):
-    // these feed the nonlinear KING_DANGER_TABLE lookup, not a linear sum,
-    // so probing can't measure a meaningful per-unit contribution for them.
-    let mut sentinel = default.from_vec(&vec![0i32; pos_dim]);
-    sentinel.king_attacker_weight = [(1, 1); 4];
-    sentinel.king_attacks = (1, 1);
-    sentinel.safe_knight_check = (1, 1);
-    sentinel.safe_bishop_check = (1, 1);
-    sentinel.safe_rook_check = (1, 1);
-    sentinel.safe_queen_check = (1, 1);
-    // 2026-07-26: king safety stopped being a linear sum. Shelter, storm,
-    // the weak-ring count and the flank counts now feed the same danger
-    // curve the attack units do, instead of being added straight to the
-    // score -- so a one-unit probe of any of them no longer measures that
-    // field's contribution, it measures a slope somewhere on a curve. Left
-    // off this list they would be tuned as if linear, quietly and wrongly.
-    sentinel.pawn_shelter = [(1, 1); 4];
-    sentinel.shelter_open = (1, 1);
-    sentinel.pawn_tornado = [(1, 1); 4];
-    sentinel.weak_king_ring = (1, 1);
-    sentinel.king_flank_attacks = [(1, 1); 2];
-    sentinel.king_flank_defenses = [(1, 1); 2];
-    let sentinel_vec = sentinel.to_vec();
-    let is_king_field: Vec<bool> = sentinel_vec.iter().map(|&x| x == 1).collect();
-    let king_field_count = is_king_field.iter().filter(|&&b| b).count();
-    let mut king_only_vec = vec![0i32; pos_dim];
-    for i in 0..pos_dim {
-        if is_king_field[i] {
-            king_only_vec[i] = default_vec[i];
-        }
-    }
-    let w_king_only = default.from_vec(&king_only_vec);
-    println!(
-        "tune_full: mat_dim={}, pos_dim={}, total_dim={}, king fields fixed={}, chunk={}, threads={}",
-        mat_dim, pos_dim, total_dim, king_field_count, chunk_size, threads
-    );
-
-    // extract (bias, sparse GLOBAL feature vec) for one board: material
-    // indices as-is [0,mat_dim), positional indices offset by +mat_dim.
-    let extract = |board: &Board, mat_buf: &mut [f32]| -> (f64, Vec<(u16, f32)>) {
-        let p_base = eval::positional_terms(board, &w_king_only);
-        let bias = p_base as f64; // material is a FEATURE now, not baked into bias
-        let mut sp: Vec<(u16, f32)> = Vec::new();
-        eval::material_pst_features(board, mat_buf);
-        for (i, &v) in mat_buf.iter().enumerate() {
-            if v != 0.0 {
-                sp.push((i as u16, v));
-            }
-        }
-        let mut probe_vec = king_only_vec.clone();
-        for i in 0..pos_dim {
-            if is_king_field[i] {
-                continue;
-            }
-            probe_vec[i] = 1;
-            let fi = (eval::positional_terms(board, &w_king_only.from_vec(&probe_vec)) - p_base) as f32;
-            probe_vec[i] = king_only_vec[i];
-            if fi != 0.0 {
-                sp.push(((mat_dim + i) as u16, fi));
-            }
-        }
-        (bias, sp)
-    };
-
-    // === Decomposition check (task item 3): bias + feats.w_init must
-    // reproduce material_pst_white(board) + positional_terms(board,
-    // default) -- the White's-POV full eval under the CURRENT (untuned)
-    // weights, same convention tune_stream already relies on -- to
-    // within the integer-taper rounding `checkmatpst` already tolerates. ===
-    {
-        let w_init: Vec<f64> = mat_init.iter().chain(default_vec.iter()).map(|&x| x as f64).collect();
-        // NB: not every FEN passes to the letter -- the linear-probing
-        // decomposition (same technique `tune_fast`/`tune_stream` already
-        // rely on) has rare few-cp mismatches on specific positions
-        // (confirmed pre-existing: `TUNEFAST_DEBUG_CHECK=1 tunefast` on
-        // "8/1p3Q1p/p3r3/2pk4/8/5K1P/Pb3PP1/7R b - - 0 30" alone shows a
-        // 169cp diff under the ALREADY-SHIPPED tuner, nothing new here).
-        // These four are picked because they match cleanly.
-        let check_fens = [
-            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
-            "2rqr1k1/3n1pp1/p2b1n1p/1ppp4/3P4/P2BPPPb/1P2NQNP/R1B1R1K1 b - - 1 18",
-            "2r1r1k1/5p2/p5n1/1p1Nn3/4P1Pq/PP1BQ3/6K1/3RR3 w - - 4 36",
-            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
-        ];
-        let mut mat_buf = vec![0f32; mat_dim];
-        let mut all_ok = true;
-        println!("decomposition check (bias + feats.w_init  vs  material_pst_white + positional_terms(default)):");
-        for fen in check_fens {
-            let board = Board::from_fen(fen);
-            let (bias, sp) = extract(&board, &mut mat_buf);
-            let mut pred = bias;
-            for &(idx, val) in &sp {
-                pred += w_init[idx as usize] * val as f64;
-            }
-            let real = eval::material_pst_white(&board) as f64 + eval::positional_terms(&board, &default) as f64;
-            let diff = (pred - real).abs();
-            // tolerance covers both the integer-taper rounding
-            // `checkmatpst` already allows and the same few-cp linear-
-            // probing jitter `tune_fast`'s own TUNEFAST_DEBUG_CHECK shows
-            // on real positions (pre-existing, not specific to this code)
-            let ok = diff <= 3.0;
-            if !ok {
-                all_ok = false;
-            }
-            println!("  ok={} pred={:.2} real={:.0} diff={:.2}: {}", ok, pred, real, diff, fen);
-        }
-        println!("{}", if all_ok { "DECOMPOSITION CHECK OK" } else { "DECOMPOSITION CHECK FAILED -- do not trust this tuner run!" });
-    }
-
-    fn sigmoid(x: f64, k: f64) -> f64 {
-        1.0 / (1.0 + 10f64.powf(-k * x / 400.0))
-    }
-    let ln10 = 10f64.ln();
-
-    // fit K on a small sample (serial, quick)
-    let mut sample: Vec<(f64, Vec<(u16, f32)>, f64)> = Vec::new();
-    {
-        let f = File::open(dataset_path).expect("abrir dataset");
-        let mut mat_buf = vec![0f32; mat_dim];
-        for line in BufReader::new(f).lines().take(30000) {
-            let line = line.unwrap();
-            let l = line.trim();
-            if l.is_empty() {
-                continue;
-            }
-            let mut parts = l.split('\t');
-            let fen = parts.next().unwrap();
-            let target: f64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0.5);
-            let board = Board::from_fen(fen);
-            let (bias, feats) = extract(&board, &mut mat_buf);
-            sample.push((bias, feats, target));
-        }
-    }
-    let w0: Vec<f64> = mat_init.iter().chain(default_vec.iter()).map(|&x| x as f64).collect();
-    let sample_err = |k: f64| -> f64 {
-        let mut s = 0.0;
-        for (bias, feats, target) in &sample {
-            let mut pred = *bias;
-            for &(idx, val) in feats {
-                pred += w0[idx as usize] * val as f64;
-            }
-            let d = target - sigmoid(pred, k);
-            s += d * d;
-        }
-        s / sample.len() as f64
-    };
-    let mut best_k = 1.0;
-    let mut best_e = f64::MAX;
-    let mut k = 0.4;
-    while k <= 3.0 {
-        let e = sample_err(k);
-        if e < best_e {
-            best_e = e;
-            best_k = k;
-        }
-        k += 0.1;
-    }
-    println!("fit K = {:.2} (sample error {:.6}, {} sample positions)", best_k, best_e, sample.len());
-
-    let t0 = std::time::Instant::now();
-
-    // PHASE 1: extract SPARSE features once (stream from disk in chunks,
-    // extract in parallel). cache: (bias, [(global_idx,val)], target).
-    println!("extracting sparse features (parallel, {} threads)...", threads);
-    let mut cache: Vec<(f64, Vec<(u16, f32)>, f64)> = Vec::new();
-    {
-        let file = File::open(dataset_path).expect("abrir dataset");
-        let mut reader = BufReader::new(file);
-        let mut raw: Vec<(Board, f64)> = Vec::with_capacity(chunk_size);
-        let mut line = String::new();
-        let extract_chunk = |raw: &[(Board, f64)], cache: &mut Vec<(f64, Vec<(u16, f32)>, f64)>| {
-            let n = raw.len();
-            if n == 0 {
-                return;
-            }
-            let kf = &is_king_field;
-            let kov = &king_only_vec;
-            let wko = &w_king_only;
-            let parts: Vec<Vec<(f64, Vec<(u16, f32)>, f64)>> = std::thread::scope(|scope| {
-                let per = (n + threads - 1) / threads;
-                let mut handles = Vec::new();
-                for t in 0..threads {
-                    let start = t * per;
-                    let end = ((t + 1) * per).min(n);
-                    if start >= end {
-                        continue;
-                    }
-                    let slice = &raw[start..end];
-                    handles.push(scope.spawn(move || {
-                        let mut out = Vec::with_capacity(slice.len());
-                        let mut probe_vec = kov.clone();
-                        let mut mat_buf = vec![0f32; mat_dim];
-                        for (board, target) in slice {
-                            let p_base = eval::positional_terms(board, wko);
-                            let bias = p_base as f64;
-                            let mut sp: Vec<(u16, f32)> = Vec::new();
-                            eval::material_pst_features(board, &mut mat_buf);
-                            for (i, &v) in mat_buf.iter().enumerate() {
-                                if v != 0.0 {
-                                    sp.push((i as u16, v));
-                                }
-                            }
-                            for i in 0..pos_dim {
-                                if kf[i] {
-                                    continue;
-                                }
-                                probe_vec[i] = 1;
-                                let fi = (eval::positional_terms(board, &wko.from_vec(&probe_vec)) - p_base) as f32;
-                                probe_vec[i] = kov[i];
-                                if fi != 0.0 {
-                                    sp.push(((mat_dim + i) as u16, fi));
-                                }
-                            }
-                            out.push((bias, sp, *target));
-                        }
-                        out
-                    }));
-                }
-                handles.into_iter().map(|h| h.join().unwrap()).collect()
-            });
-            for p in parts {
-                cache.extend(p);
-            }
-        };
-        let mut more = true;
-        while more {
-            line.clear();
-            let nread = reader.read_line(&mut line).expect("read");
-            if nread == 0 {
-                more = false;
-            } else {
-                let l = line.trim();
-                if !l.is_empty() {
-                    let mut ps = l.split('\t');
-                    let fen = ps.next().unwrap();
-                    let target: f64 = ps.next().and_then(|s| s.parse().ok()).unwrap_or(0.5);
-                    raw.push((Board::from_fen(fen), target));
-                }
-            }
-            if raw.len() >= chunk_size || (!more && !raw.is_empty()) {
-                let before = cache.len();
-                extract_chunk(&raw, &mut cache);
-                raw.clear();
-                if cache.len() / 500000 != before / 500000 {
-                    println!("  extracted {} positions ({:.1}s)...", cache.len(), t0.elapsed().as_secs_f64());
-                }
-            }
-        }
-    }
-    let n_pos = cache.len();
-    println!("sparse feature extraction done: {} positions in {:.1}s", n_pos, t0.elapsed().as_secs_f64());
-    if n_pos == 0 {
-        eprintln!("dataset vazio");
-        return;
-    }
-
-    // PHASE 2: fast full-batch gradient iterations over the sparse cache.
-    let mut w: Vec<f64> = mat_init.iter().chain(default_vec.iter()).map(|&x| x as f64).collect();
-    let meancenter = std::env::var("KESTREL_TUNE_MEANCENTER").map(|v| v != "0").unwrap_or(true);
-    // Flat (non-paired) mean-center groups: the 6 MG + 6 EG PST tables,
-    // 64 scalars each -- offsets per material_pst_features' doc comment
-    // (MG_PST_OFF=12, EG_PST_OFF=396, piece order P,N,B,R,Q,K).
-    let matpst_flat_groups: [(usize, usize); 12] = [
-        (12, 64), (76, 64), (140, 64), (204, 64), (268, 64), (332, 64), // MG: P,N,B,R,Q,K
-        (396, 64), (460, 64), (524, 64), (588, 64), (652, 64), (716, 64), // EG: P,N,B,R,Q,K
-    ];
-    // Paired (mg,eg) mean-center groups: the 4 positional mobility
-    // tables, same offsets tune_stream uses, shifted by +mat_dim into
-    // the global vector.
-    let mob_groups: [(usize, usize); 4] = [
-        (mat_dim + 16, 9), (mat_dim + 72, 14), (mat_dim + 128, 15), (mat_dim + 184, 28),
-    ];
-    println!("mean-centering PST + mobility tables: {} (12 raw material values soft-anchored instead, lr*1e-3)", meancenter);
-    for iter in 0..epochs {
-        let w_ref = &w;
-        let (grad, loss) = std::thread::scope(|scope| {
-            let per = (n_pos + threads - 1) / threads;
-            let mut handles = Vec::new();
-            for t in 0..threads {
-                let start = t * per;
-                let end = ((t + 1) * per).min(n_pos);
-                if start >= end {
-                    continue;
-                }
-                let slice = &cache[start..end];
-                handles.push(scope.spawn(move || {
-                    let mut g = vec![0f64; total_dim];
-                    let mut ls = 0.0f64;
-                    for (bias, sp, target) in slice {
-                        let mut pred = *bias;
-                        for &(idx, val) in sp {
-                            pred += w_ref[idx as usize] * val as f64;
-                        }
-                        let sv = sigmoid(pred, best_k);
-                        let d = target - sv;
-                        ls += d * d;
-                        let dloss = 2.0 * (sv - target) * (best_k * ln10 / 400.0) * sv * (1.0 - sv);
-                        for &(idx, val) in sp {
-                            g[idx as usize] += dloss * val as f64;
-                        }
-                    }
-                    (g, ls)
-                }));
-            }
-            let mut tg = vec![0f64; total_dim];
-            let mut tl = 0.0f64;
-            for h in handles {
-                let (g, l) = h.join().unwrap();
-                for i in 0..total_dim {
-                    tg[i] += g[i];
-                }
-                tl += l;
-            }
-            (tg, tl)
-        });
-        let mut grad = grad;
-        if meancenter {
-            for &(off, n) in &matpst_flat_groups {
-                let mean: f64 = grad[off..off + n].iter().sum::<f64>() / n as f64;
-                for i in 0..n {
-                    grad[off + i] -= mean;
-                }
-            }
-            for &(off, n) in &mob_groups {
-                let mg_mean: f64 = (0..n).map(|i| grad[off + 2 * i]).sum::<f64>() / n as f64;
-                let eg_mean: f64 = (0..n).map(|i| grad[off + 2 * i + 1]).sum::<f64>() / n as f64;
-                for i in 0..n {
-                    grad[off + 2 * i] -= mg_mean;
-                    grad[off + 2 * i + 1] -= eg_mean;
-                }
-            }
-        }
-        for j in 0..total_dim {
-            if j < 12 {
-                // Raw material values: NOT mean-centered, so they absorb the
-                // whole DC offset the mean-centered PST tables push onto them
-                // -> large gradient. Use a much smaller lr (x0.01) plus a
-                // stronger soft L2 anchor, or they saturate i32.
-                let lr_mat = lr * 0.01;
-                w[j] -= lr_mat * grad[j] / n_pos as f64;
-                w[j] -= lr_mat * 1e-2 * (w[j] - mat_init[j] as f64);
-            } else if j < mat_dim {
-                w[j] -= lr * grad[j] / n_pos as f64; // PST (mean-centered)
-            } else {
-                let pi = j - mat_dim;
-                if is_king_field[pi] {
-                    continue; // frozen, nonlinear king-danger path
-                }
-                w[j] -= lr * grad[j] / n_pos as f64;
-            }
-        }
-        if iter % 20 == 0 || iter == epochs - 1 {
-            println!("iter {}: mean loss {:.6} ({:.1}s)", iter, loss / n_pos as f64, t0.elapsed().as_secs_f64());
-        }
-    }
-
-    let out_vec: Vec<i32> = w.iter().map(|&x| x.round() as i32).collect();
-    let mat_out: Vec<String> = out_vec[0..mat_dim].iter().map(|x| x.to_string()).collect();
-    let pos_out: Vec<String> = out_vec[mat_dim..].iter().map(|x| x.to_string()).collect();
-    let mat_path = format!("{}.mat", out_path);
-    std::fs::write(&mat_path, mat_out.join(",")).expect("escrever output .mat");
-    std::fs::write(out_path, pos_out.join(",")).expect("escrever output positional");
-    println!(
-        "wrote {} material/PST scalars to {} and {} positional scalars to {}",
-        mat_out.len(), mat_path, pos_out.len(), out_path
-    );
-}
 
 /// Tuner logistico dedicado a MATERIAL + PST (as tabelas educacionais
 /// genericas de partida). Mesma
@@ -2532,556 +1010,8 @@ fn pin_psqt_means(w: &mut [f64], init_means: &[f64]) {
     }
 }
 
-/// Write a training set for an external (GPU) tuner: one record per
-/// position, holding the marginal contribution of every tunable weight.
-///
-/// Why this is worth having. Our own tuners run coordinate descent or plain
-/// gradient descent on the CPU, and the biggest one takes three quarters of
-/// an hour for a quarter of a million positions. The same problem on a GPU
-/// is a sparse linear regression -- millions of positions in minutes -- and
-/// that is the difference between tuning what we have and being able to
-/// afford several times as many parameters, one set per game phase.
-///
-/// The features come from the engine's own evaluation rather than from a
-/// separate reimplementation of it. `positional_terms` is linear in its
-/// weights, so setting one weight to 1 with the rest at zero and reading the
-/// result back gives that weight's contribution exactly. An external
-/// extractor would have to restate every evaluation term in its own code and
-/// could drift out of step with the engine silently; this cannot, because it
-/// IS the engine. `gpucheck` below verifies the decomposition reproduces the
-/// real evaluation.
-///
-/// King safety is deliberately absent, and stays in the fixed bias: it goes
-/// through the danger curve, so it is not linear in its weights and a
-/// one-unit probe would measure a slope on a curve rather than a
-/// contribution.
-///
-/// Record layout, little-endian, matching what the GPU trainer reads:
-///   u16 count, count x (u16 index, f32 value), f32 phase, f32 result
-/// Index `dim` is the fixed bias (material, PST and king safety); its weight
-/// is frozen at 1 by the trainer. With `buckets` > 1 the indices are shifted
-/// by `bucket * (dim + 1)`, which is all a bucketed model needs: each phase
-/// range then owns a private copy of every weight and they are free to
-/// disagree with each other, instead of being tied to one straight line
-/// between a midgame and an endgame value.
-/// Which weight breaks linearity, if any.
-///
-/// The feature extraction assumes `positional_terms` is linear in its
-/// weights. Rather than argue about it: halve the weight vector, evaluate
-/// each half alone, and see whether the halves add up to the whole. Recurse
-/// into whichever half fails and the culprit falls out in a few steps.
-/// Truncation makes each split cost up to a centipawn, so the search only
-/// follows gaps clearly larger than that.
-fn linearity_probe(fen: &str) {
-    let default = eval::default_weights().clone();
-    let base = default.to_vec();
-    let dim = base.len();
-    let board = Board::from_fen(fen);
-    let zero = default.from_vec(&vec![0i32; dim]);
-    let p_zero = eval::positional_terms(&board, &zero);
 
-    let eval_subset = |lo: usize, hi: usize| -> i32 {
-        let mut v = vec![0i32; dim];
-        v[lo..hi].copy_from_slice(&base[lo..hi]);
-        eval::positional_terms(&board, &default.from_vec(&v)) - p_zero
-    };
 
-    println!("position: {}", fen);
-    println!("positional(all) - positional(0) = {}", eval_subset(0, dim));
-    let mut lo = 0usize;
-    let mut hi = dim;
-    loop {
-        let whole = eval_subset(lo, hi);
-        if hi - lo <= 1 {
-            println!("single weight [{}..{}] -- gap {} cp lives here", lo, hi, whole);
-            return;
-        }
-        let mid = (lo + hi) / 2;
-        let a = eval_subset(lo, mid);
-        let b = eval_subset(mid, hi);
-        let gap = whole - a - b;
-        println!("[{:>3}..{:>3}] whole={:>6}  left={:>6}  right={:>6}  gap={:>5}", lo, hi, whole, a, b, gap);
-        if gap.abs() <= 1 {
-            println!("additive here to within truncation -- nothing further to find");
-            return;
-        }
-        // Follow whichever half is itself non-additive; if both are clean the
-        // non-linearity is an interaction BETWEEN them, which is worth saying.
-        let mid_l = (lo + mid) / 2;
-        let gap_l = if mid - lo > 1 { eval_subset(lo, mid) - eval_subset(lo, mid_l) - eval_subset(mid_l, mid) } else { 0 };
-        if gap_l.abs() > 1 {
-            hi = mid;
-        } else {
-            let mid_r = (mid + hi) / 2;
-            let gap_r = if hi - mid > 1 { eval_subset(mid, hi) - eval_subset(mid, mid_r) - eval_subset(mid_r, hi) } else { 0 };
-            if gap_r.abs() > 1 {
-                lo = mid;
-            } else {
-                println!("both halves are additive on their own -- the {} cp comes from an INTERACTION between [{}..{}] and [{}..{}]", gap, lo, mid, mid, hi);
-                return;
-            }
-        }
-    }
-}
-
-fn gpu_extract(dataset_path: &str, out_path: &str, max_positions: usize, buckets: usize, threads: usize) {
-    use std::io::Write as _;
-
-    // Probe size, and it matters more than it looks. Reading a weight's
-    // contribution means setting it, evaluating, and subtracting -- but the
-    // evaluation truncates, so whatever the probe is worth comes back rounded
-    // down, and six hundred roundings do not cancel. Probing at 1 left a 256cp
-    // hole; at MAX_PHASE, which makes the final taper divide exactly, still
-    // 14cp, because terms round on the way in as well. Ten times MAX_PHASE
-    // puts every rounding an order of magnitude below the quantity being
-    // measured and the reconstruction lands within 2cp of the real
-    // evaluation, which is all the engine's own integer arithmetic allows.
-    //
-    // Adjustable because that is how the question was settled: a residual
-    // that shrinks as this grows was rounding; one that does not means the
-    // model is not the function, and no amount of scaling would hide it.
-    //
-    // 2026-07-29: this was `10 * MAX_PHASE`, and MAX_PHASE is 24 -- so the
-    // probe was 240, which the reasoning above says is far too small. It was:
-    // at 240 the self-check reported a 14.5cp gap, at 1024 it drops to 3.2 and
-    // stays there through 240000. Every value the residual was tested against
-    // by hand happened to be above the knee, so it looked scale-independent
-    // and was read as "the model is not the function" for a day. A fixed
-    // number, well past where the curve flattens, rather than one derived from
-    // a phase constant it has nothing to do with.
-    let probe_mult: i32 = std::env::var("KESTREL_PROBE_MULT")
-        .ok().and_then(|v| v.parse().ok()).unwrap_or(4096);
-    let default = eval::default_weights().clone();
-    let default_vec = default.to_vec();
-    let dim = default_vec.len();
-
-    // Same sentinel trick the CPU tuners use to find the non-linear
-    // king-safety fields without hardcoding offsets.
-    let mut sentinel = default.from_vec(&vec![0i32; dim]);
-    sentinel.king_attacker_weight = [(1, 1); 4];
-    sentinel.king_attacks = (1, 1);
-    sentinel.safe_knight_check = (1, 1);
-    sentinel.safe_bishop_check = (1, 1);
-    sentinel.safe_rook_check = (1, 1);
-    sentinel.safe_queen_check = (1, 1);
-    sentinel.pawn_shelter = [(1, 1); 4];
-    sentinel.shelter_open = (1, 1);
-    sentinel.pawn_tornado = [(1, 1); 4];
-    sentinel.weak_king_ring = (1, 1);
-    sentinel.king_flank_attacks = [(1, 1); 2];
-    sentinel.king_flank_defenses = [(1, 1); 2];
-    let is_king_field: Vec<bool> = sentinel.to_vec().iter().map(|&x| x == 1).collect();
-    let n_king = is_king_field.iter().filter(|&&b| b).count();
-
-    // The switched-off features, by index.
-    //
-    // The probes below call `positional_terms` directly and so bypass the gate
-    // that `weights_for` applies. Emitting a column the engine zeroes would
-    // train the model on an evaluation that does not exist -- it would learn a
-    // weight for the term and the engine would then ignore it.
-    let feature_off: Vec<bool> =
-        default.field_names().iter().map(|n| !eval::feature_on(n)).collect();
-    let n_off = feature_off.iter().filter(|&&b| b).count();
-    if n_off > 0 {
-        eprintln!("gpuextract: {} of {} positional features are switched off and \
-                   will emit no column", n_off, feature_off.len());
-    }
-
-    let mut king_only_vec = vec![0i32; dim];
-    for i in 0..dim {
-        if is_king_field[i] {
-            king_only_vec[i] = default_vec[i];
-        }
-    }
-    let w_king_only = default.from_vec(&king_only_vec);
-
-    let text = std::fs::read_to_string(dataset_path).expect("nao consegui ler o dataset");
-    let lines: Vec<&str> = text
-        .lines()
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty())
-        .take(max_positions)
-        .collect();
-    let per_bucket = dim + eval::MAT_PST_DIM + 1;
-    println!(
-        "gpu_extract: {} positions, {} positional + {} material/PST tunable ({} king fields in the bias), {} buckets -> {} parameters",
-        lines.len(), dim - n_king, eval::MAT_PST_DIM, n_king, buckets, per_bucket * buckets
-    );
-
-    // One Weights per probe index, built once and shared by every position.
-    //
-    // The probe loop used to call from_vec for each feature of each position:
-    // that rebuilds the whole struct -- the 128-entry danger table, the
-    // mobility arrays, every threat table -- to change one scalar, and it was
-    // costing more than the evaluation the probe existed to measure. Built
-    // once here it is a few megabytes and the extraction stops being
-    // dominated by work that has nothing to do with the positions.
-    let probes: Vec<eval::Weights> = {
-        let mut v = vec![0i32; dim];
-        (0..dim)
-            .map(|i| {
-                if is_king_field[i] {
-                    return w_king_only.clone();  // never used; keeps indices aligned
-                }
-                v[i] = probe_mult;
-                let w = w_king_only.from_vec(&v);
-                v[i] = 0;
-                w
-            })
-            .collect()
-    };
-
-    // The same idea for the king fields, but built on an ALL-ZERO base rather
-    // than on `w_king_only`: the probe is read against the accumulator, and
-    // the accumulator has to start from zero for the difference to be the
-    // field's own count and nothing else.
-    let probes_king: Vec<eval::Weights> = {
-        let zero = default.from_vec(&vec![0i32; dim]);
-        let mut v = vec![0i32; dim];
-        (0..dim)
-            .map(|i| {
-                if !is_king_field[i] {
-                    return zero.clone();  // never used; keeps indices aligned
-                }
-                v[i] = probe_mult;
-                let w = zero.from_vec(&v);
-                v[i] = 0;
-                w
-            })
-            .collect()
-    };
-
-    let chunk = (lines.len() + threads - 1) / threads.max(1);
-    let out: Vec<Vec<u8>> = std::thread::scope(|scope| {
-        let mut handles = Vec::new();
-        for part in lines.chunks(chunk.max(1)) {
-            let w_king_only = &w_king_only;
-            let king_only_vec = &king_only_vec;
-            let is_king_field = &is_king_field;
-            let feature_off = &feature_off;
-            let probes = &probes;
-            let probes_king = &probes_king;
-            handles.push(scope.spawn(move || {
-                let mut buf: Vec<u8> = Vec::new();
-                // Probes run from an all-zero weight set so nothing else is
-                // in the sum to be truncated alongside the feature.
-                let mut probe_vec = vec![0i32; king_only_vec.len()];
-                let w_zero = w_king_only.from_vec(&probe_vec);
-                let mut mat_feats = vec![0f32; eval::MAT_PST_DIM];
-                for line in part {
-                    let mut it = line.split('\t');
-                    let fen = match it.next() { Some(f) => f, None => continue };
-                    let result: f32 = match it.next().and_then(|r| r.parse().ok()) {
-                        Some(r) => r,
-                        None => continue,
-                    };
-                    let board = Board::from_fen(fen);
-                    let probe_base = eval::positional_terms(&board, &w_zero);
-                    // Bias: what the linear model cannot express. King safety
-                    // used to live here -- it goes through the danger curve,
-                    // so it is not linear in its weights -- and that is why the
-                    // largest block in the evaluation was never fitted.
-                    //
-                    // It comes OUT now: the king fields go in as raw counts
-                    // above and the model applies the curve itself. Leaving it
-                    // here as well would count it twice, and silently: the bias
-                    // is per position and nothing downstream would complain.
-                    let bias = probe_base;
-                    let _ = &w_king_only;
-                    let phase = eval::phase_fraction(&board);
-                    // The SAME partition the engine uses to pick a weight set.
-                    //
-                    // This split the phase evenly while `eval::bucket_of`
-                    // splits by pawn count, so a run would have trained each
-                    // set on one population and the engine would then have
-                    // applied it to another -- every weight landing in a
-                    // bucket it was not fitted for. The two must be the same
-                    // function or the whole exercise measures nothing.
-                    let b = if buckets <= 1 { 0 } else { eval::bucket_of(&board) };
-                    let b = b.min(buckets - 1);
-                    let off = (b * (is_king_field.len() + eval::MAT_PST_DIM + 1)) as u16;
-
-                    // Probed at MAX_PHASE rather than at 1, from an all-zero
-                    // base, and divided back out in floating point.
-                    //
-                    // The evaluation tapers with an integer division by
-                    // MAX_PHASE at the very end. Probe a weight at 1 and that
-                    // division truncates the single feature's own
-                    // contribution; do it for six hundred features and the
-                    // discarded remainders add up -- measured at 256cp on
-                    // real positions, which is not a rounding error, it is a
-                    // different function. At MAX_PHASE the numerator divides
-                    // exactly, so the probe returns the untruncated quantity
-                    // and the taper is applied here in floating point
-                    // instead. The model this feeds is then linear in exact
-                    // arithmetic, which is what it claims to be.
-                    let mut feats: Vec<(u16, f32)> = Vec::new();
-                    // King-safety fields go in as RAW COUNTS, not as a
-                    // contribution. The curve sits between them and the score,
-                    // so probing the score measures a slope somewhere on that
-                    // curve rather than the field's own quantity -- which is
-                    // why they used to be skipped and folded into the bias,
-                    // and why the largest block in the evaluation has never
-                    // been fitted.
-                    //
-                    // But the ACCUMULATOR the curve is applied to is exactly
-                    // linear in these weights, measured: `kestrel kinglin`
-                    // probes each one at +1 and +2 and gets x and 2x on all 46,
-                    // with zero exceptions. So a linear probe against the
-                    // accumulator recovers each field's count exactly, and the
-                    // model downstream applies the curve itself.
-                    //
-                    // The 46 slots already exist in the layout and were always
-                    // zero, so nothing about the file's shape changes: white's
-                    // count goes in the pair's mg slot, black's in its eg slot.
-                    let acc0 = eval::king_accumulators(&board, &w_zero);
-                    for i in 0..is_king_field.len() {
-                        if feature_off[i] {
-                            continue;
-                        }
-                        if is_king_field[i] {
-                            let acc = eval::king_accumulators(&board, &probes_king[i]);
-                            // Even index of a pair -> White's count; odd -> Black's.
-                            let x = if i % 2 == 0 {
-                                acc[0].0 - acc0[0].0
-                            } else {
-                                acc[1].0 - acc0[1].0
-                            };
-                            if x != 0 {
-                                feats.push((off + i as u16, x as f32 / probe_mult as f32));
-                            }
-                            continue;
-                        }
-                        let v = eval::positional_terms(&board, &probes[i]) - probe_base;
-                        if v != 0 {
-                            feats.push((off + i as u16, v as f32 / probe_mult as f32));
-                        }
-                    }
-                    // Material and piece-square tables.
-                    //
-                    // These were assumed rather than fitted: the tables came
-                    // in as generic published ones and the piece values were
-                    // set separately, so there has never been any reason to
-                    // believe the two agree with each other. A knight's table
-                    // says what a knight is worth on each square RELATIVE to
-                    // its own value -- if that value was chosen elsewhere,
-                    // the table can be systematically off everywhere and
-                    // nothing in the engine would show it.
-                    //
-                    // Exact, and in floating point: unlike the probe above,
-                    // material_pst_features computes the taper directly
-                    // rather than reading it back out of a truncated
-                    // evaluation, so there is no rounding to work around.
-                    eval::material_pst_features(&board, &mut mat_feats);
-                    for (j, &v) in mat_feats.iter().enumerate() {
-                        if v != 0.0 {
-                            feats.push((off + (is_king_field.len() + j) as u16, v));
-                        }
-                    }
-                    feats.push((off + (is_king_field.len() + eval::MAT_PST_DIM) as u16, bias as f32));
-
-                    buf.extend_from_slice(&(feats.len() as u16).to_le_bytes());
-                    for (idx, v) in &feats {
-                        buf.extend_from_slice(&idx.to_le_bytes());
-                        buf.extend_from_slice(&v.to_le_bytes());
-                    }
-                    buf.extend_from_slice(&phase.to_le_bytes());
-                    buf.extend_from_slice(&result.to_le_bytes());
-                }
-                buf
-            }));
-        }
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    });
-
-    // Self-check: rebuild the evaluation from the features we just wrote and
-    // compare against what the engine really returns. The whole method rests
-    // on `positional_terms` being linear in its weights; if that ever stops
-    // being true -- as it just did for king safety -- this catches it here
-    // instead of after a tuning run has quietly optimised the wrong function.
-    {
-        let mut worst = 0f64;
-        let mut worst_fen = String::new();
-        let mut checked = 0usize;
-        let mut probe_vec = vec![0i32; dim];
-        let w_zero = default.from_vec(&probe_vec);
-        let mat_pst_now = eval::material_pst_current_vec();
-        let mut mat_feats = vec![0f32; eval::MAT_PST_DIM];
-        for line in lines.iter().take(200) {
-            let fen = match line.split('\t').next() { Some(f) => f, None => continue };
-            let board = Board::from_fen(fen);
-            let probe_base = eval::positional_terms(&board, &w_zero);
-            let mut rebuilt = eval::positional_terms(&board, &w_king_only) as f64;
-            // Material and piece-square tables are features now, so the
-            // reconstruction has to add them back the same way the tuner
-            // will: as a dot product against the values in force.
-            eval::material_pst_features(&board, &mut mat_feats);
-            for (j, &v) in mat_feats.iter().enumerate() {
-                rebuilt += mat_pst_now[j] as f64 * v as f64;
-            }
-            for i in 0..dim {
-                if is_king_field[i] {
-                    continue;
-                }
-                probe_vec[i] = probe_mult;
-                let w_probe = default.from_vec(&probe_vec);
-                let v = eval::positional_terms(&board, &w_probe) - probe_base;
-                probe_vec[i] = 0;
-                rebuilt += default_vec[i] as f64 * v as f64 / probe_mult as f64;
-            }
-            // Compared against material + positional ALONE, which is what the
-            // linear model covers. The engine's final evaluation also applies
-            // the complexity adjustment and the endgame scale factor, and
-            // both are non-linear -- they multiply the result rather than add
-            // to it. Checking against those would report a mismatch that has
-            // nothing to do with whether the features are right, and hide a
-            // real one if it ever appeared.
-            let real_white = (eval::material_pst_white(&board)
-                + eval::positional_terms(&board, &default)) as f64;
-            let gap = (rebuilt - real_white).abs();
-            if std::env::var_os("KESTREL_SPLIT_CHECK").is_some() && gap > 3.0 {
-                // Which half disagrees: material/PST, or the positional terms?
-                let mut mat_only = 0f64;
-                for (j, &v) in mat_feats.iter().enumerate() {
-                    mat_only += mat_pst_now[j] as f64 * v as f64;
-                }
-                let pos_rebuilt = rebuilt - mat_only;
-                let pos_real = eval::positional_terms(&board, &default) as f64;
-                println!("  split: material gap {:.1}, positional gap {:.1}  ({})",
-                         mat_only - eval::material_pst_white(&board) as f64,
-                         pos_rebuilt - pos_real, fen);
-            }
-            if gap > worst {
-                worst = gap;
-                worst_fen = fen.to_string();
-            }
-            checked += 1;
-        }
-        // A couple of centipawns is the engine's own truncation, which the
-        // float reconstruction deliberately does not repeat. Much more than
-        // that means the model is not the function.
-        println!(
-            "self-check on {} positions: largest gap between the feature decomposition and the real evaluation = {:.1} cp{}",
-            checked, worst,
-            // 3.5, not 3.0. The residual is a floor set by integer truncation
-            // inside the evaluation, and the floor is where it is: measured on
-            // two datasets it settles at 2.4 and 3.2 and does not move when
-            // the probe scale is raised a hundredfold. That invariance is the
-            // real test -- a residual that shrinks with the probe is rounding,
-            // one that does not is the model failing to be the function -- and
-            // a threshold set just under the measured floor reports the former
-            // as the latter, which is a day of hunting for a bug that is not
-            // there.
-            if worst <= 3.5 { " (as close as integer truncation allows)" } else { "  <-- NOT LINEAR, the features are wrong" }
-        );
-        if worst > 3.0 {
-            println!("worst position: {}", worst_fen);
-        }
-    }
-
-    let mut f = std::fs::File::create(out_path).expect("nao consegui criar o output");
-    let mut total = 0usize;
-    for part in &out {
-        f.write_all(part).expect("escrita falhou");
-        total += part.len();
-    }
-    println!("wrote {:.1} MB to {}", total as f64 / 1024.0 / 1024.0, out_path);
-}
-
-fn tune_matpst(dataset_path: &str, out_path: &str, iters: u32, lr: f64) {
-    let text = std::fs::read_to_string(dataset_path).expect("nao consegui ler o dataset");
-    let mut boards: Vec<Board> = Vec::new();
-    let mut results: Vec<f64> = Vec::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() { continue; }
-        let mut parts = line.split('\t');
-        let fen = parts.next().unwrap();
-        let res: f64 = parts.next().unwrap().parse().unwrap();
-        boards.push(Board::from_fen(fen));
-        results.push(res);
-    }
-    let n_pos = boards.len();
-    let dim = eval::MAT_PST_DIM;
-    println!("dataset: {} positions, tuning {} material/PST scalars", n_pos, dim);
-
-    // fixar o material do rei (nao tem valor): indices 5 (MG_VALUE king)
-    // e 11 (EG_VALUE king). As PST do rei SAO tunaveis.
-    // Fixar TODO o material (indices 0..12 = MG_VALUE + EG_VALUE), tunar
-    // SO' as PST (12..780). Rondas 1 e 1b (tunar o material tambem)
-    // regrediram -120 Elo: o tuner deu razoes de peca desequilibradas
-    // (torre 4.62 peoes, dama 7.5 no mg -- baixas) que fazem o motor
-    // trocar pecas mal, alem de derivar a escala global (descalibra as
-    // margens de busca). Fixando o material nos valores classicos bons,
-    // a escala/razoes ficam ancoradas e o tuner so' ajusta as PST
-    // (posicional por casa) -- ajustes pequenos, muito menos perigosos.
-    let is_fixed: Vec<bool> = (0..dim).map(|i| i < 12).collect();
-
-    let w_pos = eval::default_weights();
-    println!("extracting material/PST features ({} positions)...", n_pos);
-    let t0 = std::time::Instant::now();
-    // bias = positional COMPLETO (fixo), white POV. features = material/PST.
-    let mut biases: Vec<f64> = Vec::with_capacity(n_pos);
-    let mut features: Vec<Vec<f32>> = Vec::with_capacity(n_pos);
-    let mut f = vec![0f32; dim];
-    for board in &boards {
-        let bias = eval::positional_terms(board, w_pos) as f64;
-        eval::material_pst_features(board, &mut f);
-        features.push(f.clone());
-        biases.push(bias);
-    }
-    println!("feature extraction done in {:.1}s", t0.elapsed().as_secs_f64());
-
-    fn sigmoid(x: f64, k: f64) -> f64 { 1.0 / (1.0 + 10f64.powf(-k * x / 400.0)) }
-    let mut w: Vec<f64> = eval::material_pst_current_vec().iter().map(|&x| x as f64).collect();
-    // Level each table starts at -- the value pin_psqt_means() holds it to.
-    let init_means: Vec<f64> = psqt_tables()
-        .iter()
-        .map(|&(start, is_pawn)| table_mean(&w, start, is_pawn))
-        .collect();
-    let predict = |w: &[f64], i: usize| -> f64 {
-        let mut e = biases[i];
-        let f = &features[i];
-        for j in 0..dim { if f[j] != 0.0 { e += w[j] * f[j] as f64; } }
-        e
-    };
-    let mean_error = |w: &[f64], k: f64| -> f64 {
-        let mut sum = 0.0;
-        for i in 0..n_pos { let d = results[i] - sigmoid(predict(w, i), k); sum += d * d; }
-        sum / n_pos as f64
-    };
-    let mut best_k = 1.0; let mut best_k_err = f64::MAX; let mut k = 0.2;
-    while k <= 3.0 {
-        let e = mean_error(&w, k);
-        if e < best_k_err { best_k_err = e; best_k = k; }
-        k += 0.1;
-    }
-    println!("best K = {:.2}  (starting error = {:.6})", best_k, best_k_err);
-
-    let ln10 = std::f64::consts::LN_10;
-    let mut grad = vec![0f64; dim];
-    let t1 = std::time::Instant::now();
-    for iter in 0..iters {
-        for g in grad.iter_mut() { *g = 0.0; }
-        for i in 0..n_pos {
-            let s = sigmoid(predict(&w, i), best_k);
-            let d_loss_d_eval = 2.0 * (s - results[i]) * (best_k * ln10 / 400.0) * s * (1.0 - s);
-            let f = &features[i];
-            for j in 0..dim { if f[j] != 0.0 { grad[j] += d_loss_d_eval * f[j] as f64; } }
-        }
-        for j in 0..dim { if !is_fixed[j] { w[j] -= lr * grad[j] / n_pos as f64; } }
-        pin_psqt_means(&mut w, &init_means);
-        if iter % 200 == 0 || iter == iters - 1 {
-            println!("iter {}: error={:.6}  ({:.2}s)", iter, mean_error(&w, best_k), t1.elapsed().as_secs_f64());
-        }
-    }
-    let final_err = mean_error(&w, best_k);
-    println!("final error: {:.6} (started {:.6}) in {:.2}s", final_err, best_k_err, t1.elapsed().as_secs_f64());
-    let out_vec: Vec<i32> = w.iter().map(|&x| x.round() as i32).collect();
-    let serialized: Vec<String> = out_vec.iter().map(|x| x.to_string()).collect();
-    std::fs::write(out_path, serialized.join(",")).expect("nao consegui escrever o output");
-    println!("wrote {} material/PST scalars to {}", out_vec.len(), out_path);
-}
 
 /// Logistic eval tuning: coordinate descent on `Weights::to_vec()`'s flat
 /// parameter vector, minimizing squared error between the sigmoid of
@@ -3091,135 +1021,6 @@ fn tune_matpst(dataset_path: &str, out_path: &str, iters: u32, lr: f64) {
 /// -step, keep whichever reduces total error over the whole dataset,
 /// else leave it unchanged. Dataset format: one line per position,
 /// "<FEN>\t<white_score>".
-fn tune_weights(dataset_path: &str, out_path: &str, epochs: u32, lambda: f64) {
-    let text = std::fs::read_to_string(dataset_path).expect("nao consegui ler o dataset");
-    let mut boards: Vec<Board> = Vec::new();
-    let mut results: Vec<f64> = Vec::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let mut parts = line.split('\t');
-        let fen = parts.next().unwrap();
-        let res: f64 = parts.next().unwrap().parse().unwrap();
-        boards.push(Board::from_fen(fen));
-        results.push(res);
-    }
-    println!("dataset: {} positions", boards.len());
-
-    // sigmoid(eval) = 1 / (1 + 10^(-k*eval/400)) -- eval from White's POV.
-    fn sigmoid(eval_cp: f64, k: f64) -> f64 {
-        1.0 / (1.0 + 10f64.powf(-k * eval_cp / 400.0))
-    }
-    fn white_eval(board: &Board, w: &eval::Weights) -> f64 {
-        let e = eval::evaluate_with_weights(board, w);
-        if board.side == types::Color::White { e as f64 } else { -e as f64 }
-    }
-    fn total_error(boards: &[Board], results: &[f64], w: &eval::Weights, k: f64) -> f64 {
-        let mut sum = 0.0;
-        for (b, r) in boards.iter().zip(results.iter()) {
-            let pred = sigmoid(white_eval(b, w), k);
-            let d = r - pred;
-            sum += d * d;
-        }
-        sum / boards.len() as f64
-    }
-
-    let base = eval::default_weights().clone();
-    let default_vec = base.to_vec();
-
-    // L2 regularization toward the hand-derived defaults: found AFTER
-    // the first real tuning run that unregularized coordinate descent
-    // let several parameters drift by exactly the same +/-1 every
-    // single epoch for all 20 epochs (e.g. mobility_knight's "0 legal
-    // moves" penalty roughly halved, its "1 legal move" entry flipped
-    // sign from penalty to bonus) -- never reversing direction, i.e.
-    // never actually converging to a nearby optimum, just sliding
-    // along an unconstrained slope shaped by this specific self-play
-    // distribution. That run's tuned weights held up on a held-out
-    // set drawn from the SAME weak self-player but regressed the
-    // tactical suite hard (82.6% -> 73.9%, reproducible). `lambda`>0
-    // adds a quadratic penalty for straying from the reasoned starting
-    // point, so a parameter only keeps moving if the fit improvement
-    // clearly outweighs the distance traveled -- lambda=0 reproduces
-    // the original unregularized behavior exactly.
-    fn regularized(err: f64, v: &[i32], default_vec: &[i32], lambda: f64) -> f64 {
-        if lambda == 0.0 {
-            return err;
-        }
-        let mut penalty = 0.0;
-        for (a, b) in v.iter().zip(default_vec.iter()) {
-            let d = (a - b) as f64;
-            penalty += d * d;
-        }
-        err + lambda * penalty / v.len() as f64
-    }
-
-    // Find the best sigmoid scale K for the CURRENT (untuned) weights
-    // first -- a coarse 1D scan, fixed for the rest of the run: K only
-    // rescales how harshly error is measured, tuning it jointly with
-    // every other parameter every step is unnecessary.
-    let mut best_k = 1.0;
-    let mut best_k_err = f64::MAX;
-    let mut k = 0.2;
-    while k <= 3.0 {
-        let e = total_error(&boards, &results, &base, k);
-        if e < best_k_err {
-            best_k_err = e;
-            best_k = k;
-        }
-        k += 0.1;
-    }
-    println!("best K = {:.2}  (error at default weights = {:.6})", best_k, best_k_err);
-
-    let mut v = base.to_vec();
-    let mut current = base.from_vec(&v);
-    let mut current_err = total_error(&boards, &results, &current, best_k);
-    let mut current_obj = regularized(current_err, &v, &default_vec, lambda);
-    println!("starting error: {:.6}  (lambda={}, objective={:.6})", current_err, lambda, current_obj);
-
-    for epoch in 0..epochs {
-        let mut improved = 0;
-        for i in 0..v.len() {
-            let orig = v[i];
-            v[i] = orig + 1;
-            let cand = current.from_vec(&v);
-            let err_up = total_error(&boards, &results, &cand, best_k);
-            let obj_up = regularized(err_up, &v, &default_vec, lambda);
-            if obj_up < current_obj {
-                current_err = err_up;
-                current_obj = obj_up;
-                current = cand;
-                improved += 1;
-                continue;
-            }
-            v[i] = orig - 1;
-            let cand = current.from_vec(&v);
-            let err_down = total_error(&boards, &results, &cand, best_k);
-            let obj_down = regularized(err_down, &v, &default_vec, lambda);
-            if obj_down < current_obj {
-                current_err = err_down;
-                current_obj = obj_down;
-                current = cand;
-                improved += 1;
-                continue;
-            }
-            v[i] = orig;
-        }
-        println!("epoch {}: error={:.6}  objective={:.6}  params improved={}", epoch, current_err, current_obj, improved);
-        if improved == 0 {
-            println!("converged (no parameter improved this epoch)");
-            break;
-        }
-    }
-
-    let out_vec = current.to_vec();
-    let serialized: Vec<String> = out_vec.iter().map(|x| x.to_string()).collect();
-    std::fs::write(out_path, serialized.join(",")).expect("nao consegui escrever o output");
-    println!("wrote tuned weights ({} scalars) to {}", out_vec.len(), out_path);
-    println!("final error: {:.6}  (started at {:.6}, default-K error {:.6})", current_err, current_err, best_k_err);
-}
 
 /// Resolve every position in a `kestrel tune`-format dataset (`<fen>\t
 /// <result>` per line) to its quiescence leaf before tuning touches it.
@@ -3236,106 +1037,6 @@ fn tune_weights(dataset_path: &str, out_path: &str, epochs: u32, lambda: f64) {
 /// (positions are guaranteed tactically settled) without that cost;
 /// `tune`/`tunefast` afterward are unchanged, still score with
 /// `evaluate_with_weights`, just on cleaner input.
-fn resolve_quiet_dataset(in_path: &str, out_path: &str) {
-    use crate::search::{Searcher, SearchLimits, CONT_HIST_SIZE, CORR_HIST_SIZE, MAX_PLY, MATE_SCORE};
-    let atk = Attacks::new();
-    let zob = zobrist::Zobrist::new();
-    let tt = tt::TranspositionTable::new(1);
-
-    let text = std::fs::read_to_string(in_path).expect("nao consegui ler o dataset");
-    let lines: Vec<&str> = text.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
-    println!("resolving {} positions to quiescence leaves...", lines.len());
-    let t0 = std::time::Instant::now();
-
-    let mut out = String::new();
-    let mut skipped = 0u32;
-    for (i, line) in lines.iter().enumerate() {
-        let mut parts = line.split('\t');
-        let fen = parts.next().unwrap();
-        let res = parts.next().unwrap();
-        let mut board = Board::from_fen(fen);
-
-        let mut searcher = Searcher {
-            thread_idx: 0,
-            root_side: board.side,
-            stop_flag: &crate::search::NO_STOP,
-            asp_re: 0,
-                asp_nos: 0,
-                cut_nodes: 0,
-            cut_first: 0,
-            nmp_tried: 0,
-            nmp_tried_pv: 0,
-            nmp_failed_pv: 0,
-            nmp_cutoff_raw: 0,
-            nmp_cut_taken: 0,
-            nmp_verify_tried: 0,
-            nmp_verify_ok: 0,
-            nmp_verify_failed: 0,
-            nmp_failed_low: 0,
-            qnodes: 0,
-            cut_rfp: 0,
-            cut_razor: 0,
-            cut_futility: 0,
-            nodes_shallow: 0,
-            lmr_quiet_total: 0,
-            lmr_skip_check: 0,
-            lmr_skip_depth: 0,
-            lmr_skip_extend: 0,
-            lmr_skip_early: 0,
-            lmr_tried: 0,
-            lmr_research: 0,
-            lmr_sum: 0,
-            atk: &atk,
-            zob: &zob,
-            tt: &tt,
-            nodes: 0,
-            limits: SearchLimits { deadline: None, max_depth: 64, max_nodes: None, soft_budget: None },
-            stop: false,
-            history: Vec::new(),
-            killers: [[None; 2]; MAX_PLY],
-            history_scores: [[[0; 64]; 64]; 2],
-            countermoves: [[None; 64]; 6],
-            cont_hist: vec![0i32; CONT_HIST_SIZE].into_boxed_slice(),
-            corr_hist: vec![0i32; CORR_HIST_SIZE * 2].into_boxed_slice(),
-            corr_hist_np_stm: vec![0i32; CORR_HIST_SIZE * 2].into_boxed_slice(),
-            corr_hist_np_nstm: vec![0i32; CORR_HIST_SIZE * 2].into_boxed_slice(),
-            corr_hist_minor: vec![0i32; CORR_HIST_SIZE * 2].into_boxed_slice(),
-            corr_hist_major: vec![0i32; CORR_HIST_SIZE * 2].into_boxed_slice(),
-            corr_hist_threats: vec![0i32; CORR_HIST_SIZE * 2].into_boxed_slice(),
-            ply_last_move: [None; MAX_PLY],
-            static_evals: [0i32; MAX_PLY],
-            root_best: None,
-                        root_scores: Vec::new(),
-                        nmp_min_ply: 0,
-            excluded_move: None,
-            excluded_root_moves: vec![],
-            style_book: None,
-            root_move_nodes: Vec::new(),
-            capture_history: [[[0; 6]; 6]; 2],
-            dextensions: [0; MAX_PLY],
-            report: false, // offline tools: no UCI narration
-        };
-        let (score, leaf) = searcher.quiescence_leaf(&mut board, -MATE_SCORE, MATE_SCORE, 0);
-        if score.abs() >= MATE_SCORE - MAX_PLY as i32 {
-            // Forced mate found inside quiescence -- drop it, same filter
-            // tune_weights's own dataset-reading loop would want (a
-            // position where the game is already tactically decided
-            // isn't useful signal for eval-weight tuning).
-            skipped += 1;
-            continue;
-        }
-        out.push_str(&leaf.to_fen());
-        out.push('\t');
-        out.push_str(res);
-        out.push('\n');
-        if (i + 1) % 5000 == 0 {
-            println!("  {}/{} ({:.0}s)", i + 1, lines.len(), t0.elapsed().as_secs_f64());
-        }
-    }
-    std::fs::write(out_path, &out).expect("nao consegui escrever o output");
-    println!("wrote {} quiet-resolved positions ({} skipped as forced mate) to {} in {:.0}s",
-        lines.len() as u32 - skipped, skipped, out_path, t0.elapsed().as_secs_f64());
-}
 
 /// Etiquetar posicoes com o que a NOSSA busca ve a profundidade fixa.
 ///
@@ -3350,79 +1051,6 @@ fn resolve_quiet_dataset(in_path: &str, out_path: &str) {
 /// e' exactamente o que faz um motor jogar bem sem gastar relogio.
 ///
 /// Iterativo por natureza: cada versao melhor produz etiquetas melhores.
-fn rotula_dataset(in_path: &str, out_path: &str, depth: i32, threads: usize) {
-    use crate::search::{Searcher, SearchLimits, CONT_HIST_SIZE, CORR_HIST_SIZE, MAX_PLY, MATE_SCORE};
-    let atk = Attacks::new();
-    let zob = zobrist::Zobrist::new();
-    let text = std::fs::read_to_string(in_path).expect("nao consegui ler o dataset");
-    let lines: Vec<String> = text.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
-    let total = lines.len();
-    println!("rotula: {} posicoes, profundidade {}, {} threads", total, depth, threads);
-    let t0 = std::time::Instant::now();
-    let feito = std::sync::atomic::AtomicUsize::new(0);
-    let partes: Vec<Vec<String>> = (0..threads)
-        .map(|k| lines.iter().skip(k).step_by(threads).cloned().collect())
-        .collect();
-    let saidas: Vec<String> = std::thread::scope(|sc| {
-        let hs: Vec<_> = partes.iter().map(|parte| {
-            let atk = &atk; let zob = &zob; let feito = &feito;
-            sc.spawn(move || {
-                let tt = tt::TranspositionTable::new(16);
-                let mut out = String::new();
-                for linha in parte {
-                    let fen = linha.split('\t').next().unwrap_or("");
-                    let mut board = Board::from_fen(fen);
-                    let mut s = Searcher {
-                        thread_idx: 0,
-                        root_side: board.side,
-                        stop_flag: &crate::search::NO_STOP,
-                        asp_re: 0,
-                asp_nos: 0,
-                cut_nodes: 0, cut_first: 0, nmp_tried: 0, nmp_tried_pv: 0,
-                        nmp_failed_pv: 0, nmp_cutoff_raw: 0, nmp_cut_taken: 0,
-                        nmp_verify_tried: 0, nmp_verify_ok: 0, nmp_verify_failed: 0,
-                        nmp_failed_low: 0, qnodes: 0, cut_rfp: 0, cut_razor: 0,
-                        cut_futility: 0, nodes_shallow: 0, lmr_quiet_total: 0,
-                        lmr_skip_check: 0, lmr_skip_depth: 0, lmr_skip_extend: 0,
-                        lmr_skip_early: 0, lmr_tried: 0, lmr_research: 0, lmr_sum: 0,
-                        atk, zob, tt: &tt, nodes: 0,
-                        limits: SearchLimits { deadline: None, max_depth: depth, max_nodes: None, soft_budget: None },
-                        stop: false, history: Vec::new(), killers: [[None; 2]; MAX_PLY],
-                        history_scores: [[[0; 64]; 64]; 2], countermoves: [[None; 64]; 6],
-                        cont_hist: vec![0i32; CONT_HIST_SIZE].into_boxed_slice(),
-                        corr_hist: vec![0i32; CORR_HIST_SIZE * 2].into_boxed_slice(),
-                        corr_hist_np_stm: vec![0i32; CORR_HIST_SIZE * 2].into_boxed_slice(),
-                        corr_hist_np_nstm: vec![0i32; CORR_HIST_SIZE * 2].into_boxed_slice(),
-                        corr_hist_minor: vec![0i32; CORR_HIST_SIZE * 2].into_boxed_slice(),
-                        corr_hist_major: vec![0i32; CORR_HIST_SIZE * 2].into_boxed_slice(),
-                        corr_hist_threats: vec![0i32; CORR_HIST_SIZE * 2].into_boxed_slice(),
-                        ply_last_move: [None; MAX_PLY], static_evals: [0i32; MAX_PLY],
-                        root_best: None, root_scores: Vec::new(), nmp_min_ply: 0,
-                        excluded_move: None, excluded_root_moves: vec![], style_book: None,
-                        root_move_nodes: Vec::new(), capture_history: [[[0; 6]; 6]; 2],
-                        dextensions: [0; MAX_PLY], report: false,
-                    };
-                    let (_mv, score, _d, _n) = s.iterative_deepening(&mut board);
-                    let n = feito.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    if n % 20000 == 0 { println!("  {} posicoes", n); }
-                    // Mates fora: uma posicao ja' decidida tacticamente nao
-                    // ensina nada a uma avaliacao estatica.
-                    if score.abs() >= MATE_SCORE - MAX_PLY as i32 { continue; }
-                    // Score na perspectiva das BRANCAS, que e' a convencao do
-                    // extractor de features.
-                    let branco = if board.side == crate::types::Color::White { score } else { -score };
-                    out.push_str(fen); out.push('\t');
-                    out.push_str(&branco.to_string()); out.push('\n');
-                }
-                out
-            })
-        }).collect();
-        hs.into_iter().map(|h| h.join().unwrap()).collect()
-    });
-    let junto: String = saidas.concat();
-    std::fs::write(out_path, &junto).expect("nao consegui escrever");
-    println!("rotula: {} linhas em {:.0}s -> {}", junto.lines().count(), t0.elapsed().as_secs_f64(), out_path);
-}
 
 /// Debug helper: does `book_path` have an entry for `fen`? Prints the
 /// move(s)/counts found or "no entry" -- used to check coverage
@@ -3537,143 +1165,6 @@ fn build_book(games_path: &str, out_path: &str) {
 /// sigmoid instead of improving the evaluation -- an error already made twice
 /// on this project, once by fitting it during training and once by reusing a
 /// K measured against different targets.
-fn tune_king(dataset_path: &str, out_path: &str, max_positions: usize, threads: usize) {
-    use std::sync::Arc;
-
-    let text = std::fs::read_to_string(dataset_path).expect("nao consegui ler o dataset");
-    let mut boards: Vec<Board> = Vec::new();
-    let mut results: Vec<f64> = Vec::new();
-    for line in text.lines() {
-        if boards.len() >= max_positions {
-            break;
-        }
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let mut parts = line.split('\t');
-        let fen = match parts.next() { Some(f) => f, None => continue };
-        let res: f64 = match parts.next().and_then(|s| s.parse().ok()) { Some(r) => r, None => continue };
-        boards.push(Board::from_fen(fen));
-        results.push(res);
-    }
-    drop(text);
-    let n = boards.len();
-    println!("dataset: {} posicoes, {} threads", n, threads);
-
-    let boards = Arc::new(boards);
-    let results = Arc::new(results);
-
-    // Mean squared error of sigmoid(eval/K) against the game result, split
-    // across threads by contiguous slice.
-    let mse = |w: &eval::Weights, k: f64| -> f64 {
-        let chunk = (n + threads - 1) / threads.max(1);
-        std::thread::scope(|s| {
-            let handles: Vec<_> = (0..threads)
-                .map(|t| {
-                    let boards = Arc::clone(&boards);
-                    let results = Arc::clone(&results);
-                    let w = w.clone();
-                    s.spawn(move || {
-                        let lo = t * chunk;
-                        let hi = ((t + 1) * chunk).min(n);
-                        let mut acc = 0.0;
-                        for i in lo..hi {
-                            // White's point of view. `evaluate_with` returns
-                            // the score for the side to move, and the labels
-                            // are game results for White -- comparing them
-                            // directly disagrees on sign for every position
-                            // where Black is to move, which is half of them.
-                            // Symptom, before this was fixed: the measured K
-                            // ran off to the top of whatever range it was
-                            // given, because a flat sigmoid genuinely does fit
-                            // a signal that has been randomised.
-                            let raw = eval::evaluate_with_weights(&boards[i], &w);
-                            let e = if boards[i].side == types::Color::White { raw } else { -raw } as f64;
-                            let p = 1.0 / (1.0 + (-e / k).exp());
-                            let d = p - results[i];
-                            acc += d * d;
-                        }
-                        acc
-                    })
-                })
-                .collect();
-            handles.into_iter().map(|h| h.join().unwrap()).sum::<f64>() / n as f64
-        })
-    };
-
-    let base = eval::default_weights().clone();
-
-    // Which flat indices are king-safety fields: mark them and read the
-    // vector back, so this never goes stale against the struct's field order.
-    let dim = base.to_vec().len();
-    let mut sentinel = base.from_vec(&vec![0i32; dim]);
-    sentinel.king_attacker_weight = [(1, 1); 4];
-    sentinel.king_attacks = (1, 1);
-    sentinel.safe_knight_check = (1, 1);
-    sentinel.safe_bishop_check = (1, 1);
-    sentinel.safe_rook_check = (1, 1);
-    sentinel.safe_queen_check = (1, 1);
-    sentinel.pawn_shelter = [(1, 1); 4];
-    sentinel.shelter_open = (1, 1);
-    sentinel.pawn_tornado = [(1, 1); 4];
-    sentinel.weak_king_ring = (1, 1);
-    sentinel.king_flank_attacks = [(1, 1); 2];
-    sentinel.king_flank_defenses = [(1, 1); 2];
-    let sv = sentinel.to_vec();
-    let idx: Vec<usize> = (0..dim).filter(|&i| sv[i] == 1).collect();
-    println!("campos de king safety a calibrar: {}", idx.len());
-
-    // K first, and then never again.
-    // Wide enough that the optimum cannot sit on the boundary. A first
-    // version scanned 120..580 and returned exactly 580 -- the top of its own
-    // range, which is not a measurement, it is a clipped one.
-    let mut best_k = 200.0;
-    let mut best_e = f64::INFINITY;
-    for step in 0..60 {
-        let k = 100.0 + step as f64 * 40.0;
-        let e = mse(&base, k);
-        if e < best_e {
-            best_e = e;
-            best_k = k;
-        }
-    }
-    println!("K medido para este par (dados, modelo): {:.0}  erro base {:.6}", best_k, best_e);
-
-    let mut cur = base.to_vec();
-    let mut cur_err = best_e;
-    let mut step = 16i32;
-    while step >= 1 {
-        let mut improved_any = false;
-        loop {
-            let mut improved_this_pass = false;
-            for &i in &idx {
-                for dir in [step, -step] {
-                    let mut trial = cur.clone();
-                    trial[i] += dir;
-                    let e = mse(&base.from_vec(&trial), best_k);
-                    if e < cur_err - 1e-9 {
-                        cur = trial;
-                        cur_err = e;
-                        improved_this_pass = true;
-                        improved_any = true;
-                        break;
-                    }
-                }
-            }
-            if !improved_this_pass {
-                break;
-            }
-        }
-        println!("passo {:>3}: erro {:.6}{}", step, cur_err, if improved_any { "" } else { "  (sem melhoria)" });
-        step /= 2;
-    }
-    let gain = (best_e - cur_err) / best_e * 100.0;
-    println!("erro {:.6} -> {:.6}  ({:.2}% melhor)", best_e, cur_err, gain);
-    let out: Vec<String> = cur.iter().map(|v| v.to_string()).collect();
-    std::fs::write(out_path, out.join(",")).expect("nao consegui escrever");
-    println!("pesos escritos em {}", out_path);
-}
 
 
 /// Positions spanning the phases the search behaves differently in: opening,
@@ -3746,7 +1237,7 @@ fn bench(depth: i32) {
     let atk = Attacks::new();
     let zob = zobrist::Zobrist::new();
     let tt = tt::TranspositionTable::new(16);
-    eval::warmup();
+    evaluation::warmup();
     search::warmup();
     let start = std::time::Instant::now();
     let mut total: u64 = 0;
@@ -3824,29 +1315,123 @@ fn bench(depth: i32) {
 /// Diagnostic: is the king accumulator linear in the king weights?
 /// `kinglin <fen>` probes each king field at +1 and +2 and prints the two
 /// deltas. Linear means they are exactly x_i and 2*x_i.
-pub fn kinglin(fen: &str) {
-    let b = board::Board::from_fen(fen);
-    let base = eval::default_weights().clone();
-    let dim = base.to_vec().len();
-    let idx = eval::king_field_indices();
-    let v0 = eval::king_accumulators(&b, &base);
-    let mut nao_lineares = 0;
-    let mut fired = 0;
-    for &i in idx.iter() {
-        let mut probe = |k: i32| {
-            let mut v = base.to_vec();
-            v[i] += k;
-            let w = base.from_vec(&v);
-            eval::king_accumulators(&b, &w)
-        };
-        let (a, c) = (probe(1), probe(2));
-        for us in 0..2 {
-            let d1 = a[us].0 - v0[us].0;
-            let d2 = c[us].0 - v0[us].0;
-            if d1 != 0 { fired += 1; }
-            if d2 != 2 * d1 { nao_lineares += 1; }
-        }
+
+
+/// `FEN<TAB>result` in, `FEN | score | result` out -- the text form the
+/// network trainer converts from.
+///
+/// Both numbers are white-relative, which is the trainer's convention and NOT
+/// the engine's: our search returns a score for the side to move, so it is
+/// negated on black's turn. Getting that backwards trains the network to
+/// evaluate half the positions upside down, and nothing downstream would say
+/// so -- the loss simply stops falling.
+fn bullet_data(in_path: &str, out_path: &str, depth: i32, threads: usize) {
+    use crate::search::{MATE_SCORE, MAX_PLY};
+    let texto = std::fs::read_to_string(in_path).expect("nao consegui ler o dataset");
+    let linhas: Vec<&str> = texto.lines().filter(|l| !l.trim().is_empty()).collect();
+    println!("bulletdata: {} posicoes, profundidade {}, {} threads", linhas.len(), depth, threads);
+
+    let atk = Attacks::new();
+    let zob = zobrist::Zobrist::new();
+    let feito = std::sync::atomic::AtomicUsize::new(0);
+    let t0 = std::time::Instant::now();
+    let chunk = linhas.len().div_ceil(threads.max(1));
+
+    let saidas: Vec<String> = std::thread::scope(|scope| {
+        let hs: Vec<_> = linhas
+            .chunks(chunk.max(1))
+            .map(|parte| {
+                let atk = &atk;
+                let zob = &zob;
+                let feito = &feito;
+                scope.spawn(move || {
+                    let tt = tt::TranspositionTable::new(16);
+                    let mut out = String::new();
+                    for linha in parte {
+                        let mut it = linha.split('\t');
+                        let fen = match it.next() { Some(f) => f, None => continue };
+                        // Only true game results. Our previous dataset had
+                        // values like 0.826712 sitting in this column -- a
+                        // search score run through a sigmoid, wearing a
+                        // result's clothes. Anything that is not a result is
+                        // dropped rather than trusted.
+                        let res: f32 = match it.next().and_then(|r| r.trim().parse().ok()) {
+                            Some(r) => r,
+                            None => continue,
+                        };
+                        if res != 0.0 && res != 0.5 && res != 1.0 { continue; }
+
+                        let mut board = Board::from_fen(fen);
+                        let mut s = novo_searcher_raso(atk, zob, &tt, depth);
+                        let (_mv, score, _d, _n) = s.iterative_deepening(&mut board);
+                        // A position already decided tactically teaches a
+                        // static evaluator nothing.
+                        if score.abs() >= MATE_SCORE - MAX_PLY as i32 { continue; }
+                        let branco = if board.side == crate::types::Color::White { score } else { -score };
+
+                        out.push_str(fen);
+                        out.push_str(" | ");
+                        out.push_str(&branco.to_string());
+                        out.push_str(" | ");
+                        out.push_str(&format!("{:.1}", res));
+                        out.push('\n');
+
+                        let n = feito.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        if n % 100_000 == 0 {
+                            println!("  {} posicoes, {:.0}s", n, t0.elapsed().as_secs_f64());
+                        }
+                    }
+                    out
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    let junto: String = saidas.concat();
+    std::fs::write(out_path, &junto).expect("nao consegui escrever");
+    println!(
+        "bulletdata: {} linhas em {:.0}s -> {}",
+        junto.lines().count(),
+        t0.elapsed().as_secs_f64(),
+        out_path
+    );
+}
+
+fn novo_searcher_raso<'a>(
+    atk: &'a Attacks,
+    zob: &'a zobrist::Zobrist,
+    tt: &'a tt::TranspositionTable,
+    depth: i32,
+) -> search::Searcher<'a> {
+    use crate::search::{SearchLimits, CONT_HIST_SIZE, CORR_HIST_SIZE, MAX_PLY};
+    search::Searcher {
+        thread_idx: 0,
+        root_side: crate::types::Color::White,
+        stop_flag: &crate::search::NO_STOP,
+        asp_re: 0, asp_nos: 0,
+        cut_nodes: 0, cut_first: 0, nmp_tried: 0, nmp_tried_pv: 0,
+        nmp_failed_pv: 0, nmp_cutoff_raw: 0, nmp_cut_taken: 0,
+        nmp_verify_tried: 0, nmp_verify_ok: 0, nmp_verify_failed: 0,
+        nmp_failed_low: 0, qnodes: 0, cut_rfp: 0, cut_razor: 0,
+        cut_futility: 0, nodes_shallow: 0, lmr_quiet_total: 0,
+        lmr_skip_check: 0, lmr_skip_depth: 0, lmr_skip_extend: 0,
+        lmr_skip_early: 0, lmr_tried: 0, lmr_research: 0, lmr_sum: 0,
+        atk, zob, tt, nodes: 0,
+        limits: SearchLimits { deadline: None, max_depth: depth, max_nodes: None, soft_budget: None },
+        stop: false, history: Vec::new(), killers: [[None; 2]; MAX_PLY],
+        history_scores: [[[0; 64]; 64]; 2], countermoves: [[None; 64]; 6],
+        cont_hist: vec![0i32; CONT_HIST_SIZE].into_boxed_slice(),
+        corr_hist: vec![0i32; CORR_HIST_SIZE * 2].into_boxed_slice(),
+        corr_hist_np_stm: vec![0i32; CORR_HIST_SIZE * 2].into_boxed_slice(),
+        corr_hist_np_nstm: vec![0i32; CORR_HIST_SIZE * 2].into_boxed_slice(),
+        corr_hist_minor: vec![0i32; CORR_HIST_SIZE * 2].into_boxed_slice(),
+        corr_hist_major: vec![0i32; CORR_HIST_SIZE * 2].into_boxed_slice(),
+        corr_hist_threats: vec![0i32; CORR_HIST_SIZE * 2].into_boxed_slice(),
+        ply_last_move: [None; MAX_PLY], static_evals: [0i32; MAX_PLY],
+        root_best: None, root_scores: Vec::new(), nmp_min_ply: 0,
+        excluded_move: None, excluded_root_moves: vec![], style_book: None,
+        root_move_nodes: Vec::new(), capture_history: [[[0; 6]; 6]; 2],
+        dextensions: [0; MAX_PLY], report: false,
     }
-    let _ = dim;
-    println!("king fields: {}  probes that fired: {}  NON-LINEAR: {}", idx.len(), fired, nao_lineares);
 }
