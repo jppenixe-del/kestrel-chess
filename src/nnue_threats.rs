@@ -23,6 +23,34 @@ const QB: i32 = 64;
 // A escala vive em `nnue`: as duas arquitecturas tem de a partilhar, senao
 // trocar de rede mudava silenciosamente a unidade em que a busca pensa.
 use crate::nnue::escala;
+
+/// Whether the threat half of the input set is applied at all.
+///
+/// The same network, run with `mode 0` -- its piece features only, the 9216
+/// threat inputs left out. Not a different net: the same weights, asked a
+/// smaller question.
+///
+/// It exists to answer one thing nothing else can: do the threat features earn
+/// anything? The network scores 154 Elo BELOW the plain piece-square one at
+/// equal time, and that number cannot separate "the threats are worthless"
+/// from "the threats are good and cost too much". Turning them off inside this
+/// network holds everything else fixed -- same weights, same training, same
+/// code path -- and asks only what they contribute.
+///
+/// The evaluation is out of distribution with them off: the net was fitted
+/// expecting them, so their absence is not a clean ablation of the idea. It is
+/// still decisive in one direction. If the crippled version does not lose,
+/// the threat inputs are not paying for themselves.
+static AMEACAS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+#[inline]
+pub fn ameacas_ligadas() -> bool {
+    AMEACAS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_ameacas(v: bool) {
+    AMEACAS.store(v, std::sync::atomic::Ordering::Relaxed);
+}
 const OUT_BUCKETS: usize = 8;
 
 pub struct RedeThreats {
@@ -144,7 +172,8 @@ pub fn evaluate(net: &RedeThreats, board: &Board) -> i32 {
     static SO_ENUM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let so_enum = *SO_ENUM.get_or_init(|| std::env::var_os("KESTREL_SO_ENUM").is_some());
     let mut n_feat = 0usize;
-    map_features_pairs_mode(&pos, stm, 2, &mut |a: usize, b: usize| {
+    let modo = if ameacas_ligadas() { 2 } else { 0 };
+    map_features_pairs_mode(&pos, stm, modo, &mut |a: usize, b: usize| {
         n_feat += 1;
         if so_enum { return; }
         aplica_feature(net, a, &mut us);
@@ -512,7 +541,8 @@ impl AccThreats {
         {
             let nu = &mut self.novo_us;
             let nt = &mut self.novo_them;
-            map_features_pairs_mode(&pos, stm, 2, &mut |a: usize, b: usize| {
+            let modo = if ameacas_ligadas() { 2 } else { 0 };
+    map_features_pairs_mode(&pos, stm, modo, &mut |a: usize, b: usize| {
                 nu[a >> 6] |= 1u64 << (a & 63);
                 nt[b >> 6] |= 1u64 << (b & 63);
             });
