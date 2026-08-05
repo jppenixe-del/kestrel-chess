@@ -1749,6 +1749,7 @@ impl Engine {
                     let _ = writeln!(out, "option name OnlineTablebase type check default false");
                     let _ = writeln!(out, "option name Contempt type spin default 20 min -200 max 200");
                     let _ = writeln!(out, "option name LazyVote type check default true");
+                    let _ = writeln!(out, "option name Threats type check default true");
                     let _ = writeln!(
                         out,
                         "option name EvalScale type spin default {} min 100 max 2000",
@@ -1802,6 +1803,10 @@ impl Engine {
                     } else if tokens.len() >= 5 && tokens[1] == "name" && tokens[2] == "HeatmapOnly" && tokens[3] == "value" {
                         let on = tokens[4].eq_ignore_ascii_case("true") || tokens[4] == "1";
                         HEATMAP_ONLY.store(on, std::sync::atomic::Ordering::Relaxed);
+                    } else if tokens.len() >= 5 && tokens[1] == "name" && tokens[2] == "Threats"
+                        && tokens[3] == "value" {
+                        crate::nnue_threats::set_ameacas(
+                            tokens[4].eq_ignore_ascii_case("true") || tokens[4] == "1");
                     } else if tokens.len() >= 5 && tokens[1] == "name" && tokens[2] == "LazyVote"
                         && tokens[3] == "value" {
                         self.lazy_vote = tokens[4].eq_ignore_ascii_case("true") || tokens[4] == "1";
