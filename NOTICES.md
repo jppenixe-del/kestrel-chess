@@ -68,6 +68,43 @@ were imported at their original scale — that was found to be a defect, not a
 shortcut: values calibrated against another engine's material scale are wrong
 in ours, and measuring that cost is documented in the source comments.
 
+## The threat feature set, and an unresolved question about it
+
+The 9216 threat inputs in `src/features.rs` are a five-dimensional tuple --
+side, relation, attacker type, victim type, victim square -- flattened by
+mixed-radix packing. The packing arithmetic is the obvious way to flatten a
+tuple and belongs to nobody. The choice of *which* dimensions, and the decision
+to leave the king out as a victim, is the design.
+
+That choice is not ours. Threat features as an NNUE input originate with
+Stockfish; **Reckless** later simplified the formula, and this feature set
+follows Reckless's lighter version rather than Stockfish's original. It came
+here through an earlier in-house project, whose own credits record it as read
+conceptually with no code copied.
+
+**Reckless is AGPL-3.0**, which is the one licence this project refuses outright
+-- and refuses precisely because the engine runs a bot on a network, where
+§13 would oblige publishing everything.
+
+Two things have to be said plainly rather than left comfortable:
+
+- By the standard written further down this page, a feature-to-index mapping is
+  exactly the kind of thing that counts as taking, even when no code is copied.
+  We hold ourselves to that standard and this set does not clear it.
+- Another agentically-developed engine reached the same crossroads and did not
+  find "conceptual only" sufficient: Coda's licence audit found its threat
+  feature-index construction closely modelled on Reckless and reimplemented it.
+
+Nothing here is resolved by asserting good faith. The honest options are to
+re-derive a threat feature set from our own reasoning about what a threat is --
+which costs a retraining, since a network is bound to the mapping it was
+trained on -- or to establish that the dimensions are common practice
+independent of Reckless. Until one of those is done, this section stands as the
+disclosure.
+
+The 640-input compact set (`make_threat_640`, direction x victim type x square)
+is a different and much coarser choice, and is our own.
+
 ## Licence classes we avoid entirely
 
 No AGPL-licensed engine has been read or used. This is deliberate and it is the
