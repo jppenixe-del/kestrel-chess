@@ -85,9 +85,21 @@ fn sem_rede() {
 /// so inverting it recovers the probability the network was actually fitted
 /// to.
 pub fn win_draw_loss(score: i32) -> (i32, i32, i32) {
-    const ESCALA: f64 = 400.0;
-    let w = 1.0 / (1.0 + (-(score as f64) / ESCALA).exp());
-    let l = 1.0 / (1.0 + ((score as f64) / ESCALA).exp());
+    // The same scale the score itself is on, read rather than written down.
+    //
+    // It was the constant 400, which was right for exactly as long as the
+    // evaluation scale was also 400. Halving that scale halved every score
+    // without touching this, so the curve was being fed numbers half the size
+    // it expected and answered that every position was nearly drawn.
+    //
+    // Tying the two together is not tidiness. This curve is what fixes the
+    // meaning of a score: a pawn is worth whatever it moves the probability of
+    // winning by, and every pruning margin in the search is denominated in the
+    // same units. Let the two drift apart and the engine reports a confidence
+    // it does not act on.
+    let escala = crate::nnue::escala() as f64;
+    let w = 1.0 / (1.0 + (-(score as f64) / escala).exp());
+    let l = 1.0 / (1.0 + ((score as f64) / escala).exp());
     // Draws are what is left. Modelling them separately needs a second fitted
     // curve and the number is reported, not searched on.
     let d = (1.0 - w - l).max(0.0);
