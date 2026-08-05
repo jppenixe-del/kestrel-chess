@@ -6,23 +6,51 @@ browser will actually load.
 
 ## The pieces
 
-`wK wQ wR wB wN wP` and the same with `b` — light and dark. PNG with an alpha
-channel, 320x320, drawn as carved wood: pale oak against dark red.
+`wK wQ wR wB wN wP` and the same with `b`. PNG with an alpha channel, 320x320.
 
-The knight is a bird of prey rather than a horse. Kestrel is a falcon.
+Copper and fire against blackened steel, to match the falcon in `assets/`. The
+knight is a bird of prey rather than a horse: Kestrel is a falcon.
 
-**Relative heights are preserved and that matters more than it sounds:**
+**The two sides are not the same shapes in another colour.** The black pieces
+are drawn heavier and stand taller than their white counterparts. That is the
+design, and normalising the two to match would erase the one thing that
+separates the sides at a glance.
 
-| | K | Q | B | N | R | P |
+One global scale for all twelve. The tallest piece fills its square, everything
+else scales by the same factor, and every piece sits on a common baseline.
+Nothing is fitted to its own square individually: relative height is how a
+player tells a rook from a queen without looking twice, and per-piece fitting
+would make the pawn as tall as the king.
+
+Heights as shipped, in pixels of the 320 canvas:
+
+| | K | Q | R | B | N | P |
 |---|---|---|---|---|---|---|
-| height | 1.00 | 0.89 | 0.81 | 0.79 | 0.70 | 0.64 |
+| white | 219 | 186 | 214 | 186 | 208 | 162 |
+| black | 296 | 263 | 237 | 221 | 245 | 163 |
 
-Cutting each piece to fill its own square is the obvious thing to do and it is
-wrong: it makes the pawn as tall as the king, and height is how a player tells
-them apart at a glance. Every piece here shares one scale and one baseline.
+The flames count toward height, which is why the rook stands close to the
+queen. Deliberate: the art was drawn to fill the square.
 
-Widened by 14% with the height untouched, so they sit fuller in a square
-without any of them changing rank.
+## Rebuilding them
+
+`pecas-fonte.jpeg` is the generated sheet -- twelve pieces on flat green, two
+rows of six. `recorta_pecas.py` turns it into the twelve files:
+
+```
+python3 recorta_pecas.py pecas-fonte.jpeg .
+```
+
+Two things in there are worth knowing before changing it. The row bands are
+**measured** from the image's own row profile rather than guessed, because the
+flames rise well above the bodies and a tight crop beheads the king -- which is
+only visible once it is published. And the green is un-mixed from the edge
+pixels rather than merely keyed out: skip that and every piece carries a green
+halo the moment it lands on a board, which is exactly where it lands.
+
+The source is a 1024-wide JPEG, so each piece is about 150 pixels across before
+being scaled up. They are softer than a natively-drawn set at this size would
+be.
 
 ## The squares
 
