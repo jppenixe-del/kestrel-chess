@@ -191,6 +191,42 @@ pub fn gather_pieces(pos: &Pos, persp: usize, out: &mut Vec<usize>) {
 /// ⭐ MAP PAREADO p/ o bullet: (feat_stm, feat_ntm) por ELEMENTO FÍSICO (peça/threat).
 ///   O CONJUNTO por perspetiva é IGUAL ao gather_pieces/gather_threats_full (auto-teste valida).
 ///   stm: 0 = brancas a jogar. Threats com offset PIECE_FEATURES.
+/// Só as features de peça, sem tocar em ameaças.
+///
+/// Existe porque os modos que não querem as 9216 chamavam a enumeração
+/// completa e filtravam o resultado -- pagando os mapas de ataque e as
+/// duzentas emissões de ameaça para as deitar fora à saída. Quem não quer
+/// ameaças não deve pagá-las.
+pub fn map_pieces_pairs<F: FnMut(usize, usize)>(pos: &Pos, stm: usize, f: &mut F) {
+    let ntm = stm ^ 1;
+    let ks_w = pos.pieces[0][5].trailing_zeros() as usize;
+    let ks_b = pos.pieces[1][5].trailing_zeros() as usize;
+    let bucket = [BUCKET_MAP[ks_w], BUCKET_MAP[ks_b ^ 56]];
+    let piece_feat = |persp: usize, c: usize, t: usize, sq_raw: usize| -> Option<usize> {
+        let sq = if persp == 0 { sq_raw } else { sq_raw ^ 56 };
+        if t == 5 {
+            if c != persp { Some(bucket[persp] * 704 + sq) } else { None }
+        } else {
+            Some(bucket[persp] * 704 + (piece_idx(t) + if c == persp { 0 } else { 5 }) * 64 + sq)
+        }
+    };
+    {
+        let a = piece_feat(stm, ntm, 5, pos.pieces[ntm][5].trailing_zeros() as usize);
+        let b = piece_feat(ntm, stm, 5, pos.pieces[stm][5].trailing_zeros() as usize);
+        if let (Some(x), Some(y)) = (a, b) { f(x, y); }
+    }
+    for c in 0..2 {
+        for t in 0..5 {
+            let mut bb = pos.pieces[c][t];
+            while bb != 0 {
+                let sq_raw = bb.trailing_zeros() as usize; bb &= bb - 1;
+                f(piece_feat(stm, c, t, sq_raw).unwrap(),
+                  piece_feat(ntm, c, t, sq_raw).unwrap());
+            }
+        }
+    }
+}
+
 pub fn map_features_pairs<F: FnMut(usize, usize)>(pos: &Pos, stm: usize, f: &mut F) {
     let ntm = stm ^ 1;
     let ks_w = pos.pieces[0][5].trailing_zeros() as usize;
@@ -309,7 +345,7 @@ pub const TOTAL_INPUTS_640:  usize = PIECE_FEATURES + THREAT_FEATURES_640; // 23
 ///   que eu ataco — iterando o threat FÍSICO 1× e emitindo o par (stm, ntm).
 pub fn map_features_pairs_mode<F: FnMut(usize, usize)>(pos: &Pos, stm: usize, mode: u8, f: &mut F) {
     if mode == 2 { map_features_pairs(pos, stm, f); return; }
-    map_features_pairs(pos, stm, &mut |a, b| { if a < PIECE_FEATURES { f(a, b); } });
+    map_pieces_pairs(pos, stm, f);
     if mode == 0 { return; }
     let ntm = stm ^ 1;
     let maps = compute_attack_maps_by_type(pos);

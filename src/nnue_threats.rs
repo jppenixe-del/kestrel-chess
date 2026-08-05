@@ -171,15 +171,41 @@ pub fn evaluate(net: &RedeThreats, board: &Board) -> i32 {
     // enumerar do custo de aplicar.
     static SO_ENUM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let so_enum = *SO_ENUM.get_or_init(|| std::env::var_os("KESTREL_SO_ENUM").is_some());
+    // Recolher primeiro, aplicar depois.
+    //
+    // Aplicar dentro da chamada de retorno significa que, ao somar uma coluna,
+    // ninguem sabe qual e' a proxima -- e a primeira camada tem 32,5 MB, nao
+    // cabe em cache, e cada coluna e' um quilobyte que vem da RAM. O
+    // processador fica a somar quinhentos e doze inteiros com a memoria
+    // parada, e depois espera pela coluna seguinte do principio.
+    //
+    // Com a lista em maos, pede-se a coluna seguinte enquanto se soma a
+    // actual. Custa uma passagem por um vector na pilha; poupa a espera.
+    let mut idx_us: [u32; 320] = [0; 320];
+    let mut idx_them: [u32; 320] = [0; 320];
     let mut n_feat = 0usize;
     let modo = if ameacas_ligadas() { 2 } else { 0 };
     map_features_pairs_mode(&pos, stm, modo, &mut |a: usize, b: usize| {
+        if n_feat < 320 {
+            idx_us[n_feat] = a as u32;
+            idx_them[n_feat] = b as u32;
+        }
         n_feat += 1;
-        if so_enum { return; }
-        aplica_feature(net, a, &mut us);
-        aplica_feature(net, b, &mut them);
     });
-    let _ = n_feat;
+    // O limite de 320 e' folgado -- uma posicao densa mede ~200 -- mas se
+    // alguma vez for excedido a lista fica truncada e a avaliacao errada em
+    // silencio. Nesse caso volta-se ao caminho sem lista, que nao trunca nada.
+    if !so_enum {
+        if n_feat <= 320 {
+            aplica_lista(net, &idx_us[..n_feat], &mut us);
+            aplica_lista(net, &idx_them[..n_feat], &mut them);
+        } else {
+            map_features_pairs_mode(&pos, stm, modo, &mut |a: usize, b: usize| {
+                aplica_feature(net, a, &mut us);
+                aplica_feature(net, b, &mut them);
+            });
+        }
+    }
 
     let n = board.occ_all.count_ones() as usize;
     let ob = ((n.max(1) - 1) / 4).min(OUT_BUCKETS - 1);
@@ -191,6 +217,34 @@ pub fn evaluate(net: &RedeThreats, board: &Board) -> i32 {
     let (a, b) = if board.side == Color::White { (&us, &them) } else { (&them, &us) };
     let soma = saida_par(a, b, w);
     (soma / QA + net.l1b[ob] as i32) * escala() / (QA * QB)
+}
+
+/// Apply a whole list of feature columns, asking for the next while adding
+/// the current one.
+///
+/// The prefetch is the point. Each column is a kilobyte from a 32.5 MB layer
+/// that does not fit in cache, so the add itself is never the bottleneck --
+/// waiting for the line is. Issuing the request one column ahead overlaps that
+/// wait with work that is already available.
+#[inline]
+fn aplica_lista(net: &RedeThreats, idx: &[u32], dst: &mut [i16]) {
+    let corte = 1 + crate::features::PIECE_FEATURES;
+    for k in 0..idx.len() {
+        #[cfg(target_arch = "x86_64")]
+        if k + 1 < idx.len() {
+            unsafe {
+                use std::arch::x86_64::_mm_prefetch;
+                let a = idx[k + 1] as usize;
+                let p = if a < corte {
+                    net.l0w.as_ptr().add(a * HIDDEN) as *const i8
+                } else {
+                    net.l0w_threats.as_ptr().add((a - corte) * HIDDEN)
+                };
+                _mm_prefetch(p, std::arch::x86_64::_MM_HINT_T0);
+            }
+        }
+        aplica_feature(net, idx[k] as usize, dst);
+    }
 }
 
 /// Add one feature's column, from whichever block holds it.
