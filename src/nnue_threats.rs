@@ -127,8 +127,14 @@ pub fn evaluate(net: &RedeThreats, board: &Board) -> i32 {
     // trainer clips the first layer so that no combination of active features
     // can leave i16, which is the same guarantee the piece-square network
     // relies on.
-    let mut us = vec![0i16; HIDDEN];
-    let mut them = vec![0i16; HIDDEN];
+    // Na PILHA, nao no heap.
+    //
+    // Isto eram dois `vec![0i16; HIDDEN]`, ou seja duas alocacoes por
+    // avaliacao. A 360 mil nos por segundo sao setecentas mil alocacoes por
+    // segundo para escrever mil bytes que cabem num registo de pilha, e o
+    // alocador nao e' gratis nem em tempo nem em falhas de cache.
+    let mut us = [0i16; HIDDEN];
+    let mut them = [0i16; HIDDEN];
     us.copy_from_slice(&net.l0b);
     them.copy_from_slice(&net.l0b);
     // The pair callback gives both perspectives of the same physical thing at
