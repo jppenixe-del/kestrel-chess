@@ -1588,6 +1588,22 @@ impl<'a> Searcher<'a> {
         if c == 0 {
             return 0;
         }
+        // Escalado com a avaliacao, nao fixo em centipeoes.
+        //
+        // O valor foi escolhido contra uma escala em que a dama valia 1980, e
+        // a escala passou para metade disso hoje. Sem esta correccao os mesmos
+        // vinte centipeoes valeriam o dobro do que foram afinados para valer:
+        // o comentario acima diz "menos de um quinto de peao" e passariam a
+        // ser mais de um terco.
+        //
+        // E' o mesmo erro que a curva de vitoria/derrota tinha: um numero em
+        // centipeoes so' significa o mesmo enquanto o centipeao significar o
+        // mesmo. Ancorar na escala e' o que faz o contempt querer dizer sempre
+        // a mesma fraccao de peao.
+        let c = c * crate::nnue::escala() / 400;
+        if c == 0 {
+            return 0;
+        }
         // Do ponto de vista de quem joga NESTE no', e negativo para o lado que
         // manda na raiz: e' a nos que um empate custa.
         if board.side == self.root_side { -c } else { c }
