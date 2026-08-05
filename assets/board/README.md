@@ -8,8 +8,8 @@ browser will actually load.
 
 `wK wQ wR wB wN wP` and the same with `b`. PNG with an alpha channel, 320x320.
 
-Copper and warm flame for white; blackened steel and cold violet fire, with
-runes, for black. The knight is a bird of prey rather than a horse: Kestrel is
+Copper and warm flame for white; blackened steel with cold blue light for
+black, a raven on its king. The knight is a bird of prey rather than a horse: Kestrel is
 a falcon.
 
 **The two sides are not one set in two colours** -- they are separate designs,
@@ -30,10 +30,14 @@ Heights as shipped, in pixels of the 320 canvas:
 | | K | Q | R | B | N | P |
 |---|---|---|---|---|---|---|
 | white | 296 | 252 | 289 | 252 | 281 | 219 |
-| black | 266 | 250 | 227 | 219 | 235 | 132 |
+| black | 266 | 206 | 189 | 206 | 204 | 179 |
 
-The black pawn is the one place the two sheets disagree sharply: it is drawn at
-half its king where white's is at three quarters. Left as drawn.
+`pretas-fonte.png` holds two alternative designs, one per row, and the **first**
+is the one used. Not for its look -- for its proportions. In the second row the
+pawn is drawn at half its king; here it is at two thirds, which is close to
+white's three quarters. Scaling a row so its tallest piece fits means every
+other piece inherits that row's internal ratios, so a squat pawn in the sheet
+becomes a pawn that disappears on the board.
 
 ## Rebuilding them
 
@@ -41,12 +45,11 @@ Two sheets, because the sides were generated separately:
 
 ```
 python3 recorta_pecas.py pecas-fonte.jpeg  . "w,-"  296   # brancas: 1a fila
-python3 recorta_pecas.py pretas-fonte.png  . "-,b"  266   # pretas:  2a fila
+python3 recorta_pecas.py pretas-fonte.png  . "b,-"  266   # pretas:  1a fila
 ```
 
 The third argument says what each row of the sheet is, top to bottom -- `w`,
-`b`, or `-` to skip. `pretas-fonte.png` offers two alternative designs and only
-the second is used. The fourth is how tall that row's tallest piece ends up.
+`b`, or `-` to skip. The fourth is how tall that row's tallest piece ends up.
 
 Two things in there are worth knowing before changing it. The row bands are
 **measured** from the image's own row profile rather than guessed, because the
