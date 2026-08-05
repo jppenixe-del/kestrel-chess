@@ -12,44 +12,45 @@ Copper and warm flame for white; blackened steel with cold blue light for
 black, a raven on its king. The knight is a bird of prey rather than a horse: Kestrel is
 a falcon.
 
-**The two sides are not one set in two colours** -- they are separate designs,
-from separate sheets, and white is the imposing one. White fills the square at
-296 pixels; black stands at 266, nine tenths of that. That ratio is a choice
-and it has to be stated, because with the sides coming from different sheets
-there is nothing inside either one that could imply it.
+**The two sides are not one set in two colours** -- they are separate designs
+from separate sheets, and white is the imposing one. The king fills all but a
+few pixels of its square, and every black piece stands at **0.92 of the white
+piece of the same type**.
 
-Within each side nothing is normalised. Relative heights between pieces are
+That last part is the whole trick, and it is not the obvious way to do it. The
+obvious way scales each row as a unit, so every piece inherits the internal
+proportions its own sheet drew. Done that way here, the ratio between the
+sides came out anywhere from 0.77 to 1.07 depending on the piece -- which put
+the black rook TALLER than the white one. A board is read as piece types, not
+as sheets: what has to match across the sides is rook against rook.
+
+Within white nothing is normalised. Relative heights between white pieces are
 exactly as drawn, flames and crests included, which is why the rook stands
-close to the queen. One baseline for all twelve. Nothing is fitted to its own
-square individually: relative height is how a player tells a rook from a queen
-without looking twice, and per-piece fitting would make the pawn as tall as
-the king.
+well below the bishop. One baseline for all twelve.
 
 Heights as shipped, in pixels of the 320 canvas:
 
 | | K | Q | R | B | N | P |
 |---|---|---|---|---|---|---|
-| white | 296 | 252 | 289 | 252 | 281 | 219 |
-| black | 266 | 206 | 189 | 206 | 204 | 179 |
+| white | 308 | 304 | 221 | 298 | 250 | 167 |
+| black | 283 | 280 | 201 | 274 | 230 | 154 |
 
-`pretas-fonte.png` holds two alternative designs, one per row, and the **first**
-is the one used. Not for its look -- for its proportions. In the second row the
-pawn is drawn at half its king; here it is at two thirds, which is close to
-white's three quarters. Scaling a row so its tallest piece fits means every
-other piece inherits that row's internal ratios, so a squat pawn in the sheet
-becomes a pawn that disappears on the board.
+Both sides come from the second row of their sheet -- the one with flame and
+runes. The first row of each is a quieter alternative, still there.
 
 ## Rebuilding them
 
 Two sheets, because the sides were generated separately:
 
 ```
-python3 recorta_pecas.py pecas-fonte.jpeg  . "w,-"  296   # brancas: 1a fila
-python3 recorta_pecas.py pretas-fonte.png  . "b,-"  266   # pretas:  1a fila
+python3 recorta_pecas.py brancas-fonte.png . "-,w" 308            # 2a fila
+python3 recorta_pecas.py pretas-fonte.png  . "-,b" ref:.:0.92     # 2a fila
 ```
 
 The third argument says what each row of the sheet is, top to bottom -- `w`,
-`b`, or `-` to skip. The fourth is how tall that row's tallest piece ends up.
+`b`, or `-` to skip. The fourth is either a height for that row's tallest
+piece, or `ref:<dir>:<razao>` to size each piece against the white one of the
+same type already in `<dir>`. White is cut first; black refers to it.
 
 Two things in there are worth knowing before changing it. The row bands are
 **measured** from the image's own row profile rather than guessed, because the
@@ -58,10 +59,9 @@ only visible once it is published. And the green is un-mixed from the edge
 pixels rather than merely keyed out: skip that and every piece carries a green
 halo the moment it lands on a board, which is exactly where it lands.
 
-The black sheet is 2400x1792 PNG, so its pieces are reduced into place. The
-white one is a 1024-wide JPEG and is being enlarged -- about 150 pixels across
-before scaling to 320 -- and is visibly softer. Regenerating white at the same
-size as black is the outstanding job here.
+Both sheets are 2400x1792 PNG, so every piece is reduced into place rather
+than enlarged. `pecas-fonte.jpeg` is the original 1024-wide sheet the set
+started from, kept for the record.
 
 ## The squares
 
