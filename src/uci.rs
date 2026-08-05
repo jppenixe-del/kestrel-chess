@@ -1719,6 +1719,11 @@ impl Engine {
                     let _ = writeln!(out, "option name Move Overhead type spin default {} min 0 max 5000", MOVE_OVERHEAD_DEFAULT_MS);
                     let _ = writeln!(out, "option name OnlineTablebase type check default false");
                     let _ = writeln!(out, "option name Contempt type spin default 20 min -200 max 200");
+                    let _ = writeln!(
+                        out,
+                        "option name EvalScale type spin default {} min 100 max 2000",
+                        crate::nnue::escala()
+                    );
                     // Every search parameter, announced as a spin so an SPSA
                     // harness can read the default and the band straight from
                     // `uci` and drive them with `setoption`. They were already
@@ -1767,6 +1772,15 @@ impl Engine {
                     } else if tokens.len() >= 5 && tokens[1] == "name" && tokens[2] == "HeatmapOnly" && tokens[3] == "value" {
                         let on = tokens[4].eq_ignore_ascii_case("true") || tokens[4] == "1";
                         HEATMAP_ONLY.store(on, std::sync::atomic::Ordering::Relaxed);
+                    } else if tokens.len() >= 5 && tokens[1] == "name" && tokens[2] == "EvalScale"
+                        && tokens[3] == "value" {
+                        // Exposed so it can be fitted the way every other search
+                        // parameter is, by SPSA over real games, instead of by
+                        // rebuilding the engine for each candidate. It is worth
+                        // about two plies and nobody has ever fitted it.
+                        if let Ok(v) = tokens[4].parse::<i32>() {
+                            crate::nnue::set_escala(v);
+                        }
                     } else if tokens.len() >= 5 && tokens[1] == "name" && tokens[2] == "Hash" && tokens[3] == "value" {
                         if let Ok(mb) = tokens[4].parse::<usize>() {
                             self.tt = TranspositionTable::new(mb.max(1));
