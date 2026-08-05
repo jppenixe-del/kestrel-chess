@@ -302,6 +302,75 @@ fn main() {
         println!("selada: {} buckets, HIDDEN={} -> {}", buckets, nnue::HIDDEN, args[3]);
         return;
     }
+    if args.len() >= 4 && args[1] == "empacota" {
+        // empacota <rede.bin> <saida.leb128.bin>
+        //
+        // Recomprime uma rede ja selada (v1, dump cru + cabecalho) para o
+        // formato v2 (LEB128+zigzag). So' o ficheiro em disco muda de forma;
+        // o array i16 em memoria depois de carregado e' byte-a-byte o mesmo,
+        // por isso a verificacao a seguir (nao so' o tamanho) e' o que prova
+        // que isto e' seguro para o bot usar.
+        let bytes = std::fs::read(&args[2]).expect("nao consegui ler");
+        let net = match nnue::load(&bytes) {
+            Some(n) => n,
+            None => { eprintln!("nao consegui interpretar {} como rede", args[2]); return; }
+        };
+        nnue::empacota_rede(&net, &args[3]).expect("nao consegui escrever");
+        let antes = bytes.len();
+        let depois = std::fs::metadata(&args[3]).map(|m| m.len()).unwrap_or(0);
+        println!(
+            "empacotada: {} -> {} bytes ({:.1}% do original) -> {}",
+            antes, depois, 100.0 * depois as f64 / antes as f64, args[3]
+        );
+        return;
+    }
+    if args.len() >= 3 && args[1] == "carregatest" {
+        // carregatest <rede.bin> [repeticoes]
+        //
+        // Isola SO' o custo de ler+interpretar o ficheiro, para responder a
+        // "fica mais rapido a carregar" sem o ruido de uma pesquisa inteira
+        // por cima (foi isso que aconteceu na primeira medicao: bench()
+        // gasta a maior parte do tempo em milhoes de nos, nao no parse).
+        let n: usize = args.get(2 + 1).and_then(|s| s.parse().ok()).unwrap_or(2000);
+        let path = &args[2];
+        // Um read() de aquecimento poe o ficheiro na page cache do SO antes
+        // de cronometrar -- sem isto o PRIMEIRO ficheiro medido pagaria I/O
+        // de disco real e o segundo nao, o que mediria a ordem e nao o
+        // formato.
+        let _ = std::fs::read(path);
+        let start = std::time::Instant::now();
+        for _ in 0..n {
+            let bytes = std::fs::read(path).expect("nao consegui ler");
+            let net = nnue::load(&bytes).expect("nao consegui interpretar");
+            std::hint::black_box(&net);
+        }
+        let total = start.elapsed();
+        println!(
+            "{}: {} iteracoes, {:.1} us/iteracao (ler+interpretar)",
+            path, n, total.as_secs_f64() * 1e6 / n as f64
+        );
+        return;
+    }
+    if args.len() >= 4 && args[1] == "verificaempacota" {
+        // verificaempacota <original.bin> <empacotado.bin>
+        //
+        // Carrega os dois e compara os quatro tensores VALOR A VALOR -- nao
+        // so' o tamanho do ficheiro, nao so' um checksum. Isto e' o que
+        // decide se o formato novo pode substituir o ficheiro que o bot le.
+        let a = nnue::load(&std::fs::read(&args[2]).expect("nao consegui ler original"))
+            .expect("original nao carrega");
+        let b = nnue::load(&std::fs::read(&args[3]).expect("nao consegui ler empacotado"))
+            .expect("empacotado nao carrega");
+        let iguais = a.l0w == b.l0w && a.l0b == b.l0b && a.l1w == b.l1w && a.l1b == b.l1b
+            && a.buckets == b.buckets && a.output_buckets == b.output_buckets;
+        if iguais {
+            println!("identico: {} valores, byte a byte", a.l0w.len() + a.l0b.len() + a.l1w.len() + a.l1b.len());
+        } else {
+            println!("DIFERENTE -- nao substituir a rede em producao com isto");
+            std::process::exit(1);
+        }
+        return;
+    }
     if args.len() >= 2 && args[1] == "verificathreats" {
         let net = match nnue_threats::rede() {
             Some(n) => n,
