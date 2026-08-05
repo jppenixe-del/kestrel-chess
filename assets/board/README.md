@@ -19,7 +19,7 @@ piece of the same type** -- very slightly taller, on purpose. A dark shape
 reads smaller than a light one of the same size, so matching the numbers
 exactly makes black look shrunken. The two percent buys back the illusion.
 
-Two pieces carry their own ratio on top of that: the black rook at 1.12 and
+Two pieces carry their own ratio on top of that: the black rook at 1.131 and
 the bishop at 0.96. The sheets do not agree about those two shapes, and the
 disagreement is visible when a rook stands next to its counterpart. Fixed by a
 number rather than by regenerating the art.
@@ -40,7 +40,7 @@ Heights as shipped, in pixels of the 320 canvas:
 | | K | Q | R | B | N | P |
 |---|---|---|---|---|---|---|
 | white | 308 | 304 | 221 | 298 | 250 | 167 |
-| black | 314 | 310 | 245 | 286 | 255 | 170 |
+| black | 314 | 310 | 250 | 286 | 255 | 170 |
 
 Both sides come from the second row of their sheet -- the one with flame and
 runes. The first row of each is a quieter alternative, still there.
@@ -51,7 +51,7 @@ Two sheets, because the sides were generated separately:
 
 ```
 python3 recorta_pecas.py brancas-fonte.png . "-,w" 308            # 2a fila
-python3 recorta_pecas.py pretas-fonte.png  . "-,b" ref:.:1.02:R=1.12,B=0.96
+python3 recorta_pecas.py pretas-fonte.png  . "-,b" ref:.:1.02:R=1.131,B=0.96
 ```
 
 The third argument says what each row of the sheet is, top to bottom -- `w`,
