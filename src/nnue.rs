@@ -26,7 +26,33 @@ pub const HIDDEN: usize = 512;
 pub const INPUTS: usize = 768;
 const QA: i32 = 255;
 const QB: i32 = 64;
-const SCALE: i32 = 400;
+
+/// How many centipawns one unit of the network's output is worth.
+///
+/// Tunable at runtime -- `setoption name EvalScale value <n>` -- because it is
+/// not really a property of the network. It is the exchange rate between the
+/// network's opinion and the units every pruning margin in the search is
+/// written in, and those margins were fitted against whatever this happened to
+/// be.
+///
+/// It is worth about two plies, which is why it is a knob and not a constant.
+/// Loading a network trained elsewhere, whose output is on half our scale,
+/// cost three plies of depth at a HIGHER node rate -- the signature of margins
+/// that no longer fire, so the tree widens. Rescaling that same network, one
+/// number and not one weight, gave the plies straight back.
+///
+/// Changing it detunes every margin at once, so a measured gain is the net of
+/// both effects, not the scale alone.
+static ESCALA: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(200);
+
+#[inline]
+pub fn escala() -> i32 {
+    ESCALA.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_escala(v: i32) {
+    ESCALA.store(v.clamp(1, 4000), std::sync::atomic::Ordering::Relaxed);
+}
 
 /// Weights, in the layout `bullet` writes them.
 ///
@@ -220,7 +246,7 @@ pub fn evaluate(net: &Network, acc: &Accumulator, side: Color, ob: usize) -> i32
     }
     // One QA from the squaring in the activation, then the usual QA*QB from
     // the two quantised layers.
-    (sum / QA + vies) * SCALE / (QA * QB)
+    (sum / QA + vies) * escala() / (QA * QB)
 }
 
 /// Read the raw little-endian dump `bullet` saves.

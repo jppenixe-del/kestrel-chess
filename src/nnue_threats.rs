@@ -20,7 +20,9 @@ pub const INPUTS: usize = TOTAL_INPUTS_V10; // 31744
 pub const HIDDEN: usize = 512;
 const QA: i32 = 255;
 const QB: i32 = 64;
-const SCALE: i32 = 400;
+// A escala vive em `nnue`: as duas arquitecturas tem de a partilhar, senao
+// trocar de rede mudava silenciosamente a unidade em que a busca pensa.
+use crate::nnue::escala;
 const OUT_BUCKETS: usize = 8;
 
 pub struct RedeThreats {
@@ -153,7 +155,7 @@ pub fn evaluate(net: &RedeThreats, board: &Board) -> i32 {
     // primeiro. Trocar aqui e' de graca e mantem o acumulador estavel.
     let (a, b) = if board.side == Color::White { (&us, &them) } else { (&them, &us) };
     let soma = saida_par(a, b, w);
-    (soma / QA + net.l1b[ob] as i32) * SCALE / (QA * QB)
+    (soma / QA + net.l1b[ob] as i32) * escala() / (QA * QB)
 }
 
 /// Add one feature's column, from whichever block holds it.
@@ -566,7 +568,7 @@ impl AccThreats {
             (&self.them, &self.us)
         };
         let soma = saida_par(a, b, w);
-        (soma / QA + net.l1b[ob] as i32) * SCALE / (QA * QB)
+        (soma / QA + net.l1b[ob] as i32) * escala() / (QA * QB)
     }
 }
 
