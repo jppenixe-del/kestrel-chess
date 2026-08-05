@@ -5,7 +5,8 @@ A sheet is one image: rows of six pieces on a flat colour, in the order
 K Q R B N P. What comes out is what the board actually loads -- 320x320 RGBA,
 one file per piece.
 
-    python3 recorta_pecas.py <folha> <destino> <bandas> [altura_max]
+    python3 recorta_pecas.py <folha> <destino> <bandas> <altura_max>
+    python3 recorta_pecas.py <folha> <destino> <bandas> ref:<dir>:<razao>
 
 `bandas` says what each row of the sheet is, top to bottom, comma separated:
 `w` white, `b` black, `-` skip. So `w,b` takes both rows of one sheet, and
@@ -15,8 +16,15 @@ sheet offering two alternatives needs.
 `altura_max` is how tall the tallest piece of that row ends up, in pixels of
 the 320 canvas. It is given rather than derived because the two sides can come
 from DIFFERENT sheets, and then nothing inside one sheet can say how big it
-should be relative to the other. White fills the square at 296; black is
-deliberately smaller, at 266.
+should be relative to the other.
+
+`ref:<dir>:<razao>` sizes each piece against the one already in `<dir>` of the
+same type, at that ratio -- so a black rook is a fixed fraction of the white
+rook rather than of the black king. That is not the same thing, and the
+difference shows: with each row scaled as a unit, the two sheets' internal
+proportions came out at ratios from 0.77 to 1.07 between the sides, which put
+the black rook TALLER than the white one. A board is read as piece types, not
+as sheets.
 """
 from PIL import Image
 import numpy as np
@@ -25,7 +33,7 @@ import os
 
 NOMES = ["K", "Q", "R", "B", "N", "P"]
 LADO = 320
-MARGEM = 12
+MARGEM = 6
 
 
 def carrega(caminho):
@@ -78,7 +86,16 @@ def bandas_de(m, minimo=40):
     return bs
 
 
-def colunas_de(m, y0, y1):
+def colunas_de(m, y0, y1, quantas=6):
+    """The six pieces of a row, split apart.
+
+    Blank columns are enough when the pieces stand clear of each other. They do
+    not always: on one sheet two pieces in a flaming row overlap at the tips,
+    which merges them into a single group and silently yields five pieces
+    instead of six. When that happens the widest group is split at the deepest
+    valley in its own column profile -- the narrowest point between two bodies
+    -- and the split repeats until the count is right.
+    """
     col = m[y0:y1].sum(axis=0)
     gs, ini = [], None
     for x, v in enumerate(col):
@@ -90,14 +107,41 @@ def colunas_de(m, y0, y1):
             ini = None
     if ini is not None:
         gs.append((ini, len(col)))
+
+    while len(gs) < quantas:
+        i = max(range(len(gs)), key=lambda k: gs[k][1] - gs[k][0])
+        x0, x1 = gs[i]
+        # Only the middle is a candidate: the valley between two bodies is
+        # never within a quarter-width of either end.
+        m0, m1 = x0 + (x1 - x0) // 4, x1 - (x1 - x0) // 4
+        if m1 - m0 < 4:
+            break
+        corte = m0 + int(np.argmin(col[m0:m1]))
+        gs[i:i + 1] = [(x0, corte), (corte, x1)]
+        gs.sort()
     return gs
+
+
+def altura_visivel(im):
+    """How tall the drawing inside a 320x320 tile actually is."""
+    a = np.asarray(im.convert("RGBA"))
+    ys = np.nonzero((a[:, :, 3] > 20).any(axis=1))[0]
+    return int(ys.max() - ys.min() + 1)
 
 
 def main():
     if len(sys.argv) < 4:
         raise SystemExit(__doc__)
     folha, destino, spec = sys.argv[1], sys.argv[2], sys.argv[3].split(",")
-    alvo = int(sys.argv[4]) if len(sys.argv) > 4 else LADO - 2 * MARGEM
+    arg = sys.argv[4] if len(sys.argv) > 4 else str(LADO - 2 * MARGEM)
+    ref = None
+    if arg.startswith("ref:"):
+        _, refdir, razao = arg.split(":")
+        ref = {n: Image.open(os.path.join(refdir, f"w{n}.png")) for n in NOMES}
+        ref = {n: altura_visivel(im) * float(razao) for n, im in ref.items()}
+        alvo = None
+    else:
+        alvo = int(arg)
     os.makedirs(destino, exist_ok=True)
 
     a, fundo = carrega(folha)
@@ -122,12 +166,14 @@ def main():
             rec[NOMES[i]] = Image.fromarray(
                 sub[ys.min():ys.max() + 1, xs.min():xs.max() + 1], "RGBA")
 
-        # One scale for the whole row. Nothing is normalised piece by piece:
-        # relative height between pieces is exactly as drawn, and it is how a
-        # player tells a rook from a queen without looking twice. Fitting each
-        # piece to its own square would make the pawn as tall as the king.
-        g = alvo / max(im.size[1] for im in rec.values())
+        # Either one scale for the whole row -- relative heights exactly as
+        # drawn -- or one height per piece, taken from the reference set. The
+        # first keeps a sheet honest to itself; the second keeps two sheets
+        # honest to each other, which is what a board needs when the sides were
+        # generated separately.
+        g_fila = None if alvo is None else alvo / max(im.size[1] for im in rec.values())
         for nome, img in rec.items():
+            g = g_fila if g_fila is not None else ref[nome] / img.size[1]
             nw = max(1, round(img.size[0] * g))
             nh = max(1, round(img.size[1] * g))
             r = img.resize((nw, nh), Image.LANCZOS)
@@ -135,7 +181,8 @@ def main():
             # Centred, and standing on a baseline shared by every piece.
             tela.alpha_composite(r, ((LADO - nw) // 2, LADO - MARGEM - nh))
             tela.save(os.path.join(destino, f"{cor}{nome}.png"))
-        hs = {n: round(rec[n].size[1] * g) for n in NOMES}
+        hs = {n: round(rec[n].size[1] * (g_fila if g_fila is not None else ref[n] / rec[n].size[1]))
+              for n in NOMES}
         print(f"  {cor}: " + "  ".join(f"{n}={hs[n]:3d}" for n in NOMES))
 
 
