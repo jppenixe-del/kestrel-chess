@@ -1356,17 +1356,32 @@ impl Engine {
             match best {
                 Some(mv) => {
                     collected.push((((b'A' + (pv_index - 1) as u8)) as char, mv, score));
-                    // Com MultiPV a 1 a busca ja' narrou esta profundidade enquanto
-                    // aprofundava, e esta era uma SEGUNDA linha para a mesma -- sem o
-                    // campo wdl e com o nps recalculado sobre o tempo total, portanto
-                    // com numeros diferentes dos da primeira. Uma interface que leia
-                    // info linha a linha via duas actualizacoes incoerentes para a
-                    // mesma profundidade, e um `tail -1` apanhava a errada -- foi o que
-                    // aconteceu a varias medicoes deste projecto.
+                    // Com MultiPV a 1 e UMA thread a busca ja' narrou esta
+                    // profundidade enquanto aprofundava, e esta seria uma SEGUNDA
+                    // linha para a mesma -- sem o campo wdl e com o nps recalculado
+                    // sobre o tempo total, portanto com numeros diferentes dos da
+                    // primeira. Uma interface que leia info linha a linha via duas
+                    // actualizacoes incoerentes para a mesma profundidade, e um
+                    // `tail -1` apanhava a errada -- foi o que aconteceu a varias
+                    // medicoes deste projecto.
                     //
-                    // Com MultiPV > 1 continua a ser precisa: as linhas B, C e
-                    // seguintes nao passam pelo narrador da busca.
-                    if pv_index <= multipv && (multipv > 1 || pv_index > 1) {
+                    // Com VARIAS threads essa supressao estava errada, e de uma
+                    // forma que se ve de fora: quem narra durante a busca e' a
+                    // thread 0, mas quem decide e' a votacao entre threads. Quando
+                    // a votacao elege outro lance, a ultima linha impressa nomeia
+                    // um lance e o `bestmove` seguinte nomeia outro. Medido nesta
+                    // posicao, tres vezes em doze a 300ms -- um quarto dos lances.
+                    // O PV corrigido ja' era calculado aqui a partir da thread
+                    // vencedora e depois deitado fora.
+                    //
+                    // Um motor que anuncia uma variante e joga outra contradiz-se
+                    // no proprio protocolo: corrompe qualquer ferramenta que leia
+                    // a linha, e esconde exactamente o caso que interessa
+                    // investigar, que e' quando a votacao muda a decisao.
+                    //
+                    // Com MultiPV > 1 continua a ser precisa por outra razao: as
+                    // linhas B, C e seguintes nao passam pelo narrador da busca.
+                    if pv_index <= multipv && (multipv > 1 || pv_index > 1 || self.threads > 1) {
                         let pv_str = if pv_line.is_empty() {
                             mv.to_uci()
                         } else {
