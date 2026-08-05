@@ -647,6 +647,15 @@ pub struct Engine {
     last_score: Option<i32>, // score (cp, nossa perspetiva) do ultimo "go" -- para os niveis 2/3 de compute_time_budget
     style_book: Option<crate::book::Book>, // "assinatura" da Judit Polgar -- ver book.rs
     threads: usize, // Lazy SMP -- ver search_mt(). 1 = sem paralelismo (comportamento antigo).
+    /// Whether the threads vote on the move, or the main thread simply decides.
+    ///
+    /// An option because the two models have never been separated by enough
+    /// games to tell them apart here. The comment defending the vote cites 50
+    /// games; fifty games separate nothing. Measured in the position that lost
+    /// a rated game, the vote overrode a CORRECT main thread and played the
+    /// losing move in 2 runs of 20, while the main thread picked it in 0 of 20
+    /// at either thread count.
+    lazy_vote: bool,
     /// Learned tables kept ACROSS moves of a game (one set per search
     /// thread) -- see `HistoryTables`. Cleared on `ucinewgame`, which is
     /// exactly the lifetime the UCI protocol defines for them. Before
@@ -690,6 +699,7 @@ impl Engine {
             last_score: None,
             style_book,
             threads: 1,
+            lazy_vote: true,
             hist: Vec::new(),
         }
     }
@@ -1494,6 +1504,7 @@ impl Engine {
         let mut pool_iter = pool.into_iter();
         // One flag for the whole search: when the thread that reports decides
         // the position is settled, every thread stops, not just that one.
+        let vote_on = self.lazy_vote;
         let stop_flag = std::sync::atomic::AtomicBool::new(false);
         let stop_ref = &stop_flag;
         let tt_ref = &self.tt;
@@ -1609,7 +1620,10 @@ impl Engine {
             if results.is_empty() {
                 return ((None, 0, 0, 0, Vec::new()), Vec::new());
             }
-            let best_idx = if results.len() < 2 {
+            // Thread 0 is index 0 and is the one that narrated the search.
+            // With the vote off it simply decides, which is the other model in
+            // common use: helpers exist only to fill the shared table.
+            let best_idx = if results.len() < 2 || !vote_on {
                 0
             } else {
                 // The score votes, but only when it can be trusted.
@@ -1734,6 +1748,7 @@ impl Engine {
                     let _ = writeln!(out, "option name Move Overhead type spin default {} min 0 max 5000", MOVE_OVERHEAD_DEFAULT_MS);
                     let _ = writeln!(out, "option name OnlineTablebase type check default false");
                     let _ = writeln!(out, "option name Contempt type spin default 20 min -200 max 200");
+                    let _ = writeln!(out, "option name LazyVote type check default true");
                     let _ = writeln!(
                         out,
                         "option name EvalScale type spin default {} min 100 max 2000",
@@ -1787,6 +1802,9 @@ impl Engine {
                     } else if tokens.len() >= 5 && tokens[1] == "name" && tokens[2] == "HeatmapOnly" && tokens[3] == "value" {
                         let on = tokens[4].eq_ignore_ascii_case("true") || tokens[4] == "1";
                         HEATMAP_ONLY.store(on, std::sync::atomic::Ordering::Relaxed);
+                    } else if tokens.len() >= 5 && tokens[1] == "name" && tokens[2] == "LazyVote"
+                        && tokens[3] == "value" {
+                        self.lazy_vote = tokens[4].eq_ignore_ascii_case("true") || tokens[4] == "1";
                     } else if tokens.len() >= 5 && tokens[1] == "name" && tokens[2] == "EvalScale"
                         && tokens[3] == "value" {
                         // Exposed so it can be fitted the way every other search
