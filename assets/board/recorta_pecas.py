@@ -6,7 +6,7 @@ K Q R B N P. What comes out is what the board actually loads -- 320x320 RGBA,
 one file per piece.
 
     python3 recorta_pecas.py <folha> <destino> <bandas> <altura_max>
-    python3 recorta_pecas.py <folha> <destino> <bandas> ref:<dir>:<razao>
+    python3 recorta_pecas.py <folha> <destino> <bandas> ref:<dir>:<razao>[:R=1.1,B=.97]
 
 `bandas` says what each row of the sheet is, top to bottom, comma separated:
 `w` white, `b` black, `-` skip. So `w,b` takes both rows of one sheet, and
@@ -19,7 +19,11 @@ from DIFFERENT sheets, and then nothing inside one sheet can say how big it
 should be relative to the other.
 
 `ref:<dir>:<razao>` sizes each piece against the one already in `<dir>` of the
-same type, at that ratio -- so a black rook is a fixed fraction of the white
+same type, at that ratio. A trailing `R=1.1,B=0.97` overrides it per piece --
+the sheets do not agree about every shape, and a rook that reads short next to
+its counterpart is fixed here rather than by regenerating the art.
+
+The ratio sizes each piece against the one already in `<dir>` of the same type -- so a black rook is a fixed fraction of the white
 rook rather than of the black king. That is not the same thing, and the
 difference shows: with each row scaled as a unit, the two sheets' internal
 proportions came out at ratios from 0.77 to 1.07 between the sides, which put
@@ -136,9 +140,16 @@ def main():
     arg = sys.argv[4] if len(sys.argv) > 4 else str(LADO - 2 * MARGEM)
     ref = None
     if arg.startswith("ref:"):
-        _, refdir, razao = arg.split(":")
-        ref = {n: Image.open(os.path.join(refdir, f"w{n}.png")) for n in NOMES}
-        ref = {n: altura_visivel(im) * float(razao) for n, im in ref.items()}
+        partes = arg.split(":")
+        refdir, razao = partes[1], float(partes[2])
+        por_peca = {}
+        if len(partes) > 3:
+            for kv in partes[3].split(","):
+                k, v = kv.split("=")
+                por_peca[k.strip()] = float(v)
+        ref = {n: altura_visivel(Image.open(os.path.join(refdir, f"w{n}.png")))
+                  * por_peca.get(n, razao)
+               for n in NOMES}
         alvo = None
     else:
         alvo = int(arg)
