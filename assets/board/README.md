@@ -11,26 +11,29 @@ browser will actually load.
 Copper and fire against blackened steel, to match the falcon in `assets/`. The
 knight is a bird of prey rather than a horse: Kestrel is a falcon.
 
-**The two sides are not the same shapes in another colour.** The black pieces
-are drawn heavier and stand taller than their white counterparts. That is the
-design, and normalising the two to match would erase the one thing that
-separates the sides at a glance.
+**The two sides are not the same shapes in another colour**, and white is the
+imposing one. The white pieces fill the square; black stands at 90% of that.
+That is a choice, and it is the reverse of what the source sheet gives: there
+the black pieces are drawn 35% LARGER, so a single scale for all twelve
+inherits it and the wrong side dominates the board.
 
-One global scale for all twelve. The tallest piece fills its square, everything
-else scales by the same factor, and every piece sits on a common baseline.
-Nothing is fitted to its own square individually: relative height is how a
-player tells a rook from a queen without looking twice, and per-piece fitting
-would make the pawn as tall as the king.
+Within each side nothing is normalised. Relative heights between pieces are
+exactly as drawn -- the art was made to fill the square, and the flames count
+toward height, which is why the rook stands close to the queen.
+
+One baseline for all twelve. Nothing is fitted to its own square individually:
+relative height is how a player tells a rook from a queen without looking
+twice, and per-piece fitting would make the pawn as tall as the king.
 
 Heights as shipped, in pixels of the 320 canvas:
 
 | | K | Q | R | B | N | P |
 |---|---|---|---|---|---|---|
-| white | 219 | 186 | 214 | 186 | 208 | 162 |
-| black | 296 | 263 | 237 | 221 | 245 | 163 |
+| white | 296 | 252 | 289 | 252 | 281 | 219 |
+| black | 266 | 237 | 213 | 199 | 221 | 146 |
 
-The flames count toward height, which is why the rook stands close to the
-queen. Deliberate: the art was drawn to fill the square.
+The ratio between the sides is one constant, `PROPORCAO_PRETAS` in
+`recorta_pecas.py`.
 
 ## Rebuilding them
 
