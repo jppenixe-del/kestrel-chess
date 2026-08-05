@@ -221,26 +221,49 @@ pub fn map_features_pairs<F: FnMut(usize, usize)>(pos: &Pos, stm: usize, f: &mut
             }
         }
     }
-    // THREATS físicos → par nas 2 perspetivas
+    // THREATS físicos → par nas 2 perspetivas.
+    //
+    // Percorrido do lado do ATACANTE, não do lado da vítima. A versão anterior
+    // perguntava a cada peça do tabuleiro "quem te ataca?", testando os seis
+    // tipos de atacante vezes as duas relações: trinta e duas peças vezes doze
+    // são 384 testes de bitboard para encontrar as ~58 ameaças que existem.
+    //
+    // Invertido, cada mapa de ataque é intersectado UMA vez com as peças e o
+    // que sobra são exactamente os acertos. Doze intersecções e cinquenta e
+    // oito iterações, em vez de trezentas e oitenta e quatro perguntas de que
+    // seis em cada sete têm resposta negativa.
+    //
+    // A tabela casa→peça é construída uma vez por posição: sem ela a inversão
+    // não sabe o tipo da vítima que acabou de encontrar, e voltaríamos a
+    // procurá-lo.
     let maps = compute_attack_maps_by_type(pos);
-    for v_col in 0..2 {
-        for vt in 0..6 {
-            let mut victims = pos.pieces[v_col][vt];
-            while victims != 0 {
-                let sq_raw = victims.trailing_zeros() as usize; victims &= victims - 1;
-                let sq_bb = 1u64 << sq_raw;
-                for at in 0..6 {
-                    for rel in 0..2 {
-                        let att_col = if rel == 0 { v_col ^ 1 } else { v_col };
-                        if maps[att_col][at] & sq_bb != 0 {
-                            let side_stm = if v_col == stm { 0 } else { 1 };
-                            let sq_stm = if stm == 0 { sq_raw } else { sq_raw ^ 56 };
-                            let sq_ntm = if ntm == 0 { sq_raw } else { sq_raw ^ 56 };
-                            f(PIECE_FEATURES + make_threat_full(side_stm, rel, at, vt, sq_stm),
-                              PIECE_FEATURES + make_threat_full(side_stm ^ 1, rel, at, vt, sq_ntm));
-                        }
-                    }
-                }
+    let mut em: [u8; 64] = [0xFF; 64];
+    for c in 0..2 {
+        for t in 0..6 {
+            let mut bb = pos.pieces[c][t];
+            while bb != 0 {
+                let sq = bb.trailing_zeros() as usize; bb &= bb - 1;
+                em[sq] = (c * 8 + t) as u8;
+            }
+        }
+    }
+    let todas = pos.occ();
+    for att_col in 0..2 {
+        for at in 0..6 {
+            let mut alvos = maps[att_col][at] & todas;
+            while alvos != 0 {
+                let sq_raw = alvos.trailing_zeros() as usize; alvos &= alvos - 1;
+                let cod = em[sq_raw];
+                let v_col = (cod >> 3) as usize;
+                let vt = (cod & 7) as usize;
+                // rel 0 = a vítima é atacada pelo adversário; rel 1 = defendida
+                // pelos seus. É o mesmo contrato de antes, lido ao contrário.
+                let rel = (v_col == att_col) as usize;
+                let side_stm = if v_col == stm { 0 } else { 1 };
+                let sq_stm = if stm == 0 { sq_raw } else { sq_raw ^ 56 };
+                let sq_ntm = if ntm == 0 { sq_raw } else { sq_raw ^ 56 };
+                f(PIECE_FEATURES + make_threat_full(side_stm, rel, at, vt, sq_stm),
+                  PIECE_FEATURES + make_threat_full(side_stm ^ 1, rel, at, vt, sq_ntm));
             }
         }
     }
