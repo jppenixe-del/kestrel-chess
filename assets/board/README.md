@@ -14,8 +14,10 @@ a falcon.
 
 **The two sides are not one set in two colours** -- they are separate designs
 from separate sheets, and white is the imposing one. The king fills all but a
-few pixels of its square, and every black piece stands at **0.92 of the white
-piece of the same type**.
+few pixels of its square, and every black piece stands at **1.02 of the white
+piece of the same type** -- very slightly taller, on purpose. A dark shape
+reads smaller than a light one of the same size, so matching the numbers
+exactly makes black look shrunken. The two percent buys back the illusion.
 
 That last part is the whole trick, and it is not the obvious way to do it. The
 obvious way scales each row as a unit, so every piece inherits the internal
@@ -33,7 +35,7 @@ Heights as shipped, in pixels of the 320 canvas:
 | | K | Q | R | B | N | P |
 |---|---|---|---|---|---|---|
 | white | 308 | 304 | 221 | 298 | 250 | 167 |
-| black | 283 | 280 | 201 | 274 | 230 | 154 |
+| black | 314 | 310 | 223 | 304 | 255 | 170 |
 
 Both sides come from the second row of their sheet -- the one with flame and
 runes. The first row of each is a quieter alternative, still there.
@@ -44,7 +46,7 @@ Two sheets, because the sides were generated separately:
 
 ```
 python3 recorta_pecas.py brancas-fonte.png . "-,w" 308            # 2a fila
-python3 recorta_pecas.py pretas-fonte.png  . "-,b" ref:.:0.92     # 2a fila
+python3 recorta_pecas.py pretas-fonte.png  . "-,b" ref:.:1.02     # 2a fila
 ```
 
 The third argument says what each row of the sheet is, top to bottom -- `w`,
