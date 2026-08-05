@@ -8,67 +8,51 @@ browser will actually load.
 
 `wK wQ wR wB wN wP` and the same with `b`. PNG with an alpha channel, 320x320.
 
-Copper and warm flame for white; blackened steel with cold blue light for
-black, a raven on its king. The knight is a bird of prey rather than a horse: Kestrel is
-a falcon.
+White marble with gold; deep red marble with gold, a bird of prey standing
+in for both knights -- Kestrel is a falcon, not a horse.
 
-**The two sides are not one set in two colours** -- they are separate designs
-from separate sheets, and white is the imposing one. The king fills all but a
-few pixels of its square, and every black piece stands at **1.02 of the white
-piece of the same type** -- very slightly taller, on purpose. A dark shape
-reads smaller than a light one of the same size, so matching the numbers
-exactly makes black look shrunken. The two percent buys back the illusion.
+**One sheet, two colours of the same design** -- `aguia-fonte.png`, white on
+top and red below, twelve pieces in one 2814x1536 image. Every red piece
+stands at **1.02 of the white piece of the same type**, matched by type
+rather than by scaling the row as a unit: a flat, dark colour reads smaller
+than a light one of the same size, and the two percent buys that back. One
+ratio for the whole set this time -- the earlier two-sheet version needed
+per-piece overrides because its sides did not agree on some shapes; this one
+does.
 
-Two pieces carry their own ratio on top of that: the black rook at 1.131 and
-the bishop at 0.96. The sheets do not agree about those two shapes, and the
-disagreement is visible when a rook stands next to its counterpart. Fixed by a
-number rather than by regenerating the art.
-
-That last part is the whole trick, and it is not the obvious way to do it. The
-obvious way scales each row as a unit, so every piece inherits the internal
-proportions its own sheet drew. Done that way here, the ratio between the
-sides came out anywhere from 0.77 to 1.07 depending on the piece -- which put
-the black rook TALLER than the white one. A board is read as piece types, not
-as sheets: what has to match across the sides is rook against rook.
-
-Within white nothing is normalised. Relative heights between white pieces are
-exactly as drawn, flames and crests included, which is why the rook stands
-well below the bishop. One baseline for all twelve.
+Within each colour nothing else is normalised. Relative heights are exactly
+as drawn, crests and finials included, which is why the rook stands well
+below the bishop. One shared baseline for all twelve.
 
 Heights as shipped, in pixels of the 320 canvas:
 
 | | K | Q | R | B | N | P |
 |---|---|---|---|---|---|---|
-| white | 308 | 304 | 221 | 298 | 250 | 167 |
-| black | 314 | 310 | 250 | 286 | 255 | 170 |
-
-Both sides come from the second row of their sheet -- the one with flame and
-runes. The first row of each is a quieter alternative, still there.
+| white | 308 | 287 | 272 | 301 | 258 | 204 |
+| red | 314 | 293 | 277 | 307 | 263 | 208 |
 
 ## Rebuilding them
 
-Two sheets, because the sides were generated separately:
-
 ```
-python3 recorta_pecas.py brancas-fonte.png . "-,w" 308            # 2a fila
-python3 recorta_pecas.py pretas-fonte.png  . "-,b" ref:.:1.02:R=1.131,B=0.96
+python3 recorta_pecas.py aguia-fonte.png . 308
 ```
 
-The third argument says what each row of the sheet is, top to bottom -- `w`,
-`b`, or `-` to skip. The fourth is either a height for that row's tallest
-piece, or `ref:<dir>:<razao>` to size each piece against the white one of the
-same type already in `<dir>`. White is cut first; black refers to it.
+The third argument is the white king's height in the 320 canvas; every other
+white piece follows the same ratio, and the red side follows per-type at
+1.02 of white (see the script's own docstring for why per-type, not per-row).
 
-Two things in there are worth knowing before changing it. The row bands are
-**measured** from the image's own row profile rather than guessed, because the
-flames rise well above the bodies and a tight crop beheads the king -- which is
-only visible once it is published. And the green is un-mixed from the edge
-pixels rather than merely keyed out: skip that and every piece carries a green
-halo the moment it lands on a board, which is exactly where it lands.
-
-Both sheets are 2400x1792 PNG, so every piece is reduced into place rather
-than enlarged. `pecas-fonte.jpeg` is the original 1024-wide sheet the set
-started from, kept for the record.
+Two things worth knowing before changing it. Pieces are isolated by
+**connected component**, not by a fixed column grid -- the bishop's small
+eagle finial and the knight's head both draw outside their own nominal
+column, and a hard grid cut either beheads one or lets a fragment of the
+neighbour bleed into it. And the background is removed by thresholding
+**greenness** (G minus the stronger of R/B) rather than by un-mixing against
+one measured background colour -- this source has a faint green-tinted halo
+around its own outline stroke that is a different colour from the flat
+background behind it, and un-mixing against a single sampled colour left
+that halo visible. Check whichever way round against a dark test
+background if a future sheet comes from a different generator: a green
+fringe cannot hide there.
 
 ## The squares
 

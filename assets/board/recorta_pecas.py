@@ -1,200 +1,138 @@
 #!/usr/bin/env python3
 """Cut chess pieces out of a generated sheet, onto transparent squares.
 
-A sheet is one image: rows of six pieces on a flat colour, in the order
-K Q R B N P. What comes out is what the board actually loads -- 320x320 RGBA,
-one file per piece.
+A sheet is one image: two rows of six pieces (white on top, the other side
+below) on a flat green background, in the order K Q R B N P. What comes out
+is what the board actually loads -- 320x320 RGBA, one file per piece.
 
-    python3 recorta_pecas.py <folha> <destino> <bandas> <altura_max>
-    python3 recorta_pecas.py <folha> <destino> <bandas> ref:<dir>:<razao>[:R=1.1,B=.97]
+    python3 recorta_pecas.py <folha> <destino> [altura_rei_branco]
 
-`bandas` says what each row of the sheet is, top to bottom, comma separated:
-`w` white, `b` black, `-` skip. So `w,b` takes both rows of one sheet, and
-`-,b` takes only the second row and leaves the first alone -- which is what a
-sheet offering two alternatives needs.
+The white row is cut first, scaled as one unit so its own internal
+proportions -- crests, flames, whatever the art draws taller or shorter --
+stay exactly as drawn. `altura_rei_branco` sets the scale (default 308, the
+value this set ships at) by fixing the king's own height in the 320 canvas;
+every other white piece follows the same ratio.
 
-`altura_max` is how tall the tallest piece of that row ends up, in pixels of
-the 320 canvas. It is given rather than derived because the two sides can come
-from DIFFERENT sheets, and then nothing inside one sheet can say how big it
-should be relative to the other.
+The second row is then cut and scaled per PIECE TYPE against the white
+piece already produced, at RATIO_SEGUNDA_COR (1.02). A flat, dark colour
+reads smaller than a light one of the same size, so matching pixel heights
+exactly would make the second colour look shrunken; the two percent buys
+back the illusion. Scaling by type rather than by row matters too -- scaling
+the whole row as a unit inherits whatever internal ratio the sheet happened
+to draw between its own pieces, which is not the same number as "how this
+rook compares to that rook" and has, on past sheets, come out backwards.
 
-`ref:<dir>:<razao>` sizes each piece against the one already in `<dir>` of the
-same type, at that ratio. A trailing `R=1.1,B=0.97` overrides it per piece --
-the sheets do not agree about every shape, and a rook that reads short next to
-its counterpart is fixed here rather than by regenerating the art.
+Pieces are isolated by CONNECTED COMPONENT, not by a fixed column grid. Two
+pieces in this set draw outside their own nominal column -- the small eagle
+finial on the bishop, the knight's head -- and a hard grid cut either
+beheads the piece or lets a fragment of the neighbour bleed in. A component
+is assigned to whichever nominal cell its centroid falls in.
 
-The ratio sizes each piece against the one already in `<dir>` of the same type -- so a black rook is a fixed fraction of the white
-rook rather than of the black king. That is not the same thing, and the
-difference shows: with each row scaled as a unit, the two sheets' internal
-proportions came out at ratios from 0.77 to 1.07 between the sides, which put
-the black rook TALLER than the white one. A board is read as piece types, not
-as sheets.
+Background removal is by "greenness" (G channel minus the stronger of R/B),
+not by un-mixing against one measured background colour. This source has a
+second, faint green-tinted halo around its own black outline stroke that is
+not the same colour as the flat background behind it; measuring one colour
+and un-mixing against it left that halo visible, while thresholding on
+greenness directly -- with a soft band so the antialiased edge doesn't get a
+hard cut -- did not. Worth re-checking whichever way round if a future sheet
+comes from a different generator: the right fix is whichever one is
+actually clean on THAT source, checked against a dark background where a
+green fringe cannot hide.
 """
 from PIL import Image
 import numpy as np
-import sys
+from scipy import ndimage
 import os
+import sys
 
 NOMES = ["K", "Q", "R", "B", "N", "P"]
 LADO = 320
 MARGEM = 6
+RATIO_SEGUNDA_COR = 1.02
 
 
-def carrega(caminho):
-    """The sheet, and the background colour read off its own corners.
-
-    Measured, not written down: two sheets from the same generator came back
-    on different greens -- (50,90,63) and (59,117,76) -- and a hard-coded
-    colour keys out nothing at all, producing twelve opaque squares that look
-    fine until they reach a board.
-    """
-    a = np.asarray(Image.open(caminho).convert("RGB")).astype(np.float32)
-    cantos = [a[3, 3], a[3, -4], a[-4, 3], a[-4, -4]]
-    return a, np.median(np.stack(cantos), axis=0)
-
-
-def alfa(a, fundo):
-    """Coverage per pixel, with the background un-mixed out of the edges.
-
-    An edge pixel is the piece blended with the sheet behind it. Recovering
-    coverage is the easy half; un-mixing the colour is the half that matters,
-    because an edge left part-background wears a halo of that background the
-    moment it lands on a board -- which is exactly where it lands.
-    """
-    dist = np.linalg.norm(a - fundo[None, None, :], axis=2)
-    al = np.clip((dist - 18.0) / 34.0, 0, 1)
-    al[al < 0.10] = 0.0
-    seguro = np.maximum(al, 0.03)[:, :, None]
-    puro = np.clip((a - fundo[None, None, :] * (1 - al[:, :, None])) / seguro, 0, 255)
-    return al, np.dstack([puro, al * 255]).astype(np.uint8)
+def remove_fundo(im):
+    arr = np.array(im.convert("RGBA")).astype(np.int16)
+    r, g, b, a = arr[..., 0], arr[..., 1], arr[..., 2], arr[..., 3]
+    verdura = g - np.maximum(r, b)
+    fundo = verdura > 35
+    alfa = a.copy()
+    suave = np.clip(1.0 - (verdura - 8) / 27.0, 0.0, 1.0)
+    alfa = np.where((~fundo) & (verdura > 8), (alfa * suave).astype(np.uint8), alfa)
+    alfa[fundo] = 0
+    arr[..., 3] = alfa
+    return arr.astype(np.uint8)
 
 
-def bandas_de(m, minimo=40):
-    """Rows holding pieces, found from the sheet's own row profile.
+def isola_pecas(rgba):
+    """One connected component per piece, matched to its nominal grid cell."""
+    h, w = rgba.shape[0], rgba.shape[1]
+    cell_w, cell_h = w / 6, h / 2
+    mascara = rgba[..., 3] > 60
+    rotulos, n = ndimage.label(mascara, structure=np.ones((3, 3)))
 
-    Measured rather than guessed. Flames and crests rise well above the
-    bodies, hand-written bands came out fifteen pixels too tight, and a
-    beheaded king is the kind of thing only visible once it is published.
-    """
-    linhas = m.sum(axis=1)
-    bs, ini = [], None
-    for y, v in enumerate(linhas):
-        if v > 3 and ini is None:
-            ini = y
-        elif v <= 3 and ini is not None:
-            if y - ini > minimo:
-                bs.append((ini, y))
-            ini = None
-    if ini is not None and len(linhas) - ini > minimo:
-        bs.append((ini, len(linhas)))
-    return bs
+    def isola(lbl):
+        ys, xs = np.where(rotulos == lbl)
+        x0, x1, y0, y1 = xs.min(), xs.max(), ys.min(), ys.max()
+        sub = rgba[y0:y1 + 1, x0:x1 + 1].copy()
+        sub_rot = rotulos[y0:y1 + 1, x0:x1 + 1]
+        outra = (sub_rot != lbl) & (sub_rot != 0)
+        sub[..., 3] = np.where(outra, 0, sub[..., 3])
+        return Image.fromarray(sub, "RGBA")
 
-
-def colunas_de(m, y0, y1, quantas=6):
-    """The six pieces of a row, split apart.
-
-    Blank columns are enough when the pieces stand clear of each other. They do
-    not always: on one sheet two pieces in a flaming row overlap at the tips,
-    which merges them into a single group and silently yields five pieces
-    instead of six. When that happens the widest group is split at the deepest
-    valley in its own column profile -- the narrowest point between two bodies
-    -- and the split repeats until the count is right.
-    """
-    col = m[y0:y1].sum(axis=0)
-    gs, ini = [], None
-    for x, v in enumerate(col):
-        if v > 3 and ini is None:
-            ini = x
-        elif v <= 3 and ini is not None:
-            if x - ini > 30:
-                gs.append((ini, x))
-            ini = None
-    if ini is not None:
-        gs.append((ini, len(col)))
-
-    while len(gs) < quantas:
-        i = max(range(len(gs)), key=lambda k: gs[k][1] - gs[k][0])
-        x0, x1 = gs[i]
-        # Only the middle is a candidate: the valley between two bodies is
-        # never within a quarter-width of either end.
-        m0, m1 = x0 + (x1 - x0) // 4, x1 - (x1 - x0) // 4
-        if m1 - m0 < 4:
-            break
-        corte = m0 + int(np.argmin(col[m0:m1]))
-        gs[i:i + 1] = [(x0, corte), (corte, x1)]
-        gs.sort()
-    return gs
+    pecas = {}
+    for row, lado in enumerate(["w", "b"]):
+        for col, nome in enumerate(NOMES):
+            cx, cy = (col + 0.5) * cell_w, (row + 0.5) * cell_h
+            lbl = rotulos[int(cy), int(cx)]
+            if lbl == 0:
+                x0c, x1c = col * cell_w, (col + 1) * cell_w
+                y0c, y1c = row * cell_h, (row + 1) * cell_h
+                melhor, melhor_d = None, None
+                for cand in range(1, n + 1):
+                    ys, xs = np.where(rotulos == cand)
+                    if len(xs) < 200:
+                        continue
+                    mx, my = xs.mean(), ys.mean()
+                    if x0c <= mx <= x1c and y0c <= my <= y1c:
+                        d = (mx - cx) ** 2 + (my - cy) ** 2
+                        if melhor_d is None or d < melhor_d:
+                            melhor, melhor_d = cand, d
+                lbl = melhor
+            pecas[(lado, nome)] = isola(lbl)
+    return pecas
 
 
-def altura_visivel(im):
-    """How tall the drawing inside a 320x320 tile actually is."""
-    a = np.asarray(im.convert("RGBA"))
-    ys = np.nonzero((a[:, :, 3] > 20).any(axis=1))[0]
-    return int(ys.max() - ys.min() + 1)
+def coloca(img, altura_alvo, destino):
+    g = altura_alvo / img.size[1]
+    nw, nh = max(1, round(img.size[0] * g)), max(1, round(img.size[1] * g))
+    r = img.resize((nw, nh), Image.LANCZOS)
+    tela = Image.new("RGBA", (LADO, LADO), (0, 0, 0, 0))
+    tela.alpha_composite(r, ((LADO - nw) // 2, LADO - MARGEM - nh))
+    tela.save(destino)
 
 
 def main():
-    if len(sys.argv) < 4:
+    if len(sys.argv) < 3:
         raise SystemExit(__doc__)
-    folha, destino, spec = sys.argv[1], sys.argv[2], sys.argv[3].split(",")
-    arg = sys.argv[4] if len(sys.argv) > 4 else str(LADO - 2 * MARGEM)
-    ref = None
-    if arg.startswith("ref:"):
-        partes = arg.split(":")
-        refdir, razao = partes[1], float(partes[2])
-        por_peca = {}
-        if len(partes) > 3:
-            for kv in partes[3].split(","):
-                k, v = kv.split("=")
-                por_peca[k.strip()] = float(v)
-        ref = {n: altura_visivel(Image.open(os.path.join(refdir, f"w{n}.png")))
-                  * por_peca.get(n, razao)
-               for n in NOMES}
-        alvo = None
-    else:
-        alvo = int(arg)
+    folha, destino = sys.argv[1], sys.argv[2]
+    altura_rei = int(sys.argv[3]) if len(sys.argv) > 3 else 308
     os.makedirs(destino, exist_ok=True)
 
-    a, fundo = carrega(folha)
-    al, rgba = alfa(a, fundo)
-    print(f"  fundo medido: {fundo.astype(int)}")
+    rgba = remove_fundo(Image.open(folha))
+    pecas = isola_pecas(rgba)
 
-    bandas = bandas_de(al > 0.10)
-    if len(bandas) != len(spec):
-        raise SystemExit(f"a folha tem {len(bandas)} filas, a spec tem {len(spec)}: {bandas}")
+    g_branca = altura_rei / pecas[("w", "K")].size[1]
+    alturas = {}
+    for nome in NOMES:
+        alt = round(pecas[("w", nome)].size[1] * g_branca)
+        coloca(pecas[("w", nome)], alt, os.path.join(destino, f"w{nome}.png"))
+        alturas[nome] = alt
+    for nome in NOMES:
+        alt = round(alturas[nome] * RATIO_SEGUNDA_COR)
+        coloca(pecas[("b", nome)], alt, os.path.join(destino, f"b{nome}.png"))
 
-    m = al > 0.35
-    for (y0, y1), cor in zip(bandas, spec):
-        if cor == "-":
-            continue
-        gs = colunas_de(m, y0, y1)
-        if len(gs) != 6:
-            raise SystemExit(f"fila {cor}: encontrei {len(gs)} pecas, esperava 6")
-        rec = {}
-        for i, (x0, x1) in enumerate(gs):
-            sub = rgba[y0:y1, x0:x1]
-            ys, xs = np.nonzero(sub[:, :, 3] > 20)
-            rec[NOMES[i]] = Image.fromarray(
-                sub[ys.min():ys.max() + 1, xs.min():xs.max() + 1], "RGBA")
-
-        # Either one scale for the whole row -- relative heights exactly as
-        # drawn -- or one height per piece, taken from the reference set. The
-        # first keeps a sheet honest to itself; the second keeps two sheets
-        # honest to each other, which is what a board needs when the sides were
-        # generated separately.
-        g_fila = None if alvo is None else alvo / max(im.size[1] for im in rec.values())
-        for nome, img in rec.items():
-            g = g_fila if g_fila is not None else ref[nome] / img.size[1]
-            nw = max(1, round(img.size[0] * g))
-            nh = max(1, round(img.size[1] * g))
-            r = img.resize((nw, nh), Image.LANCZOS)
-            tela = Image.new("RGBA", (LADO, LADO), (0, 0, 0, 0))
-            # Centred, and standing on a baseline shared by every piece.
-            tela.alpha_composite(r, ((LADO - nw) // 2, LADO - MARGEM - nh))
-            tela.save(os.path.join(destino, f"{cor}{nome}.png"))
-        hs = {n: round(rec[n].size[1] * (g_fila if g_fila is not None else ref[n] / rec[n].size[1]))
-              for n in NOMES}
-        print(f"  {cor}: " + "  ".join(f"{n}={hs[n]:3d}" for n in NOMES))
+    print("branca:", "  ".join(f"{n}={alturas[n]:3d}" for n in NOMES))
 
 
 if __name__ == "__main__":
