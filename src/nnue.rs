@@ -301,7 +301,8 @@ pub fn load(bytes: &[u8]) -> Option<Network> {
     // the shape has to be inferred from its length, which is what the code
     // below still does -- but a file that HAS the header gets checked instead
     // of guessed, and a layout mismatch is caught here rather than never.
-    let bytes = if bytes.len() > 16 && bytes[..4] == MAGIC {
+    if bytes.len() > 16 && bytes[..4] == MAGIC {
+        let versao = u16::from_le_bytes([bytes[4], bytes[5]]);
         let buckets = u16::from_le_bytes([bytes[6], bytes[7]]) as usize;
         let hidden = u16::from_le_bytes([bytes[8], bytes[9]]) as usize;
         let esperado = cabecalho(buckets, HIDDEN, &king_bucket_layout());
@@ -317,6 +318,22 @@ pub fn load(bytes: &[u8]) -> Option<Network> {
             );
             return None;
         }
+        if versao == 2 {
+            return carrega_leb128(bytes, buckets);
+        }
+        if versao != 1 {
+            eprintln!("nnue: versao de cabecalho {} desconhecida deste binario", versao);
+            return None;
+        }
+    }
+    load_bruto(bytes)
+}
+
+/// The v1/no-header path: raw little-endian `i16` dump, shape inferred from
+/// byte length. Untouched by the v2 (LEB128) addition below -- every file
+/// that loaded before this existed still takes the exact same branch.
+fn load_bruto(bytes: &[u8]) -> Option<Network> {
+    let bytes = if bytes.len() > 16 && bytes[..4] == MAGIC {
         &bytes[16..]
     } else {
         bytes
@@ -381,6 +398,139 @@ pub fn load(bytes: &[u8]) -> Option<Network> {
         buckets, output_buckets
     );
     Some(Network { l0w, l0b, l1w, l1b, buckets, output_buckets })
+}
+
+// --- LEB128 packing (v2 file format) --------------------------------------
+//
+// Storage only. The decoded result is the exact same `Vec<i16>` the raw (v1)
+// path produces, and every hot loop in this file and in the accumulator
+// reads that `Vec<i16>` the same way regardless of which format it came
+// from -- packing shrinks the file on disk, it does not touch a single
+// nanosecond of search. Quantised NNUE weights cluster near zero (most
+// squares are irrelevant to most positions, so most learned weights stay
+// small), which is exactly the distribution zigzag+LEB128 is small for.
+
+/// Maps a signed value to unsigned so small magnitudes -- positive OR
+/// negative -- both encode as small numbers. Without this, -1 would encode
+/// as 0xFFFF and cost the full three bytes every time.
+#[inline]
+fn zigzag_encode(v: i16) -> u16 {
+    ((v << 1) ^ (v >> 15)) as u16
+}
+
+#[inline]
+fn zigzag_decode(u: u16) -> i16 {
+    ((u >> 1) as i16) ^ -((u & 1) as i16)
+}
+
+fn leb128_push(mut v: u16, out: &mut Vec<u8>) {
+    loop {
+        let byte = (v & 0x7F) as u8;
+        v >>= 7;
+        if v == 0 {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+/// Returns `None` on a truncated stream rather than panicking -- a corrupt or
+/// short file is a network we refuse, not a crash.
+fn leb128_pop(bytes: &[u8], pos: &mut usize) -> Option<u16> {
+    let mut result: u32 = 0;
+    let mut shift = 0;
+    loop {
+        let byte = *bytes.get(*pos)?;
+        *pos += 1;
+        result |= ((byte & 0x7F) as u32) << shift;
+        if byte & 0x80 == 0 {
+            return Some(result as u16);
+        }
+        shift += 7;
+        // 16-bit payloads need at most 3 groups of 7 bits. A fourth means
+        // the stream is not ours (or corrupt) -- refuse rather than loop.
+        if shift > 21 {
+            return None;
+        }
+    }
+}
+
+fn empacota_leb128(valores: &[i16]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(valores.len() * 2);
+    for &v in valores {
+        leb128_push(zigzag_encode(v), &mut out);
+    }
+    out
+}
+
+/// Returns the decoded values AND how many bytes they occupied, in one pass.
+/// The first version of this called a second helper afterward just to
+/// re-decode the same stream and count its length -- for `l0w` (393216 of
+/// this network's 394753 values) that was the whole tensor parsed twice for
+/// no reason. Reading littleindian's own LEB128 reader in nnue_net.cpp
+/// (`lebOne`/`lebI16`) turned up nothing structurally faster -- same
+/// scalar, byte-at-a-time decode -- but its chunk format stores each
+/// chunk's byte length up front instead of re-deriving it, which is the
+/// actual fix: don't recompute what the first pass already knew.
+fn desempacota_leb128(bytes: &[u8], n: usize) -> Option<(Vec<i16>, usize)> {
+    let mut out = Vec::with_capacity(n);
+    let mut pos = 0;
+    for _ in 0..n {
+        out.push(zigzag_decode(leb128_pop(bytes, &mut pos)?));
+    }
+    Some((out, pos))
+}
+
+/// v2 header adds `output_buckets` explicitly (bytes 16..18). It has to:
+/// v1's shape inference divides the total BYTE length by a fixed 2-byte
+/// stride to recover value counts, and that trick does not exist once
+/// values are variable-width. Storing the count sidesteps guessing instead
+/// of reimplementing it against a stream that cannot be measured that way.
+fn carrega_leb128(bytes: &[u8], buckets: usize) -> Option<Network> {
+    if bytes.len() < 18 {
+        eprintln!("nnue: cabecalho v2 truncado");
+        return None;
+    }
+    let output_buckets = u16::from_le_bytes([bytes[16], bytes[17]]) as usize;
+    let payload = &bytes[18..];
+
+    let n_l0w = INPUTS * HIDDEN * buckets;
+    let n_l0b = HIDDEN;
+    let n_l1w = 2 * HIDDEN * output_buckets;
+    let n_l1b = output_buckets;
+
+    let mut pos = 0;
+    let (l0w, consumido) = desempacota_leb128(&payload[pos..], n_l0w)?;
+    pos += consumido;
+    let (l0b, consumido) = desempacota_leb128(&payload[pos..], n_l0b)?;
+    pos += consumido;
+    let (l1w, consumido) = desempacota_leb128(&payload[pos..], n_l1w)?;
+    pos += consumido;
+    let (l1b, _) = desempacota_leb128(&payload[pos..], n_l1b)?;
+
+    eprintln!(
+        "nnue: {} bucket(s) de entrada, {} de saida (LEB128, {} bytes empacotados)",
+        buckets, output_buckets, bytes.len()
+    );
+    Some(Network { l0w, l0b, l1w, l1b, buckets, output_buckets })
+}
+
+/// Repacks an already-loaded network (any input format) into the v2 LEB128
+/// file format. `escreve_com_cabecalho`'s sibling for the packed path.
+pub fn empacota_rede(net: &Network, saida: &str) -> std::io::Result<()> {
+    let mut v = cabecalho(net.buckets, HIDDEN, &king_bucket_layout());
+    v[4..6].copy_from_slice(&2u16.to_le_bytes()); // VERSAO = 2
+    v.extend_from_slice(&(net.output_buckets as u16).to_le_bytes());
+
+    let mut todos = Vec::with_capacity(net.l0w.len() + net.l0b.len() + net.l1w.len() + net.l1b.len());
+    todos.extend_from_slice(&net.l0w);
+    todos.extend_from_slice(&net.l0b);
+    todos.extend_from_slice(&net.l1w);
+    todos.extend_from_slice(&net.l1b);
+    v.extend_from_slice(&empacota_leb128(&todos));
+
+    std::fs::write(saida, v)
 }
 
 /// Evaluate a position from scratch, for callers that have no accumulator to
