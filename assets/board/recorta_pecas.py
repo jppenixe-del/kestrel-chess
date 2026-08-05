@@ -59,20 +59,25 @@ for cor, (y0, y1) in FILAS.items():
 LADO, MARGEM = 320, 12
 alvo = LADO - 2 * MARGEM
 
-# UMA escala global para as doze. Nada e' emparelhado nem normalizado.
+# Uma escala por LADO, e as brancas mandam.
 #
-# As alturas, dentro de cada fila e entre as duas, sao como foram desenhadas.
-# As brancas e as pretas NAO sao a mesma peca noutra cor -- as pretas tem outro
-# porte, e isso e' o desenho. Uma normalizacao "para ficarem iguais" apagaria
-# precisamente aquilo que distingue os dois lados.
+# As brancas enchem o quadrado; as pretas ficam um pouco abaixo. Nao e' para
+# as igualar -- os dois lados sao desenhos diferentes de proposito, e as pretas
+# tem outro porte. E' para as brancas serem as imponentes, que e' o efeito
+# pretendido e que a folha de origem dava ao contrario: nela as pretas estavam
+# desenhadas 35% maiores, e uma escala global unica herdava isso.
 #
-# A unica coisa imposta e' a linha de base: a peca mais alta do conjunto enche
-# o quadrado, todas as outras escalam com ela pelo mesmo factor, e todas pousam
-# no mesmo sitio.
-mais_alta = max(img.size[1] for img in rec.values())
-g = alvo / mais_alta
+# Dentro de cada lado nada e' normalizado: as alturas relativas entre pecas sao
+# exactamente as desenhadas.
+PROPORCAO_PRETAS = 0.90
+
+escala = {}
+for cor in ("w", "b"):
+    mais_alta = max(rec[cor + n].size[1] for n in NOMES)
+    escala[cor] = alvo / mais_alta * (PROPORCAO_PRETAS if cor == "b" else 1.0)
 
 for nome, img in rec.items():
+    g = escala[nome[0]]
     nw = max(1, round(img.size[0] * g))
     nh = max(1, round(img.size[1] * g))
     r = img.resize((nw, nh), Image.LANCZOS)
@@ -83,7 +88,7 @@ for nome, img in rec.items():
     tela.alpha_composite(r, ((LADO - nw) // 2, LADO - MARGEM - nh))
     tela.save(os.path.join(DESTINO, f'{nome}.png'))
 
-print("  alturas finais (uma so escala, como desenhadas):")
+print("  alturas finais (px de 320):")
 for cor in ("w", "b"):
-    hs = {n: round(rec[cor + n].size[1] * g) for n in NOMES}
+    hs = {n: round(rec[cor + n].size[1] * escala[cor]) for n in NOMES}
     print(f"    {cor}: " + "  ".join(f"{n}={hs[n]:3d}" for n in NOMES))
