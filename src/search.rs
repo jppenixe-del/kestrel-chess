@@ -3,7 +3,7 @@ use crate::bitboard::{bb, Bitboard};
 use crate::board::Board;
 use crate::book::{encode_move, Book};
 use crate::evaluation::evaluate;
-use crate::movegen::generate_legal;
+use crate::movegen::{generate_legal, generate_legal_caps};
 use crate::moves::{Move, MoveFlag};
 use crate::tt::{Bound, TranspositionTable};
 use crate::types::{file_of, rank_of, sq, Color, PieceType};
@@ -2086,7 +2086,15 @@ impl<'a> Searcher<'a> {
             return stand_pat;
         }
 
-        let mut moves = generate_legal(board, self.atk);
+        // Out of check, generate only what quiescence searches instead of
+        // generating everything and discarding the quiet moves -- see
+        // `generate_legal_caps`. In check, every legal evasion counts, so the
+        // full generator stays.
+        let mut moves = if in_check {
+            generate_legal(board, self.atk)
+        } else {
+            generate_legal_caps(board, self.atk)
+        };
         if in_check {
             if moves.is_empty() {
                 return -MATE_SCORE + ply as i32;
@@ -2096,6 +2104,7 @@ impl<'a> Searcher<'a> {
             // checker). SEE pruning also doesn't apply -- a losing
             // capture can still be the only legal escape from check.
         } else {
+            debug_assert!(moves.iter().all(|m| m.is_capture() || m.promotion.is_some()));
             moves.retain(|m| m.is_capture() || m.promotion == Some(PieceType::Queen));
             // Poda por SEE: uma captura que perde material na troca completa
             // (SEE negativo) quase nunca vale a pena dentro da quiescence --
