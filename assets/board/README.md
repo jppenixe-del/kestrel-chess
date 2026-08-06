@@ -56,30 +56,36 @@ fringe cannot hide there.
 
 ## The squares
 
-`casa_clara.svg` and `casa_escura.svg` -- dry plain and turned earth. The grain
-is fractal turbulence generated in the file itself, under 1KB each, so the
-browser rasterises them once and never fetches an image.
+`tabuleiro_batalha.jpg` -- one painting for all sixty-four squares, not a pair
+of tiles repeated. A battlefield: a dark phalanx along the top, a light one
+along the bottom, and open ground between them.
 
-Low contrast, but not invisible. The first version measured **2.78:1** between
-light and dark, which is below what the eye reads as a grid at a glance -- on a
-screenshot the squares blurred into one another and a white piece on a light
-square had nothing to sit against. It is now **8.32:1** (WCAG relative
-luminance), by taking the light square up to pale limestone and the dark one
-down to burnt earth.
+The checkerboard is baked into the image, so nothing has to be masked or
+tiled at the other end -- the CSS sets one background and stops.
 
-The dark square carries two faint rust-red veins. They are there to answer the
-pieces -- white marble against deep red marble -- and they are at 10-13% opacity
-because the moment they are visible as decoration they have gone too far.
+Three things were measured into it, and each fixed something visible:
 
-The principle stands and is worth keeping: a loud board eats the pieces, and the
-board is there for them to be read, not to be looked at. Louder is not the fix;
+- **The phalanxes are aligned to ranks 1 and 8.** In the source they sat
+  1604px apart while those ranks are 1792 apart, so both were cut across the
+  middle and the soldiers stood at the same height as the pieces, competing
+  with them. Stretched 1.117 vertically and offset 158px, each phalanx now
+  centres on its own rank -- behind the pieces of that colour, where it reads
+  as backdrop.
+- **Ranks 1 and 8 are veiled harder than the rest.** Sixteen of the
+  thirty-two pieces stand there, and it is also the only place the painting
+  has detail. Contrast there is 10.39:1 against 4.57:1 in the middle six
+  ranks: most legible exactly where most pieces are, and left alone where the
+  painting has nothing to compete with.
+- **The palette is the pieces' own** -- bone white, deep red, black. Light
+  squares warm bone, dark squares near-black rather than brown, because the
+  red pieces are dark and were sinking into earth tones. Square edges carry a
+  faint ember red.
+
+The earlier generated pair (`casa_clara.svg`, `casa_escura.svg`) is still in
+the repository and still works: two files under 1.2KB, no image to fetch. It
+went from 2.78:1 to 8.32:1 between light and dark for the same reason -- below
+that the grid was being inferred from the pieces rather than seen.
+
+The principle both versions follow: a loud board eats the pieces, and the board
+is there for them to be read, not to be looked at. Louder is not the fix;
 *separable* is.
-
-## Using them elsewhere
-
-Served raw from GitHub over HTTPS, which is what a page on a secure site will
-load without complaint:
-
-```
-https://raw.githubusercontent.com/jppenixe-del/kestrel-chess/main/assets/board/wK.png
-```
