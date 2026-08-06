@@ -426,6 +426,51 @@ fn main() {
         println!("threats: {} posicoes, {} divergencias, {:.1} features actualizadas por posicao", n, e, m);
         return;
     }
+    if args.len() >= 2 && args[1] == "verificahash" {
+        // Compares the incrementally maintained Board::hash against a full
+        // recompute at EVERY node of a perft, forwards AND after every undo.
+        // Perft is the right driver: it enumerates castling, en passant,
+        // promotion and check evasion exhaustively rather than sampling them,
+        // and those are exactly the moves where an incremental key drifts.
+        let atk = Attacks::new();
+        let z = zobrist::tabelas();
+        let depth: i32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(4);
+        let mut board = match args.get(3) {
+            Some(f) => Board::from_fen(f),
+            None => Board::startpos(),
+        };
+        fn caminha(b: &mut Board, atk: &Attacks, z: &zobrist::Zobrist, d: i32,
+                   mal: &mut u64, n: &mut u64) {
+            if d == 0 {
+                return;
+            }
+            for mv in movegen::generate_legal(b, atk) {
+                let undo = b.make_move(&mv);
+                *n += 1;
+                if b.hash != z.hash_completo(b) {
+                    *mal += 1;
+                    if *mal <= 3 {
+                        eprintln!("DIVERGE apos {} -> {}", mv.to_uci(), b.to_fen());
+                    }
+                }
+                caminha(b, atk, z, d - 1, mal, n);
+                b.unmake_move(&mv, &undo);
+                if b.hash != z.hash_completo(b) {
+                    *mal += 1;
+                    if *mal <= 3 {
+                        eprintln!("DIVERGE ao desfazer {} -> {}", mv.to_uci(), b.to_fen());
+                    }
+                }
+            }
+        }
+        let (mut mal, mut n) = (0u64, 0u64);
+        caminha(&mut board, &atk, z, depth, &mut mal, &mut n);
+        println!("hash: {} lances verificados (ida e volta), {} divergencias", n, mal);
+        if mal > 0 {
+            std::process::exit(1);
+        }
+        return;
+    }
     if args.len() >= 2 && args[1] == "verificacache" {
         // A cache de refresh contra a reconstrucao do zero, em posicoes reais.
         let net = match nnue::rede() {

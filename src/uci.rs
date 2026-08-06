@@ -739,13 +739,13 @@ impl Engine {
             }
         }
         self.history.clear();
-        self.history.push(self.zob.hash(&self.board));
+        self.history.push(self.board.hash);
         if tokens.get(i) == Some(&"moves") {
             i += 1;
             while i < tokens.len() {
                 if let Some(mv) = self.find_move(tokens[i]) {
                     self.board.make_move(&mv);
-                    self.history.push(self.zob.hash(&self.board));
+                    self.history.push(self.board.hash);
                 }
                 i += 1;
             }
@@ -772,7 +772,7 @@ impl Engine {
     /// of generating the move list once.
     fn book_move(&mut self) -> Option<crate::moves::Move> {
         let book = self.style_book.as_ref()?;
-        let entries = book.lookup(self.zob.hash(&self.board));
+        let entries = book.lookup(self.board.hash);
         if entries.is_empty() {
             return None;
         }
@@ -805,7 +805,7 @@ impl Engine {
             .filter(|(_, mv)| {
                 let mut ap = self.board.clone();
                 ap.make_move(mv);
-                !self.history.contains(&self.zob.hash(&ap))
+                !self.history.contains(&ap.hash)
             })
             .collect::<Vec<_>>()
             .into_iter()

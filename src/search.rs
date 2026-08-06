@@ -1499,7 +1499,7 @@ impl<'a> Searcher<'a> {
     /// loop in a corrupted chain would otherwise iterate forever).
     pub fn extract_pv(&self, board: &Board, max_len: usize) -> Vec<Move> {
         let mut b = board.clone();
-        let first = match self.tt.probe(self.zob.hash(&b)).and_then(|e| e.best) {
+        let first = match self.tt.probe(b.hash).and_then(|e| e.best) {
             Some(m) => m,
             None => return Vec::new(),
         };
@@ -1521,7 +1521,7 @@ impl<'a> Searcher<'a> {
         }
         let mut seen = std::collections::HashSet::new();
         for _ in 0..max_len {
-            let hash = self.zob.hash(&b);
+            let hash = b.hash;
             if !seen.insert(hash) {
                 break;
             }
@@ -2215,7 +2215,7 @@ impl<'a> Searcher<'a> {
 
         let mut beta = beta;
 
-        let hash = self.zob.hash(board);
+        let hash = board.hash;
         if ply > 0 && self.is_repetition_or_fifty(board, hash) {
             return self.valor_empate(board);
         }
@@ -3483,7 +3483,7 @@ impl<'a> Searcher<'a> {
         // moment the position is no longer in the book.
         let in_book = self
             .style_book
-            .map(|b| !b.lookup(self.zob.hash(board)).is_empty())
+            .map(|b| !b.lookup(board.hash).is_empty())
             .unwrap_or(false);
         let opening_move = board.fullmove <= TM_OPENING_MOVES;
 

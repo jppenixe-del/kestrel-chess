@@ -47,6 +47,13 @@ pub struct Board {
     /// O ciclo de oito e' desenrolado pelo compilador e os arrays cabem na
     /// cache L1; o custo medido esta' na nota do commit.
     pub phase: i32,
+    /// Zobrist key for this position, kept up to date move by move.
+    ///
+    /// Maintained here rather than recomputed by the search because the
+    /// recompute walks all 32 pieces and the search wants a key at every
+    /// node. See `zobrist::Zobrist::hash_completo` for why this only became
+    /// worth doing once king moves stopped needing a make/unmake.
+    pub hash: u64,
     // Mailbox O(1) -- piece_at() fazia uma varredura ate' 12 bitboards
     // (2 cores x 6 tipos) a cada chamada; era uma fatia real do tempo
     // total dentro de make_move/unmake_move (ver perf), alem de ser
@@ -64,12 +71,17 @@ pub struct Undo {
     // sempre correcto por construcao, sem precisar de reverter cada
     // captura/promocao/roque individualmente.
     pub phase: i32,
+    /// Same reasoning as `phase`, and it is what makes the incremental hash
+    /// cheap: undoing a move restores one u64 instead of replaying every XOR
+    /// backwards, so only `make_move` ever pays.
+    pub hash: u64,
 }
 
 /// Undo minimo para um null move (passar a vez): so' muda side + ep_square.
 #[derive(Copy, Clone)]
 pub struct NullUndo {
     pub ep_square: Square,
+    pub hash: u64,
 }
 
 impl Board {
@@ -144,8 +156,10 @@ impl Board {
             halfmove,
             fullmove,
             phase: 0,
+            hash: 0,
             mailbox,
         };
+        b.hash = crate::zobrist::tabelas().hash_completo(&b);
         b.recompute_occ();
         b.recompute_eval_accumulators();
         // Built once here, from the finished position. Every later change goes
@@ -306,6 +320,7 @@ impl Board {
         self.occ_color[c.idx()] &= !bb(s);
         self.occ_all &= !bb(s);
         self.mailbox[s as usize] = None;
+        self.hash ^= crate::zobrist::tabelas().piece_sq[c.idx()][pt.idx()][s as usize];
         let ph = pt.phase_inc();
         if let (Some(a), Some(net)) = (self.acc.as_mut(), crate::nnue::rede()) {
             a.push_dirty(net, c, pt, s, false);
@@ -323,6 +338,7 @@ impl Board {
         self.occ_color[c.idx()] |= bb(s);
         self.occ_all |= bb(s);
         self.mailbox[s as usize] = Some((pt, c));
+        self.hash ^= crate::zobrist::tabelas().piece_sq[c.idx()][pt.idx()][s as usize];
         let ph = pt.phase_inc();
         if let (Some(a), Some(net)) = (self.acc.as_mut(), crate::nnue::rede()) {
             a.push_dirty(net, c, pt, s, true);
@@ -355,6 +371,7 @@ impl Board {
             ep_square: self.ep_square,
             halfmove: self.halfmove,
             phase: self.phase,
+            hash: self.hash,
         };
 
         // remove captured piece (normal or en passant)
@@ -426,6 +443,25 @@ impl Board {
         }
 
         self.side = them;
+        // Everything a Zobrist key depends on that is NOT a piece on a
+        // square. The pieces took care of themselves in add_piece/
+        // remove_piece; these are the three pieces of state that also
+        // belong in the key, and each is XORed out at its old value and in
+        // at its new one. Castling rights are indexed by the whole 4-bit
+        // mask rather than per-right, so one XOR pair covers any number of
+        // rights lost at once.
+        let z = crate::zobrist::tabelas();
+        self.hash ^= z.side;
+        if undo.castling != self.castling {
+            self.hash ^= z.castling[(undo.castling & 0xF) as usize];
+            self.hash ^= z.castling[(self.castling & 0xF) as usize];
+        }
+        if undo.ep_square != NO_SQUARE {
+            self.hash ^= z.ep_file[file_of(undo.ep_square) as usize];
+        }
+        if self.ep_square != NO_SQUARE {
+            self.hash ^= z.ep_file[file_of(self.ep_square) as usize];
+        }
         // A king that crossed a bucket boundary invalidates every feature for
         // its own perspective: the same piece on the same square is a
         // different input number now. Everything above updated the
@@ -486,15 +522,21 @@ impl Board {
     /// So' altera `side` e limpa `ep_square`; tudo o resto fica intacto.
     /// NUNCA chamar em xeque (o rei poderia ser "capturado" na resposta).
     pub fn make_null_move(&mut self) -> NullUndo {
-        let undo = NullUndo { ep_square: self.ep_square };
+        let undo = NullUndo { ep_square: self.ep_square, hash: self.hash };
         self.side = self.side.opp();
         self.ep_square = NO_SQUARE;
+        let z = crate::zobrist::tabelas();
+        self.hash ^= z.side;
+        if undo.ep_square != NO_SQUARE {
+            self.hash ^= z.ep_file[file_of(undo.ep_square) as usize];
+        }
         undo
     }
 
     pub fn unmake_null_move(&mut self, undo: &NullUndo) {
         self.side = self.side.opp();
         self.ep_square = undo.ep_square;
+        self.hash = undo.hash;
     }
 
     pub fn unmake_move(&mut self, mv: &Move, undo: &Undo) {
@@ -540,6 +582,10 @@ impl Board {
         // se cancelarem exactamente): garante correccao mesmo que algum
         // caso futuro deixe de espelhar make_move perfeitamente.
         self.phase = undo.phase;
+        // One assignment instead of replaying every XOR backwards -- and it
+        // also repairs whatever the add_piece/remove_piece calls above did to
+        // the key while restoring the board.
+        self.hash = undo.hash;
         // make_move ends with corrige_bucket(); unmake_move never did. After
         // undoing a king move that crossed a bucket boundary, the accumulator
         // described the king on the right square under the WRONG bucket, and
