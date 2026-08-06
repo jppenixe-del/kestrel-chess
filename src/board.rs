@@ -255,7 +255,7 @@ impl Board {
         self.mailbox[s as usize] = None;
         let ph = pt.phase_inc();
         if let (Some(a), Some(net)) = (self.acc.as_mut(), crate::nnue::rede()) {
-            a.remove(net, c, pt, s);
+            a.push_dirty(net, c, pt, s, false);
         }
         // Os acumuladores por flanco so' sao LIDOS com a feature `psqtmirror`
         // ligada (ver `material_pst_white`). Sem ela isto era trabalho morto
@@ -272,7 +272,7 @@ impl Board {
         self.mailbox[s as usize] = Some((pt, c));
         let ph = pt.phase_inc();
         if let (Some(a), Some(net)) = (self.acc.as_mut(), crate::nnue::rede()) {
-            a.add(net, c, pt, s);
+            a.push_dirty(net, c, pt, s, true);
         }
         // Os acumuladores por flanco so' sao LIDOS com a feature `psqtmirror`
         // ligada (ver `material_pst_white`). Sem ela isto era trabalho morto
@@ -414,6 +414,11 @@ impl Board {
             if acc.bucket[cor.idx()] == quer {
                 continue;
             }
+            // The refresh below rewrites every column for this perspective, so
+            // it must not run against values that are still missing recorded
+            // changes -- and the recorded changes are indexed under the OLD
+            // bucket, which is about to stop existing. Fold them in first.
+            acc.materialise(net);
             acc.bucket[cor.idx()] = quer;
             let destino: &mut [i16; crate::nnue::HIDDEN] = if cor == Color::White {
                 &mut acc.white

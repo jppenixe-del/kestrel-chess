@@ -26,7 +26,11 @@
 use crate::board::Board;
 
 /// Score for the side to move.
-pub fn evaluate(board: &Board) -> i32 {
+///
+/// Takes `&mut Board` because the piece-square accumulator is lazy: the values
+/// it holds are only brought up to date here, at the one moment a score is
+/// actually wanted. See `nnue::Accumulator`.
+pub fn evaluate(board: &mut Board) -> i32 {
     // The threats network takes precedence when one is loaded. Chosen by which
     // file the caller supplied rather than by a build flag, so comparing the
     // two architectures compares two networks and not two binaries.
@@ -40,12 +44,18 @@ pub fn evaluate(board: &Board) -> i32 {
             return 0;
         }
     };
-    match board.acc.as_ref() {
-        // The accumulator the position carries, kept up to date one piece at a
-        // time by make_move. Rebuilding it here would make every node pay for
-        // all thirty-two pieces -- measured, that is slower than the
-        // hand-written evaluation was by more than an order of magnitude.
-        Some(acc) => crate::nnue::evaluate(net, acc, board.side, crate::nnue::output_bucket(net, board)),
+    let ob = crate::nnue::output_bucket(net, board);
+    let side = board.side;
+    match board.acc.as_mut() {
+        // The accumulator the position carries, fed one piece at a time by
+        // make_move and folded in here. Rebuilding it from scratch at this
+        // point would make every node pay for all thirty-two pieces --
+        // measured, that is slower than the hand-written evaluation was by
+        // more than an order of magnitude.
+        Some(acc) => {
+            acc.materialise(net);
+            crate::nnue::evaluate(net, acc, side, ob)
+        }
         None => crate::nnue::evaluate_board(net, board),
     }
 }
@@ -56,7 +66,7 @@ pub fn evaluate(board: &Board) -> i32 {
 /// one evaluation and it is already cheap, so the distinction is now a
 /// courtesy to the call sites rather than two different functions.
 #[inline]
-pub fn evaluate_fast(board: &Board) -> i32 {
+pub fn evaluate_fast(board: &mut Board) -> i32 {
     evaluate(board)
 }
 
