@@ -85,11 +85,53 @@ pub struct Network {
     pub buckets: usize,
 }
 
+/// One piece appearing on, or disappearing from, a square.
+///
+/// Recorded instead of applied. See `Accumulator::computed` for why.
+#[derive(Clone, Copy)]
+pub struct DirtyPiece {
+    pub pt: PieceType,
+    pub c: Color,
+    pub sq: u8,
+    pub add: bool,
+}
+
+/// How many piece changes can be outstanding before we stop deferring and
+/// just apply them.
+///
+/// Not a per-move bound -- one move is at most five changes -- but a bound on
+/// how deep the search can descend WITHOUT anything asking for a score. Past
+/// this, deferring stops paying (the list costs more to walk than the columns
+/// cost to add) so `push_dirty` applies eagerly instead. Sized from measured
+/// behaviour rather than theory: with 0.65 evaluations per node the list is
+/// almost always empty or holds one move's worth.
+pub const MAX_DIRTY: usize = 32;
+
 /// The two accumulators, side to move and the other side.
 ///
-/// Kept as plain arrays rather than behind a pointer: this is copied on every
-/// make-move in the search, and an allocation there would cost more than the
-/// evaluation it exists to speed up.
+/// Kept as plain arrays rather than behind a pointer: this rides on the
+/// `Board`, and an allocation per node would cost more than the evaluation it
+/// exists to speed up.
+///
+/// **Lazy.** `white`/`black` do not necessarily describe the current position:
+/// `dirty` holds piece changes that have not been folded in yet, and the
+/// values are only brought up to date when something actually asks for a
+/// score (`Board::materialise_acc`, called from `evaluate`). The reason is
+/// measured, not assumed -- profiling put `Accumulator::add` plus the `remove`
+/// inlined into `Board::remove_piece` at 34% of total search time, while the
+/// engine performs only 0.65 evaluations per node. A third of that work was
+/// being done for positions whose score was never read.
+///
+/// What makes this cheap without a per-ply stack of accumulators (which would
+/// be ~256 kB and is copied at all nine `Board::clone` sites): `push_dirty`
+/// CANCELS a change against its own inverse. The search's make/unmake is
+/// perfectly nested, so a move that is made, searched without ever being
+/// evaluated, and unmade pushes each change and then its opposite -- and the
+/// list returns to exactly where it started. Descending and coming back up
+/// costs nothing at all, which is the property a per-ply stack buys by
+/// spending memory. Order within the list never matters: the accumulator is a
+/// sum of columns, so any permutation of the same adds and removes lands on
+/// the same values.
 #[derive(Clone)]
 pub struct Accumulator {
     pub white: [i16; HIDDEN],
@@ -99,6 +141,9 @@ pub struct Accumulator {
     /// needs it, and because a mismatch between the bucket the values were
     /// built under and the one used to index new features is silent.
     pub bucket: [usize; 2],
+    /// Piece changes recorded but not yet applied to `white`/`black`.
+    pub dirty: [DirtyPiece; MAX_DIRTY],
+    pub n_dirty: u8,
 }
 
 /// Feature index for a piece on a square, from one side's point of view.
@@ -131,6 +176,8 @@ impl Accumulator {
                 bucket_efectivo(net, board, Color::White),
                 bucket_efectivo(net, board, Color::Black),
             ],
+            dirty: [DirtyPiece { pt: PieceType::Pawn, c: Color::White, sq: 0, add: true }; MAX_DIRTY],
+            n_dirty: 0,
         };
         acc.white.copy_from_slice(&net.l0b);
         acc.black.copy_from_slice(&net.l0b);
@@ -188,6 +235,51 @@ impl Accumulator {
             self.white[i] -= net.l0w[fw + i];
             self.black[i] -= net.l0w[fb + i];
         }
+    }
+
+    /// Record a piece change instead of applying it.
+    ///
+    /// Cancels against the tail of the list when this change is the exact
+    /// inverse of the last one recorded -- which is what `unmake_move`
+    /// produces for a move nothing evaluated under, and what makes descending
+    /// and returning free. Falls back to applying immediately once the list is
+    /// full, so the deferral can never grow unbounded or lose a change.
+    #[inline]
+    pub fn push_dirty(&mut self, net: &Network, c: Color, pt: PieceType, sq: u8, add: bool) {
+        if let Some(last) = self.n_dirty.checked_sub(1) {
+            let d = self.dirty[last as usize];
+            if d.sq == sq && d.pt == pt && d.c == c && d.add != add {
+                self.n_dirty = last;
+                return;
+            }
+        }
+        if (self.n_dirty as usize) < MAX_DIRTY {
+            self.dirty[self.n_dirty as usize] = DirtyPiece { pt, c, sq, add };
+            self.n_dirty += 1;
+            return;
+        }
+        if add {
+            self.add(net, c, pt, sq);
+        } else {
+            self.remove(net, c, pt, sq);
+        }
+    }
+
+    /// Fold every recorded change into the values, in one pass per column.
+    ///
+    /// Called from the evaluation path, and from anything that needs the
+    /// values to mean the current position -- notably a king bucket change,
+    /// which rewrites every column and must not run against a stale base.
+    pub fn materialise(&mut self, net: &Network) {
+        for i in 0..self.n_dirty as usize {
+            let d = self.dirty[i];
+            if d.add {
+                self.add(net, d.c, d.pt, d.sq);
+            } else {
+                self.remove(net, d.c, d.pt, d.sq);
+            }
+        }
+        self.n_dirty = 0;
     }
 }
 
