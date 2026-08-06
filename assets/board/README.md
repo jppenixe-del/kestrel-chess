@@ -60,8 +60,20 @@ fringe cannot hide there.
 is fractal turbulence generated in the file itself, under 1KB each, so the
 browser rasterises them once and never fetches an image.
 
-Deliberately low contrast. A loud board eats the pieces, and the board is there
-for them to be read, not to be looked at.
+Low contrast, but not invisible. The first version measured **2.78:1** between
+light and dark, which is below what the eye reads as a grid at a glance -- on a
+screenshot the squares blurred into one another and a white piece on a light
+square had nothing to sit against. It is now **8.32:1** (WCAG relative
+luminance), by taking the light square up to pale limestone and the dark one
+down to burnt earth.
+
+The dark square carries two faint rust-red veins. They are there to answer the
+pieces -- white marble against deep red marble -- and they are at 10-13% opacity
+because the moment they are visible as decoration they have gone too far.
+
+The principle stands and is worth keeping: a loud board eats the pieces, and the
+board is there for them to be read, not to be looked at. Louder is not the fix;
+*separable* is.
 
 ## Using them elsewhere
 
