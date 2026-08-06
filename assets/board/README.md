@@ -8,28 +8,24 @@ browser will actually load.
 
 `wK wQ wR wB wN wP` and the same with `b`. PNG with an alpha channel, 320x320.
 
-White marble with gold; deep red marble with gold, a bird of prey standing
-in for both knights -- Kestrel is a falcon, not a horse.
+White marble and black marble, both with gold. A Spartan helm crowns the
+king, a gargoyle perches on the bishop, and a falcon stands in for the
+knight -- Kestrel is a falcon, not a horse. Greek meander around every base.
 
 **One sheet, two colours of the same design** -- `aguia-fonte.png`, white on
-top and red below, twelve pieces in one 2814x1536 image. Every red piece
-stands at **1.02 of the white piece of the same type**, matched by type
-rather than by scaling the row as a unit: a flat, dark colour reads smaller
-than a light one of the same size, and the two percent buys that back. One
-ratio for the whole set this time -- the earlier two-sheet version needed
-per-piece overrides because its sides did not agree on some shapes; this one
-does.
+top and black below, twelve pieces in one image. Every dark piece stands at
+**1.02 of the white piece of the same type**, matched by type rather than by
+scaling the row as a unit: a flat, dark colour reads smaller than a light one
+of the same size, and the two percent buys that back.
 
 Within each colour nothing else is normalised. Relative heights are exactly
-as drawn, crests and finials included, which is why the rook stands well
-below the bishop. One shared baseline for all twelve.
+as drawn, crests and finials included. One shared baseline for all twelve.
 
-Heights as shipped, in pixels of the 320 canvas:
-
-| | K | Q | R | B | N | P |
-|---|---|---|---|---|---|---|
-| white | 308 | 287 | 272 | 301 | 258 | 204 |
-| red | 314 | 293 | 277 | 307 | 263 | 208 |
+The previous set -- white marble against DEEP RED marble -- is kept in
+`../pecas_marmore_vermelho`. Red was the more legible of the two on a dark
+board; black is the more coherent with "white against black" and with the
+board's own palette. That is a taste call, not a measurement, and the red set
+is there to go back to.
 
 ## Rebuilding them
 
@@ -38,12 +34,19 @@ python3 recorta_pecas.py aguia-fonte.png . 308
 ```
 
 The third argument is the white king's height in the 320 canvas; every other
-white piece follows the same ratio, and the red side follows per-type at
+white piece follows the same ratio, and the dark side follows per-type at
 1.02 of white (see the script's own docstring for why per-type, not per-row).
 
+Heights as cut, in pixels of the 320 canvas:
+
+| | K | Q | R | B | N | P |
+|---|---|---|---|---|---|---|
+| white | 308 | 287 | 273 | 299 | 259 | 204 |
+| black | 314 | 293 | 278 | 305 | 264 | 208 |
+
 Two things worth knowing before changing it. Pieces are isolated by
-**connected component**, not by a fixed column grid -- the bishop's small
-eagle finial and the knight's head both draw outside their own nominal
+**connected component**, not by a fixed column grid -- the bishop's gargoyle
+wings and the knight's beak both draw outside their own nominal
 column, and a hard grid cut either beheads one or lets a fragment of the
 neighbour bleed into it. And the background is removed by thresholding
 **greenness** (G minus the stronger of R/B) rather than by un-mixing against
