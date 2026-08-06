@@ -59,36 +59,38 @@ fringe cannot hide there.
 
 ## The squares
 
-`tabuleiro_batalha.jpg` -- one painting for all sixty-four squares, not a pair
-of tiles repeated. A battlefield: a dark phalanx along the top, a light one
-along the bottom, and open ground between them.
+`tabuleiro_batalha.jpg` -- cracked stone paving, one image for all sixty-four
+squares, checkerboard baked in. The CSS sets one background and stops.
 
-The checkerboard is baked into the image, so nothing has to be masked or
-tiled at the other end -- the CSS sets one background and stops.
+**It is a board and not a picture, and that is why it won.** Three painted
+alternatives came before it and all three had the same defect: they had a
+SUBJECT. Soldiers, castles, phalanxes -- things that ask to be looked at,
+under pieces that need to be looked at. Stone has texture without subject.
 
-Three things were measured into it, and each fixed something visible:
+Two measurements decided the crop:
 
-- **The phalanxes are aligned to ranks 1 and 8.** In the source they sat
-  1604px apart while those ranks are 1792 apart, so both were cut across the
-  middle and the soldiers stood at the same height as the pieces, competing
-  with them. Stretched 1.117 vertically and offset 158px, each phalanx now
-  centres on its own rank -- behind the pieces of that colour, where it reads
-  as backdrop.
-- **Ranks 1 and 8 are veiled harder than the rest.** Sixteen of the
-  thirty-two pieces stand there, and it is also the only place the painting
-  has detail. Contrast there is 10.39:1 against 4.57:1 in the middle six
-  ranks: most legible exactly where most pieces are, and left alone where the
-  painting has nothing to compete with.
-- **The palette is the pieces' own** -- bone white, deep red, black. Light
-  squares warm bone, dark squares near-black rather than brown, because the
-  red pieces are dark and were sinking into earth tones. Square edges carry a
-  faint ember red.
+- **Flat light.** Of four candidate regions, this one differs by 3 levels of
+  luminance between its left quarter and its right (the worst differed by 42).
+  A gradient across the board reads as a shadow lying over the squares and
+  competes with the checkerboard itself.
+- **6.0:1** between light and dark square. The stone is one colour throughout,
+  so the entire checker comes from the veil -- a dark near-neutral wash rather
+  than a second shade of sand, which would have invented a colour the photo
+  does not have.
 
-The earlier generated pair (`casa_clara.svg`, `casa_escura.svg`) is still in
-the repository and still works: two files under 1.2KB, no image to fetch. It
-went from 2.78:1 to 8.32:1 between light and dark for the same reason -- below
-that the grid was being inferred from the pieces rather than seen.
+It also happens to be the right floor for these pieces: a Spartan helm and a
+Greek meander belong on cracked ancient paving.
 
-The principle both versions follow: a loud board eats the pieces, and the board
-is there for them to be read, not to be looked at. Louder is not the fix;
-*separable* is.
+The alternatives are kept, not deleted, and each is better at something:
+
+- `tabuleiro_300.jpg` -- two phalanxes aligned to ranks 1 and 8, empty middle.
+  Tells the story best; 5.7:1, and the painted soldiers crowd the pieces.
+- `tabuleiro_molon.jpg` -- the interior of the MOLON LABE painting, enlarged
+  past its bronze frame. 7.6:1, the highest, but enlarged and veiled the
+  battle stops reading as a battle at all.
+- `casa_clara.svg` / `casa_escura.svg` -- generated in the file, two tiles
+  under 1.2KB, nothing to fetch. 8.3:1.
+
+The principle every one of them follows: a loud board eats the pieces, and the
+board is there for them to be read, not to be looked at. Louder is not the
+fix; *separable* is.
