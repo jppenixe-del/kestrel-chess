@@ -244,6 +244,59 @@ impl Board {
         false
     }
 
+    /// Would our king be in check on `to`, having come from `from`?
+    ///
+    /// Answers what `generate_legal` used to answer with a make/unmake, and
+    /// the two differences from a plain `is_square_attacked(to, ...)` are
+    /// exactly what made the naive version wrong:
+    ///
+    /// - **The king is lifted off `from` first.** Standing on the board it
+    ///   blocks the very ray it would be fleeing along, so a king running
+    ///   directly away from a rook or bishop would look safe on the new
+    ///   square when it is still checked.
+    /// - **A piece captured on `to` stops attacking.** It is removed from the
+    ///   attacker sets, not merely stepped over -- otherwise capturing the
+    ///   checker would look illegal because the dead piece still "attacks"
+    ///   its own square.
+    ///
+    /// King moves are the largest group `generate_legal` could not settle
+    /// without a make/unmake (up to eight per node, every node, even when not
+    /// in check), and make/unmake is expensive here because it drags the
+    /// board, the mailbox and the accumulator with it.
+    pub fn king_move_leaves_check(&self, from: Square, to: Square, atk: &Attacks) -> bool {
+        let by = self.side.opp();
+        let occ = (self.occ_all & !bb(from)) | bb(to);
+        // The captured piece, if any, is gone -- so drop `to` from every
+        // attacker set below rather than only from the occupancy.
+        let inimigos = !bb(to);
+        if atk.pawn[by.opp().idx()][to as usize]
+            & self.pieces[by.idx()][PieceType::Pawn.idx()]
+            & inimigos
+            != 0
+        {
+            return true;
+        }
+        if atk.knight[to as usize] & self.pieces[by.idx()][PieceType::Knight.idx()] & inimigos != 0 {
+            return true;
+        }
+        if atk.king[to as usize] & self.pieces[by.idx()][PieceType::King.idx()] & inimigos != 0 {
+            return true;
+        }
+        let bishops_queens = (self.pieces[by.idx()][PieceType::Bishop.idx()]
+            | self.pieces[by.idx()][PieceType::Queen.idx()])
+            & inimigos;
+        if bishop_attacks(to, occ) & bishops_queens != 0 {
+            return true;
+        }
+        let rooks_queens = (self.pieces[by.idx()][PieceType::Rook.idx()]
+            | self.pieces[by.idx()][PieceType::Queen.idx()])
+            & inimigos;
+        if rook_attacks(to, occ) & rooks_queens != 0 {
+            return true;
+        }
+        false
+    }
+
     pub fn in_check(&self, color: Color, atk: &Attacks) -> bool {
         self.is_square_attacked(self.king_sq(color), color.opp(), atk)
     }

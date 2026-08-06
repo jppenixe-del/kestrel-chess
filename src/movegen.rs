@@ -201,6 +201,27 @@ pub fn generate_legal(board: &mut Board, atk: &Attacks) -> Vec<Move> {
             legal.push(mv);
             continue;
         }
+        // Second fast path: an ordinary king move is settled by asking
+        // whether the destination is attacked, with the king lifted off its
+        // old square and anything captured on the destination removed --
+        // see `Board::king_move_leaves_check`. This is the largest group
+        // that used to need a make/unmake, since a king has up to eight
+        // moves and they were tested this way at every node, in check or
+        // not.
+        //
+        // Castling is deliberately left on the slow path even though it is
+        // a king move: `generate_pseudo_legal` already proves the squares it
+        // crosses are unattacked, so the remaining question is not the same
+        // one this answers, and the rook moves too.
+        if mv.from == king_sq
+            && mv.flag != MoveFlag::CastleKing
+            && mv.flag != MoveFlag::CastleQueen
+        {
+            if !board.king_move_leaves_check(mv.from, mv.to, atk) {
+                legal.push(mv);
+            }
+            continue;
+        }
         let undo = board.make_move(&mv);
         let illegal = board.in_check(us, atk);
         board.unmake_move(&mv, &undo);
