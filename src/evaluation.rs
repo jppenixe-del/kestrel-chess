@@ -34,6 +34,12 @@ pub fn evaluate(board: &mut Board) -> i32 {
     // The threats network takes precedence when one is loaded. Chosen by which
     // file the caller supplied rather than by a build flag, so comparing the
     // two architectures compares two networks and not two binaries.
+    // v3 first when one is loaded: same rule as everywhere else here, the
+    // architecture is chosen by which file was given, never by a build flag,
+    // so comparing two of them compares networks and not binaries.
+    if let Some(net) = crate::nnue_v3::rede() {
+        return crate::nnue_v3::evaluate(net, board);
+    }
     if let Some(net) = crate::nnue_threats::rede() {
         return crate::nnue_threats::evaluate(net, board);
     }

@@ -9,6 +9,7 @@ mod movegen;
 mod nnue;
 mod features;
 mod nnue_threats;
+mod nnue_v3;
 mod evaluation;
 mod moves;
 mod perft;
