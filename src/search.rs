@@ -1953,6 +1953,25 @@ impl<'a> Searcher<'a> {
     }
 
     fn quiescence(&mut self, board: &mut Board, alpha: i32, beta: i32, ply: usize) -> i32 {
+        // MEASURED AND REJECTED (2026-08-06), and worth knowing before
+        // trying it: reusing a stored static eval here instead of
+        // recomputing costs ~3.2% NPS rather than saving anything
+        // (1123k -> 1087k, five interleaved runs, node count identical).
+        //
+        // 54% of all evaluations do come from this line, so the premise was
+        // right -- but with the lazy accumulator in place, evaluating the
+        // piece-square network here is reading an accumulator that is
+        // usually already current plus one 2x512 output pass, while a table
+        // probe is a cache miss into several megabytes. The cheap thing was
+        // already the eval.
+        //
+        // This is NOT a general verdict. It should pay for the THREATS
+        // architecture, whose evaluate() re-enumerates ~200 features from
+        // scratch every call with no accumulator behind it -- there the
+        // probe is far cheaper than what it replaces. Reference engines that
+        // do probe here (Coda: ~990 probes per 1000 nodes, 44% static-eval
+        // hits) have expensive evaluations, which is exactly the condition
+        // that makes it worthwhile.
         let stand_pat = crate::evaluation::evaluate_fast(board);
         self.quiescence_from(board, alpha, beta, ply, stand_pat)
     }
