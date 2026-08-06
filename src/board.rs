@@ -482,6 +482,14 @@ impl Board {
         // se cancelarem exactamente): garante correccao mesmo que algum
         // caso futuro deixe de espelhar make_move perfeitamente.
         self.phase = undo.phase;
+        // make_move ends with corrige_bucket(); unmake_move never did. After
+        // undoing a king move that crossed a bucket boundary, the accumulator
+        // described the king on the right square under the WRONG bucket, and
+        // any evaluation asked for in that window silently read weights for a
+        // king that is not there. Only actually does work when the bucket
+        // really changed -- same guard make_move relies on -- so it costs
+        // nothing on the moves that are not king moves.
+        self.corrige_bucket();
     }
 
     pub fn to_fen(&self) -> String {
