@@ -506,16 +506,16 @@ fn load_bruto(bytes: &[u8]) -> Option<Network> {
 /// negative -- both encode as small numbers. Without this, -1 would encode
 /// as 0xFFFF and cost the full three bytes every time.
 #[inline]
-fn zigzag_encode(v: i16) -> u16 {
+pub(crate) fn zigzag_encode(v: i16) -> u16 {
     ((v << 1) ^ (v >> 15)) as u16
 }
 
 #[inline]
-fn zigzag_decode(u: u16) -> i16 {
+pub(crate) fn zigzag_decode(u: u16) -> i16 {
     ((u >> 1) as i16) ^ -((u & 1) as i16)
 }
 
-fn leb128_push(mut v: u16, out: &mut Vec<u8>) {
+pub(crate) fn leb128_push(mut v: u16, out: &mut Vec<u8>) {
     loop {
         let byte = (v & 0x7F) as u8;
         v >>= 7;
@@ -529,7 +529,7 @@ fn leb128_push(mut v: u16, out: &mut Vec<u8>) {
 
 /// Returns `None` on a truncated stream rather than panicking -- a corrupt or
 /// short file is a network we refuse, not a crash.
-fn leb128_pop(bytes: &[u8], pos: &mut usize) -> Option<u16> {
+pub(crate) fn leb128_pop(bytes: &[u8], pos: &mut usize) -> Option<u16> {
     let mut result: u32 = 0;
     let mut shift = 0;
     loop {

@@ -324,6 +324,42 @@ fn main() {
         );
         return;
     }
+    if args.len() >= 4 && args[1] == "empacotathreats" {
+        // empacotathreats <rede_threats.bin> <saida.bin>
+        //
+        // Twin of `empacota` for the threats architecture, and verified the
+        // same way: packing is only worth shipping if the network that comes
+        // back is provably the same one, so this repacks AND reloads both
+        // files and compares every tensor rather than trusting the size.
+        let crus = std::fs::read(&args[2]).expect("nao consegui ler");
+        let empacotado = nnue_threats::empacota(&crus);
+        std::fs::write(&args[3], &empacotado).expect("nao consegui escrever");
+        let a = nnue_threats::load(&crus).expect("original nao carrega");
+        let b = nnue_threats::load(&empacotado).expect("empacotado nao carrega");
+        let iguais = a.l0w == b.l0w
+            && a.l0w_threats == b.l0w_threats
+            && a.l0b == b.l0b
+            && a.l1w == b.l1w
+            && a.l1b == b.l1b;
+        println!(
+            "empacotada: {} -> {} bytes ({:.1}% do original) -> {}",
+            crus.len(),
+            empacotado.len(),
+            100.0 * empacotado.len() as f64 / crus.len() as f64,
+            args[3]
+        );
+        if iguais {
+            println!(
+                "identico: {} valores de pecas + {} de ameacas, byte a byte",
+                a.l0w.len(),
+                a.l0w_threats.len()
+            );
+        } else {
+            println!("DIFERENTE -- nao usar este ficheiro");
+            std::process::exit(1);
+        }
+        return;
+    }
     if args.len() >= 3 && args[1] == "carregatest" {
         // carregatest <rede.bin> [repeticoes]
         //

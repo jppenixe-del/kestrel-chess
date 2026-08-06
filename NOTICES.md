@@ -61,6 +61,22 @@ shows the reasoning.
 - **Viridithas** — the case for coordinate-descent tuning against game
   results scored through quiescence, rather than gradient descent against
   search scores. No code or constants taken.
+- **Stockfish** (GPL-3.0) and **Coda** (GPL-3.0) — read, on 2026-08-06, to
+  understand how a lazy NNUE accumulator is usually built: that the update
+  can be deferred until something actually asks for a score, that a design
+  keeping per-ply state makes returning up the tree free, and that many
+  feature deltas are better applied in one pass over the accumulator than in
+  one pass each. Coda was also built and benchmarked on the same machine as a
+  reference point, not read for code.
+
+  What is in this repository is not either of those implementations. Both
+  keep a stack of accumulators indexed by ply; `nnue::Accumulator` keeps one
+  accumulator and a short list of pending piece changes that cancels a change
+  against its own inverse, which gets the same free-return property without
+  ~256 kB of per-ply state on a `Board` that nine call sites clone. The
+  reasoning, and the measurements that chose it, are in the source comments
+  and in the commit that introduced it. `Attacks::ray_extension` was likewise
+  written from this engine's existing `between_from`, not transcribed.
 
 No values from any of these are used verbatim. Where an early version of this
 engine did carry reference values directly — the mobility and threat tables
