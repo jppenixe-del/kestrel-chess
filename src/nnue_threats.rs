@@ -81,10 +81,61 @@ pub struct RedeThreats {
 /// against it and shifting them by one row reads every feature off by one.
 const TRAINER_INPUTS: usize = 1 + TOTAL_INPUTS_V10;
 
+/// Marks a threats network stored in the packed (LEB128+zigzag) form.
+///
+/// A separate magic from the plain network's `KSTR`, deliberately: the two
+/// architectures need different first layers and different splitting, and a
+/// file handed to the wrong loader must fail rather than be misread as a
+/// shape that happens to fit.
+const MAGIC_THREATS: [u8; 4] = *b"KSTT";
+
+/// Storage only, exactly as in `nnue.rs`: the decoded `i16` stream is the
+/// same one the raw file yields, so everything downstream -- the split at the
+/// threat boundary, the `i8` clamping, every hot loop -- is byte-for-byte
+/// unchanged. This file is 32.5 MB raw and is the largest the project ships.
+pub fn empacota(bytes_crus: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(bytes_crus.len() / 2);
+    v.extend_from_slice(&MAGIC_THREATS);
+    v.extend_from_slice(&2u16.to_le_bytes()); // versao
+    let n = bytes_crus.len() / 2;
+    v.extend_from_slice(&(n as u64).to_le_bytes());
+    for c in bytes_crus.chunks_exact(2) {
+        crate::nnue::leb128_push(
+            crate::nnue::zigzag_encode(i16::from_le_bytes([c[0], c[1]])),
+            &mut v,
+        );
+    }
+    v
+}
+
+/// The `i16` stream this file describes, whichever form it is stored in.
+///
+/// Stored count rather than inferred: once values are variable-width, the
+/// v1 trick of dividing the byte length by a fixed stride stops working.
+fn valores(bytes: &[u8]) -> Option<Vec<i16>> {
+    if bytes.len() > 14 && bytes[..4] == MAGIC_THREATS {
+        let n = u64::from_le_bytes(bytes[6..14].try_into().ok()?) as usize;
+        let payload = &bytes[14..];
+        let mut out = Vec::with_capacity(n);
+        let mut pos = 0usize;
+        for _ in 0..n {
+            out.push(crate::nnue::zigzag_decode(crate::nnue::leb128_pop(payload, &mut pos)?));
+        }
+        eprintln!(
+            "nnue-threats: {} valores (LEB128, {} bytes empacotados)",
+            n,
+            bytes.len()
+        );
+        return Some(out);
+    }
+    Some(bytes.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect())
+}
+
 pub fn load(bytes: &[u8]) -> Option<RedeThreats> {
     let cauda = HIDDEN + 2 * HIDDEN * OUT_BUCKETS + OUT_BUCKETS;
     let precisa = TRAINER_INPUTS * HIDDEN + cauda;
-    let total = bytes.len() / 2;
+    let crus = valores(bytes)?;
+    let total = crus.len();
     if total < precisa {
         eprintln!(
             "nnue-threats: ficheiro tem {} valores, precisa de {} (HL={})",
@@ -92,7 +143,7 @@ pub fn load(bytes: &[u8]) -> Option<RedeThreats> {
         );
         return None;
     }
-    let mut it = bytes.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]]));
+    let mut it = crus.into_iter();
     let todos: Vec<i16> = (&mut it).take(TRAINER_INPUTS * HIDDEN).collect();
     // Split at the threat boundary. The leading slot the trainer reserves
     // stays with the piece block, which keeps the piece indices unchanged.
