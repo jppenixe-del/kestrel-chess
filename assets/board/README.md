@@ -73,10 +73,16 @@ Two measurements decided the crop:
   luminance between its left quarter and its right (the worst differed by 42).
   A gradient across the board reads as a shadow lying over the squares and
   competes with the checkerboard itself.
-- **6.0:1** between light and dark square. The stone is one colour throughout,
-  so the entire checker comes from the veil -- a dark near-neutral wash rather
-  than a second shade of sand, which would have invented a colour the photo
-  does not have.
+- **5.5:1** between light and dark square. The stone is one colour throughout,
+  so the entire checker comes from the veil. The dark wash is **reddish brown**
+  (mean RGB 94,59,40 -- R above G above B), not neutral grey: burnt stone is
+  actually that colour, and it answers the gold on the pieces. A neutral wash
+  read as a shadow lying on sand rather than as a darker stone.
+
+The photograph's own contrast is dialled DOWN before the veil goes on (0.82).
+The texture has to be present without asserting itself -- it is floor, not
+subject -- and at full strength the cracks were pulling the eye the way the
+painted boards did.
 
 It also happens to be the right floor for these pieces: a Spartan helm and a
 Greek meander belong on cracked ancient paving.
