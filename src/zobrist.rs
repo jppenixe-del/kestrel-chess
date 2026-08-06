@@ -42,18 +42,32 @@ impl Zobrist {
         Zobrist { piece_sq, side, castling, ep_file }
     }
 
-    /// Recomputed from scratch each call (once per search node). This
-    /// is deliberately NOT maintained incrementally, despite that being
-    /// the textbook approach: tried it (2026-07-21, incremental hash in
-    /// add_piece/remove_piece/make_move, verified bit-exact over 124M
-    /// perft nodes) and it was a NET LOSS here -- perft(6) went ~4.8s ->
-    /// ~5.9s. Reason specific to this engine: generate_legal() does a
-    /// make/unmake per candidate move for legality (~35 per node), so
-    /// make/unmake are called far more often than this hash() is; paying
-    /// a few XORs in every make/unmake to save one recompute per node is
-    /// negative when the make:hash call ratio is ~35:1. Measured and
-    /// reverted, documented here so it isn't re-attempted as an "obvious
-    /// speedup" without also changing how legality checking works.
+    /// The full recompute. `Board::hash` is now maintained incrementally and
+    /// is what the search reads; this remains as the definition it is checked
+    /// against (`verificahash`), and for building that value in the first
+    /// place.
+    ///
+    /// History, because it is the interesting part. This was deliberately NOT
+    /// incremental until 2026-08-06: it had been tried on 2026-07-21, verified
+    /// bit-exact over 124M perft nodes, and measured a NET LOSS -- perft(6)
+    /// went ~4.8s -> ~5.9s. The reason given was specific to this engine:
+    /// `generate_legal` settled legality with a make/unmake per candidate
+    /// move, so make/unmake ran far more often than `hash()` did, and paying
+    /// XORs in every make to save one recompute per node loses at a ratio the
+    /// comment estimated at ~35:1. The note ended by saying it should not be
+    /// re-attempted "without also changing how legality checking works".
+    ///
+    /// That is what changed. King moves no longer need a make/unmake (see
+    /// `Board::king_move_leaves_check`), and the ratio was then MEASURED
+    /// rather than estimated: 2.43 make_move per node against 0.64 hash() per
+    /// node -- **3.8:1**, not 35:1. At that ratio the arithmetic reverses, and
+    /// it reversed in practice too.
+    pub fn hash_completo(&self, board: &Board) -> u64 {
+        self.hash(board)
+    }
+
+    /// Recompute from scratch. See `hash_completo` for why this is no longer
+    /// what the search calls.
     pub fn hash(&self, board: &Board) -> u64 {
         let mut h = 0u64;
         for c in [Color::White, Color::Black] {
@@ -75,4 +89,15 @@ impl Zobrist {
         }
         h
     }
+}
+
+/// The keys, built once and shared.
+///
+/// Every `Zobrist::new()` produces the same tables -- `splitmix64` runs from a
+/// fixed seed -- so a global is not a behaviour change, it is the same numbers
+/// stopped being rebuilt per caller. `Board` needs them to keep its hash up to
+/// date move by move and has no `Zobrist` of its own to reach for.
+pub fn tabelas() -> &'static Zobrist {
+    static Z: std::sync::OnceLock<Zobrist> = std::sync::OnceLock::new();
+    Z.get_or_init(Zobrist::new)
 }
