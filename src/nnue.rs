@@ -141,6 +141,11 @@ pub struct Accumulator {
     /// needs it, and because a mismatch between the bucket the values were
     /// built under and the one used to index new features is silent.
     pub bucket: [usize; 2],
+    /// Whether each perspective's squares are flipped left-right, which the
+    /// mirrored input set requires whenever that side's king sits on e-h.
+    /// Kept beside `bucket` because it has the same dependency (the king
+    /// square) and must be refreshed at the same moments.
+    pub espelha: [bool; 2],
     /// Piece changes recorded but not yet applied to `white`/`black`.
     pub dirty: [DirtyPiece; MAX_DIRTY],
     pub n_dirty: u8,
@@ -162,6 +167,43 @@ fn feature(perspective: Color, piece_color: Color, pt: PieceType, sq: u8) -> usi
     (c as usize) * 384 + pt.idx() * 64 + s
 }
 
+/// Feature index with the horizontal mirror applied.
+///
+/// A bucketed input set that calls itself *mirrored* does two things, and the
+/// engine was only doing one of them. Choosing the bucket by the king's file
+/// folded onto a-d is the first; the second is that when the king actually
+/// sits on e-h, EVERY square of that perspective is flipped left-right
+/// (`sq ^ 7`) so the position is presented to the network from the side it was
+/// trained on. Skipping the flip reads every feature on the wrong file for
+/// half of all positions -- a network so read does not play badly, it plays
+/// nonsense.
+///
+/// Mirrors bullet's `ChessBucketsMirrored::map_features`, which computes the
+/// flip per perspective as `if ksq % 8 > 3 { 7 } else { 0 }` and XORs it into
+/// the square after `Chess768` has produced the index.
+#[inline]
+fn feature_espelhada(
+    perspective: Color,
+    espelha: bool,
+    piece_color: Color,
+    pt: PieceType,
+    sq: u8,
+) -> usize {
+    let sq = if espelha { sq ^ 7 } else { sq };
+    feature(perspective, piece_color, pt, sq)
+}
+
+/// Does this perspective's king sit on the e-h side?
+///
+/// Read from the raw square, NOT from the vertically flipped one: the mirror
+/// is about files and the vertical flip is about ranks, and `^ 56` leaves the
+/// file untouched -- which is exactly why the trainer can test `ksq % 8 > 3`
+/// on the unflipped square for both colours.
+#[inline]
+pub fn espelha_perspectiva(board: &crate::board::Board, perspectiva: Color) -> bool {
+    board.king_sq(perspectiva) % 8 > 3
+}
+
 impl Accumulator {
     pub fn fresh(net: &Network, board: &Board) -> Self {
         let mut acc = Accumulator {
@@ -176,6 +218,14 @@ impl Accumulator {
                 bucket_efectivo(net, board, Color::White),
                 bucket_efectivo(net, board, Color::Black),
             ],
+            espelha: if net.buckets > 1 {
+                [
+                    espelha_perspectiva(board, Color::White),
+                    espelha_perspectiva(board, Color::Black),
+                ]
+            } else {
+                [false, false]
+            },
             dirty: [DirtyPiece { pt: PieceType::Pawn, c: Color::White, sq: 0, add: true }; MAX_DIRTY],
             n_dirty: 0,
         };
@@ -203,8 +253,8 @@ impl Accumulator {
 
     #[inline]
     pub fn add(&mut self, net: &Network, color: Color, pt: PieceType, sq: u8) {
-        let fw = feature_bucket(Color::White, self.bucket[0], color, pt, sq) * HIDDEN;
-        let fb = feature_bucket(Color::Black, self.bucket[1], color, pt, sq) * HIDDEN;
+        let fw = feature_bucket(Color::White, self.bucket[0], self.espelha[0], color, pt, sq) * HIDDEN;
+        let fb = feature_bucket(Color::Black, self.bucket[1], self.espelha[1], color, pt, sq) * HIDDEN;
         #[cfg(target_arch = "x86_64")]
         if tem_avx2() {
             unsafe {
@@ -221,8 +271,8 @@ impl Accumulator {
 
     #[inline]
     pub fn remove(&mut self, net: &Network, color: Color, pt: PieceType, sq: u8) {
-        let fw = feature_bucket(Color::White, self.bucket[0], color, pt, sq) * HIDDEN;
-        let fb = feature_bucket(Color::Black, self.bucket[1], color, pt, sq) * HIDDEN;
+        let fw = feature_bucket(Color::White, self.bucket[0], self.espelha[0], color, pt, sq) * HIDDEN;
+        let fb = feature_bucket(Color::Black, self.bucket[1], self.espelha[1], color, pt, sq) * HIDDEN;
         #[cfg(target_arch = "x86_64")]
         if tem_avx2() {
             unsafe {
@@ -907,7 +957,7 @@ pub struct CacheRefresh {
 impl CacheRefresh {
     pub fn nova() -> Self {
         CacheRefresh {
-            entradas: (0..2 * NUM_KING_BUCKETS)
+            entradas: (0..4 * NUM_KING_BUCKETS)
                 .map(|_| EntradaCache {
                     valores: [0; HIDDEN],
                     pecas: [[0u64; 6]; 2],
@@ -918,8 +968,15 @@ impl CacheRefresh {
     }
 
     #[inline]
-    fn indice(perspectiva: Color, bucket: usize) -> usize {
-        perspectiva.idx() * NUM_KING_BUCKETS + bucket
+    /// Keyed by the mirror as well as the bucket, and it has to be: the
+    /// bucket is chosen from the king's file FOLDED onto a-d, so a king on d1
+    /// and a king on e1 land in the same bucket while needing opposite
+    /// mirrors. Keyed by bucket alone, an entry built for one is handed to the
+    /// other and every square comes back flipped. Caught by `verificacache`,
+    /// which went from 0 wrong to 211 of 428 the moment the mirror was
+    /// introduced -- that check earning its keep.
+    fn indice(perspectiva: Color, bucket: usize, espelha: bool) -> usize {
+        (perspectiva.idx() * 2 + espelha as usize) * NUM_KING_BUCKETS + bucket
     }
 
     /// Bring one perspective of `acc` up to date for `board`, using the cached
@@ -939,9 +996,10 @@ impl CacheRefresh {
         _rei_preto: u8,
         perspectiva: Color,
         bucket: usize,
+        espelha: bool,
         destino: &mut [i16; HIDDEN],
     ) -> usize {
-        let i = Self::indice(perspectiva, bucket);
+        let i = Self::indice(perspectiva, bucket, espelha);
         let e = &mut self.entradas[i];
         if !e.usada {
             // Nothing cached for this bucket yet: build from the bias, and
@@ -969,7 +1027,7 @@ impl CacheRefresh {
                 while saiu != 0 {
                     let sq = saiu.trailing_zeros() as u8;
                     saiu &= saiu - 1;
-                    let f = feature_bucket(perspectiva, bucket, cor, pt, sq) * HIDDEN;
+                    let f = feature_bucket(perspectiva, bucket, espelha, cor, pt, sq) * HIDDEN;
                     aplica(&mut e.valores, &net.l0w[f..f + HIDDEN], false);
                     mexidas += 1;
                 }
@@ -977,7 +1035,7 @@ impl CacheRefresh {
                 while entrou != 0 {
                     let sq = entrou.trailing_zeros() as u8;
                     entrou &= entrou - 1;
-                    let f = feature_bucket(perspectiva, bucket, cor, pt, sq) * HIDDEN;
+                    let f = feature_bucket(perspectiva, bucket, espelha, cor, pt, sq) * HIDDEN;
                     aplica(&mut e.valores, &net.l0w[f..f + HIDDEN], true);
                     mexidas += 1;
                 }
@@ -1025,11 +1083,12 @@ fn aplica(dst: &mut [i16; HIDDEN], col: &[i16], somar: bool) {
 pub fn feature_bucket(
     perspectiva: Color,
     bucket: usize,
+    espelha: bool,
     piece_color: Color,
     pt: PieceType,
     sq: u8,
 ) -> usize {
-    bucket * INPUTS + feature(perspectiva, piece_color, pt, sq)
+    bucket * INPUTS + feature_espelhada(perspectiva, espelha, piece_color, pt, sq)
 }
 
 /// The bucket to actually use, given what the loaded network supports.
@@ -1099,8 +1158,9 @@ pub fn verifica_cache(net: &Network, fens: &[String]) -> (usize, usize) {
         let board = crate::board::Board::from_fen(fen);
         for perspectiva in [Color::White, Color::Black] {
             let bucket = bucket_do_rei(&board, perspectiva);
+            let espelha = espelha_perspectiva(&board, perspectiva);
             let mut via_cache = [0i16; HIDDEN];
-            cache.refresca(net, board.pieces, board.king_sq(Color::White), board.king_sq(Color::Black), perspectiva, bucket, &mut via_cache);
+            cache.refresca(net, board.pieces, board.king_sq(Color::White), board.king_sq(Color::Black), perspectiva, bucket, espelha, &mut via_cache);
 
             // From scratch, same bucket, same features.
             let mut do_zero = [0i16; HIDDEN];
@@ -1118,7 +1178,7 @@ pub fn verifica_cache(net: &Network, fens: &[String]) -> (usize, usize) {
                     while bb != 0 {
                         let sq = bb.trailing_zeros() as u8;
                         bb &= bb - 1;
-                        let f = feature_bucket(perspectiva, bucket, cor, pt, sq) * HIDDEN;
+                        let f = feature_bucket(perspectiva, bucket, espelha, cor, pt, sq) * HIDDEN;
                         aplica(&mut do_zero, &net.l0w[f..f + HIDDEN], true);
                     }
                 }

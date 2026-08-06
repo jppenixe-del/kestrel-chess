@@ -494,13 +494,21 @@ impl Board {
             crate::nnue::bucket_do_rei_de(self, Color::White),
             crate::nnue::bucket_do_rei_de(self, Color::Black),
         ];
+        // The mirror travels with the bucket: both are functions of the king
+        // square, and a king crossing the d/e file changes the mirror even
+        // when it stays inside the same bucket.
+        let quer_esp = [
+            crate::nnue::espelha_perspectiva(self, Color::White),
+            crate::nnue::espelha_perspectiva(self, Color::Black),
+        ];
         let acc = match self.acc.as_mut() {
             Some(a) => a,
             None => return,
         };
         for cor in [Color::White, Color::Black] {
             let quer = quer[cor.idx()];
-            if acc.bucket[cor.idx()] == quer {
+            let esp = quer_esp[cor.idx()];
+            if acc.bucket[cor.idx()] == quer && acc.espelha[cor.idx()] == esp {
                 continue;
             }
             // The refresh below rewrites every column for this perspective, so
@@ -509,12 +517,13 @@ impl Board {
             // bucket, which is about to stop existing. Fold them in first.
             acc.materialise(net);
             acc.bucket[cor.idx()] = quer;
+            acc.espelha[cor.idx()] = esp;
             let destino: &mut [i16; crate::nnue::HIDDEN] = if cor == Color::White {
                 &mut acc.white
             } else {
                 &mut acc.black
             };
-            crate::nnue::com_cache(|c| c.refresca(net, pecas, rb, rp, cor, quer, destino));
+            crate::nnue::com_cache(|c| c.refresca(net, pecas, rb, rp, cor, quer, esp, destino));
         }
     }
 
