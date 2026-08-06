@@ -1,19 +1,19 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="100" height="100">
   <defs>
     <filter id="t" x="0" y="0" width="100%" height="100%">
-      <feTurbulence type="fractalNoise" baseFrequency="0.7" numOctaves="5" seed="19" result="n"/>
+      <feTurbulence type="fractalNoise" baseFrequency="0.55" numOctaves="5" seed="23" result="n"/>
       <feColorMatrix in="n" type="saturate" values="0"/>
     </filter>
-    <linearGradient id="g" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#8d7050"/>
-      <stop offset="1" stop-color="#6d5238"/>
+    <linearGradient id="g" x1="0" y1="0" x2="0.35" y2="1">
+      <stop offset="0" stop-color="#4a3428"/>
+      <stop offset="1" stop-color="#2b1d17"/>
     </linearGradient>
-    <pattern id="r" width="100" height="7.5" patternUnits="userSpaceOnUse">
-      <rect width="100" height="2.4" y="2.2" fill="#4a3722" opacity=".07"/>
-    </pattern>
   </defs>
-  <rect width="100" height="100" fill="#7d6142"/>
-  <rect width="100" height="100" fill="url(#g)" opacity=".55"/>
-  <rect width="100" height="100" fill="url(#r)"/>
-  <rect width="100" height="100" filter="url(#t)" opacity=".22" style="mix-blend-mode:multiply"/>
+  <rect width="100" height="100" fill="url(#g)"/>
+  <rect width="100" height="100" filter="url(#t)" opacity=".22"/>
+  <path d="M0 44 L28 52 L55 41 L79 50 L100 43" stroke="#120b08" stroke-width=".9" fill="none" opacity=".35"/>
+  <path d="M0 76 L24 68 L52 78 L77 70 L100 79" stroke="#120b08" stroke-width=".7" fill="none" opacity=".26"/>
+  <path d="M18 0 L22 100" stroke="#7a2f22" stroke-width=".5" fill="none" opacity=".13"/>
+  <path d="M67 0 L63 100" stroke="#7a2f22" stroke-width=".4" fill="none" opacity=".1"/>
+  <rect width="100" height="100" fill="none" stroke="#1a110c" stroke-width="1.4" opacity=".45"/>
 </svg>
