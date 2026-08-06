@@ -179,6 +179,15 @@ fn screlu(x: i16) -> i32 {
     v * v
 }
 
+/// NOTE on the output bucket, which is computed twice below: the formula is
+/// `(pieces - 2) / ceil(32 / N)`, taken from the trainer (`MaterialCount<N>`
+/// in bullet). It used to be `(pieces - 1) / 4` here as well, which disagrees
+/// at 5, 9, 13, 17, 21, 25 and 29 pieces -- so this architecture, which has
+/// always had EIGHT output buckets, was reading the wrong one in roughly a
+/// quarter of all positions, from the day it was written. Nothing reported an
+/// error; it simply evaluated those positions with weights fitted for a
+/// different amount of material. Any earlier measurement of this network's
+/// strength was taken with that bug in place.
 pub fn evaluate(net: &RedeThreats, board: &Board) -> i32 {
     let mut pos = Pos::default();
     for c in 0..2 {
@@ -259,7 +268,7 @@ pub fn evaluate(net: &RedeThreats, board: &Board) -> i32 {
     }
 
     let n = board.occ_all.count_ones() as usize;
-    let ob = ((n.max(1) - 1) / 4).min(OUT_BUCKETS - 1);
+    let ob = (n.saturating_sub(2) / 32usize.div_ceil(OUT_BUCKETS)).min(OUT_BUCKETS - 1);
     let base = ob * 2 * HIDDEN;
     let w = &net.l1w[base..base + 2 * HIDDEN];
 
@@ -700,7 +709,7 @@ impl AccThreats {
 
     pub fn valor(&self, net: &RedeThreats, board: &Board) -> i32 {
         let n = board.occ_all.count_ones() as usize;
-        let ob = ((n.max(1) - 1) / 4).min(OUT_BUCKETS - 1);
+        let ob = (n.saturating_sub(2) / 32usize.div_ceil(OUT_BUCKETS)).min(OUT_BUCKETS - 1);
         let base = ob * 2 * HIDDEN;
         let w = &net.l1w[base..base + 2 * HIDDEN];
         let (a, b) = if board.side == Color::White {

@@ -305,8 +305,22 @@ pub fn output_bucket(net: &Network, board: &crate::board::Board) -> usize {
     if net.output_buckets <= 1 {
         return 0;
     }
+    // `(pieces - 2) / ceil(32 / N)`, which is what the trainer uses
+    // (`MaterialCount<N>` in bullet's game/outputs.rs). This was
+    // `(pieces - 1) / 4`, and the two disagree at 5, 9, 13, 17, 21, 25 and 29
+    // pieces -- roughly a quarter of all positions read the wrong output
+    // bucket, silently, with no error anywhere.
+    //
+    // It went unnoticed because every network the engine had ever run was
+    // trained with ONE output bucket, where the whole function short-circuits
+    // above. The first network with eight exposed it by losing 0-71-0.
+    //
+    // The divisor is derived from the bucket count rather than hardcoded to 4,
+    // for the same reason: a network trained with a different N would
+    // otherwise be read with the wrong stride and fail the same silent way.
     let n = board.occ_all.count_ones() as usize;
-    ((n.max(1) - 1) / 4).min(net.output_buckets - 1)
+    let divisor = 32usize.div_ceil(net.output_buckets);
+    (n.saturating_sub(2) / divisor).min(net.output_buckets - 1)
 }
 
 pub fn evaluate(net: &Network, acc: &Accumulator, side: Color, ob: usize) -> i32 {
