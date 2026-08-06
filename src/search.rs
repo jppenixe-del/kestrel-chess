@@ -463,7 +463,7 @@ impl Default for SearchParams {
             // Close to identical to a reference engine's own constants (65
             // and 5) -- see the field doc comment for why the shape, not
             // just the numbers, was adopted.
-            rfp_base: 76,
+            rfp_base: 74,
             rfp_step: 4,
             // Reasoned from this engine's own history scale (see the note
             // at the RFP block), not copied. Starting points, not tuned
@@ -506,10 +506,10 @@ impl Default for SearchParams {
             rfp_not_improving: DepthMargin { base: 0, slope: 159 },
             razor_base: 629,
             razor_per_depth: 629,
-            futility_improving: DepthMargin { base: 1, slope: 109 },
-            futility_not_improving: DepthMargin { base: 1, slope: 113 },
-            cap_futility_improving: DepthMargin { base: 1, slope: 170 },
-            cap_futility_not_improving: DepthMargin { base: 2, slope: 123 },
+            futility_improving: DepthMargin { base: 1, slope: 116 },
+            futility_not_improving: DepthMargin { base: 1, slope: 107 },
+            cap_futility_improving: DepthMargin { base: 1, slope: 169 },
+            cap_futility_not_improving: DepthMargin { base: 2, slope: 120 },
             delta_margin: 275,
             qs_lmp_limit: 8,
             tt_extended_cutoff_margin: 162,
