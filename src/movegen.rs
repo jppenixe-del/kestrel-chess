@@ -5,10 +5,33 @@ use crate::moves::*;
 use crate::types::*;
 
 pub fn generate_pseudo_legal(board: &Board, atk: &Attacks, out: &mut Vec<Move>) {
+    gera_pseudo::<false>(board, atk, out)
+}
+
+/// Captures, en passant and queen promotions only.
+///
+/// Exists for quiescence, which searches nothing else: it used to generate
+/// every move and then throw the quiet ones away, so roughly thirty moves were
+/// built per node to keep about five, at the ~30% of nodes that are quiescence.
+/// The generation is the same code with one bitboard changed -- targets are
+/// intersected with the enemy pieces instead of with everything that is not
+/// ours -- so the two cannot drift apart.
+///
+/// Quiet queen promotions are included even though they capture nothing: a
+/// pawn stepping to the last rank changes material as much as a capture does,
+/// and quiescence has always considered them.
+pub fn generate_pseudo_legal_caps(board: &Board, atk: &Attacks, out: &mut Vec<Move>) {
+    gera_pseudo::<true>(board, atk, out)
+}
+
+fn gera_pseudo<const APENAS_CAPTURAS: bool>(board: &Board, atk: &Attacks, out: &mut Vec<Move>) {
     let us = board.side;
     let them = us.opp();
     let own = board.occ_color[us.idx()];
     let occ = board.occ_all;
+    // The one line that separates the two generators: everything that is not
+    // ours, or only what is theirs.
+    let alvos = if APENAS_CAPTURAS { board.occ_color[them.idx()] } else { !own };
 
     // Pawns
     let pawns = board.pieces[us.idx()][PieceType::Pawn.idx()];
@@ -25,10 +48,10 @@ pub fn generate_pseudo_legal(board: &Board, atk: &Attacks, out: &mut Vec<Move>) 
         if one < 64 && bb(one) & occ == 0 {
             if will_promote {
                 add_promotions(out, from, one, false);
-            } else {
+            } else if !APENAS_CAPTURAS {
                 out.push(Move::quiet(from, one));
             }
-            if bb(from) & start_rank != 0 {
+            if !APENAS_CAPTURAS && bb(from) & start_rank != 0 {
                 let two = ((from as i32) + push_dir * 2) as u8;
                 if bb(two) & occ == 0 {
                     out.push(Move { from, to: two, promotion: None, flag: MoveFlag::DoublePush });
@@ -54,32 +77,34 @@ pub fn generate_pseudo_legal(board: &Board, atk: &Attacks, out: &mut Vec<Move>) 
     let mut n = board.pieces[us.idx()][PieceType::Knight.idx()];
     while n != 0 {
         let from = pop_lsb(&mut n);
-        gen_from_attacks(out, from, atk.knight[from as usize] & !own, board, them);
+        gen_from_attacks(out, from, atk.knight[from as usize] & alvos, board, them);
     }
     // Bishops
     let mut b = board.pieces[us.idx()][PieceType::Bishop.idx()];
     while b != 0 {
         let from = pop_lsb(&mut b);
-        gen_from_attacks(out, from, bishop_attacks(from, occ) & !own, board, them);
+        gen_from_attacks(out, from, bishop_attacks(from, occ) & alvos, board, them);
     }
     // Rooks
     let mut r = board.pieces[us.idx()][PieceType::Rook.idx()];
     while r != 0 {
         let from = pop_lsb(&mut r);
-        gen_from_attacks(out, from, rook_attacks(from, occ) & !own, board, them);
+        gen_from_attacks(out, from, rook_attacks(from, occ) & alvos, board, them);
     }
     // Queens
     let mut q = board.pieces[us.idx()][PieceType::Queen.idx()];
     while q != 0 {
         let from = pop_lsb(&mut q);
-        gen_from_attacks(out, from, queen_attacks(from, occ) & !own, board, them);
+        gen_from_attacks(out, from, queen_attacks(from, occ) & alvos, board, them);
     }
     // King
     let king_sq = board.king_sq(us);
-    gen_from_attacks(out, king_sq, atk.king[king_sq as usize] & !own, board, them);
+    gen_from_attacks(out, king_sq, atk.king[king_sq as usize] & alvos, board, them);
 
-    // Castling
-    if !board.in_check(us, atk) {
+    // Castling. Never a capture, so it has no place in the quiescence
+    // generator -- and skipping it also skips the in_check test and the four
+    // is_square_attacked calls behind it, at every quiescence node.
+    if !APENAS_CAPTURAS && !board.in_check(us, atk) {
         if us == Color::White {
             if board.castling & CASTLE_WK != 0
                 && occ & (bb(5) | bb(6)) == 0
@@ -175,9 +200,27 @@ pub fn compute_pinned(board: &Board, atk: &Attacks, us: Color, king_sq: Square) 
     pinned
 }
 
+/// Legal captures, en passant and queen promotions -- the quiescence move list.
+///
+/// Same legality logic as `generate_legal`, over a generator that never built
+/// the quiet moves in the first place. Quiescence used to call the full
+/// generator and then `retain` the captures, which meant building about thirty
+/// moves per node to keep five, at the ~30% of nodes that are quiescence.
+///
+/// Only correct when NOT in check: a side in check must consider every legal
+/// evasion, quiet ones included, so quiescence keeps calling `generate_legal`
+/// there.
+pub fn generate_legal_caps(board: &mut Board, atk: &Attacks) -> Vec<Move> {
+    gera_legal::<true>(board, atk)
+}
+
 pub fn generate_legal(board: &mut Board, atk: &Attacks) -> Vec<Move> {
+    gera_legal::<false>(board, atk)
+}
+
+fn gera_legal<const APENAS_CAPTURAS: bool>(board: &mut Board, atk: &Attacks) -> Vec<Move> {
     let mut pseudo = Vec::with_capacity(64);
-    generate_pseudo_legal(board, atk, &mut pseudo);
+    gera_pseudo::<APENAS_CAPTURAS>(board, atk, &mut pseudo);
     let us = board.side;
     let king_sq = board.king_sq(us);
     let in_check = board.in_check(us, atk);
