@@ -472,6 +472,57 @@ fn main() {
         }
         return;
     }
+    if args.len() >= 2 && args[1] == "verificav3" {
+        // O acumulador incremental da v3 contra a recomputacao total, a cada
+        // ply de jogos REAIS -- e depois de cada undo.
+        //
+        // Posicoes soltas nao servem: o caminho incremental so' e' alimentado
+        // por add_piece/remove_piece, chamados de dentro de make_move e
+        // unmake_move. Uma lista de FENs testaria apenas o `fresh()`.
+        if nnue_v3::rede().is_none() {
+            eprintln!("precisa de KESTREL_NNUE_V3");
+            return;
+        }
+        let net = nnue_v3::rede().unwrap();
+        let atk = Attacks::new();
+        let n_jogos: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(60);
+        let plies: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(120);
+        let mut seed: u64 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(1);
+        let mut rng = move || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed };
+        let (mut n, mut mal, mut mal_undo) = (0usize, 0usize, 0usize);
+        for _ in 0..n_jogos {
+            let mut board = Board::startpos();
+            let mut hist: Vec<(moves::Move, board::Undo)> = Vec::new();
+            for _ in 0..plies {
+                let legais = movegen::generate_legal(&mut board, &atk);
+                if legais.is_empty() { break; }
+                let mv = legais[(rng() as usize) % legais.len()];
+                let undo = board.make_move(&mv);
+                n += 1;
+                let inc = board.acc_v3.as_ref().unwrap().valor(net, &board);
+                let cheio = nnue_v3::evaluate(net, &board);
+                if inc != cheio {
+                    mal += 1;
+                    if mal <= 3 { eprintln!("DIVERGE inc={} cheio={} {}", inc, cheio, board.to_fen()); }
+                }
+                hist.push((mv, undo));
+                if hist.len() % 7 == 0 {
+                    let (m2, u2) = *hist.last().unwrap();
+                    board.unmake_move(&m2, &u2);
+                    let inc = board.acc_v3.as_ref().unwrap().valor(net, &board);
+                    let cheio = nnue_v3::evaluate(net, &board);
+                    if inc != cheio {
+                        mal_undo += 1;
+                        if mal_undo <= 3 { eprintln!("DIVERGE undo inc={} cheio={} {}", inc, cheio, board.to_fen()); }
+                    }
+                    board.make_move(&m2);
+                }
+            }
+        }
+        println!("v3: {} lances, {} divergencias make, {} divergencias unmake", n, mal, mal_undo);
+        if mal > 0 || mal_undo > 0 { std::process::exit(1); }
+        return;
+    }
     if args.len() >= 2 && args[1] == "verificacache" {
         // A cache de refresh contra a reconstrucao do zero, em posicoes reais.
         let net = match nnue::rede() {

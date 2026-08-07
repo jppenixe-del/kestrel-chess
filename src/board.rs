@@ -23,6 +23,11 @@ pub struct Board {
     /// silently wrong only in rare positions. `None` until a network is
     /// loaded, so the hand-written evaluation costs nothing for it.
     pub acc: Option<Box<crate::nnue::Accumulator>>,
+    /// O mesmo para a rede v3 -- ver `nnue_v3::AccV3`. Independente do `acc`:
+    /// qual das arquitecturas o `evaluate` le' decide-se pelo ficheiro que foi
+    /// carregado, nao por uma bandeira de compilacao, portanto os dois
+    /// acumuladores mantem-se vivos.
+    pub acc_v3: Option<Box<crate::nnue_v3::AccV3>>,
     pub castling: u8,
     pub ep_square: Square,
     pub halfmove: u32,
@@ -150,6 +155,7 @@ impl Board {
             occ_color: [0, 0],
             occ_all: 0,
             acc: None,
+            acc_v3: None,
             side,
             castling,
             ep_square,
@@ -166,6 +172,9 @@ impl Board {
         // through add_piece/remove_piece and updates it a piece at a time.
         if let Some(net) = crate::nnue::rede() {
             b.acc = Some(Box::new(crate::nnue::Accumulator::fresh(net, &b)));
+        }
+        if let Some(net) = crate::nnue_v3::rede() {
+            b.acc_v3 = Some(Box::new(crate::nnue_v3::AccV3::fresh(net, &b)));
         }
         b
     }
@@ -325,6 +334,9 @@ impl Board {
         if let (Some(a), Some(net)) = (self.acc.as_mut(), crate::nnue::rede()) {
             a.push_dirty(net, c, pt, s, false);
         }
+        if let (Some(a), Some(net)) = (self.acc_v3.as_mut(), crate::nnue_v3::rede()) {
+            a.remove_piece(net, pt, c, s, self.occ_all, self.pieces, self.mailbox);
+        }
         // Os acumuladores por flanco so' sao LIDOS com a feature `psqtmirror`
         // ligada (ver `material_pst_white`). Sem ela isto era trabalho morto
         // pago em cada peca colocada ou retirada, ou seja, em cada lance da
@@ -342,6 +354,9 @@ impl Board {
         let ph = pt.phase_inc();
         if let (Some(a), Some(net)) = (self.acc.as_mut(), crate::nnue::rede()) {
             a.push_dirty(net, c, pt, s, true);
+        }
+        if let (Some(a), Some(net)) = (self.acc_v3.as_mut(), crate::nnue_v3::rede()) {
+            a.add_piece(net, pt, c, s, self.occ_all, self.pieces, self.mailbox);
         }
         // Os acumuladores por flanco so' sao LIDOS com a feature `psqtmirror`
         // ligada (ver `material_pst_white`). Sem ela isto era trabalho morto
@@ -478,10 +493,27 @@ impl Board {
     /// was actually crossed -- measured at 16.5% of all moves, which is why it
     /// goes through the cache rather than rebuilding from the bias.
     fn corrige_bucket(&mut self) {
-        let net = match crate::nnue::rede() {
-            Some(n) if n.buckets > 1 => n,
-            _ => return,
-        };
+        // A guarda da rede SIMPLES nao pode barrar as outras.
+        //
+        // Isto era `let net = match rede() { Some(n) if n.buckets > 1 => n,
+        // _ => return }` -- um `return` no topo. Sem `KESTREL_NNUE` definido a
+        // funcao saia na primeira linha e o `fix_bucket` da v3, que vive no
+        // fim, nunca corria: os buckets de rei dela nunca se corrigiam. 2849
+        // divergencias em 3906 lances, todas a partir do primeiro rei que sai
+        // da casa inicial.
+        //
+        // Mesma familia do bug do `busy` na ponte e do `unmake_move` sem
+        // correccao de bucket: uma condicao de UM caminho a decidir por todos.
+        let pecas = self.pieces;
+        if let Some(net) = crate::nnue::rede().filter(|n| n.buckets > 1) {
+            self.corrige_bucket_simples(net);
+        }
+        if let (Some(net), Some(acc)) = (crate::nnue_v3::rede(), self.acc_v3.as_mut()) {
+            acc.fix_bucket(net, pecas);
+        }
+    }
+
+    fn corrige_bucket_simples(&mut self, net: &'static crate::nnue::Network) {
         // Read everything the refresh needs BEFORE taking the accumulator,
         // because the accumulator lives inside the same struct. Rust says so
         // and it is right to: reading the board through a stale copy taken

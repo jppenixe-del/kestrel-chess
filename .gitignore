@@ -15,3 +15,11 @@ tune_*.log
 selfplay_*.log
 resolvequiet.log
 datagen_*.log
+
+# Redes e leitores de OUTROS motores: uso interno de diagnostico, nunca
+# comitados. O Coda e' GPL-3.0 e a rede dele e' artefacto dele; serve para
+# responder "a fraqueza e' a nossa busca ou a nossa rede?", nao para andar
+# neste repositorio.
+*.nnue
+src/nnue_externo*.rs
+redes_externas/

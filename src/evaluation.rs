@@ -38,7 +38,13 @@ pub fn evaluate(board: &mut Board) -> i32 {
     // architecture is chosen by which file was given, never by a build flag,
     // so comparing two of them compares networks and not binaries.
     if let Some(net) = crate::nnue_v3::rede() {
-        return crate::nnue_v3::evaluate(net, board);
+        // Pelo acumulador quando existe, como na rede simples: recomputar as
+        // ~190 features a cada avaliacao custava 61% do tempo total (perf),
+        // contra ~16% da simples.
+        return match board.acc_v3.as_ref() {
+            Some(acc) => acc.valor(net, board),
+            None => crate::nnue_v3::evaluate(net, board),
+        };
     }
     if let Some(net) = crate::nnue_threats::rede() {
         return crate::nnue_threats::evaluate(net, board);
