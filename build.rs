@@ -12,7 +12,27 @@
 
 use std::path::PathBuf;
 
+/// Copies the network named by `var` into OUT_DIR and turns on `cfg`.
+/// Always leaves a file behind, because `include_bytes!` is resolved even on
+/// the branch that is not compiled.
+fn embute(var: &str, ficheiro: &str, cfg: &str) {
+    println!("cargo:rerun-if-env-changed={var}");
+    let saida = PathBuf::from(std::env::var("OUT_DIR").unwrap()).join(ficheiro);
+    match std::env::var(var) {
+        Ok(p) if !p.is_empty() => {
+            println!("cargo:rerun-if-changed={p}");
+            let bytes = std::fs::read(&p).unwrap_or_else(|e| panic!("nao consegui ler {p}: {e}"));
+            std::fs::write(&saida, bytes).unwrap();
+            println!("cargo:rustc-cfg={cfg}");
+        }
+        _ => {
+            std::fs::write(&saida, []).unwrap();
+        }
+    }
+}
+
 fn main() {
+    embute("KESTREL_V1_EMBUTIDA", "rede_v1_embutida.bin", "v1_embutida");
     println!("cargo:rerun-if-env-changed=KESTREL_V3_EMBUTIDA");
     let saida = PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("rede_v3_embutida.bin");
     match std::env::var("KESTREL_V3_EMBUTIDA") {

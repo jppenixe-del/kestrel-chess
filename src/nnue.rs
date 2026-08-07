@@ -708,6 +708,16 @@ static REDE: std::sync::OnceLock<Option<Network>> = std::sync::OnceLock::new();
 
 pub fn rede() -> Option<&'static Network> {
     REDE.get_or_init(|| {
+        // Rede embutida em tempo de compilacao, quando existe: e' o braco de
+        // um teste que decide e nao deve poder ser trocada por uma variavel
+        // de ambiente que nao chegou ao processo filho.
+        #[cfg(v1_embutida)]
+        {
+            const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rede_v1_embutida.bin"));
+            load(BYTES)
+        }
+        #[cfg(not(v1_embutida))]
+        {
         let path = std::env::var("KESTREL_NNUE").ok()?;
         let bytes = match std::fs::read(&path) {
             Ok(b) => b,
@@ -721,6 +731,7 @@ pub fn rede() -> Option<&'static Network> {
             eprintln!("nnue: rede carregada de {} (HIDDEN={})", path, HIDDEN);
         }
         n
+        }
     })
     .as_ref()
 }

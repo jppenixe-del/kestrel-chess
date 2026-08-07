@@ -29,6 +29,31 @@ use std::io::{BufRead, Write};
 use std::time::Instant;
 use zobrist::Zobrist;
 
+/// Quantos neuronios das camadas escondidas nunca sairam de zero.
+///
+/// Sob SCReLU um neuronio que nunca passa de zero contribui exactamente zero
+/// para tudo o que vem a seguir. "Morto" e' contavel, nao e' uma opiniao --
+/// mas o numero depende de ONDE se conta: medido num percurso aleatorio a
+/// partir da posicao inicial da' menos mortos do que em posicoes de jogo a
+/// serio, porque metade das posicoes visitadas nao se parecem com xadrez.
+fn imprime_saude(vistas: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let v = crate::nnue_v3::VISITAS.load(Relaxed).max(1);
+    let conta = |a: &[std::sync::atomic::AtomicU64]| {
+        let vals: Vec<u64> = a.iter().map(|x| x.load(Relaxed)).collect();
+        let mortos = vals.iter().filter(|&&c| c == 0).count();
+        let raros = vals.iter().filter(|&&c| c > 0 && c * 100 < v).count();
+        (mortos, raros, vals)
+    };
+    let (m1, r1, v1) = conta(&crate::nnue_v3::ACTIVOU_H1);
+    let (m2, r2, v2) = conta(&crate::nnue_v3::ACTIVOU_H2);
+    let _ = vistas;
+    println!("{v} avaliacoes | fc1: {m1}/{} mortos ({r1} raros) | fc2: {m2}/{} mortos ({r2} raros)",
+             v1.len(), v2.len());
+    println!("  fc1 taxas%: {:?}", v1.iter().map(|c| (c * 100 / v) as u32).collect::<Vec<_>>());
+    println!("  fc2 taxas%: {:?}", v2.iter().map(|c| (c * 100 / v) as u32).collect::<Vec<_>>());
+}
+
 fn main() {
     // Buckets de PSQT: ligados por feature. Arrancam com as OITO tabelas
     // iguais a' compilada, que e' a condicao do invariante da identidade --
@@ -486,6 +511,37 @@ fn main() {
         let n: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(3000);
         crate::nnue_v3::SAUDE.store(true, std::sync::atomic::Ordering::Relaxed);
         let atk = Attacks::new();
+        // Com um ficheiro EPD mede-se em posicoes REAIS. Sem ele o percurso
+        // aleatorio a partir da posicao inicial passa a maior parte do tempo
+        // em posicoes que nenhuma partida produz, e um neuronio que so'
+        // dispara em estruturas de meio-jogo a serio aparece morto sem o
+        // estar. Foi o erro da primeira medicao.
+        if let Some(caminho) = args.get(3) {
+            let texto = match std::fs::read_to_string(caminho) {
+                Ok(t) => t,
+                Err(e) => { eprintln!("nao consegui ler {caminho}: {e}"); return; }
+            };
+            let mut vistas = 0usize;
+            for linha in texto.lines().take(n) {
+                let fen = linha.split(';').next().unwrap_or("").trim();
+                if fen.is_empty() { continue; }
+                let mut b = Board::from_fen(fen);
+                // Alguns lances a partir de cada posicao: uma abertura sozinha
+                // e' meia duzia de estruturas, e o que interessa e' cobrir o
+                // meio-jogo que a rede vai mesmo ver.
+                for _ in 0..12 {
+                    if let Some(net3) = crate::nnue_v3::rede() {
+                        if let Some(acc) = b.acc_v3.as_ref() { let _ = acc.valor(net3, &b); vistas += 1; }
+                    }
+                    let legais = movegen::generate_legal(&mut b, &atk);
+                    if legais.is_empty() { break; }
+                    let mv = legais[vistas % legais.len()];
+                    b.make_move(&mv);
+                }
+            }
+            imprime_saude(vistas);
+            return;
+        }
         let mut rng = 0x1234_5678_9abc_def0u64;
         let mut board = Board::startpos();
         let mut jogadas = 0usize;
@@ -504,21 +560,7 @@ fn main() {
                 board = Board::startpos();
             }
         }
-        use std::sync::atomic::Ordering::Relaxed;
-        let v = crate::nnue_v3::VISITAS.load(Relaxed).max(1);
-        let conta = |a: &[std::sync::atomic::AtomicU64]| {
-            let vals: Vec<u64> = a.iter().map(|x| x.load(Relaxed)).collect();
-            let mortos = vals.iter().filter(|&&c| c == 0).count();
-            let raros = vals.iter().filter(|&&c| c > 0 && c * 100 < v).count();
-            (mortos, raros, vals)
-        };
-        let (m1, r1, v1) = conta(&crate::nnue_v3::ACTIVOU_H1);
-        let (m2, r2, v2) = conta(&crate::nnue_v3::ACTIVOU_H2);
-        println!("{v} avaliacoes");
-        println!("fc1: {m1}/{} mortos, {r1} raros (<1%)", v1.len());
-        println!("  taxas: {:?}", v1.iter().map(|c| (c * 100 / v) as u32).collect::<Vec<_>>());
-        println!("fc2: {m2}/{} mortos, {r2} raros (<1%)", v2.len());
-        println!("  taxas: {:?}", v2.iter().map(|c| (c * 100 / v) as u32).collect::<Vec<_>>());
+        imprime_saude(0);
         return;
     }
     if args.len() >= 2 && args[1] == "verificav3" {
