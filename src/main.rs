@@ -472,6 +472,55 @@ fn main() {
         }
         return;
     }
+    if args.len() >= 2 && args[1] == "saudev3" {
+        // Quantos neuronios das camadas escondidas estao mortos.
+        //
+        // O Coda documenta a morte de neuronios de fc1 por volta do SB40 sem
+        // aquecimento do LR, e o nosso treinador da v3 nao tem aquecimento
+        // nenhum -- cosseno desde o superbatch 1. Isto mede em vez de supor:
+        // sob SCReLU um neuronio que nunca passa de zero contribui zero.
+        let Some(net) = crate::nnue_v3::rede() else {
+            eprintln!("sem KESTREL_NNUE_V3");
+            return;
+        };
+        let n: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(3000);
+        crate::nnue_v3::SAUDE.store(true, std::sync::atomic::Ordering::Relaxed);
+        let atk = Attacks::new();
+        let mut rng = 0x1234_5678_9abc_def0u64;
+        let mut board = Board::startpos();
+        let mut jogadas = 0usize;
+        while jogadas < n {
+            let mvs = movegen::generate_legal(&mut board, &atk);
+            if mvs.is_empty() {
+                board = Board::startpos();
+                continue;
+            }
+            let _ = board.acc_v3.as_ref().map(|a| a.valor(net, &board));
+            rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+            let mv = mvs[(rng as usize) % mvs.len()];
+            board.make_move(&mv);
+            jogadas += 1;
+            if board.halfmove >= 100 || board.occ_all.count_ones() <= 4 {
+                board = Board::startpos();
+            }
+        }
+        use std::sync::atomic::Ordering::Relaxed;
+        let v = crate::nnue_v3::VISITAS.load(Relaxed).max(1);
+        let conta = |a: &[std::sync::atomic::AtomicU64]| {
+            let vals: Vec<u64> = a.iter().map(|x| x.load(Relaxed)).collect();
+            let mortos = vals.iter().filter(|&&c| c == 0).count();
+            let raros = vals.iter().filter(|&&c| c > 0 && c * 100 < v).count();
+            (mortos, raros, vals)
+        };
+        let (m1, r1, v1) = conta(&crate::nnue_v3::ACTIVOU_H1);
+        let (m2, r2, v2) = conta(&crate::nnue_v3::ACTIVOU_H2);
+        println!("{v} avaliacoes");
+        println!("fc1: {m1}/{} mortos, {r1} raros (<1%)", v1.len());
+        println!("  taxas: {:?}", v1.iter().map(|c| (c * 100 / v) as u32).collect::<Vec<_>>());
+        println!("fc2: {m2}/{} mortos, {r2} raros (<1%)", v2.len());
+        println!("  taxas: {:?}", v2.iter().map(|c| (c * 100 / v) as u32).collect::<Vec<_>>());
+        return;
+    }
     if args.len() >= 2 && args[1] == "verificav3" {
         // O acumulador incremental da v3 contra a recomputacao total, a cada
         // ply de jogos REAIS -- e depois de cada undo.
@@ -503,7 +552,11 @@ fn main() {
                 let cheio = nnue_v3::evaluate(net, &board);
                 if inc != cheio {
                     mal += 1;
-                    if mal <= 3 { eprintln!("DIVERGE inc={} cheio={} {}", inc, cheio, board.to_fen()); }
+                    if mal <= 3 {
+                        let (ca, np) = board.acc_v3.as_ref().unwrap().debug_fase();
+                        eprintln!("DIVERGE inc={} cheio={} | acc: com_ameacas={} n_pecas={} | tabuleiro: {} pecas | {}",
+                                  inc, cheio, ca, np, board.occ_all.count_ones(), board.to_fen());
+                    }
                 }
                 hist.push((mv, undo));
                 if hist.len() % 7 == 0 {

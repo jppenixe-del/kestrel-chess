@@ -288,12 +288,41 @@ fn cabeca(net: &RedeV3, us: &[i16], them: &[i16], ob: usize) -> i32 {
         }
         h2[o] = (s / QA + net.fc2b[o] as i32) / QB;
     }
+    if SAUDE.load(std::sync::atomic::Ordering::Relaxed) {
+        regista_saude(&h1, &h2);
+    }
     let w = &net.fc3w[ob * FC2..(ob + 1) * FC2];
     let mut s = 0i32;
     for (i, &wi) in w.iter().enumerate() {
         s += screlu(h2[i]) * wi as i32;
     }
     (s / QA + net.fc3b[ob] as i32) * escala() / (QA * QB)
+}
+
+/// Diagnostico de saude das camadas escondidas.
+///
+/// Sob SCReLU um neuronio que nunca sai de zero contribui exactamente zero
+/// para tudo o que vem a seguir -- "morto" nao e' uma opiniao, conta-se. O
+/// Coda documenta que sem aquecimento do LR os neuronios da primeira camada
+/// escondida morrem por volta do superbatch 40, e o nosso treinador nao tem
+/// aquecimento nenhum; isto foi escrito para verificar a suspeita em vez de
+/// a aceitar. (Verificou-se: 3 em 32. A suspeita estava errada.)
+pub static SAUDE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub static ACTIVOU_H1: [std::sync::atomic::AtomicU64; FC1] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; FC1];
+pub static ACTIVOU_H2: [std::sync::atomic::AtomicU64; FC2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; FC2];
+pub static VISITAS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn regista_saude(h1: &[i32; FC1], h2: &[i32; FC2]) {
+    use std::sync::atomic::Ordering::Relaxed;
+    VISITAS.fetch_add(1, Relaxed);
+    for i in 0..FC1 {
+        if h1[i] > 0 { ACTIVOU_H1[i].fetch_add(1, Relaxed); }
+    }
+    for i in 0..FC2 {
+        if h2[i] > 0 { ACTIVOU_H2[i].fetch_add(1, Relaxed); }
+    }
 }
 
 static REDE: std::sync::OnceLock<Option<RedeV3>> = std::sync::OnceLock::new();
@@ -723,6 +752,20 @@ impl AccV3Inner {
         self.n_pecas = pos.occ().count_ones();
         self.pecas = pecas;
         self.com_ameacas = self.n_pecas >= crate::features::AMEACAS_MIN_PECAS;
+        // O bucket cacheado tambem faz parte do estado, e reconstruir sem ele
+        // deixa o acumulador certo e a etiqueta errada. `map_features_pairs`
+        // calcula o bucket a partir dos reis e nao o diz a ninguem; o
+        // `fix_bucket` acredita neste campo. Ficando obsoleto, o lance de rei
+        // seguinte tira colunas de um bucket que ja' nao esta' la' dentro.
+        //
+        // Sintoma: divergencias so' abaixo do limiar das ameacas -- nao porque
+        // as ameacas tivessem que ver com isto, mas porque so' se reconstroi
+        // ao cruzar o limiar, e era a reconstrucao que sujava a etiqueta.
+        for persp in 0..2usize {
+            let ks_raw = pecas[persp][5].trailing_zeros() as usize;
+            let ks = if persp == 0 { ks_raw } else { ks_raw ^ 56 };
+            self.piece_bucket[persp] = crate::features::BUCKET_MAP[ks];
+        }
     }
 
     /// Record a change, or cancel it against its own inverse.
@@ -1007,6 +1050,15 @@ impl AccV3 {
     /// since the last read) and read the score. `&self` because the search
     /// treats evaluation as read-only -- see the `AccV3` struct note on
     /// why materializing through a `RefCell` is what makes that possible.
+    /// Com que regime de fase o acumulador esta' construido, e sobre quantas
+    /// pecas. Diagnostico: as divergencias apareciam todas em cima do corte
+    /// das doze pecas, e supor de que lado estava o acumulador nao substitui
+    /// perguntar-lhe.
+    pub fn debug_fase(&self) -> (bool, u32) {
+        let i = self.0.borrow();
+        (i.com_ameacas, i.n_pecas)
+    }
+
     pub fn valor(&self, net: &RedeV3, board: &Board) -> i32 {
         let mut inner = self.0.borrow_mut();
         Self::materialize(net, &mut inner, board.pieces);

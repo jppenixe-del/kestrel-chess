@@ -44,6 +44,9 @@ fittedpsqtb8 = ["psqtbuckets"]
 # PSQT com dimensao de bucket: [bucket][peca][casa]. Ver PSQT_BUCKETS.
 psqtbuckets = []
 
+[lints.rust]
+unexpected_cfgs = { level = "allow" }
+
 [dependencies]
 
 [profile.release]
