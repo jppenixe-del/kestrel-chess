@@ -1972,7 +1972,10 @@ impl<'a> Searcher<'a> {
         // do probe here (Coda: ~990 probes per 1000 nodes, 44% static-eval
         // hits) have expensive evaluations, which is exactly the condition
         // that makes it worthwhile.
-        let stand_pat = crate::evaluation::evaluate_fast(board);
+        let stand_pat = crate::evaluation::amortece_rule50(
+            crate::evaluation::evaluate_fast(board),
+            board.halfmove,
+        );
         self.quiescence_from(board, alpha, beta, ply, stand_pat)
     }
 
@@ -2238,7 +2241,10 @@ impl<'a> Searcher<'a> {
         // quiescence_from() already has the equivalent guard; negamax
         // didn't.
         if ply >= MAX_PLY - 1 {
-            return crate::evaluation::evaluate_fast(board);
+            return crate::evaluation::amortece_rule50(
+                crate::evaluation::evaluate_fast(board),
+                board.halfmove,
+            );
         }
 
         let mut beta = beta;
@@ -2401,12 +2407,16 @@ impl<'a> Searcher<'a> {
             // posicao, calcula-la outra vez e' repetir trabalho identico.
             // Aqui pesa mais do que la', porque a entrada da quiescencia e'
             // onde esta' a maioria dos nos.
-            let full_stand_pat = match tt_entry_captured
+            let raw_full_stand_pat = match tt_entry_captured
                 .filter(|e| e.static_eval != crate::tt::TT_EVAL_NONE)
             {
                 Some(e) => e.static_eval as i32,
                 None => evaluate(board),
             };
+            // Scaled at THIS node's halfmove, whether the raw value came
+            // fresh or from a TT entry stored at some other node's halfmove
+            // -- see `evaluation::amortece_rule50`.
+            let full_stand_pat = crate::evaluation::amortece_rule50(raw_full_stand_pat, board.halfmove);
             return self.quiescence_from(board, alpha, beta, ply, full_stand_pat);
         }
 
@@ -2432,13 +2442,25 @@ impl<'a> Searcher<'a> {
         } else {
             crate::evaluation::evaluate(board)
         };
+        // Halfmove-scaled before correction (see `evaluation::amortece_rule50`
+        // for why this has to happen here and not inside `evaluate()`
+        // itself): `raw_static_eval` above may have come from a TT entry
+        // stored at a different node's halfmove, so the scale is applied
+        // fresh against THIS node's clock rather than baked into the cached
+        // value.
+        //
         // Corrected version (see corr_hist) used for pruning-margin
-        // decisions below; the raw value is what improving/static_evals
-        // track, since correction is a slow-moving average and mixing
-        // it into the improving comparison would blur a signal that's
-        // meant to be about THIS node's fast eval trend, not the
-        // learned bias.
-        let static_eval = if in_check { 0 } else { self.corrected_static_eval(board, raw_static_eval) };
+        // decisions below; the raw (unscaled, uncorrected) value is what
+        // improving/static_evals track, since correction is a slow-moving
+        // average and mixing it -- or the halfmove shrink -- into the
+        // improving comparison would blur a signal that's meant to be about
+        // THIS node's fast eval trend, not the learned bias or the clock.
+        let static_eval = if in_check {
+            0
+        } else {
+            let amortecido = crate::evaluation::amortece_rule50(raw_static_eval, board.halfmove);
+            self.corrected_static_eval(board, amortecido)
+        };
         if ply < MAX_PLY {
             self.static_evals[ply] = raw_static_eval;
         }

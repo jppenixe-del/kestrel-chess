@@ -25,7 +25,9 @@
 
 use crate::board::Board;
 
-/// Score for the side to move.
+/// Score for the side to move. Halfmove-independent -- see
+/// `amortece_rule50` for why that has to be true and where the scaling
+/// happens instead.
 ///
 /// Takes `&mut Board` because the piece-square accumulator is lazy: the values
 /// it holds are only brought up to date here, at the one moment a score is
@@ -80,6 +82,33 @@ pub fn evaluate(board: &mut Board) -> i32 {
 #[inline]
 pub fn evaluate_fast(board: &mut Board) -> i32 {
     evaluate(board)
+}
+
+/// `v -= v * rule50 / 199`, ported literally from `Eval::evaluate` in
+/// Stockfish's `evaluate.cpp`. The network knows nothing about the 50-move
+/// clock -- it is not an input feature -- so without this the search always
+/// trusts the full advantage, even ten moves from bleeding out into a draw.
+/// The shrink is what gives the search a reason to prefer, when ahead, a
+/// move that zeroes the counter (the score snaps back to full) and to avoid
+/// zeroing when behind (that would hand the opponent's own score back to
+/// full too).
+///
+/// Deliberately NOT folded into `evaluate()` itself. `evaluate()`'s raw
+/// output is what the search caches -- TT's `static_eval` field and the
+/// improving heuristic's `static_evals[ply]` -- and reused across nodes that
+/// share a position but not a halfmove count. Baking the scale in there
+/// would freeze a value computed for one node's halfmove into a cache read
+/// back by a different node's, applying the wrong shrink. Coda hit this
+/// exact class of bug (their comment: "apply this at the point of use,
+/// never before storing to TT") and their own conversion-failure study
+/// traced won-position draws to an earlier, more aggressive version of this
+/// same formula -- worth remembering before touching the constant here.
+/// Callers apply this to a raw eval (freshly computed OR read back from a
+/// cache) immediately before using it for a decision, with THIS node's
+/// `board.halfmove`, never before storing it.
+#[inline]
+pub fn amortece_rule50(v: i32, halfmove: u32) -> i32 {
+    v - v * halfmove as i32 / 199
 }
 
 /// Said once, on the first evaluation with no network loaded.
