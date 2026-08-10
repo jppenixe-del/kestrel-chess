@@ -159,25 +159,77 @@ pub fn load(bytes: &[u8]) -> Option<RedeThreats> {
     // com a rede de producao -- que e' a assinatura de um leitor partido e nao
     // de uma rede por treinar. Uma rede fraca ainda sabe quanto vale uma dama.
     //
-    // DESCARTAR e nao somar: o treinador ja' fundiu o factor comum nos pesos
-    // por bucket antes de gravar, e o bloco que fica e' residuo. Somei-o uma
-    // vez na v2 e deu 88 derrotas em 88 jogos -- ver a nota do `funde`.
+    // SOMAR, nao descartar. Esta linha ja' esteve dos dois lados, e as duas
+    // vezes anteriores o veredicto foi tirado da coisa errada.
+    //
+    // O que o trainer grava: `Factorised` poe as 704 linhas do factor a'
+    // frente e as reais a seguir, e o peso EFECTIVO de uma feature de peca e'
+    // a soma das duas -- e' assim que `Factorised::merge_factoriser` esta'
+    // escrito no proprio bullet:
+    //
+    //     merged[feat] = unmerged[offset + feat] + unmerged[derive(feat)]
+    //
+    // e NADA na arvore do bullet chama essa funcao. O ficheiro sai por fundir,
+    // sempre. A crenca de que "o treinador ja' fundiu" era so' isso.
+    //
+    // MEDIDO, contra Stockfish 18 a depth 12 em 4000 posicoes de jogos reais:
+    //
+    //     rede de producao                        correlacao 0.862
+    //     esta rede com o bloco DESCARTADO        correlacao 0.315
+    //     esta rede com o bloco SOMADO            correlacao 0.895
+    //
+    // O bloco tem amplitude media 25.6 contra 14.1 dos pesos por bucket: leva
+    // mais sinal do que a parte que se estava a guardar. Descartado, a
+    // avaliacao sai comprimida a um terco da escala (o "+6 onde o Stockfish
+    // diz +32" da nota do `funde`), o que detona todas as margens de poda de
+    // uma vez -- e foi isso, e nao a arquitectura, que perdeu 1136 jogos a nos
+    // fixos sem ganhar um.
+    //
+    // Porque e' que somar falhou antes: a tentativa da v2 somava na rede
+    // SIMPLES, cujo factorizador e' `Chess768` (768 linhas, derive = feat %
+    // 768), nao estas 704. Somar o bloco certo com a regra errada da' um
+    // desvio grande e constante, que foi exactamente o sintoma registado
+    // (~350cp que nao desciam com o treino). A regra tem de vir do
+    // `Factorises` que treinou a rede, e para esta arquitectura e'
+    // `Napk704Chess`: as features de peca colapsam em `feat % 704`, as de
+    // ameaca nao tem factor nenhum.
     //
     // Detectado pelo TAMANHO e nao por uma opcao: assim os dois formatos
     // carregam, e uma rede antiga nao deixa de funcionar por causa disto.
     let com_factorizador = (704 + TRAINER_INPUTS) * HIDDEN + cauda;
-    // KESTREL_THR_SALTO existe SO' para a experiencia que localiza o bloco:
-    // se eu adivinhar a posicao errada, o erro parece o mesmo (correlacao
-    // baixa) venha ele de onde vier. Medir cada hipotese e' mais barato do que
-    // discuti-las.
-    let salto: i64 = std::env::var("KESTREL_THR_SALTO").ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(if total >= com_factorizador { 704 } else { 0 });
-    if salto > 0 {
-        let _: Vec<i16> = (&mut it).take(salto as usize * HIDDEN).collect();
-        eprintln!("nnue-threats: saltadas {} linhas a' cabeca", salto);
+    // KESTREL_THR_FACTOR=0 desliga a fusao, para se poder voltar a medir o
+    // antes e o depois com o mesmo binario em vez de dois.
+    let fundir = total >= com_factorizador
+        && std::env::var("KESTREL_THR_FACTOR").map(|v| v != "0").unwrap_or(true);
+    let factor: Vec<i16> = if total >= com_factorizador {
+        (&mut it).take(704 * HIDDEN).collect()
+    } else {
+        Vec::new()
+    };
+    let mut todos: Vec<i16> = (&mut it).take(TRAINER_INPUTS * HIDDEN).collect();
+    if fundir {
+        // So' as features de peca tem factor. Em i32 e com corte declarado:
+        // um estouro silencioso aqui seria indistinguivel de uma rede fraca,
+        // que e' precisamente o erro que esta seccao existe para nao repetir.
+        let mut cortados = 0usize;
+        for f in 0..crate::features::PIECE_FEATURES.min(TRAINER_INPUTS) {
+            let base_f = (f % 704) * HIDDEN;
+            for i in 0..HIDDEN {
+                let v = todos[f * HIDDEN + i] as i32 + factor[base_f + i] as i32;
+                if v > i16::MAX as i32 || v < i16::MIN as i32 {
+                    cortados += 1;
+                }
+                todos[f * HIDDEN + i] = v.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+            }
+        }
+        eprintln!(
+            "nnue-threats: factorizador de 704 linhas SOMADO nas features de peca{}",
+            if cortados > 0 { format!(" ({cortados} pesos cortados a i16)") } else { String::new() }
+        );
+    } else if !factor.is_empty() {
+        eprintln!("nnue-threats: factorizador DESCARTADO (KESTREL_THR_FACTOR=0)");
     }
-    let todos: Vec<i16> = (&mut it).take(TRAINER_INPUTS * HIDDEN).collect();
+    let todos = todos;
     // Split at the threat boundary. The leading slot the trainer reserves
     // stays with the piece block, which keeps the piece indices unchanged.
     let corte = (1 + crate::features::PIECE_FEATURES) * HIDDEN;
