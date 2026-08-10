@@ -697,6 +697,31 @@ pub fn evaluate_board(net: &Network, board: &Board) -> i32 {
     evaluate(net, &acc, board.side, output_bucket(net, board))
 }
 
+/// The `2 * HIDDEN` post-SCReLU activations that feed the output layer, in
+/// the exact order `evaluate` reads them: our perspective first, then theirs.
+///
+/// Exists for probing, not for play. `evaluate` collapses these against one
+/// weight vector; dumping them lets an offline fit ask what a DIFFERENT
+/// readout could have done with the same features -- e.g. whether a
+/// per-king-zone weight vector fits better than the single global one, which
+/// is the cheap way to test an output-bucketing idea without training a
+/// network to find out.
+///
+/// Deliberately returns the raw `i32` squares rather than anything scaled:
+/// the caller is fitting its own weights, and any scaling here would just be
+/// a constant it has to undo.
+pub fn activacoes_saida(net: &Network, board: &Board) -> Vec<i32> {
+    let acc = Accumulator::fresh(net, board);
+    let (us, them) = match board.side {
+        crate::types::Color::White => (&acc.white, &acc.black),
+        crate::types::Color::Black => (&acc.black, &acc.white),
+    };
+    let mut v = Vec::with_capacity(2 * HIDDEN);
+    v.extend((0..HIDDEN).map(|i| screlu(us[i])));
+    v.extend((0..HIDDEN).map(|i| screlu(them[i])));
+    v
+}
+
 /// The loaded network, if any.
 ///
 /// Read from the path in `KESTREL_NNUE` on first use. An env var rather than

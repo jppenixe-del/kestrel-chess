@@ -690,6 +690,77 @@ fn main() {
         bullet_data(&args[2], &args[3], d, t);
         return;
     }
+    if args.len() >= 4 && args[1] == "accdump" {
+        // accdump <fens.txt> <out.bin>
+        //
+        // Dumps, per position, the 1024 post-SCReLU activations that feed the
+        // output layer, plus the network's own score. For asking offline what
+        // a different READOUT could do with the features this network already
+        // computes -- fitting a per-king-zone weight vector against the single
+        // global one, say -- which answers an output-bucketing question
+        // without paying for a training run to find out.
+        //
+        // The score rides along as a checksum, not as a label: a fit that
+        // reproduces `evaluate()` from these activations and the network's own
+        // l1 weights proves the dumped matrix is the one the engine actually
+        // reads. Without that check a transposed or mis-ordered dump would
+        // still produce a plausible-looking regression against any target.
+        let Some(net) = nnue::rede() else {
+            eprintln!("accdump precisa de KESTREL_NNUE=<rede.bin>");
+            return;
+        };
+        let texto = match std::fs::read_to_string(&args[2]) {
+            Ok(t) => t,
+            Err(e) => { eprintln!("nao consegui ler {}: {e}", args[2]); return; }
+        };
+        let mut bin: Vec<u8> = Vec::new();
+        let mut fens_usadas = String::new();
+        let mut n = 0usize;
+        let mut saltadas = 0usize;
+        for linha in texto.lines() {
+            // EPD carries operations after a ';' and sometimes after the
+            // move-number fields; take the board part and let from_fen default
+            // the rest.
+            let fen = linha.split(';').next().unwrap_or("").trim();
+            if fen.is_empty() || fen.starts_with('#') {
+                continue;
+            }
+            let board = Board::from_fen(fen);
+            // A FEN that failed to parse leaves an empty board, which would
+            // otherwise enter the fit as a row of zeros and quietly drag every
+            // coefficient toward it.
+            if board.occ_all.count_ones() < 2 {
+                saltadas += 1;
+                continue;
+            }
+            for v in nnue::activacoes_saida(net, &board) {
+                bin.extend_from_slice(&v.to_le_bytes());
+            }
+            bin.extend_from_slice(&nnue::evaluate_board(net, &board).to_le_bytes());
+            fens_usadas.push_str(fen);
+            fens_usadas.push('\n');
+            n += 1;
+        }
+        if let Err(e) = std::fs::write(&args[3], &bin) {
+            eprintln!("nao consegui escrever {}: {e}", args[3]);
+            return;
+        }
+        let fens_path = format!("{}.fens", args[3]);
+        if let Err(e) = std::fs::write(&fens_path, &fens_usadas) {
+            eprintln!("nao consegui escrever {fens_path}: {e}");
+            return;
+        }
+        println!(
+            "accdump: {} posicoes ({} saltadas), {} valores por posicao + score -> {} ({:.1} MB) e {}",
+            n,
+            saltadas,
+            2 * nnue::HIDDEN,
+            args[3],
+            bin.len() as f64 / 1e6,
+            fens_path
+        );
+        return;
+    }
     let mut engine = uci::Engine::new();
     engine.run();
 }
