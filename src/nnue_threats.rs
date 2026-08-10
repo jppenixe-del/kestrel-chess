@@ -144,6 +144,39 @@ pub fn load(bytes: &[u8]) -> Option<RedeThreats> {
         return None;
     }
     let mut it = crus.into_iter();
+    // O bloco do FACTORIZADOR, quando existe, vem a' frente e nao e' parcela.
+    //
+    // A rede das ameacas passou a ser treinada com factorizador (`Factorised::
+    // from_parts(NapkChess, Napk704Chess)`), para os 32 buckets de rei nao
+    // aprenderem cada um de raiz sobre um trinta-e-dois-avos dos dados. O
+    // treinador grava 704 linhas a mais, a' cabeca, e este leitor nao sabia
+    // que elas existiam: comecava a ler 704 linhas antes do sitio certo e
+    // tudo deslizava 360 448 valores. O que ele julgava serem os pesos das
+    // pecas era o factorizador.
+    //
+    // Sintoma medido: uma dama a mais valia 7 centipeoes (contra 1272 na rede
+    // de producao), amplitude media trinta vezes maior, e correlacao de 0.18
+    // com a rede de producao -- que e' a assinatura de um leitor partido e nao
+    // de uma rede por treinar. Uma rede fraca ainda sabe quanto vale uma dama.
+    //
+    // DESCARTAR e nao somar: o treinador ja' fundiu o factor comum nos pesos
+    // por bucket antes de gravar, e o bloco que fica e' residuo. Somei-o uma
+    // vez na v2 e deu 88 derrotas em 88 jogos -- ver a nota do `funde`.
+    //
+    // Detectado pelo TAMANHO e nao por uma opcao: assim os dois formatos
+    // carregam, e uma rede antiga nao deixa de funcionar por causa disto.
+    let com_factorizador = (704 + TRAINER_INPUTS) * HIDDEN + cauda;
+    // KESTREL_THR_SALTO existe SO' para a experiencia que localiza o bloco:
+    // se eu adivinhar a posicao errada, o erro parece o mesmo (correlacao
+    // baixa) venha ele de onde vier. Medir cada hipotese e' mais barato do que
+    // discuti-las.
+    let salto: i64 = std::env::var("KESTREL_THR_SALTO").ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(if total >= com_factorizador { 704 } else { 0 });
+    if salto > 0 {
+        let _: Vec<i16> = (&mut it).take(salto as usize * HIDDEN).collect();
+        eprintln!("nnue-threats: saltadas {} linhas a' cabeca", salto);
+    }
     let todos: Vec<i16> = (&mut it).take(TRAINER_INPUTS * HIDDEN).collect();
     // Split at the threat boundary. The leading slot the trainer reserves
     // stays with the piece block, which keeps the piece indices unchanged.
@@ -527,12 +560,25 @@ static REDE: std::sync::OnceLock<Option<RedeThreats>> = std::sync::OnceLock::new
 
 pub fn rede() -> Option<&'static RedeThreats> {
     REDE.get_or_init(|| {
-        let path = std::env::var("KESTREL_NNUE_THREATS").ok()?;
-        match std::fs::read(&path) {
-            Ok(b) => load(&b),
-            Err(e) => {
-                eprintln!("nnue-threats: nao consegui ler {}: {}", path, e);
-                None
+        // Rede embutida em tempo de compilacao, quando existe: e' o braco de
+        // um teste que decide e nao deve poder ser trocada por uma variavel
+        // de ambiente que nao chegou ao processo filho. Mesmo mecanismo de
+        // `nnue::rede`.
+        #[cfg(threats_embutida)]
+        {
+            const BYTES: &[u8] =
+                include_bytes!(concat!(env!("OUT_DIR"), "/rede_threats_embutida.bin"));
+            load(BYTES)
+        }
+        #[cfg(not(threats_embutida))]
+        {
+            let path = std::env::var("KESTREL_NNUE_THREATS").ok()?;
+            match std::fs::read(&path) {
+                Ok(b) => load(&b),
+                Err(e) => {
+                    eprintln!("nnue-threats: nao consegui ler {}: {}", path, e);
+                    None
+                }
             }
         }
     })

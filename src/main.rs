@@ -497,6 +497,46 @@ fn main() {
         }
         return;
     }
+    if args.len() >= 2 && args[1] == "contafeatures" {
+        // Quantas features ACTIVAS emite cada posicao, no modo das ameacas.
+        //
+        // O adaptador do treinador (`NapkChess::map_features`) corta a lista
+        // em `max_active()` = 192 pares. Se as posicoes reais passarem disso,
+        // o treinador aprende sobre uma posicao MUTILADA e o motor avalia
+        // sobre a inteira -- e nenhuma quantidade de treino aproxima as duas.
+        let atk = Attacks::new();
+        let mut n_max = 0usize;
+        let mut acima = 0usize;
+        let mut total = 0usize;
+        let mut soma = 0usize;
+        let caminho = args.get(2).map(|s| s.as_str()).unwrap_or("/root/kestrel_joao/UHO_4060_v2.epd");
+        let texto = std::fs::read_to_string(caminho).expect("sem epd");
+        let mut rng: u64 = 12345;
+        for linha in texto.lines().take(400) {
+            let fen = linha.split(';').next().unwrap_or("").trim();
+            if fen.is_empty() { continue; }
+            let mut b = Board::from_fen(fen);
+            // Alguns lances a partir da abertura, para apanhar meio-jogo a
+            // serio: e' la' que ha' mais ameacas.
+            for _ in 0..24 {
+                let legais = movegen::generate_legal(&mut b, &atk);
+                if legais.is_empty() { break; }
+                rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+                let mv = legais[(rng as usize) % legais.len()];
+                b.make_move(&mv);
+                let pos = features::Pos { pieces: b.pieces };
+                let mut n = 0usize;
+                features::map_features_pairs_mode(&pos, 0, 2, &mut |_a, _b| { n += 1; });
+                total += 1; soma += n;
+                if n > n_max { n_max = n; }
+                if n > 192 { acima += 1; }
+            }
+        }
+        println!("posicoes: {total}");
+        println!("features activas: media {:.1}, maximo {}", soma as f64 / total as f64, n_max);
+        println!("acima do corte de 192: {} ({:.1}%)", acima, 100.0 * acima as f64 / total as f64);
+        return;
+    }
     if args.len() >= 2 && args[1] == "saudev3" {
         // Quantos neuronios das camadas escondidas estao mortos.
         //

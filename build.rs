@@ -33,6 +33,7 @@ fn embute(var: &str, ficheiro: &str, cfg: &str) {
 
 fn main() {
     embute("KESTREL_V1_EMBUTIDA", "rede_v1_embutida.bin", "v1_embutida");
+    embute("KESTREL_THREATS_EMBUTIDA", "rede_threats_embutida.bin", "threats_embutida");
     println!("cargo:rerun-if-env-changed=KESTREL_V3_EMBUTIDA");
     let saida = PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("rede_v3_embutida.bin");
     match std::env::var("KESTREL_V3_EMBUTIDA") {
