@@ -537,6 +537,69 @@ fn main() {
         println!("acima do corte de 192: {} ({:.1}%)", acima, 100.0 * acima as f64 / total as f64);
         return;
     }
+    if args.len() >= 2 && args[1] == "churn" {
+        // Quantas features MUDAM de um lance para o seguinte, separadas por
+        // metade (peca-casa contra ameacas).
+        //
+        // E' o numero que decide se vale a pena tornar algo incremental, e
+        // as quatro tentativas anteriores mediram-no so' para o conjunto
+        // todo. Uma metade pode compensar largamente e a outra nao: as
+        // features de peca mudam uma ou duas por lance (excepto quando o
+        // nosso rei muda de bucket, e ai mudam TODAS), enquanto mexer uma
+        // peca reescreve o mapa de ataque dela e com ele muitas ameacas.
+        // Somar as duas esconde exactamente a diferenca que interessa.
+        let atk = Attacks::new();
+        let caminho = args.get(2).map(|s| s.as_str()).unwrap_or("/root/kestrel_joao/UHO_4060_v2.epd");
+        let texto = std::fs::read_to_string(caminho).expect("sem epd");
+        let mut rng: u64 = 987_654_321;
+        let (mut n_lances, mut d_pecas, mut d_ameacas) = (0usize, 0usize, 0usize);
+        let (mut tot_pecas, mut tot_ameacas) = (0usize, 0usize);
+        let mut trocas_bucket = 0usize;
+        let recolhe = |b: &mut Board| -> (std::collections::HashSet<usize>, std::collections::HashSet<usize>) {
+            let pos = features::Pos { pieces: b.pieces };
+            let (mut p, mut a) = (std::collections::HashSet::new(), std::collections::HashSet::new());
+            features::map_features_pairs_mode(&pos, 0, 2, &mut |x, _y| {
+                if x < features::PIECE_FEATURES { p.insert(x); } else { a.insert(x); }
+            });
+            (p, a)
+        };
+        for linha in texto.lines().take(200) {
+            let fen = linha.split(';').next().unwrap_or("").trim();
+            if fen.is_empty() { continue; }
+            let mut b = Board::from_fen(fen);
+            let (mut p0, mut a0) = recolhe(&mut b);
+            for _ in 0..24 {
+                let ks_antes = b.pieces[0][5].trailing_zeros() as usize;
+                let legais = movegen::generate_legal(&mut b, &atk);
+                if legais.is_empty() { break; }
+                rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+                let mv = legais[(rng as usize) % legais.len()];
+                b.make_move(&mv);
+                let ks_depois = b.pieces[0][5].trailing_zeros() as usize;
+                if features::BUCKET_MAP[ks_antes] != features::BUCKET_MAP[ks_depois] {
+                    trocas_bucket += 1;
+                }
+                let (p1, a1) = recolhe(&mut b);
+                // Simetrica: entradas mais saidas, que e' o trabalho real de
+                // um acumulador incremental (uma coluna somada ou subtraida).
+                d_pecas += p0.symmetric_difference(&p1).count();
+                d_ameacas += a0.symmetric_difference(&a1).count();
+                tot_pecas += p1.len();
+                tot_ameacas += a1.len();
+                n_lances += 1;
+                p0 = p1; a0 = a1;
+            }
+        }
+        let n = n_lances as f64;
+        println!("lances medidos: {n_lances}");
+        println!("  PECAS   : {:5.1} activas, {:5.1} mudam por lance  ({:4.1}%)",
+                 tot_pecas as f64 / n, d_pecas as f64 / n, 100.0 * d_pecas as f64 / tot_pecas as f64);
+        println!("  AMEACAS : {:5.1} activas, {:5.1} mudam por lance  ({:4.1}%)",
+                 tot_ameacas as f64 / n, d_ameacas as f64 / n, 100.0 * d_ameacas as f64 / tot_ameacas as f64);
+        println!("  trocas de bucket do rei: {} ({:.1}% dos lances)",
+                 trocas_bucket, 100.0 * trocas_bucket as f64 / n);
+        return;
+    }
     if args.len() >= 2 && args[1] == "saudev3" {
         // Quantos neuronios das camadas escondidas estao mortos.
         //
