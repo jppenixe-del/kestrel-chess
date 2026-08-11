@@ -32,6 +32,18 @@ fn embute(var: &str, ficheiro: &str, cfg: &str) {
 }
 
 fn main() {
+    // A escala da rede, decidida em tempo de COMPILACAO e nao pela ponte.
+    //
+    // As margens de poda sao centipeoes absolutos, portanto a escala e' uma
+    // propriedade da REDE que o binario traz -- nao uma preferencia de quem o
+    // lanca. Configurada de fora, bastava trocar o binario e esquecer o
+    // `setoption` para a busca inteira correr com todas as margens
+    // proporcionalmente erradas, sem nada a avisar. Aqui as duas coisas
+    // viajam juntas.
+    println!("cargo:rerun-if-env-changed=KESTREL_ESCALA");
+    let escala = std::env::var("KESTREL_ESCALA").unwrap_or_else(|_| "200".to_string());
+    println!("cargo:rustc-env=KESTREL_ESCALA_COMPILADA={escala}");
+
     embute("KESTREL_V1_EMBUTIDA", "rede_v1_embutida.bin", "v1_embutida");
     embute("KESTREL_THREATS_EMBUTIDA", "rede_threats_embutida.bin", "threats_embutida");
     println!("cargo:rerun-if-env-changed=KESTREL_V3_EMBUTIDA");

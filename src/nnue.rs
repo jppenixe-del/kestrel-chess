@@ -43,7 +43,15 @@ const QB: i32 = 64;
 ///
 /// Changing it detunes every margin at once, so a measured gain is the net of
 /// both effects, not the scale alone.
-static ESCALA: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(200);
+/// Omissao vinda da COMPILACAO (`KESTREL_ESCALA`, ver build.rs), para a
+/// escala viajar com a rede embutida em vez de depender de quem lanca o
+/// motor. Sem a variavel fica 200, que e' a escala da rede v1.
+const ESCALA_COMPILADA: i32 = match i32::from_str_radix(env!("KESTREL_ESCALA_COMPILADA"), 10) {
+    Ok(v) => v,
+    Err(_) => 200,
+};
+static ESCALA: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(ESCALA_COMPILADA);
 
 #[inline]
 pub fn escala() -> i32 {
