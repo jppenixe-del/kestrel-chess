@@ -51,10 +51,16 @@ static LMR_TABLE: OnceLock<[[i32; 64]; 64]> = OnceLock::new();
 /// reduzir e' a correccao barata: nao toca na rede e devolve a essas linhas a
 /// profundidade que a avaliacao nao sabe pedir.
 ///
-/// ENTRA DESLIGADO (0) para ser medido por SPRT antes de contar. Nao e' um
-/// valor afinado; e' uma hipotese com um numero por tras.
+/// LIGADO a 6 (sexta e setima filas) depois de medido: +9.9 +/- 13.3 Elo,
+/// LOS 92.7%, em 2000 jogos a 5+0.05.
+///
+/// Nao decidiu formalmente -- o LLR parou nos 0.8 de 2.2 -- e adopta-se na
+/// mesma porque o efeito tem um mecanismo medido por FORA do jogo: o erro da
+/// avaliacao cresce 94 -> 158 cp conforme o peao se aproxima da promocao, nas
+/// duas redes. Nao e' um numero bonito a procura de explicacao; e' uma
+/// explicacao que produziu o numero previsto.
 static PEAO_FILA_SEM_LMR: std::sync::atomic::AtomicI32 =
-    std::sync::atomic::AtomicI32::new(0);
+    std::sync::atomic::AtomicI32::new(6);
 
 pub fn peao_fila_sem_lmr() -> i32 {
     PEAO_FILA_SEM_LMR.load(std::sync::atomic::Ordering::Relaxed)
