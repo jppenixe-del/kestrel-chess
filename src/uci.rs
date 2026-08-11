@@ -120,6 +120,40 @@ const PREDADOR_FOLGADO_PCT: i64 = 130;
 /// A partir de que vantagem, em decimos do relogio dele, se considera folga.
 /// 13 = 1.3x o relogio dele.
 const PREDADOR_FOLGA_R10: i64 = 13;
+
+/// O outro lado do ritmo: quanto podemos pensar ACIMA do ritmo dele quando
+/// NAO temos folga de relogio, em percentagem do ritmo dele.
+///
+/// A regra do predador acima e' so' um PISO -- acompanha um adversario lento e
+/// nao faz nada contra um rapido. Medido em quatro partidas de blitz reais:
+/// gastamos 15-25% mais por lance do que o adversario e acabamos com muito
+/// menos relogio (21s contra 53s num 180+0), que e' onde aparecem os erros e
+/// as bandeiras.
+///
+/// Um tecto absoluto ja' foi tentado e era mau -- ver PREDADOR_PCT: apagava o
+/// investimento do meio-jogo sempre que ele respondesse depressa. A diferenca
+/// aqui e' o `folgado`: com o relogio a nosso favor nao se aplica nada e
+/// investe-se a vontade; so' quando estamos a par ou atras e' que se recusa a
+/// pensar varias vezes o que ele pensa.
+///
+/// 250 = podemos gastar 2.5x o ritmo dele. Nao corta o lance normal (andamos
+/// nos 1.25x); corta os picos -- sete segundos num lance contra um adversario
+/// que responde em 1.4s.
+///
+/// NAO E' UM VALOR AFINADO. Entra desligado (`RitmoTecto` a 0) precisamente
+/// para poder ser medido por SPRT antes de contar para alguma coisa, um valor
+/// de cada vez, como o HARD_CAP_BUDGET_MULT exige de si proprio.
+const TECTO_RITMO_PCT_OMISSAO: i64 = 0;
+static TECTO_RITMO: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(TECTO_RITMO_PCT_OMISSAO);
+
+pub fn tecto_ritmo() -> i64 {
+    TECTO_RITMO.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_tecto_ritmo(v: i64) {
+    TECTO_RITMO.store(v.clamp(0, 1000), std::sync::atomic::Ordering::Relaxed);
+}
 /// The hard ceiling, as a percentage of the remaining clock. Guards the game
 /// as a whole; on a healthy clock the ceiling below binds long before it.
 /// Corrigido de 45 para 25: o tecto real nunca passava dos 25%.
@@ -429,6 +463,19 @@ fn compute_time_budget(
             let fac = if folgado { PREDADOR_FOLGADO_PCT } else { PREDADOR_PCT };
             let predador = pace * fac / 100;
             soft = soft.max(predador.min(hard_cap));
+
+            // E o tecto, so' sem folga de relogio. Ver TECTO_RITMO_PCT_OMISSAO.
+            //
+            // Aplicado ao `soft` e nao ao `hard_cap`: uma posicao critica
+            // continua a poder pedir a extensao que merece, e o que se recusa
+            // e' gastar por rotina varias vezes o que ele gasta. Nunca abaixo
+            // do que a formula normal ja' daria sem ritmo nenhum, para um
+            // adversario que joga de livro instantaneamente nao nos deixar
+            // sem tempo para pensar.
+            let tecto = tecto_ritmo();
+            if tecto > 0 && !folgado {
+                soft = soft.min((pace * tecto / 100).max(base));
+            }
         }
     }
 
@@ -1785,6 +1832,13 @@ impl Engine {
                         "option name EvalScale type spin default {} min 100 max 2000",
                         crate::nnue::escala()
                     );
+                    // Tecto de tempo pelo ritmo do adversario. 0 = desligado,
+                    // que e' a omissao ate' um SPRT dizer o contrario.
+                    let _ = writeln!(
+                        out,
+                        "option name RitmoTecto type spin default {} min 0 max 1000",
+                        tecto_ritmo()
+                    );
                     // Every search parameter, announced as a spin so an SPSA
                     // harness can read the default and the band straight from
                     // `uci` and drive them with `setoption`. They were already
@@ -1840,6 +1894,14 @@ impl Engine {
                     } else if tokens.len() >= 5 && tokens[1] == "name" && tokens[2] == "LazyVote"
                         && tokens[3] == "value" {
                         self.lazy_vote = tokens[4].eq_ignore_ascii_case("true") || tokens[4] == "1";
+                    } else if tokens.len() >= 5 && tokens[1] == "name" && tokens[2] == "RitmoTecto"
+                        && tokens[3] == "value" {
+                        // Percentagem do ritmo do adversario que podemos gastar
+                        // por lance quando NAO temos folga de relogio. Ver
+                        // TECTO_RITMO_PCT_OMISSAO.
+                        if let Ok(v) = tokens[4].parse::<i64>() {
+                            set_tecto_ritmo(v);
+                        }
                     } else if tokens.len() >= 5 && tokens[1] == "name" && tokens[2] == "EvalScale"
                         && tokens[3] == "value" {
                         // Exposed so it can be fitted the way every other search
