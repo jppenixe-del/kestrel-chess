@@ -463,7 +463,7 @@ impl Default for SearchParams {
             // Close to identical to a reference engine's own constants (65
             // and 5) -- see the field doc comment for why the shape, not
             // just the numbers, was adopted.
-            rfp_base: 74,
+            rfp_base: 75,
             rfp_step: 4,
             // Reasoned from this engine's own history scale (see the note
             // at the RFP block), not copied. Starting points, not tuned
@@ -506,10 +506,25 @@ impl Default for SearchParams {
             rfp_not_improving: DepthMargin { base: 0, slope: 159 },
             razor_base: 629,
             razor_per_depth: 629,
-            futility_improving: DepthMargin { base: 1, slope: 116 },
-            futility_not_improving: DepthMargin { base: 1, slope: 107 },
-            cap_futility_improving: DepthMargin { base: 1, slope: 169 },
-            cap_futility_not_improving: DepthMargin { base: 2, slope: 120 },
+            // SPSA do OpenBench (teste #3), leitura aos 531 018 jogos.
+            //
+            // Os valores anteriores eram uma leitura INTERMEDIA da mesma
+            // corrida; ela continuou a andar e estes sao os ultimos
+            // registados. Nao sao finais -- a corrida nunca convergiu porque
+            // foi parada -- mas sao estritamente mais informados do que os
+            // que substituem, que e' o criterio que a casa usa para adoptar
+            // ("os testes sao so' para verificar, e' sempre para
+            // implementar").
+            //
+            // AFINADOS PARA A rede_bot v1. A rede 512 nova e' a MESMA
+            // arquitectura com mais dados, portanto herda-os razoavelmente.
+            // A arquitectura de ameacas nao: enumera outras features e le'
+            // noutra escala, e estas margens nao lhe dizem respeito -- e' uma
+            // afinacao por fazer, nao uma que se aproveite.
+            futility_improving: DepthMargin { base: 2, slope: 114 },
+            futility_not_improving: DepthMargin { base: 1, slope: 114 },
+            cap_futility_improving: DepthMargin { base: 1, slope: 186 },
+            cap_futility_not_improving: DepthMargin { base: 2, slope: 97 },
             delta_margin: 275,
             qs_lmp_limit: 8,
             tt_extended_cutoff_margin: 162,
@@ -3909,6 +3924,25 @@ impl<'a> Searcher<'a> {
             eprintln!(
                 "lmr-stats: reduzidos={} repesquisados={} ({:.1}%) reducao-media={:.2}",
                 self.lmr_tried, self.lmr_research, rr, avg
+            );
+            // QUEM esta a impedir a reducao, e nao so' quantas houve.
+            //
+            // Uma taxa de re-pesquisa de 1% nao diz se reduzimos de menos ou
+            // de mais -- diz que quase nada do que reduzimos volta acima de
+            // alpha. As duas explicacoes possiveis sao opostas: ou reduzimos
+            // tao fundo que a busca reduzida nunca acha nada (poda cega), ou
+            // so' chegam a' reducao lances que ja eram maus. Os contadores
+            // separam-nas, e existiam sem nunca terem sido impressos, o que
+            // e' o mesmo que nao existirem.
+            let qt = self.lmr_quiet_total.max(1);
+            eprintln!(
+                "lmr-porque: quiets={} | xeque={} ({:.1}%) profundidade={} ({:.1}%)                  extensao={} ({:.1}%) cedo-demais={} ({:.1}%) | reduzidos={} ({:.1}%)",
+                self.lmr_quiet_total,
+                self.lmr_skip_check, 100.0 * self.lmr_skip_check as f64 / qt as f64,
+                self.lmr_skip_depth, 100.0 * self.lmr_skip_depth as f64 / qt as f64,
+                self.lmr_skip_extend, 100.0 * self.lmr_skip_extend as f64 / qt as f64,
+                self.lmr_skip_early, 100.0 * self.lmr_skip_early as f64 / qt as f64,
+                self.lmr_tried, 100.0 * self.lmr_tried as f64 / qt as f64
             );
             // What the tables actually hold. Every consumer of history --
             // history pruning, the LMR step, the RFP shift, the quiescence
