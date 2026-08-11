@@ -27,6 +27,65 @@ use std::time::{Duration, Instant};
 /// env var replaces that with a reproducible single-binary comparison.
 static LMR_TABLE: OnceLock<[[i32; 64]; 64]> = OnceLock::new();
 
+/// A partir de que fila (contada do lado de quem joga) um lance de peao deixa
+/// de ser reduzido pelo LMR. 6 = sexta e setima filas. 0 desliga a regra.
+///
+/// Porque existe: a avaliacao nao ve peoes passados. Nao ha feature nenhuma
+/// nas 768 entradas que diga "este peao esta passado" ou "faltam-lhe duas
+/// casas" -- ve peca e casa, e se o peao esta livre depende dos peoes do
+/// adversario em tres colunas, que uma camada so' infere mal.
+///
+/// Medido nas nossas proprias posicoes, contra o Stockfish em 6000 posicoes
+/// etiquetadas, o erro medio da avaliacao por distancia a promocao:
+///
+///     sem passados   94 cp        a 2 filas   128 cp
+///     a 3 filas     118 cp        a 1 fila    158 cp
+///
+/// Uma posicao com um peao a uma casa de promover e' avaliada com 68% mais
+/// erro do que uma sem passados -- e sao posicoes de resposta binaria, ou se
+/// para o peao ou se perde. O mesmo padrao existe na rede anterior, portanto
+/// nao e' regressao: e' a arquitectura.
+///
+/// Se a avaliacao nao sabe que a linha e' critica, o LMR reduz-a como reduz
+/// qualquer lance quieto tardio, e a promocao cai para alem do horizonte. Nao
+/// reduzir e' a correccao barata: nao toca na rede e devolve a essas linhas a
+/// profundidade que a avaliacao nao sabe pedir.
+///
+/// ENTRA DESLIGADO (0) para ser medido por SPRT antes de contar. Nao e' um
+/// valor afinado; e' uma hipotese com um numero por tras.
+static PEAO_FILA_SEM_LMR: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(0);
+
+pub fn peao_fila_sem_lmr() -> i32 {
+    PEAO_FILA_SEM_LMR.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_peao_fila_sem_lmr(v: i32) {
+    PEAO_FILA_SEM_LMR.store(v.clamp(0, 8), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Este lance leva um peao a uma fila avancada?
+///
+/// Chamado DEPOIS de `make_move`, portanto quem jogou e' `board.side.opp()` e
+/// a peca ja esta em `mv.to` -- as duas coisas que o bug de 2026-07-25 nesta
+/// mesma funcao de reducao apanhou da maneira dificil.
+#[inline]
+fn peao_avancado(board: &crate::board::Board, mv: &crate::moves::Move) -> bool {
+    let fila_min = peao_fila_sem_lmr();
+    if fila_min == 0 {
+        return false;
+    }
+    let mover = board.side.opp();
+    match board.piece_at(mv.to) {
+        Some((crate::types::PieceType::Pawn, c)) if c == mover => {
+            let r = (mv.to as i32) / 8;                  // 0..7, absoluta
+            let rel = if mover == crate::types::Color::White { r } else { 7 - r };
+            rel + 1 >= fila_min                          // rel 0 = 1a fila
+        }
+        _ => false,
+    }
+}
+
 /// Same reasoning as `evaluation::warmup`: build the search-side globals before
 /// the clock matters, not inside the first search.
 pub fn warmup() {
@@ -3064,6 +3123,7 @@ impl<'a> Searcher<'a> {
                     && !mv.is_capture()
                     && mv.promotion.is_none()
                     && !gives_check
+                    && !peao_avancado(board, &mv)
                 {
                     let base = lmr_table()[(depth as usize).min(63)][(i + 1).min(63)];
                     // BUG FIX (2026-07-25): this runs AFTER make_move, so

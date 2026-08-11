@@ -1771,6 +1771,7 @@ impl Engine {
                     let trusted = if pv_len[i] > 2 { 1i64 } else { 0i64 };
                     ((r.1 - min_score + 14) as i64) * (r.2.max(1) as i64) * trusted
                 };
+                let mut return_idx: Option<usize> = None;
                 let mut votes: Vec<(Option<crate::moves::Move>, i64)> = Vec::new();
                 for (i, r) in results.iter().enumerate() {
                     match votes.iter_mut().find(|(m, _)| *m == r.0) {
@@ -1782,6 +1783,50 @@ impl Engine {
                 // search and the one whose clock decisions end it, so when the
                 // pool is genuinely split, the move already being announced is
                 // the one to play.
+                // DUAS coisas que a votacao nunca pode fazer, e que ate' aqui
+                // podia. Ambas vem do `get_best_thread` do Stockfish, que as
+                // trata antes de contar votos (GPL-3.0, ver NOTICES.md):
+                //
+                //   1. Eleger um lance cuja PROPRIA pontuacao e' derrota
+                //      provada. Uma thread convencida de que esta perdida nao
+                //      deve poder arrastar as outras para la'.
+                //   2. Sobrepor-se a uma thread que ja' provou vitoria. Se ha'
+                //      mate visto, a decisao passa a ser "qual o mate mais
+                //      curto" e a votacao deixa de mandar.
+                //
+                // A primeira e' exactamente a avaria registada no comentario
+                // acima -- "a votacao sobrepos-se a um thread principal
+                // CORRECTO e jogou o lance perdedor em 2 de 20". O peso podia
+                // ser grande porque `score - min_score` e' grande justamente
+                // quando as OUTRAS threads estao ainda pior.
+                let limiar_decisivo = crate::search::MATE_SCORE - crate::search::MAX_PLY as i32;
+                let vitoria = |sc: i32| sc >= limiar_decisivo;
+                let derrota = |sc: i32| sc <= -limiar_decisivo;
+
+                // Ha' vitoria provada? Entao escolhe-se o mate mais curto e
+                // acabou -- pontuacao maior significa mate em menos lances.
+                if let Some((i, _)) = results
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, r)| vitoria(r.1))
+                    .max_by_key(|(_, r)| r.1)
+                {
+                    return_idx = Some(i);
+                }
+
+                // Lances que sao derrota provada saem da contagem. Se TODOS o
+                // forem, nao ha nada a salvar e a votacao segue como antes --
+                // recusar tudo deixaria a escolha sem candidatos.
+                let algum_salvavel = results.iter().any(|r| !derrota(r.1));
+                if algum_salvavel {
+                    let perdidos: Vec<Option<crate::moves::Move>> = results
+                        .iter()
+                        .filter(|r| derrota(r.1))
+                        .map(|r| r.0)
+                        .collect();
+                    votes.retain(|(m, _)| !perdidos.contains(m) || results[0].0 == *m);
+                }
+
                 let top = votes.iter().map(|(_, v)| *v).max().unwrap_or(0);
                 let winner = if votes.iter().any(|(m, v)| *v == top && *m == results[0].0) {
                     results[0].0
@@ -1795,10 +1840,15 @@ impl Engine {
                 // Among the threads that agree on the winning move, take the
                 // one with the strongest individual claim: its PV is the one
                 // worth reporting.
-                (0..results.len())
-                    .filter(|&i| results[i].0 == winner)
-                    .max_by_key(|&i| weight(i, &results[i]))
-                    .unwrap_or(0)
+                match return_idx {
+                    // Vitoria provada: ja' esta decidido, e a votacao nao
+                    // opina sobre mates.
+                    Some(i) => i,
+                    None => (0..results.len())
+                        .filter(|&i| results[i].0 == winner)
+                        .max_by_key(|&i| weight(i, &results[i]))
+                        .unwrap_or(0),
+                }
             };
             let nodes_total: u64 = results.iter().map(|r| r.3).sum();
             let (best, score, depth_reached, _, winner) = results.remove(best_idx);
@@ -1876,6 +1926,13 @@ impl Engine {
                         "option name RitmoTecto type spin default {} min 0 max 1000",
                         tecto_ritmo()
                     );
+                    // A partir de que fila um peao deixa de ser reduzido pelo
+                    // LMR. 0 = desligado. Ver PEAO_FILA_SEM_LMR.
+                    let _ = writeln!(
+                        out,
+                        "option name PeaoSemLmr type spin default {} min 0 max 8",
+                        crate::search::peao_fila_sem_lmr()
+                    );
                     // Every search parameter, announced as a spin so an SPSA
                     // harness can read the default and the band straight from
                     // `uci` and drive them with `setoption`. They were already
@@ -1931,6 +1988,11 @@ impl Engine {
                     } else if tokens.len() >= 5 && tokens[1] == "name" && tokens[2] == "LazyVote"
                         && tokens[3] == "value" {
                         self.lazy_vote = tokens[4].eq_ignore_ascii_case("true") || tokens[4] == "1";
+                    } else if tokens.len() >= 5 && tokens[1] == "name" && tokens[2] == "PeaoSemLmr"
+                        && tokens[3] == "value" {
+                        if let Ok(v) = tokens[4].parse::<i32>() {
+                            crate::search::set_peao_fila_sem_lmr(v);
+                        }
                     } else if tokens.len() >= 5 && tokens[1] == "name" && tokens[2] == "RitmoTecto"
                         && tokens[3] == "value" {
                         // Percentagem do ritmo do adversario que podemos gastar
