@@ -178,7 +178,18 @@ pub fn score_normalizado(interno: i32) -> i32 {
 /// think about nothing. This is called once when the engine starts.
 pub fn warmup() {
     let _ = atk();
+    // EVERY architecture, not just the piece-square one. Each `rede()` is a
+    // separate OnceLock, so loading one leaves the others to be decoded
+    // inside the first search that asks for a score -- and the threats
+    // network is 16.7 MB of LEB128, measured at ~1.6s to decode. A bullet
+    // game cannot pay that on its first move, which is the same failure that
+    // once cost six losses a day when the warmup did not run at all.
+    //
+    // Cheap when a network is absent: `rede()` returns None without reading
+    // anything when its variable is unset and nothing is embedded.
     let _ = crate::nnue::rede();
+    let _ = crate::nnue_threats::rede();
+    let _ = crate::nnue_v3::rede();
 }
 
 /// The attack tables, built once.
