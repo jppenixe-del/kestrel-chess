@@ -280,6 +280,7 @@ fn compute_time_budget(
     pieces_left: i64,
     game_ply: i64,
     opp_pace: Option<i64>,
+    relogio_inicial: Option<i64>,
 ) -> (i64, i64) {
     let safe_time = (my_time - move_overhead_ms()).max(1);
 
@@ -483,10 +484,25 @@ fn compute_time_budget(
     let clearly_winning = last_score.map(|s| s >= 400).unwrap_or(false);
     let clearly_losing = last_score.map(|s| s <= -400).unwrap_or(false);
 
-    // Nivel 2: relogio baixo (< 20s) e SEM vantagem clara -- corta mais
+    // Os patamares, escalados ao ritmo da partida.
+    //
+    // Eram 20s e 10s fixos. Um nono do relogio inicial da' exactamente esses
+    // vinte segundos num 180+0 -- o blitz nao muda nada -- e desce-os para
+    // oito num 60+0, onde vinte eram um terco da partida a ser jogada em modo
+    // de corte. O tecto de 20s mantem o comportamento de tudo o que seja mais
+    // lento do que blitz, onde a formula ja estava calibrada.
+    //
+    // Sem relogio inicial conhecido (analise, `go` sem tempos) fica-se pelos
+    // valores de sempre.
+    let limiar_corte = relogio_inicial
+        .map(|ini| (ini / 9).clamp(8_000, 20_000))
+        .unwrap_or(20_000);
+    let limiar_rajada = limiar_corte / 2;
+
+    // Nivel 2: relogio baixo e SEM vantagem clara -- corta mais
     // fundo do que a formula normal permitiria. So' se relaxa quando a
     // vantagem e' NOSSA (clearly_winning); nunca quando e' do adversario.
-    if safe_time < 20_000 && !clearly_winning {
+    if safe_time < limiar_corte && !clearly_winning {
         let cut = (safe_time / 25).clamp(20, 800);
         soft = soft.min(cut);
         hard_cap = hard_cap.min(cut);
@@ -506,7 +522,7 @@ fn compute_time_budget(
     // Ten seconds buys about eighty moves at this rate, which is more chess
     // than most positions have remaining. Kept clear of the panic tier below,
     // which is a different thing: this is playing fast, that is surviving.
-    if safe_time < 10_000 {
+    if safe_time < limiar_rajada {
         let burst = (safe_time / 80).clamp(15, 150);
         soft = soft.min(burst);
         // An increment is income, not savings. Whatever is spent up to it comes
@@ -690,6 +706,20 @@ pub struct Engine {
     /// Semente para escolher entre lances de livro. Ver escolhe_do_livro.
     book_rng: u64,
     opp_time_anterior: Option<i64>,
+    /// O relogio no inicio DESTA partida, estimado pelo maior valor ja visto.
+    ///
+    /// Existe porque os patamares de relogio baixo eram absolutos -- cortar
+    /// aos 20s e disparar aos 10s -- e vinte segundos nao querem dizer o mesmo
+    /// em todos os ritmos: num 180+0 sao o ultimo nono do relogio, num 60+0
+    /// sao um terco dele. O bullet entrava em modo de corte com um terco da
+    /// partida por jogar, que e' a origem do "primeiro lento de mais, depois
+    /// rapido de mais".
+    ///
+    /// Estimado e nao recebido: o UCI nao diz qual foi o relogio inicial, so'
+    /// o actual. O maior ja visto e' exacto desde o primeiro `go` da partida,
+    /// e se a ponte so' apanhar o jogo a meio erra para MENOS, o que torna os
+    /// patamares mais conservadores em vez de mais arriscados.
+    relogio_inicial: Option<i64>,
     opp_pace: Option<i64>,
     last_score: Option<i32>, // score (cp, nossa perspetiva) do ultimo "go" -- para os niveis 2/3 de compute_time_budget
     style_book: Option<crate::book::Book>, // "assinatura" da Judit Polgar -- ver book.rs
@@ -743,6 +773,7 @@ impl Engine {
                 | 1,
             opp_time_anterior: None,
             opp_pace: None,
+            relogio_inicial: None,
             last_score: None,
             style_book,
             threads: 1,
@@ -972,6 +1003,12 @@ impl Engine {
         }
         if wtime > 0 || btime > 0 {
             self.opp_time_anterior = Some(opp_time);
+            // O maior relogio ja visto nesta partida e a melhor estimativa do
+            // inicial que o UCI permite. Ver `relogio_inicial`.
+            self.relogio_inicial = Some(match self.relogio_inicial {
+                Some(m) => m.max(my_time),
+                None => my_time,
+            });
         }
 
         let instant_book_ok = restrict_root.is_empty()
@@ -1266,7 +1303,7 @@ impl Engine {
                 compute_time_budget(my_time, my_inc, opp_time, movestogo, self.last_score,
                                     pieces_left, (self.board.fullmove as i64 - 1) * 2
                                         + if side_white { 0 } else { 1 },
-                                    self.opp_pace);
+                                    self.opp_pace, self.relogio_inicial);
             // The opening is played, not calculated -- including the parts of
             // it the book does not reach.
             //
@@ -1988,6 +2025,7 @@ impl Engine {
                     self.last_score = None;
                     self.opp_time_anterior = None;
                     self.opp_pace = None;
+                    self.relogio_inicial = None;
                 }
                 "position" => {
                     self.set_position(&tokens[1..]);
