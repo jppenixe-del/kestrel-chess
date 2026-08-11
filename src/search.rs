@@ -3548,7 +3548,13 @@ impl<'a> Searcher<'a> {
         //    depth too, and paying full depth to confirm it is what makes
         //    fail-highs expensive.
         let sp = search_params();
-        let mut delta: i32 = sp.asp_init_delta + prev_score * prev_score / 16384;
+        // A janela e' o que separa as threads umas das outras agora. Cada uma
+        // parte de uma largura propria, portanto falha alto/baixo em pontos
+        // diferentes e explora ordens diferentes -- mesma ideia do
+        // `5 + threadIdx % 8` do Stockfish, escrita nas nossas unidades.
+        let mut delta: i32 = sp.asp_init_delta
+            + (self.thread_idx as i32 % 8)
+            + prev_score * prev_score / 16384;
         let (mut alpha, mut beta) = if depth >= sp.min_asp_depth {
             (
                 (prev_score - delta).max(-MATE_SCORE - 1),
@@ -3638,15 +3644,29 @@ impl<'a> Searcher<'a> {
         // Cada ajudante salta um padrao proprio de profundidades, portanto
         // chega a cada uma com a TT noutro estado e explora outra ordem. A
         // thread 0 nunca salta nada: e ela que decide o lance.
-        const SALTO_TAM: [i32; 20] = [1, 1, 2, 2, 2, 3, 3, 4, 4, 4, 5, 5, 6, 6, 6, 7, 7, 8, 8, 8];
-        const SALTO_FASE: [i32; 20] = [0, 1, 0, 1, 2, 0, 1, 0, 1, 2, 0, 1, 0, 1, 2, 0, 1, 0, 1, 2];
+        // SEM SALTOS. As threads passam a divergir pela LARGURA DA JANELA DE
+        // ASPIRACAO (ver `asp_init_delta` em search_root), que e' como o
+        // Stockfish actual o faz -- `delta = 5 + threadIdx % 8 + ...`.
+        //
+        // Os saltos de profundidade vinham de uma versao antiga do Stockfish
+        // que entretanto os abandonou, e o efeito medido aqui foi patologico:
+        // na MESMA posicao e com o MESMO tempo, um fio escolhia sempre o mesmo
+        // lance e seis fios espalhavam-se por cinco lances diferentes, sem
+        // nunca escolher o do fio unico --
+        //
+        //     abertura, 10 corridas:  1 fio -> 10x a2a3
+        //                             6 fios -> 3x b1c3, 2x g1f3, 2x f1d3,
+        //                                       2x b2b4, 1x c1e3
+        //     meio-jogo, 8 corridas:  1 fio -> 8x f3e5
+        //                             6 fios -> 6x h2h3, 1x h2h4, 1x f3e5
+        //
+        // Divergir e' o proposito do Lazy SMP -- tirar a votacao custa 37,6%,
+        // medido. O que nao e' proposito e' as ajudantes estarem em
+        // profundidades DIFERENTES e a votacao pesar por profundidade: uma
+        // thread que saltou para um numero alto por um caminho raso ganha peso
+        // exactamente por isso. Com janelas em vez de saltos, todas percorrem
+        // as mesmas profundidades e divergem no caminho, que e' o que se quer.
         for depth in 1..=self.limits.max_depth {
-            if self.thread_idx > 0 {
-                let i = (self.thread_idx - 1) % 20;
-                if ((depth + SALTO_FASE[i]) / SALTO_TAM[i]) % 2 != 0 {
-                    continue;
-                }
-            }
             let score = self.search_root(board, depth, prev_score);
             // 2026-07-20 (BUG REAL corrigido -- irmao do bug ja' corrigido
             // dentro do loop de lances de negamax(), "nunca descartar o

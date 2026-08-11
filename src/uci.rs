@@ -1769,7 +1769,14 @@ impl Engine {
                     // plays -- it simply does not get to outvote one that
                     // searched something through to an end.
                     let trusted = if pv_len[i] > 2 { 1i64 } else { 0i64 };
-                    ((r.1 - min_score + 14) as i64) * (r.2.max(1) as i64) * trusted
+                    // SEM o factor de profundidade. O Stockfish actual pesa
+                    // por `score - minScore + 14` e mais nada; o `* depth`
+                    // vinha de uma versao antiga, a par do esquema de saltos
+                    // que o acompanhava. Com as threads todas a percorrer as
+                    // mesmas profundidades (ver search.rs), multiplicar pela
+                    // profundidade so' amplifica ruido de quem chegou la'
+                    // primeiro.
+                    ((r.1 - min_score + 14) as i64) * trusted
                 };
                 let mut return_idx: Option<usize> = None;
                 let mut votes: Vec<(Option<crate::moves::Move>, i64)> = Vec::new();
