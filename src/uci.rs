@@ -745,7 +745,22 @@ impl Engine {
     pub fn new() -> Self {
         let atk = Attacks::new();
         let zob = Zobrist::new();
-        let style_book = crate::book::Book::load(&default_style_book_path()).ok();
+        // DESLIGAR O LIVRO, e dizê-lo em voz alta.
+        //
+        // Já era possível ficar sem livro -- bastava o ficheiro não existir --
+        // mas isso acontece EM SILÊNCIO, e foi assim que o motor jogou dias
+        // inteiros a improvisar aberturas sem ninguém dar por isso, depois de
+        // o ficheiro ser renomeado. Uma ausência que se escolhe tem de se
+        // distinguir de uma ausência por acidente.
+        let sem_livro = std::env::var("KESTREL_SEM_LIVRO")
+            .map(|v| v != "0")
+            .unwrap_or(false);
+        let style_book = if sem_livro {
+            eprintln!("livro: DESLIGADO por KESTREL_SEM_LIVRO -- aberturas jogadas pela busca");
+            None
+        } else {
+            crate::book::Book::load(&default_style_book_path()).ok()
+        };
         // Build every lazily-initialised global now, while no clock is
         // running -- see evaluation::warmup().
         // Profile before warm-up: warm-up evaluates a position, which seals
