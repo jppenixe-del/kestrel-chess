@@ -932,6 +932,36 @@ impl Engine {
             && depth.is_none()
             && nodes.is_none()
             && std::env::var_os("KESTREL_NO_BOOK_INSTANT").is_none();
+
+        // UM so' lance legal: joga-se, nao se pensa.
+        //
+        // Nao havia atalho nenhum para isto -- uma recaptura obrigatoria ou uma
+        // saida de xeque unica pagavam a busca inteira, e num relogio de bullet
+        // isso e' orcamento gasto onde nao ha nada para decidir. Reportado com
+        // `time 0` e `nodes 0` porque e' a verdade: nao houve busca.
+        //
+        // A montante do livro e das tablebases de proposito: se so' ha um
+        // lance, nem vale a pena perguntar-lhes. Gerar os legais custa
+        // microsegundos contra os centenas de milissegundos que se poupam.
+        //
+        // Sem pontuacao inventada: a busca e' que sabe quanto vale a posicao e
+        // aqui nao correu, portanto anuncia-se cp 0. Quem le' o score para
+        // decidir empates (ver `lichess_bridge.py`) ve' um valor neutro, que e'
+        // preferivel a um numero com ar de opiniao que ninguem formou.
+        if instant_book_ok {
+            let legais = crate::movegen::generate_legal(&mut self.board, &self.atk);
+            if legais.len() == 1 {
+                let mv = legais[0];
+                let _ = writeln!(
+                    out,
+                    "info depth 1 multipv 1 score cp 0 nodes 0 nps 0 time 0 pv {}",
+                    mv.to_uci()
+                );
+                let _ = writeln!(out, "bestmove {}", mv.to_uci());
+                let _ = out.flush();
+                return;
+            }
+        }
         // Solved before it is searched.
         //
         // Same place as the book and for the same reason: if the answer already
