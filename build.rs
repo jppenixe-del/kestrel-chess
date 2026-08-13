@@ -31,7 +31,30 @@ fn embute(var: &str, ficheiro: &str, cfg: &str) {
     }
 }
 
+/// Nap2Siriux's own `nnue_net.cpp`, vendored and compiled straight in --
+/// their real evaluate(), their real SIMD, no Rust reimplementation to keep
+/// in sync bug-for-bug. `board.h` here is a ~50-line stand-in (see the file)
+/// exposing only the handful of methods nnue_net.cpp actually calls; their
+/// real board.h pulls in movegen/attacks/eval_state/cuckoo that a static
+/// eval call never needed.
+fn compila_napv10_cpp() {
+    println!("cargo:rerun-if-changed=vendor/napv10");
+    cc::Build::new()
+        .cpp(true)
+        .std("c++20")
+        .file("vendor/napv10/napoleon/nnue_net.cpp")
+        .file("vendor/napv10/attacks.cpp")
+        .file("vendor/napv10/shim.cpp")
+        .include("vendor/napv10")
+        .flag_if_supported("-mavx2")
+        .flag_if_supported("-mfma")
+        .flag_if_supported("-w") // vendored code, not ours to keep warning-clean
+        .opt_level(3)
+        .compile("napv10cpp");
+}
+
 fn main() {
+    compila_napv10_cpp();
     // A escala da rede, decidida em tempo de COMPILACAO e nao pela ponte.
     //
     // As margens de poda sao centipeoes absolutos, portanto a escala e' uma

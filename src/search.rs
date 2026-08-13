@@ -154,7 +154,7 @@ pub fn eval_margin_scale() -> i32 {
     // denso, pode dar-se ao luxo de explorar mais por no'; a nossa, mais
     // lenta por no' nesta rede, so' fica com MENOS profundidade efectiva
     // ao alargar. Desligado ate' se perceber melhor a causa.
-    let _ = crate::nnue_napv10::active();
+    let _ = crate::nnue_napv10_ffi::active();
     100
 }
 

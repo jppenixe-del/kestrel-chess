@@ -1716,11 +1716,22 @@ impl Engine {
                         report: ti == 0,
                         thread_idx: ti,
                     };
-                    scope.spawn(move || {
-                        let mut searcher = searcher;
-                        let (best, score, depth_reached, nodes) = searcher.iterative_deepening(&mut b);
-                        (best, score, depth_reached, nodes, searcher)
-                    })
+                    // A pilha por omissão (2MB) chegava para a busca em Rust
+                    // sozinha, mas a napv10 (vendor/napv10/, C++ vendorizado)
+                    // aloca buffers grandes na pilha por CADA chamada a
+                    // evaluate() (concat[2*1536+32], a1[1024] floats, ...) --
+                    // multiplicado pela profundidade real de negamax, estoura
+                    // a pilha por omissão. 16MB e' folga generosa, barata em
+                    // memória virtual num sistema 64-bit.
+                    std::thread::Builder::new()
+                        .stack_size(16 * 1024 * 1024)
+                        .spawn_scoped(scope, move || {
+                            let mut searcher = searcher;
+                            let (best, score, depth_reached, nodes) =
+                                searcher.iterative_deepening(&mut b);
+                            (best, score, depth_reached, nodes, searcher)
+                        })
+                        .expect("falha a criar thread de busca")
                 })
                 .collect();
             // Weighted vote across threads, not a head count.

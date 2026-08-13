@@ -42,10 +42,11 @@ pub fn evaluate(board: &mut Board) -> i32 {
     // A napv10 (Nap2Siriux, rede NOSSA) tem prioridade sobre a li11 quando
     // ambas as variaveis estiverem definidas -- nao deviam estar as duas ao
     // mesmo tempo em uso a serio, mas a ordem tem de ser alguma.
-    if crate::nnue_napv10::ligada() {
-        if let Some(net) = crate::nnue_napv10::rede() {
-            return crate::nnue_napv10::evaluate(net, board);
-        }
+    // FFI para o evaluate() REAL do Nap2Siriux (vendor/napv10/) -- ver
+    // nnue_napv10_ffi.rs para o porque' de ja' nao ser a reimplementacao
+    // Rust em nnue_napv10.rs (ainda no repo, fora do dispatch).
+    if crate::nnue_napv10_ffi::active() {
+        return crate::nnue_napv10_ffi::evaluate(board);
     }
     if crate::nnue_li11::li11_ligada() {
         if let Some(net) = crate::nnue_li11::rede() {
@@ -215,7 +216,7 @@ pub fn warmup() {
     // LEB128 (rede + ameacas full): a mesma classe de bug que esta warmup()
     // ja existe para evitar, so' que nao as cobria.
     let _ = crate::nnue_li11::rede();
-    let _ = crate::nnue_napv10::rede();
+    let _ = crate::nnue_napv10_ffi::rede_carregada();
 }
 
 /// The attack tables, built once.
