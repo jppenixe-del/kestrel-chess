@@ -136,6 +136,28 @@ pub const MATE_SCORE: i32 = 30000;
 pub const NO_SCORE: i32 = -MATE_SCORE - 100;
 pub const MAX_PLY: usize = 128;
 
+/// Percent multiplier for the eval-margin pruning thresholds (RFP, NMP,
+/// razoring, futility) -- 100 = unchanged. A foreign network read through
+/// our own port has a different noise/volatility profile than the one
+/// these margins were tuned against; the Nap2Siriux reference documents
+/// exactly this (`search_params.h`: separate, ~1.5x wider `_NNUE` margins,
+/// "the HCE margins fire too early" against their own bullet-WDL net).
+/// We do not have a second network to split constants against the way
+/// they do -- one pragmatic knob instead of relearning their whole
+/// parameter set, widening every eval-margin site the same way while this
+/// gets measured.
+#[inline]
+pub fn eval_margin_scale() -> i32 {
+    // 2026-08-13: tentativa de alargar 1.5x (a proporcao que o
+    // dual_vision.h deles usa) mediu PIOR (15% vs 27.5% vs SF1800 sem
+    // isto) -- a busca deles e' multi-thread com SIMD pesado no forward
+    // denso, pode dar-se ao luxo de explorar mais por no'; a nossa, mais
+    // lenta por no' nesta rede, so' fica com MENOS profundidade efectiva
+    // ao alargar. Desligado ate' se perceber melhor a causa.
+    let _ = crate::nnue_napv10::active();
+    100
+}
+
 /// Every scalar pruning margin/threshold in the search, in one runtime-
 /// swappable place -- same reversible pattern as `Weights`/
 /// `KESTREL_TUNED_WEIGHTS` in eval.rs, but for the SEARCH side. Before
@@ -2602,7 +2624,7 @@ impl<'a> Searcher<'a> {
                 margin += prev_hist / sp.rfp_hist_divisor.max(1);
             }
 
-            let margin = margin.max(20);
+            let margin = (margin.max(20) * eval_margin_scale()) / 100;
             if static_eval - margin >= beta {
                 self.cut_rfp += 1;
                 return static_eval - margin;
@@ -2662,9 +2684,11 @@ impl<'a> Searcher<'a> {
             // corrected value cannot do that job. A 2026-07-23 review saw the
             // raw value here, read it as a copy-paste slip, and made both
             // gates corrected. It was not a slip.
-            && static_eval >= beta + sp_nmp.nmp_eval_margin
+            && static_eval >= beta + (sp_nmp.nmp_eval_margin * eval_margin_scale()) / 100
             && raw_static_eval
-                >= beta + sp_nmp.nmp_static_eval_base_margin - sp_nmp.nmp_static_eval_depth_margin * depth
+                >= beta
+                    + (sp_nmp.nmp_static_eval_base_margin * eval_margin_scale()) / 100
+                    - sp_nmp.nmp_static_eval_depth_margin * depth
         {
             let r = ((sp_nmp.nmp_base_reduction + depth * sp_nmp.nmp_depth_reduction_scale) / 256
                 + ((static_eval - beta) / sp_nmp.nmp_eval_reduction_scale).min(sp_nmp.nmp_max_eval_reduction))
@@ -2732,7 +2756,7 @@ impl<'a> Searcher<'a> {
         // o fail-low, para nunca perder uma tactica real.
         if !is_pv && !in_check && ply > 0 && depth <= 3 {
             let sp = search_params();
-            let margin = sp.razor_base + sp.razor_per_depth * (depth - 1);
+            let margin = ((sp.razor_base + sp.razor_per_depth * (depth - 1)) * eval_margin_scale()) / 100;
             if static_eval + margin <= alpha {
                 // `raw_static_eval` already IS `evaluate(board)` here (we are
                 // under `!in_check`, so it was computed as the full eval on
@@ -2961,7 +2985,9 @@ impl<'a> Searcher<'a> {
                 && alpha.abs() < MATE_SCORE - MAX_PLY as i32
             {
                 let sp = search_params();
-                let margin = if improving { sp.futility_improving.at(depth) } else { sp.futility_not_improving.at(depth) };
+                let margin = (if improving { sp.futility_improving.at(depth) } else { sp.futility_not_improving.at(depth) }
+                    * eval_margin_scale())
+                    / 100;
                 let fe = *futility_eval.get_or_insert(static_eval);
                 if fe + margin <= alpha {
                     i += 1;
@@ -2988,7 +3014,9 @@ impl<'a> Searcher<'a> {
                 && alpha.abs() < MATE_SCORE - MAX_PLY as i32
             {
                 let sp = search_params();
-                let margin = if improving { sp.cap_futility_improving.at(depth) } else { sp.cap_futility_not_improving.at(depth) };
+                let margin = (if improving { sp.cap_futility_improving.at(depth) } else { sp.cap_futility_not_improving.at(depth) }
+                    * eval_margin_scale())
+                    / 100;
                 let fe = *futility_eval.get_or_insert(static_eval);
                 let see_val = see::see(self.atk, board, &mv);
                 if fe + see_val + margin <= alpha {
@@ -3518,10 +3546,26 @@ impl<'a> Searcher<'a> {
     /// que os testes em lote (futility/RFP/razoring/mate-distance)
     /// validaram como positiva em conjunto. Ver NOTAS_PROXIMA_SESSAO
     /// para o historico completo.
-    fn search_root(&mut self, board: &mut Board, depth: i32, prev_score: i32) -> i32 {
+    fn search_root(
+        &mut self,
+        board: &mut Board,
+        depth: i32,
+        prev_score: i32,
+        _root_average: &mut Option<i32>,
+    ) -> i32 {
         if depth <= 1 {
             return self.negamax(board, depth, -MATE_SCORE - 1, MATE_SCORE + 1, 0, false);
         }
+        // 2026-08-13: tried a napv10-gated sliding-average variant here
+        // (Nap2Siriux's aspWindowsNNUE(), centers on a running average
+        // instead of prev_score, asymmetric 52/256 vs 120/256 widening).
+        // Measured WORSE against the same SF1800 baseline than the plain
+        // version below (21.7% vs the un-gated 35% baseline), on top of an
+        // already-documented history of three independent negative signals
+        // for touching this function at all. Reverted; not worth the added
+        // surface for an unproven gain. `_root_average` kept as a parameter
+        // so the call site does not have to change again if this is
+        // revisited with better evidence.
         // Adopted whole, rather than assembled a piece at a time.
         //
         // Every part of this had a reason behind it in the engine it comes
@@ -3592,6 +3636,9 @@ impl<'a> Searcher<'a> {
         let mut best_score = 0;
         let mut last_depth = 0;
         let mut prev_score = 0;
+        // Sliding average of the root score across iterations, only read
+        // when napv10 is active -- see `search_root`'s use of it.
+        let mut root_average: Option<i32> = None;
         let mut stable_count: u32 = 0;
         // How often the search has changed its mind about the best move.
         // Stability says "nothing has moved lately"; this says "this position
@@ -3667,7 +3714,7 @@ impl<'a> Searcher<'a> {
         // exactamente por isso. Com janelas em vez de saltos, todas percorrem
         // as mesmas profundidades e divergem no caminho, que e' o que se quer.
         for depth in 1..=self.limits.max_depth {
-            let score = self.search_root(board, depth, prev_score);
+            let score = self.search_root(board, depth, prev_score, &mut root_average);
             // 2026-07-20 (BUG REAL corrigido -- irmao do bug ja' corrigido
             // dentro do loop de lances de negamax(), "nunca descartar o
             // resultado de um lance-filho ja' terminado so' porque o
