@@ -237,6 +237,16 @@ fn carrega(bytes: &[u8]) -> Option<RedeNapV10> {
             has_threats = full; // so' suportamos o esquema FULL (9216), como o li11/thr_x5
         }
     }
+    // Bisseccao temporaria: NAPV10_NO_THREATS / NAPV10_NO_BULLET para isolar
+    // qual componente esta' a estragar o jogo real (ver derrota 1-69 do SPRT
+    // interno, mesmo depois do fix do warmup -- os spot-checks estaticos nao
+    // apanharam isto, so' jogo real apanhou).
+    if std::env::var("NAPV10_NO_THREATS").is_ok() {
+        has_threats = false;
+    }
+    if std::env::var("NAPV10_NO_BULLET").is_ok() {
+        bullet = None;
+    }
 
     eprintln!(
         "nnue-napv10: rede carregada (L1={}, threats={}, {} bytes)",
@@ -382,6 +392,30 @@ thread_local! {
     static THR_BUF: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// Recomputo do zero, sem cache nenhuma -- so' para `NAPV10_VALIDATE_CACHE`
+/// apanhar divergencia do cache incremental sob busca real (muitos nos,
+/// muitos ramos, nao so' a chamada isolada de um teste estatico).
+fn recompute_pecas(net: &RedeNapV10, pecas: [[u64; 6]; 2], persp: usize, bucket: usize) -> Vec<i32> {
+    let l1 = net.l1;
+    let mut v: Vec<i32> = net.acc_bias.iter().map(|&b| b as i32).collect();
+    for c in 0..2 {
+        for t in 0..6 {
+            let mut bb = pecas[c][t];
+            while bb != 0 {
+                let sq = bb.trailing_zeros() as usize;
+                bb &= bb - 1;
+                if let Some(f) = napv10_feature(bucket, persp, c, t, sq) {
+                    let row = &net.acc_weight[f * l1..f * l1 + l1];
+                    for k in 0..l1 {
+                        v[k] += row[k] as i32;
+                    }
+                }
+            }
+        }
+    }
+    v
+}
+
 /// Avalia com a cabeça "big". `evaluate(board)` no C++ e' exactamente
 /// `evaluate(board, HEAD_BIG)` -- e' o que o comando `eval` deles usa, e a
 /// referencia mais facil de validar.
@@ -402,6 +436,18 @@ pub fn evaluate(net: &RedeNapV10, board: &Board) -> i32 {
         cache.refresca(net, board.pieces, 0, bucket_w, acc_w);
         cache.refresca(net, board.pieces, 1, bucket_b, acc_b);
     });
+
+    if std::env::var("NAPV10_VALIDATE_CACHE").is_ok() {
+        let ref_w = recompute_pecas(net, board.pieces, 0, bucket_w);
+        let ref_b = recompute_pecas(net, board.pieces, 1, bucket_b);
+        if ref_w[..] != acc_w[..] || ref_b[..] != acc_b[..] {
+            eprintln!(
+                "DIVERGENCIA cache pecas! bucket_w={} bucket_b={} acc_w[0..4]={:?} ref_w[0..4]={:?} acc_b[0..4]={:?} ref_b[0..4]={:?}",
+                bucket_w, bucket_b, &acc_w[..4.min(l1)], &ref_w[..4.min(l1)], &acc_b[..4.min(l1)], &ref_b[..4.min(l1)]
+            );
+            panic!("cache de pecas divergiu do recomputo");
+        }
+    }
 
     if net.has_threats {
         let pos = features::Pos { pieces: board.pieces };
@@ -451,7 +497,11 @@ pub fn evaluate(net: &RedeNapV10, board: &Board) -> i32 {
     }
 
     let n = board.occ_all.count_ones() as usize;
-    let bucket = ((n as i32 - 2) / 4).clamp(0, MATERIAL_BUCKETS as i32 - 1) as usize;
+    // materialBucket(pc) do C++ (nnue_net.cpp:178): clamp((pc-1)/4, 0, 7) --
+    // NAO (pc-2)/4. As duas so' coincidem quando pc%4 != 1; em pc=5,9,13,...
+    // liam-se os pesos do balde ERRADO (um a menos), sistematicamente, em
+    // qualquer jogo real conforme as pecas saem do tabuleiro.
+    let bucket = ((n as i32 - 1) / 4).clamp(0, MATERIAL_BUCKETS as i32 - 1) as usize;
     // Cabeca barata so' quando o material ja' decidiu a posicao (dama liquida
     // a mais ou mais) -- a cascata por profundidade que o nome "bullet"
     // sugeria foi medida a perder 66 Elo la' e nunca chegou a activar por
@@ -542,8 +592,34 @@ pub fn evaluate(net: &RedeNapV10, board: &Board) -> i32 {
         eprintln!("l3_b[bucket]={}", h.l3_b[bucket]);
     }
 
-    let score = ((out + psqt_bias) * OUTPUT_SCALE_CP).round() as i32;
-    score.clamp(-3000, 3000)
+    // Clamp primeiro, à escala crua (a que o treino/formula do C++ produz),
+    // DEPOIS escala-se para a busca -- clampar depois de escalar destruia o
+    // gradiente inteiro para posicoes so' moderadamente ma's (tudo o que
+    // passasse de -300cp cru virava o MESMO -3000 final a escala 10x,
+    // indistinguivel de um mate objectivo). MATE_SCORE e' 30000; a escala
+    // fica bem abaixo disso mesmo no pior caso (scale<=1000 -> 30000 max).
+    let score_cru = ((out + psqt_bias) * OUTPUT_SCALE_CP).round() as i32;
+    let score_cru = score_cru.clamp(-3000, 3000);
+    // `nnueScale` do dual_vision.h, mesma razao la' e' ca': "a rede bullet WDL
+    // da' cp comprimidos; aumentar (ex: 400) descomprime para a escala Sirius
+    // (~100cp/peao) para a poda bater certo". Sem isto as margens de poda do
+    // Kestrel (RFP, null-move, LMR -- todas em cp ~peao=100) veem um "quase
+    // nada" onde deviam ver "dama pendurada" e cortam a busca cegamente, e o
+    // `clearly_winning`/`clearly_losing` do uci.rs (limiar fixo em 400cp)
+    // nunca dispara -- ficamos presos no tecto de tempo apertado a partida
+    // toda mesmo quando claramente a ganhar. 100 = sem alteracao.
+    let scale_pct = napv10_scale();
+    if scale_pct == 100 { score_cru } else { score_cru * scale_pct / 100 }
+}
+
+fn napv10_scale() -> i32 {
+    static SCALE: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    *SCALE.get_or_init(|| {
+        std::env::var("KESTREL_NAPV10_SCALE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100)
+    })
 }
 
 pub fn escala() -> i32 {

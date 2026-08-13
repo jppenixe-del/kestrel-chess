@@ -209,6 +209,13 @@ pub fn warmup() {
     let _ = crate::nnue::rede();
     let _ = crate::nnue_threats::rede();
     let _ = crate::nnue_v3::rede();
+    // As duas mais recentes (li11, napv10) tinham ficado de fora desta lista
+    // -- ambas so' se avaliam a si proprias no primeiro evaluate() real, que
+    // e' dentro do relogio do primeiro lance. A napv10 sozinha e' 34MB de
+    // LEB128 (rede + ameacas full): a mesma classe de bug que esta warmup()
+    // ja existe para evitar, so' que nao as cobria.
+    let _ = crate::nnue_li11::rede();
+    let _ = crate::nnue_napv10::rede();
 }
 
 /// The attack tables, built once.
