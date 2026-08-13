@@ -53,6 +53,23 @@ pub struct RedeNapV10 {
     threat_weight: Vec<i16>, // [THREAT_FEATURES_FULL * l1], vazio se ausente
     has_threats: bool,
     big: Head,
+    bullet: Option<Head>,   // cabeca 16-larga, so' para material ja' decidido
+}
+
+/// `MVAL` do `dual_vision.cpp` (P,N,B,R,Q,K) e o limiar `pureDecidedMaterial`
+/// que la' vem a 900 por omissao -- so' dama liquida a mais dispara a troca
+/// para a cabeca bullet, nao qualquer troca pendente (ver comentario deles:
+/// com 500 disparava em 38% dos nos a depth 20, com trocas so' PENDENTES).
+const MVAL: [i32; 6] = [100, 320, 330, 500, 900, 0];
+const DECIDED_MATERIAL: i32 = 900;
+
+fn material_diff(board: &Board) -> i32 {
+    let mut diff = 0i32;
+    for t in 0..5 {
+        diff += MVAL[t]
+            * (board.pieces[0][t].count_ones() as i32 - board.pieces[1][t].count_ones() as i32);
+    }
+    diff
 }
 
 // -------------------------------------------------------------- leitura ---
@@ -179,13 +196,21 @@ fn carrega(bytes: &[u8]) -> Option<RedeNapV10> {
         l3_w: Default::default(), l3_b: [0.0; MATERIAL_BUCKETS],
         l1_out: BIG_DL1, l2_out: BIG_DL2,
     };
+    let mut bullet: Option<Head> = None;
     if flags & 2 != 0 {
         // As 3 cabecas vem em ORDEM: bullet(16,32), small(32,32), big(32,32).
-        // Le-se e descarta-se bullet e small para chegar a' big na posicao
-        // certa -- o ficheiro e' sequencial, nao ha' como saltar directo.
-        let _bullet = le_cabeca(bytes, &mut pos, l1 * 2, 16, 32, qa, qb)?;
+        // Guarda-se a bullet (usada quando o material ja' decidiu a posicao,
+        // ver `escolhe_cabeca`) e descarta-se a small -- o dual_vision.h do
+        // Nap2Siriux documenta que a small so' entra com pureMidDepth != 0,
+        // que e' 0 (desligado) por omissao la' e aqui tambem, de proposito:
+        // a cascata por profundidade foi MEDIDA a perder 66 Elo contra
+        // "big em toda a parte" (comentario no proprio dual_vision.h) e foi
+        // por isso que os defaults mudaram para 0/0. So' se porta o que
+        // ficou validado: bullet por material decidido, nunca a cascata.
+        let b = le_cabeca(bytes, &mut pos, l1 * 2, 16, 32, qa, qb)?;
         let _small = le_cabeca(bytes, &mut pos, l1 * 2, 32, 32, qa, qb)?;
         big = le_cabeca(bytes, &mut pos, l1 * 2, BIG_DL1, BIG_DL2, qa, qb)?;
+        bullet = Some(b);
     }
 
     // Chaos/Fear head (flag bit2) -- lido e descartado, nao usamos.
@@ -218,7 +243,7 @@ fn carrega(bytes: &[u8]) -> Option<RedeNapV10> {
         l1, has_threats, bytes.len()
     );
 
-    Some(RedeNapV10 { l1, qa, qb, acc_bias, acc_weight, psqt, threat_weight, has_threats, big })
+    Some(RedeNapV10 { l1, qa, qb, acc_bias, acc_weight, psqt, threat_weight, has_threats, big, bullet })
 }
 
 // ---------------------------------------------------------- accumulador ---
@@ -427,7 +452,20 @@ pub fn evaluate(net: &RedeNapV10, board: &Board) -> i32 {
 
     let n = board.occ_all.count_ones() as usize;
     let bucket = ((n as i32 - 2) / 4).clamp(0, MATERIAL_BUCKETS as i32 - 1) as usize;
-    let h = &net.big;
+    // Cabeca barata so' quando o material ja' decidiu a posicao (dama liquida
+    // a mais ou mais) -- a cascata por profundidade que o nome "bullet"
+    // sugeria foi medida a perder 66 Elo la' e nunca chegou a activar por
+    // omissao; isto e' o que ficou validado no lugar dela.
+    let h = match &net.bullet {
+        Some(bh) => {
+            let diff = material_diff(board);
+            if std::env::var("NAPV10_DEBUG_DUMP").is_ok() {
+                eprintln!("material_diff={}", diff);
+            }
+            if diff >= DECIDED_MATERIAL || -diff >= DECIDED_MATERIAL { bh } else { &net.big }
+        }
+        None => &net.big,
+    };
     let l1_in = 2 * l1;
 
     let dequant1 = 1.0 / (127.0 * net.qb);
