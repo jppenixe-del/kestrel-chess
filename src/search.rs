@@ -117,12 +117,67 @@ fn lmr_table() -> &'static [[i32; 64]; 64] {
         for d in 1..64 {
             for m in 1..64 {
                 let r = 0.5 + (d as f64).ln() * (m as f64).ln() / divisor;
-                t[d][m] = r as i32;
+                // Stored in MILLI-PLIES (see `LMR_ESCALA`), not whole plies.
+                // Same curve as before, same divisor -- only the resolution
+                // changes. Truncating this to an integer here was discarding
+                // 42% of the reduction the formula asks for at depth 5,
+                // move 5 (1.733 -> 1), and 21% at depth 14 (3.816 -> 3).
+                t[d][m] = (r * LMR_ESCALA as f64).round() as i32;
             }
         }
         t
     })
 }
+
+/// Fixed-point scale for LMR reductions: they accumulate in 1/1024 of a ply
+/// and are divided down to whole plies ONCE, at the end.
+///
+/// Every modulator used to be rounded to a whole ply on its own -- the base
+/// truncated from its float, history integer-divided, the rest a flat +/-1 --
+/// so each term could only say "nothing" or "a whole ply". Measured on our own
+/// constants, that threw away up to 42% of the base reduction and silenced the
+/// history term entirely below h=8846 (a move at 8845, over half of
+/// HISTORY_MAX, asked for -1.000 ply and got 0).
+///
+/// The mechanism is common practice, arrived at independently by every engine
+/// that carries several modulators: Stockfish (GPL-3.0) and Coda (GPL-3.0)
+/// both accumulate this way, as does our own earlier napv10 engine -- the
+/// first two in 1/1024, Coda in 1/100. The scale is arbitrary; 1024 is chosen
+/// here because it makes the final division a shift.
+///
+/// The constants below are NOT taken from any of them. Every term keeps the
+/// value this engine already had tuned (divisor 2.1, history divisor 8846,
+/// the +/-1 ply caps), expressed exactly instead of rounded.
+const LMR_ESCALA: i32 = 1024;
+
+/// Reduction subtracted per move index, in milli-plies (`r -= c * i`).
+///
+/// Our base curve grows as `ln(depth) * ln(move)` and never flattens, so the
+/// deeper into a move list we go the harder we cut -- by the 20th move we
+/// were reducing ~0.6 ply more than a reference engine does at the same
+/// point, which is where a late tactic stops being seen at all. A linear
+/// term is what bends that tail back.
+///
+/// Fitted against the reference SHAPE, not copied from it: the coefficient
+/// that maps OUR curve onto that shape is ~31 milli-plies per move, half the
+/// value that engine applies to its own (differently-shaped) base curve.
+/// Compile-time so each SPRT arm is its own binary; 0 = off.
+const LMR_MOVE_LINEAR: i32 = match i32::from_str_radix(env!("KESTREL_LMR_MOVE_LINEAR_COMPILADO"), 10) {
+    Ok(v) => v,
+    Err(_) => 0,
+};
+
+/// Extra reduction at a cutnode, in milli-plies.
+///
+/// A cutnode is where a fail-high is expected, so it is the one place a
+/// deeper cut costs least -- every engine that carries the signal reduces
+/// harder there. Tried here once as a flat +2 whole plies and it was
+/// catastrophic; the term only makes sense as a fraction, which the
+/// fixed-point accumulator now allows. Compile-time; 0 = off.
+const LMR_CUTNODE: i32 = match i32::from_str_radix(env!("KESTREL_LMR_CUTNODE_COMPILADO"), 10) {
+    Ok(v) => v,
+    Err(_) => 0,
+};
 
 static ROOT_TRACE: OnceLock<bool> = OnceLock::new();
 /// Is the root trace switched on? Read once -- the check sits in the root
@@ -2324,7 +2379,16 @@ impl<'a> Searcher<'a> {
     /// guard for safety; using the reduction formula without it caused a
     /// severe regression (A/B: 6.7% vs a pre-change baseline) -- ~93% of
     /// games lost, not a small/noisy signal, a real missing safety net.
-    fn negamax(&mut self, board: &mut Board, depth: i32, mut alpha: i32, beta: i32, ply: usize, reached_by_null: bool) -> i32 {
+    fn negamax(
+        &mut self,
+        board: &mut Board,
+        depth: i32,
+        mut alpha: i32,
+        beta: i32,
+        ply: usize,
+        reached_by_null: bool,
+        cutnode: bool,
+    ) -> i32 {
         self.nodes += 1;
         if depth <= 6 {
             self.nodes_shallow += 1;
@@ -2699,7 +2763,7 @@ impl<'a> Searcher<'a> {
                 self.nmp_tried_pv += 1;
             }
             let undo = board.make_null_move();
-            let score = -self.negamax(board, depth - r, -beta, -beta + 1, ply + 1, true);
+            let score = -self.negamax(board, depth - r, -beta, -beta + 1, ply + 1, true, !cutnode);
             board.unmake_null_move(&undo);
             if self.stop {
                 return 0;
@@ -2736,7 +2800,7 @@ impl<'a> Searcher<'a> {
                 self.nmp_verify_tried += 1;
                 let saved = self.nmp_min_ply;
                 self.nmp_min_ply = ply as i32 + (depth - r) * 3 / 4;
-                let verify = self.negamax(board, depth - r, beta - 1, beta, ply, false);
+                let verify = self.negamax(board, depth - r, beta - 1, beta, ply, false, true);
                 self.nmp_min_ply = saved;
                 if self.stop {
                     return 0;
@@ -2837,9 +2901,9 @@ impl<'a> Searcher<'a> {
                     }
                     // Cheap verification at depth 1, then a real (but
                     // reduced) search only if the quick probe holds up.
-                    let mut score = -self.negamax(board, 1, -prob_beta, -prob_beta + 1, ply + 1, false);
+                    let mut score = -self.negamax(board, 1, -prob_beta, -prob_beta + 1, ply + 1, false, !cutnode);
                     if score >= prob_beta && !self.stop {
-                        score = -self.negamax(board, depth - 4, -prob_beta, -prob_beta + 1, ply + 1, false);
+                        score = -self.negamax(board, depth - 4, -prob_beta, -prob_beta + 1, ply + 1, false, !cutnode);
                     }
                     board.unmake_move(mv, &undo);
                     if self.stop {
@@ -2881,7 +2945,7 @@ impl<'a> Searcher<'a> {
                     let s_beta = (tt_score - 2 * depth).max(-MATE_SCORE + 1);
                     let s_depth = (depth - 1) / 2;
                     self.excluded_move = Some(tm);
-                    let s_score = self.negamax(board, s_depth, s_beta - 1, s_beta, ply, reached_by_null);
+                    let s_score = self.negamax(board, s_depth, s_beta - 1, s_beta, ply, reached_by_null, cutnode);
                     self.excluded_move = None;
                     if self.stop {
                         return 0;
@@ -3111,7 +3175,7 @@ impl<'a> Searcher<'a> {
                 0
             };
             let score = if i == 0 {
-                -self.negamax(board, depth - 1 + extend, -beta, -alpha, ply + 1, false)
+                -self.negamax(board, depth - 1 + extend, -beta, -alpha, ply + 1, false, if is_pv { false } else { !cutnode })
             } else {
                 // LMR: late quiet moves are usually not the best -- search
                 // them at a reduced depth first, verify with full depth
@@ -3170,29 +3234,32 @@ impl<'a> Searcher<'a> {
                     let mover = board.side.opp().idx();
                     let h = self.history_scores[mover][mv.from as usize][mv.to as usize];
                     // 2026-07-23: divisor was a hand-set guess (4000);
-                    // retuned to 8846. Kestrel's base LMR table already
-                    // produces final ply units directly (no /1024
-                    // fixed-point step), so `h/8846` applies the divisor
-                    // straight, our HISTORY_MAX being 16000.
-                    let hist_adj = -(h / 8846);
+                    // retuned to 8846, our HISTORY_MAX being 16000. Same
+                    // divisor as before -- now applied in milli-plies, so
+                    // it stops being all-or-nothing: h=8845 used to ask for
+                    // -1.000 ply and get 0.
+                    let hist_adj = -(h * LMR_ESCALA / 8846);
                     // TTPV: this position was reached by a real PV search
                     // before (full window, not a scout probe) -- reduce
                     // one ply less here. A position that earned
                     // full-window search once is less likely to be a
                     // safe-to-skip wasteland.
-                    let ttpv_adj = if tt_entry_captured.map(|e| e.pv).unwrap_or(false) { -1 } else { 0 };
+                    let ttpv_adj = if tt_entry_captured.map(|e| e.pv).unwrap_or(false) { -LMR_ESCALA } else { 0 };
                     // Continuation history as its OWN reduction term, with
                     // its own divisor -- deliberately NOT folded into `h`
                     // above. It sums two lags, so its range is ~2x the main
                     // history's; adding it into `h` and reusing the 8846
                     // divisor silently tripled the reduction swing and
-                    // measured neutral (1247 games, 50.4%). Scaled here so
-                    // it contributes at most ~1 ply on its own, matching
-                    // every other adjustment's quantization. The piece
-                    // already sits on `mv.to` at this point (post-make_move).
+                    // measured neutral (1247 games, 50.4%). Capped at ~1 ply
+                    // on its own, as before -- the cap is unchanged, only
+                    // the values inside it are now continuous instead of
+                    // snapping to -1/0/+1. The piece already sits on
+                    // `mv.to` at this point (post-make_move).
                     let cont_adj = match board.piece_at(mv.to) {
                         Some((pt, _)) => {
-                            -(self.cont_hist_score(pt, mv.to, ply) / search_params().lmr_hist_divisor.max(1)).clamp(-1, 1)
+                            let ch = self.cont_hist_score(pt, mv.to, ply);
+                            (-(ch * LMR_ESCALA / search_params().lmr_hist_divisor.max(1)))
+                                .clamp(-LMR_ESCALA, LMR_ESCALA)
                         }
                         None => 0,
                     };
@@ -3202,20 +3269,30 @@ impl<'a> Searcher<'a> {
                     // says this position's static eval is trending far
                     // from what raw material/PST said (a "complex"
                     // position where blind reduction is riskier).
-                    // Rounded to a whole ply here (same integer-
-                    // quantization style already used by `hist_adj`/
-                    // `ttpv_adj` above) rather than threading a
-                    // fixed-point accumulator through just this one
-                    // term.
+                    // A threshold term: either the position is complex or it
+                    // is not, so this one is genuinely a whole ply -- it just
+                    // says so in milli-plies now, like the rest.
                     let corrplexity = (static_eval - raw_static_eval).abs();
-                    let corrplexity_adj = if corrplexity > 89 { -1 } else { 0 };
-                    // lmrNonImp: reduce MORE (one whole ply) when
-                    // !improving -- when the position isn't trending
-                    // better (same
-                    // `improving` signal RFP/futility already use).
-                    // Rounded to 1 whole ply, same quantization style.
-                    let non_imp_adj = if !improving { 1 } else { 0 };
-                    (base + hist_adj + cont_adj + ttpv_adj + corrplexity_adj + non_imp_adj).clamp(0, depth - 1)
+                    let corrplexity_adj = if corrplexity > 89 { -LMR_ESCALA } else { 0 };
+                    // Reduce MORE (one whole ply) when !improving -- the same
+                    // `improving` signal RFP/futility already use. Also a
+                    // threshold, also exactly one ply.
+                    let non_imp_adj = if !improving { LMR_ESCALA } else { 0 };
+                    // The two compile-time terms. Both 0 unless their build
+                    // variable was set, so the default binary is unchanged.
+                    let cutnode_adj = if cutnode { LMR_CUTNODE } else { 0 };
+                    let move_linear_adj = -LMR_MOVE_LINEAR * (i as i32 + 1);
+                    let r_milli = base
+                        + hist_adj
+                        + cont_adj
+                        + ttpv_adj
+                        + corrplexity_adj
+                        + non_imp_adj
+                        + cutnode_adj
+                        + move_linear_adj;
+                    // ONE division, at the end. Clamped in milli-plies first so
+                    // the ceiling means the same thing it did before.
+                    r_milli.clamp(0, (depth - 1) * LMR_ESCALA) / LMR_ESCALA
                 } else {
                     0
                 };
@@ -3237,7 +3314,11 @@ impl<'a> Searcher<'a> {
                 // calibração dos valores").
                 let new_depth = depth - 1 + extend;
                 let mut research_depth = new_depth;
-                let mut s = -self.negamax(board, new_depth - r, -alpha - 1, -alpha, ply + 1, false);
+                // Floor the reduced DEPTH at 1 (never 0 = plain quiescence),
+                // exactly as the reference does: max(newDepth - reduction, 1).
+                let reduced_depth = (new_depth - r).max(1);
+                let probe_cutnode = if r > 0 { true } else { !cutnode };
+                let mut s = -self.negamax(board, reduced_depth, -alpha - 1, -alpha, ply + 1, false, probe_cutnode);
                 if r > 0 {
                     self.lmr_tried += 1;
                     self.lmr_sum += r as u64;
@@ -3253,10 +3334,10 @@ impl<'a> Searcher<'a> {
                     let do_deeper = (s > best_score + sp.do_deeper_margin_base + sp.do_deeper_margin_depth * new_depth / 64) as i32;
                     let do_shallower = (s < best_score + sp.do_shallower_margin) as i32;
                     research_depth = (new_depth + do_deeper - do_shallower).max(1);
-                    s = -self.negamax(board, research_depth, -alpha - 1, -alpha, ply + 1, false);
+                    s = -self.negamax(board, research_depth, -alpha - 1, -alpha, ply + 1, false, !cutnode);
                 }
                 if s > alpha && s < beta && !self.stop {
-                    s = -self.negamax(board, research_depth, -beta, -alpha, ply + 1, false)
+                    s = -self.negamax(board, research_depth, -beta, -alpha, ply + 1, false, false)
                 }
                 s
             };
@@ -3555,7 +3636,7 @@ impl<'a> Searcher<'a> {
         _root_average: &mut Option<i32>,
     ) -> i32 {
         if depth <= 1 {
-            return self.negamax(board, depth, -MATE_SCORE - 1, MATE_SCORE + 1, 0, false);
+            return self.negamax(board, depth, -MATE_SCORE - 1, MATE_SCORE + 1, 0, false, false);
         }
         // 2026-08-13: tried a napv10-gated sliding-average variant here
         // (Nap2Siriux's aspWindowsNNUE(), centers on a running average
@@ -3611,7 +3692,7 @@ impl<'a> Searcher<'a> {
         let mut asp_depth = depth;
         let nos_antes = self.nodes;
         loop {
-            let score = self.negamax(board, asp_depth.max(1), alpha, beta, 0, false);
+            let score = self.negamax(board, asp_depth.max(1), alpha, beta, 0, false, false);
             if self.stop {
                 return score;
             }
