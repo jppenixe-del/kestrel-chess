@@ -1716,13 +1716,13 @@ impl Engine {
                         report: ti == 0,
                         thread_idx: ti,
                     };
-                    // A pilha por omissão (2MB) chegava para a busca em Rust
-                    // sozinha, mas a napv10 (vendor/napv10/, C++ vendorizado)
-                    // aloca buffers grandes na pilha por CADA chamada a
-                    // evaluate() (concat[2*1536+32], a1[1024] floats, ...) --
-                    // multiplicado pela profundidade real de negamax, estoura
-                    // a pilha por omissão. 16MB e' folga generosa, barata em
-                    // memória virtual num sistema 64-bit.
+                    // The default stack (2MB) was enough for Rust search
+                    // alone, but napv10 (vendor/napv10/, vendored C++)
+                    // allocates large stack buffers on EVERY evaluate() call
+                    // (concat[2*1536+32], a1[1024] floats, ...) -- multiplied
+                    // by real negamax recursion depth, that overflows the
+                    // default stack. 16MB is generous headroom, cheap in
+                    // virtual memory on a 64-bit system.
                     std::thread::Builder::new()
                         .stack_size(16 * 1024 * 1024)
                         .spawn_scoped(scope, move || {
@@ -1731,7 +1731,7 @@ impl Engine {
                                 searcher.iterative_deepening(&mut b);
                             (best, score, depth_reached, nodes, searcher)
                         })
-                        .expect("falha a criar thread de busca")
+                        .expect("failed to spawn search thread")
                 })
                 .collect();
             // Weighted vote across threads, not a head count.

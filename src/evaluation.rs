@@ -33,21 +33,20 @@ use crate::board::Board;
 /// it holds are only brought up to date here, at the one moment a score is
 /// actually wanted. See `nnue::Accumulator`.
 pub fn evaluate(board: &mut Board) -> i32 {
-    // A li11, quando carregada, tem prioridade sobre tudo o resto -- a
-    // rede-teste da noite de 2026-08-12/13, leitor validado byte a byte
-    // contra o motor (acumulador, FC0, FC1 conferidos), correlacao ainda
-    // fraca (0.42 sem ameacas contra 0.91 da 512) e NUNCA jogada. Atras de
-    // KESTREL_NNUE_LI11 vazio por omissao -- sem a variavel, este bloco nao
-    // faz nada e o caminho de sempre continua a decidir.
-    // A napv10 (Nap2Siriux, rede NOSSA) tem prioridade sobre a li11 quando
-    // ambas as variaveis estiverem definidas -- nao deviam estar as duas ao
-    // mesmo tempo em uso a serio, mas a ordem tem de ser alguma.
-    // FFI para o evaluate() REAL do Nap2Siriux (vendor/napv10/) -- ver
-    // nnue_napv10_ffi.rs para o porque' de ja' nao ser a reimplementacao
-    // Rust em nnue_napv10.rs (ainda no repo, fora do dispatch).
+    // napv10 (our own network, ported from a related project) takes
+    // priority over li11 when both are loaded -- the two should not be in
+    // real use at the same time, but the order has to be something. See
+    // `nnue_napv10_ffi.rs` for why this calls the vendored C++ evaluate()
+    // (vendor/napv10/) directly instead of a Rust reimplementation.
     if crate::nnue_napv10_ffi::active() {
         return crate::nnue_napv10_ffi::evaluate(board);
     }
+    // li11, when loaded, takes priority over everything else below -- a
+    // test network from 2026-08-12/13, its reader validated byte-for-byte
+    // against the engine (accumulator, FC0, FC1 checked), correlation still
+    // weak (0.42 without threats vs 0.91 for the 512) and never played.
+    // Gated on KESTREL_NNUE_LI11 being empty by default -- without the
+    // variable this block does nothing and the usual path keeps deciding.
     if crate::nnue_li11::li11_ligada() {
         if let Some(net) = crate::nnue_li11::rede() {
             return crate::nnue_li11::evaluate(net, board);
@@ -210,13 +209,13 @@ pub fn warmup() {
     let _ = crate::nnue::rede();
     let _ = crate::nnue_threats::rede();
     let _ = crate::nnue_v3::rede();
-    // As duas mais recentes (li11, napv10) tinham ficado de fora desta lista
-    // -- ambas so' se avaliam a si proprias no primeiro evaluate() real, que
-    // e' dentro do relogio do primeiro lance. A napv10 sozinha e' 34MB de
-    // LEB128 (rede + ameacas full): a mesma classe de bug que esta warmup()
-    // ja existe para evitar, so' que nao as cobria.
+    // The two most recent architectures (li11, napv10) had been left out of
+    // this list -- both only load themselves on the first real evaluate(),
+    // which is inside the clock of the first move. napv10 alone is 34MB of
+    // LEB128 (net + full threats): the same class of bug this warmup()
+    // already exists to prevent, just not covering these two.
     let _ = crate::nnue_li11::rede();
-    let _ = crate::nnue_napv10_ffi::rede_carregada();
+    let _ = crate::nnue_napv10_ffi::net_loaded();
 }
 
 /// The attack tables, built once.

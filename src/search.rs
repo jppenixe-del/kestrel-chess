@@ -148,12 +148,13 @@ pub const MAX_PLY: usize = 128;
 /// gets measured.
 #[inline]
 pub fn eval_margin_scale() -> i32 {
-    // 2026-08-13: tentativa de alargar 1.5x (a proporcao que o
-    // dual_vision.h deles usa) mediu PIOR (15% vs 27.5% vs SF1800 sem
-    // isto) -- a busca deles e' multi-thread com SIMD pesado no forward
-    // denso, pode dar-se ao luxo de explorar mais por no'; a nossa, mais
-    // lenta por no' nesta rede, so' fica com MENOS profundidade efectiva
-    // ao alargar. Desligado ate' se perceber melhor a causa.
+    // 2026-08-13: tried widening by 1.5x (the ratio dual_vision.h uses)
+    // and measured WORSE (15% vs 27.5% vs the same SF1800 baseline
+    // without this) -- their search is multi-threaded with heavy SIMD in
+    // the dense forward pass and can afford to explore more per node;
+    // ours, already slower per node on this network, only loses
+    // effective depth by widening. Off until the cause is better
+    // understood.
     let _ = crate::nnue_napv10_ffi::active();
     100
 }

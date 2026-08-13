@@ -37,7 +37,7 @@ fn embute(var: &str, ficheiro: &str, cfg: &str) {
 /// exposing only the handful of methods nnue_net.cpp actually calls; their
 /// real board.h pulls in movegen/attacks/eval_state/cuckoo that a static
 /// eval call never needed.
-fn compila_napv10_cpp() {
+fn build_napv10_cpp() {
     println!("cargo:rerun-if-changed=vendor/napv10");
     cc::Build::new()
         .cpp(true)
@@ -54,7 +54,7 @@ fn compila_napv10_cpp() {
 }
 
 fn main() {
-    compila_napv10_cpp();
+    build_napv10_cpp();
     // A escala da rede, decidida em tempo de COMPILACAO e nao pela ponte.
     //
     // As margens de poda sao centipeoes absolutos, portanto a escala e' uma
