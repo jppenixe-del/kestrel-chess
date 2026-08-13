@@ -33,6 +33,25 @@ use crate::board::Board;
 /// it holds are only brought up to date here, at the one moment a score is
 /// actually wanted. See `nnue::Accumulator`.
 pub fn evaluate(board: &mut Board) -> i32 {
+    // A li11, quando carregada, tem prioridade sobre tudo o resto -- a
+    // rede-teste da noite de 2026-08-12/13, leitor validado byte a byte
+    // contra o motor (acumulador, FC0, FC1 conferidos), correlacao ainda
+    // fraca (0.42 sem ameacas contra 0.91 da 512) e NUNCA jogada. Atras de
+    // KESTREL_NNUE_LI11 vazio por omissao -- sem a variavel, este bloco nao
+    // faz nada e o caminho de sempre continua a decidir.
+    // A napv10 (Nap2Siriux, rede NOSSA) tem prioridade sobre a li11 quando
+    // ambas as variaveis estiverem definidas -- nao deviam estar as duas ao
+    // mesmo tempo em uso a serio, mas a ordem tem de ser alguma.
+    if crate::nnue_napv10::ligada() {
+        if let Some(net) = crate::nnue_napv10::rede() {
+            return crate::nnue_napv10::evaluate(net, board);
+        }
+    }
+    if crate::nnue_li11::li11_ligada() {
+        if let Some(net) = crate::nnue_li11::rede() {
+            return crate::nnue_li11::evaluate(net, board);
+        }
+    }
     // The threats network takes precedence when one is loaded. Chosen by which
     // file the caller supplied rather than by a build flag, so comparing the
     // two architectures compares two networks and not two binaries.
