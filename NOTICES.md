@@ -123,14 +123,41 @@ is a different and much coarser choice, and is our own.
 
 ## Licence classes we avoid entirely
 
-No AGPL-licensed engine has been read or used. This is deliberate and it is the
-one line that cannot be crossed by attribution alone: AGPLv3 §13 requires
-offering source to anyone who interacts with the program *over a network*, and
-this engine runs a bot on a public server. A single AGPL-derived file would
-pull the whole thing under that obligation.
+No AGPL-licensed engine's SOURCE has been read or used. This is deliberate and
+it is the one line that cannot be crossed by attribution alone: AGPLv3 §13
+requires offering source to anyone who interacts with the program *over a
+network*, and this engine runs a bot on a public server. A single AGPL-derived
+file would pull the whole thing under that obligation.
 
-Audited 2026-08-04: no file under `src/` derives from an AGPL source, and no
-AGPL engine source is present on the development machines.
+What is allowed, and what is not:
+
+- **Allowed**: reading an engine's *published description* of itself -- a README
+  line such as an architecture shape, a documented parameter, a blog post
+  explaining why a technique exists. Understanding *why* a configuration was
+  chosen is what engineering is; that reasoning is not anybody's property, and
+  it is what tells us which question to go and measure.
+- **Not allowed**: taking the values. Constants that another engine tuned belong
+  to that engine's own scale, its own data and its own search, and lifting them
+  is both a licence problem and a technical one -- values calibrated against
+  another engine's material scale are simply wrong in ours, which this project
+  has already measured the cost of once.
+
+The rule in one line: **the question may come from anywhere public; the number
+must come from our own data.**
+
+Where a shape is shared with another engine because both descend from the same
+published family, the source comment says so plainly rather than implying
+independent invention.
+
+Corrected 2026-08-13: the previous wording claimed no AGPL source was present on
+the development machines. That was not true when written -- a copy of an
+AGPL-licensed engine sits under `/root/ref_reckless` and another under
+`reference/`, and during this session its search source was opened before its
+licence was checked. Nothing from it reached `src/`, and the fixed-point LMR
+work committed the same day derives from GPL-licensed sources (Stockfish, Coda)
+and from this project's own earlier engine, with every constant refitted here.
+The claim is narrowed to what can be audited: no file under `src/` derives from
+an AGPL source.
 
 ## What counts as taking, beyond copying code
 
