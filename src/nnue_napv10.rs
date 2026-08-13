@@ -592,13 +592,45 @@ pub fn evaluate(net: &RedeNapV10, board: &Board) -> i32 {
         eprintln!("l3_b[bucket]={}", h.l3_b[bucket]);
     }
 
+    // "REGULADOR CIRURGICO ANTI-KING WALK" do nnue_net.cpp -- correctivo à mao,
+    // dentro do PROPRIO evaluate() deles (nao e' HCE-side, e' parte da funcao
+    // NNUE que eu tinha ficado a dever). Penaliza o rei que avanca quando o
+    // adversario ja perdeu a dama mas ainda tem torres/2+ menores -- material
+    // de mate suficiente para punir um rei que saiu cedo demais, um ponto
+    // cego classico de uma rede treinada sem essa nocao explicita.
+    let white_queens = board.pieces[0][4].count_ones() as i32;
+    let black_queens = board.pieces[1][4].count_ones() as i32;
+    let white_rooks = board.pieces[0][3].count_ones() as i32;
+    let black_rooks = board.pieces[1][3].count_ones() as i32;
+    let white_minors = (board.pieces[0][1] | board.pieces[0][2]).count_ones() as i32;
+    let black_minors = (board.pieces[1][1] | board.pieces[1][2]).count_ones() as i32;
+    let mut white_king_penalty = 0i32;
+    if black_queens == 0 && (black_rooks > 0 || black_minors >= 2) {
+        let rank = ksq_w / 8;
+        if rank >= 2 {
+            white_king_penalty = 150 + black_rooks * 50 + black_minors * 25;
+        }
+    }
+    let mut black_king_penalty = 0i32;
+    if white_queens == 0 && (white_rooks > 0 || white_minors >= 2) {
+        let rank = ksq_b / 8;
+        if rank <= 5 {
+            black_king_penalty = 150 + white_rooks * 50 + white_minors * 25;
+        }
+    }
+    let king_walk_adj = if stm == 0 {
+        black_king_penalty - white_king_penalty
+    } else {
+        white_king_penalty - black_king_penalty
+    };
+
     // Clamp primeiro, à escala crua (a que o treino/formula do C++ produz),
     // DEPOIS escala-se para a busca -- clampar depois de escalar destruia o
     // gradiente inteiro para posicoes so' moderadamente ma's (tudo o que
     // passasse de -300cp cru virava o MESMO -3000 final a escala 10x,
     // indistinguivel de um mate objectivo). MATE_SCORE e' 30000; a escala
     // fica bem abaixo disso mesmo no pior caso (scale<=1000 -> 30000 max).
-    let score_cru = ((out + psqt_bias) * OUTPUT_SCALE_CP).round() as i32;
+    let score_cru = ((out + psqt_bias) * OUTPUT_SCALE_CP).round() as i32 + king_walk_adj;
     let score_cru = score_cru.clamp(-3000, 3000);
     // `nnueScale` do dual_vision.h, mesma razao la' e' ca': "a rede bullet WDL
     // da' cp comprimidos; aumentar (ex: 400) descomprime para a escala Sirius
