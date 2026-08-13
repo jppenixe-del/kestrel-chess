@@ -38,6 +38,11 @@ pub fn evaluate(board: &mut Board) -> i32 {
     // real use at the same time, but the order has to be something. See
     // `nnue_napv10_ffi.rs` for why this calls the vendored C++ evaluate()
     // (vendor/napv10/) directly instead of a Rust reimplementation.
+    if crate::nnue_q900::active() {
+        if let Some(net) = crate::nnue_q900::rede() {
+            return crate::nnue_q900::evaluate(net, board);
+        }
+    }
     if crate::nnue_napv10_ffi::active() {
         return crate::nnue_napv10_ffi::evaluate(board);
     }
@@ -154,7 +159,15 @@ fn sem_rede() {
 /// training target was a win probability put through a sigmoid at this scale,
 /// so inverting it recovers the probability the network was actually fitted
 /// to.
+pub fn win_draw_loss_pos(score: i32, board: &Board) -> (i32, i32, i32) {
+    wdl_com_escala(score, crate::nnue::escala_pos(board))
+}
+
 pub fn win_draw_loss(score: i32) -> (i32, i32, i32) {
+    wdl_com_escala(score, crate::nnue::escala())
+}
+
+fn wdl_com_escala(score: i32, escala_i: i32) -> (i32, i32, i32) {
     // The same scale the score itself is on, read rather than written down.
     //
     // It was the constant 400, which was right for exactly as long as the
@@ -167,7 +180,7 @@ pub fn win_draw_loss(score: i32) -> (i32, i32, i32) {
     // winning by, and every pruning margin in the search is denominated in the
     // same units. Let the two drift apart and the engine reports a confidence
     // it does not act on.
-    let escala = crate::nnue::escala() as f64;
+    let escala = escala_i as f64;
     let w = 1.0 / (1.0 + (-(score as f64) / escala).exp());
     let l = 1.0 / (1.0 + ((score as f64) / escala).exp());
     // Draws are what is left. Modelling them separately needs a second fitted
@@ -227,4 +240,56 @@ static ATTACKS: std::sync::OnceLock<crate::attacks::Attacks> = std::sync::OnceLo
 
 pub fn atk() -> &'static crate::attacks::Attacks {
     ATTACKS.get_or_init(crate::attacks::Attacks::new)
+}
+
+/// What this position says each piece is worth, measured the only way an
+/// NNUE can be asked: take the piece off, evaluate again, look at the
+/// difference.
+///
+/// Done in-process on a real `Board`, never by editing a FEN string. An
+/// earlier attempt at this rewrote the board part of the FEN and forgot to
+/// leave an empty square behind, which produced invalid positions that both
+/// engines happily scored -- and reported a knight as worth as much as a
+/// queen. The lesson stands: manipulate the position through the same code
+/// the search uses, or do not manipulate it at all.
+///
+/// Values are from the side to move's point of view: how much BETTER the
+/// position gets when the opponent loses that piece. Averaged over every
+/// copy of the piece on the board, because the first one found is not
+/// representative -- a rook on an open file and a rook boxed in a corner are
+/// not the same rook.
+///
+/// Switched on with `KESTREL_VALORES_PECAS=1`. Costs one full evaluation per
+/// piece per call, so it belongs in a diagnostic run, never in a real game.
+pub fn valores_das_pecas(board: &mut Board) -> Vec<(crate::types::PieceType, i32, usize)> {
+    use crate::types::PieceType;
+    let base = evaluate(board);
+    let them = board.side.opp();
+    let mut out = Vec::new();
+    for pt in [
+        PieceType::Pawn,
+        PieceType::Knight,
+        PieceType::Bishop,
+        PieceType::Rook,
+        PieceType::Queen,
+    ] {
+        let mut bbv = board.pieces[them.idx()][pt.idx()];
+        let mut soma = 0i64;
+        let mut n = 0usize;
+        while bbv != 0 {
+            let sq = bbv.trailing_zeros() as u8;
+            bbv &= bbv - 1;
+            let mut copia = board.clone();
+            copia.remove_piece(pt, them, sq);
+            // The accumulator carries pending changes; a fresh evaluate on the
+            // clone folds them in. Clearing it instead would rebuild from
+            // scratch and measure something else.
+            soma += (evaluate(&mut copia) - base) as i64;
+            n += 1;
+        }
+        if n > 0 {
+            out.push((pt, (soma / n as i64) as i32, n));
+        }
+    }
+    out
 }

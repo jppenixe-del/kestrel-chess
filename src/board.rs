@@ -324,7 +324,7 @@ impl Board {
         self.is_square_attacked(self.king_sq(color), color.opp(), atk)
     }
 
-    fn remove_piece(&mut self, pt: PieceType, c: Color, s: Square) {
+    pub(crate) fn remove_piece(&mut self, pt: PieceType, c: Color, s: Square) {
         self.pieces[c.idx()][pt.idx()] &= !bb(s);
         self.occ_color[c.idx()] &= !bb(s);
         self.occ_all &= !bb(s);

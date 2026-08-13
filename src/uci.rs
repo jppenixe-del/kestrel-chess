@@ -1397,6 +1397,26 @@ impl Engine {
         let max_depth = depth.unwrap_or(64);
         let limits = SearchLimits { deadline, max_depth, max_nodes: nodes, soft_budget };
         let board_now = self.board.clone();
+        // Per-move piece values, when asked for. Printed BEFORE the search
+        // so the numbers describe the position the engine is about to think
+        // about, not the one it already chose a move in.
+        if std::env::var_os("KESTREL_VALORES_PECAS").is_some() {
+            let mut b = self.board.clone();
+            let n = b.occ_all.count_ones() as usize;
+            let balde = (n.saturating_sub(2) / 4).min(7);
+            let vals = crate::evaluation::valores_das_pecas(&mut b);
+            let mut linha = format!(
+                "info string pecas balde={} n={} escala={}",
+                balde,
+                n,
+                crate::nnue::escala_pos(&b)
+            );
+            for (pt, v, cnt) in vals {
+                linha.push_str(&format!(" {:?}={}({})", pt, v, cnt));
+            }
+            let _ = writeln!(out, "{}", linha);
+            let _ = out.flush();
+        }
         let history_now = self.history.clone();
         let mut excluded_root_moves: Vec<crate::moves::Move> = Vec::new();
         // searchmoves is expressed through the root-exclusion list the
@@ -1949,6 +1969,14 @@ impl Engine {
                     let _ = writeln!(out, "option name Threats type check default true");
                     let _ = writeln!(
                         out,
+                        "option name EscalaPorBalde type check default false"
+                    );
+                    let _ = writeln!(
+                        out,
+                        "option name LmrCaptures type check default false"
+                    );
+                    let _ = writeln!(
+                        out,
                         "option name EvalScale type spin default {} min 100 max 2000",
                         crate::nnue::escala()
                     );
@@ -1995,7 +2023,20 @@ impl Engine {
                         .iter()
                         .zip(crate::search::SearchParams::default().to_vec())
                     {
-                        let band = (d.abs()).max(10);
+                        // The band is normally proportional to the default, but
+                        // a parameter that defaults to zero would get a range of
+                        // 0..10 -- and these two are measured in MILLI-plies
+                        // (1/1024 of a ply), where the interesting values are
+                        // ~31 and ~1500. A tuner handed 0..10 would sweep a
+                        // range in which nothing it can set changes anything,
+                        // and report that the parameter does not matter.
+                        let band = match *n {
+                            "lmr_move_linear" => 120,
+                            "lmr_cutnode" => 3072,
+                            "lmr_capture_base" => 3072,
+                            "lmr_capture_hist_divisor" => 15000,
+                            _ => (d.abs()).max(10),
+                        };
                         // A default below zero exists (`hist_malus_offset`),
                         // and clamping the floor to zero puts the default
                         // OUTSIDE its own declared range. A strict UCI client
@@ -2069,6 +2110,14 @@ impl Engine {
                             crate::search::CONTEMPT.store(v.clamp(-200, 200),
                                 std::sync::atomic::Ordering::Relaxed);
                         }
+                    } else if tokens.len() >= 5 && tokens[1] == "name" && tokens[2] == "EscalaPorBalde"
+                        && tokens[3] == "value" {
+                        let on = tokens[4].eq_ignore_ascii_case("true") || tokens[4] == "1";
+                        crate::nnue::set_escala_por_balde(on);
+                    } else if tokens.len() >= 5 && tokens[1] == "name" && tokens[2] == "LmrCaptures"
+                        && tokens[3] == "value" {
+                        let on = tokens[4].eq_ignore_ascii_case("true") || tokens[4] == "1";
+                        crate::search::set_lmr_captures(on);
                     } else if tokens.len() >= 5 && tokens[1] == "name" && tokens[2] == "OnlineTablebase"
                         && tokens[3] == "value" {
                         let on = tokens[4].eq_ignore_ascii_case("true") || tokens[4] == "1";

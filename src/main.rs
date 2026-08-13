@@ -11,6 +11,7 @@ mod features;
 mod nnue_threats;
 mod nnue_li11;
 mod nnue_napv10_ffi;
+mod nnue_q900;
 mod nnue_v3;
 mod evaluation;
 mod moves;

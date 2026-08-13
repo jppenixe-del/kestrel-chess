@@ -67,35 +67,6 @@ fn main() {
     let escala = std::env::var("KESTREL_ESCALA").unwrap_or_else(|_| "200".to_string());
     println!("cargo:rustc-env=KESTREL_ESCALA_COMPILADA={escala}");
 
-    // Two LMR terms, in MILLI-PLIES (1/1024 of a ply), baked in at build
-    // time so each SPRT arm is a distinct binary -- the house rule is that a
-    // test which decides something compares two binaries, never one binary
-    // handed two options, because a `setoption` that fails to arrive turns a
-    // measurement into a coin toss with nothing to show for it.
-    //
-    // Both default to 0 = OFF, so a build with neither variable set is
-    // bit-identical to the engine before they existed.
-    //
-    // KESTREL_LMR_MOVE_LINEAR -- reduction subtracted per move index, i.e.
-    //   `r -= c * move_index`. Our curve grows with ln(m) only and never
-    //   flattens, so late moves get reduced harder and harder; a linear term
-    //   is what bends the tail back. Curve analysis against a reference's
-    //   published shape put the fit for OUR base curve at ~31 (0.030 ply per
-    //   move) -- half of what that reference uses on its own curve, which is
-    //   exactly why the number had to be fitted here rather than borrowed.
-    //
-    // KESTREL_LMR_CUTNODE -- extra reduction at a cutnode, where a fail-high
-    //   is expected. Tried once as a flat +2 whole plies and it wrecked the
-    //   engine; with the fixed-point accumulator it can finally be a
-    //   fraction, which is the only form in which it has ever worked
-    //   anywhere.
-    for (var, default) in [("KESTREL_LMR_MOVE_LINEAR", "0"), ("KESTREL_LMR_CUTNODE", "0")] {
-        println!("cargo:rerun-if-env-changed={var}");
-        let v = std::env::var(var).unwrap_or_else(|_| default.to_string());
-        v.parse::<i32>()
-            .unwrap_or_else(|e| panic!("{var} tem de ser um inteiro em milli-plies: {e}"));
-        println!("cargo:rustc-env={var}_COMPILADO={v}");
-    }
 
     embute("KESTREL_V1_EMBUTIDA", "rede_v1_embutida.bin", "v1_embutida");
     embute("KESTREL_THREATS_EMBUTIDA", "rede_threats_embutida.bin", "threats_embutida");

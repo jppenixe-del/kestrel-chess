@@ -150,34 +150,7 @@ fn lmr_table() -> &'static [[i32; 64]; 64] {
 /// the +/-1 ply caps), expressed exactly instead of rounded.
 const LMR_ESCALA: i32 = 1024;
 
-/// Reduction subtracted per move index, in milli-plies (`r -= c * i`).
-///
-/// Our base curve grows as `ln(depth) * ln(move)` and never flattens, so the
-/// deeper into a move list we go the harder we cut -- by the 20th move we
-/// were reducing ~0.6 ply more than a reference engine does at the same
-/// point, which is where a late tactic stops being seen at all. A linear
-/// term is what bends that tail back.
-///
-/// Fitted against the reference SHAPE, not copied from it: the coefficient
-/// that maps OUR curve onto that shape is ~31 milli-plies per move, half the
-/// value that engine applies to its own (differently-shaped) base curve.
-/// Compile-time so each SPRT arm is its own binary; 0 = off.
-const LMR_MOVE_LINEAR: i32 = match i32::from_str_radix(env!("KESTREL_LMR_MOVE_LINEAR_COMPILADO"), 10) {
-    Ok(v) => v,
-    Err(_) => 0,
-};
 
-/// Extra reduction at a cutnode, in milli-plies.
-///
-/// A cutnode is where a fail-high is expected, so it is the one place a
-/// deeper cut costs least -- every engine that carries the signal reduces
-/// harder there. Tried here once as a flat +2 whole plies and it was
-/// catastrophic; the term only makes sense as a fraction, which the
-/// fixed-point accumulator now allows. Compile-time; 0 = off.
-const LMR_CUTNODE: i32 = match i32::from_str_radix(env!("KESTREL_LMR_CUTNODE_COMPILADO"), 10) {
-    Ok(v) => v,
-    Err(_) => 0,
-};
 
 static ROOT_TRACE: OnceLock<bool> = OnceLock::new();
 /// Is the root trace switched on? Read once -- the check sits in the root
@@ -520,6 +493,38 @@ pub struct SearchParams {
     pub hist_malus_max: i32,
     /// Divides continuation history into the LMR reduction step.
     pub lmr_hist_divisor: i32,
+    /// LMR reduction subtracted per move index, in MILLI-PLIES (1/1024 ply).
+    ///
+    /// Our base curve grows as `ln(depth)*ln(move)` and never flattens, so the
+    /// deeper into a move list we go the harder we cut -- by the 20th move we
+    /// reduce ~0.6 ply more than a reference engine does at the same point,
+    /// which is where a late tactic stops being seen at all. A linear term is
+    /// what bends that tail back.
+    ///
+    /// Fitted against the reference SHAPE, never copied from it: the
+    /// coefficient that maps OUR curve onto that shape is ~31, half the value
+    /// that engine applies to its own differently-shaped base curve. 0 = off.
+    pub lmr_move_linear: i32,
+    /// Extra LMR reduction at a cutnode, in MILLI-PLIES.
+    ///
+    /// A cutnode is where a fail-high is expected, so it is the one place a
+    /// deeper cut costs least. Tried once as a flat +2 whole plies and it was
+    /// catastrophic; the term only works as a fraction, which the fixed-point
+    /// accumulator now allows. 0 = off.
+    pub lmr_cutnode: i32,
+    /// Flat MILLI-PLY offset applied only to captures reduced under
+    /// `LmrCaptures` (see `lmr_captures_enabled`). Quiets never read this.
+    ///
+    /// Every move type we reduce needs its own zero point: a losing
+    /// exchange still resolves a tension a quiet never does, so the same
+    /// curve that fits quiets is not assumed to fit captures too. Starts at
+    /// 0 -- SPRT decides whether captures want reducing lighter, harder, or
+    /// not at all.
+    pub lmr_capture_base: i32,
+    /// Divides `capture_history[moving][captured]` into the capture LMR
+    /// term, same role `lmr_hist_divisor` plays for continuation history on
+    /// quiets. Never 0 (divide-by-zero guarded at the call site regardless).
+    pub lmr_capture_hist_divisor: i32,
     pub rfp_improving: DepthMargin,
     pub rfp_not_improving: DepthMargin,
     pub razor_base: i32,
@@ -628,6 +633,31 @@ impl Default for SearchParams {
             hist_malus_offset: -44,
             hist_malus_max: 992,
             lmr_hist_divisor: 36000,
+            lmr_move_linear: 0,
+            lmr_cutnode: 0,
+            // Not zero, but not borrowed either: -LMR_ESCALA is the same
+            // "exactly one ply" step every other threshold term here uses
+            // (ttpv_adj, corrplexity_adj, non_imp_adj), applied to captures
+            // for the same reason those exist -- our own reasoning that a
+            // losing exchange resolves a tension a quiet never does, sized
+            // in our own existing unit rather than invented from scratch.
+            //
+            // A diagnostic run tried a reference engine's own tuned
+            // capture-reduction offset instead (unit-converted, 1372/19750
+            // -- never a raw copy since the two formulas aren't even the
+            // same shape) purely to answer "does the result move at all".
+            // It landed at 49.8% over 284 games against this own-derived
+            // pair's 51.8%: statistically indistinguishable, so there was
+            // nothing there worth keeping foreign for. Reverted; this
+            // engine's own numbers stand.
+            lmr_capture_base: -1024,
+            // capture_history and the quiet history table share the same
+            // HISTORY_MAX (16000, see `update_history`/`update_capture_history`),
+            // so the quiet term's own divisor (8846, tuned for that same
+            // 16000-max table) is the correct starting point for this one
+            // too -- not a guess, our own already-tuned constant for the
+            // mathematically equivalent case.
+            lmr_capture_hist_divisor: 8846,
             // 2026-08-03: tried lowering these to a reference's raw base
             // slope (26/85) and measured a real loss (-102 Elo, LOS 0.6%).
             // Reading the reference's own formula afterward explained why:
@@ -753,6 +783,10 @@ impl SearchParams {
             self.lmr_hist_divisor,
             self.rfp_base,
             self.rfp_step,
+            self.lmr_move_linear,
+            self.lmr_cutnode,
+            self.lmr_capture_base,
+            self.lmr_capture_hist_divisor,
         ]
     }
     pub fn from_vec(v: &[i32]) -> Self {
@@ -802,6 +836,10 @@ impl SearchParams {
             lmr_hist_divisor: v[48],
             rfp_base: v[49],
             rfp_step: v[50],
+            lmr_move_linear: v[51],
+            lmr_cutnode: v[52],
+            lmr_capture_base: v[53],
+            lmr_capture_hist_divisor: v[54],
         }
     }
 }
@@ -814,7 +852,7 @@ impl SearchParams {
 /// Generated from `to_vec`, never hand-written. A list that drifts out of
 /// order does not fail: it quietly sets the wrong parameter, and the sweep
 /// reports whatever that other parameter happens to do.
-pub const PARAM_NAMES: [&str; 51] = [
+pub const PARAM_NAMES: [&str; 55] = [
     "rfp_improving_base",
     "rfp_improving_slope",
     "rfp_not_improving_base",
@@ -866,6 +904,10 @@ pub const PARAM_NAMES: [&str; 51] = [
     "lmr_hist_divisor",
     "rfp_base",
     "rfp_step",
+    "lmr_move_linear",
+    "lmr_cutnode",
+    "lmr_capture_base",
+    "lmr_capture_hist_divisor",
 ];
 
 /// Overrides applied on top of the defaults, set over UCI before the first
@@ -1123,6 +1165,23 @@ pub static NO_STOP: AtomicBool = AtomicBool::new(false);
 
 /// Quanto custa um empate, em centipeoes. Ver `valor_empate`.
 pub static CONTEMPT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(20);
+
+/// Whether losing-or-equal captures are eligible for LMR at all, on top of
+/// quiets. Off by default: extending WHICH moves get reduced is a
+/// structural change no parameter default can neutralise (unlike
+/// `lmr_capture_base`/`lmr_capture_hist_divisor`, which stay inert at their
+/// defaults), so it gets its own switch rather than piggybacking on the
+/// numeric params.
+static LMR_CAPTURES: AtomicBool = AtomicBool::new(false);
+
+pub fn set_lmr_captures(on: bool) {
+    LMR_CAPTURES.store(on, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn lmr_captures_enabled() -> bool {
+    LMR_CAPTURES.load(Ordering::Relaxed)
+}
 
 pub struct Searcher<'a> {
     /// Quem manda na raiz. Um empate e' mau para ESTE lado, e um no' qualquer
@@ -1758,7 +1817,7 @@ impl<'a> Searcher<'a> {
         // centipeoes so' significa o mesmo enquanto o centipeao significar o
         // mesmo. Ancorar na escala e' o que faz o contempt querer dizer sempre
         // a mesma fraccao de peao.
-        let c = c * crate::nnue::escala() / 400;
+        let c = c * crate::nnue::escala_pos(board) / 400;
         if c == 0 {
             return 0;
         }
@@ -3158,6 +3217,26 @@ impl<'a> Searcher<'a> {
                 }
             }
 
+            // Captures worth reducing, decided BEFORE the move: once
+            // `make_move` runs, `mv.to` holds our own piece and the
+            // captured one is gone, so this is the only point that can
+            // still ask "what did we take, and was taking it actually
+            // good". Only a losing-or-equal exchange is a candidate --
+            // reducing a capture that wins material outright throws away
+            // exactly the tactic the search exists to find.
+            let capture_lmr_info = if mv.is_capture() {
+                match (board.piece_at(mv.from), board.piece_at(mv.to)) {
+                    (Some((moving, _)), Some((captured, _))) => {
+                        let losing_or_equal = !see::see_ge(self.atk, board, &mv, 1);
+                        let ch = self.capture_history[board.side.idx()][moving.idx()][captured.idx()];
+                        Some((losing_or_equal, ch))
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
             let root_nodes_before = if ply == 0 { self.nodes } else { 0 };
             let undo = board.make_move(&mv);
             if ply + 1 < MAX_PLY {
@@ -3216,14 +3295,17 @@ impl<'a> Searcher<'a> {
                         self.lmr_skip_early += 1;
                     }
                 }
+                let capture_ok_for_lmr = lmr_captures_enabled()
+                    && matches!(capture_lmr_info, Some((losing_or_equal, _)) if losing_or_equal);
                 let r = if i >= min_moves
                     && depth >= 3
                     && extend == 0
-                    && !mv.is_capture()
+                    && (!mv.is_capture() || capture_ok_for_lmr)
                     && mv.promotion.is_none()
                     && !gives_check
                     && !peao_avancado(board, &mv)
                 {
+                    let sp_lmr = search_params();
                     let base = lmr_table()[(depth as usize).min(63)][(i + 1).min(63)];
                     // BUG FIX (2026-07-25): this runs AFTER make_move, so
                     // `board.side` is already the OPPONENT -- indexing the
@@ -3280,8 +3362,24 @@ impl<'a> Searcher<'a> {
                     let non_imp_adj = if !improving { LMR_ESCALA } else { 0 };
                     // The two compile-time terms. Both 0 unless their build
                     // variable was set, so the default binary is unchanged.
-                    let cutnode_adj = if cutnode { LMR_CUTNODE } else { 0 };
-                    let move_linear_adj = -LMR_MOVE_LINEAR * (i as i32 + 1);
+                    let cutnode_adj = if cutnode { sp_lmr.lmr_cutnode } else { 0 };
+                    let move_linear_adj = -sp_lmr.lmr_move_linear * (i as i32 + 1);
+                    // Captures reduced under `capture_ok_for_lmr` never
+                    // touch `hist_adj` above -- that table is keyed by
+                    // (from, to) and only ever written for quiets, so
+                    // reading it for a capture would score noise. Its own
+                    // table (moving, captured) and its own base offset
+                    // replace it here; `hist_adj` itself is forced to 0 so
+                    // the two never both apply to the same move.
+                    let (hist_adj, capture_adj) = match capture_lmr_info {
+                        Some((_, ch)) if capture_ok_for_lmr => (
+                            0,
+                            sp_lmr.lmr_capture_base
+                                - (ch * LMR_ESCALA / sp_lmr.lmr_capture_hist_divisor.max(1))
+                                    .clamp(-LMR_ESCALA, LMR_ESCALA),
+                        ),
+                        _ => (hist_adj, 0),
+                    };
                     let r_milli = base
                         + hist_adj
                         + cont_adj
@@ -3289,7 +3387,8 @@ impl<'a> Searcher<'a> {
                         + corrplexity_adj
                         + non_imp_adj
                         + cutnode_adj
-                        + move_linear_adj;
+                        + move_linear_adj
+                        + capture_adj;
                     // ONE division, at the end. Clamped in milli-plies first so
                     // the ceiling means the same thing it did before.
                     r_milli.clamp(0, (depth - 1) * LMR_ESCALA) / LMR_ESCALA

@@ -62,6 +62,48 @@ pub fn set_escala(v: i32) {
     ESCALA.store(v.clamp(1, 4000), std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Per-bucket scale, measured rather than chosen.
+///
+/// One constant cannot serve both ends of the game. Fitted on 185k positions
+/// from our own archived games, the eval at which the pure-win rate reaches
+/// 50% -- Stockfish's definition of "one pawn" -- runs from 305 internal
+/// units with 2-5 pieces on the board down to 105 with 30-33. Reading all of
+/// them through a single 176 inflates the endgame roughly threefold: a drawn
+/// rook ending evaluates near zero, and near-zero times three still reads as
+/// near-zero until the margins built on it start firing, at which point the
+/// engine reports a loss in a position Stockfish calls a draw. That is not a
+/// hypothetical; it was watched happening in a live bullet game.
+///
+/// Same 8 buckets the network itself uses (`output_bucket`), so the scale and
+/// the weights that produced the number are indexed the same way.
+///
+/// Values are `176 * 100 / a`, i.e. the current scale corrected by how far
+/// each bucket's measured pawn differs from the one 176 assumes. Buckets are
+/// by piece count: 0 = 2-5 pieces, 7 = 30-33.
+const ESCALA_BALDE: [i32; 8] = [58, 95, 104, 121, 135, 160, 160, 168];
+
+/// Is the per-bucket scale on? Off by default -- it changes every pruning
+/// margin at once, so it goes in behind its own switch until measured.
+static ESCALA_POR_BALDE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_escala_por_balde(on: bool) {
+    ESCALA_POR_BALDE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The scale to read THIS position's evaluation with.
+///
+/// Falls back to the single `escala()` when the switch is off, so the default
+/// binary is unchanged.
+#[inline]
+pub fn escala_pos(board: &crate::board::Board) -> i32 {
+    if !ESCALA_POR_BALDE.load(std::sync::atomic::Ordering::Relaxed) {
+        return escala();
+    }
+    let n = board.occ_all.count_ones() as usize;
+    ESCALA_BALDE[(n.saturating_sub(2) / 4).min(7)]
+}
+
 /// Weights, in the layout `bullet` writes them.
 ///
 /// `l0w` is stored input-major: all HIDDEN weights for input 0, then for
