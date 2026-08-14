@@ -38,6 +38,11 @@ pub fn evaluate(board: &mut Board) -> i32 {
     // real use at the same time, but the order has to be something. See
     // `nnue_napv10_ffi.rs` for why this calls the vendored C++ evaluate()
     // (vendor/napv10/) directly instead of a Rust reimplementation.
+    if crate::nnue_plenty::active() {
+        if let Some(net) = crate::nnue_plenty::rede() {
+            return crate::nnue_plenty::evaluate(net, atk(), board);
+        }
+    }
     if crate::nnue_q900::active() {
         if let Some(net) = crate::nnue_q900::rede() {
             return crate::nnue_q900::evaluate(net, board);

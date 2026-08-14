@@ -1417,6 +1417,16 @@ impl Engine {
             let _ = writeln!(out, "{}", linha);
             let _ = out.flush();
         }
+        // Raw static eval, no search at all -- for cross-checking a reader
+        // against an external oracle position by position, where even a
+        // depth-1 search already mixes in a best-move choice.
+        if std::env::var_os("KESTREL_EVAL_ONLY").is_some() {
+            let mut b = self.board.clone();
+            let v = crate::evaluation::evaluate(&mut b);
+            let _ = writeln!(out, "info string eval_only {}", v);
+            let _ = out.flush();
+            return;
+        }
         let history_now = self.history.clone();
         let mut excluded_root_moves: Vec<crate::moves::Move> = Vec::new();
         // searchmoves is expressed through the root-exclusion list the
