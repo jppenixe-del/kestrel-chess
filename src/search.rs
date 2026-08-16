@@ -2133,6 +2133,25 @@ impl<'a> Searcher<'a> {
         moves.sort_by_cached_key(|m| {
             if Some(*m) == tt_move {
                 -1_000_000
+            } else if m.promotion == Some(PieceType::Queen) && !m.is_capture() {
+                // A quiet queen promotion had NO branch of its own here: it
+                // fell through to the quiet arm below and scored `-h`, and the
+                // history of a promotion is ~0 because the (from, to) square
+                // pair almost never repeats. So a move that turns a pawn into
+                // a queen -- worth ~800cp on the spot -- sorted behind every
+                // good capture and every killer.
+                //
+                // In quiescence that is not merely untidy, it is a cut: the
+                // move list there is captures + queen promotions, and
+                // `qs_lmp_limit` stops after 8. Eight good captures and the
+                // promotion is never searched at all.
+                //
+                // Scored as the capture it effectively is -- the piece gained
+                // is the difference between a queen and the pawn spent -- so
+                // it lands among the good captures at its real worth instead
+                // of below them all.
+                let ganho = PieceType::Queen.value() - PieceType::Pawn.value();
+                -200_000 - ganho
             } else if m.is_capture() {
                 // SEE replaces plain MVV-LVA for ordering: good/neutral
                 // captures (SEE>=0) go to the top, ranked by the real
@@ -3059,6 +3078,23 @@ impl<'a> Searcher<'a> {
         // primeiro lance. Ver `MovePicker` no fim deste ficheiro para as
         // fases e a motivacao.
         let killers = self.killers[ply.min(MAX_PLY - 1)];
+
+        // Limpar os killers do ply SEGUINTE antes de descer.
+        //
+        // Os killers de `ply+1` foram aprendidos noutra sub-arvore irma --
+        // outra posicao, outro contexto. Herda-los faz a ordenacao tentar
+        // primeiro lances que nao tem nada a ver com esta linha, gastando
+        // nos a verificar lixo. A ideia (limpar por no', nao por
+        // profundidade) vem do Triumviratus, que a mediu em +12,15 +- 5,97
+        // Elo com 3290 jogos; a implementacao e a medicao nossa sao nossas.
+        //
+        // Atras de env var ate' termos SPRT proprio -- a extensao de xeque
+        // hoje mostrou que uma medicao noutro motor pode nao transferir
+        // (la' encolhia a arvore 11%, aqui aumentava-a 4,6x).
+        if limpa_killers_filho() && ply + 1 < MAX_PLY {
+            self.killers[ply + 1] = [None, None];
+        }
+
         let mut picker = MovePicker::new(moves, tt_move, killers);
 
         let mut best_score = -MATE_SCORE - 1;
@@ -3246,7 +3282,21 @@ impl<'a> Searcher<'a> {
             }
             // Check extension + singular extension: se este e' o
             // tt_move provado singular acima, estende +1.
-            let extend = if in_check {
+            //
+            // A extensao incondicional de xeque (estender 1 ply em TODO o
+            // xeque, a qualquer profundidade) e' das tecnicas mais antigas e
+            // ha' muito abandonada pelos motores fortes -- so' as extensoes
+            // singulares sobrevivem. Um projecto proximo mediu **+8,0 +- 8,1
+            // Elo (1654 jogos, 30+0.3) so' por a REMOVER**: a arvore encolhe
+            // ~11,5% a depth 18 no livro de aberturas, mais em finais
+            // patologicos. E' binario -- limitar por profundidade e' pior
+            // que qualquer dos extremos.
+            //
+            // Removida por omissao desde 2026-08-16. O nosso teste com a rede
+            // do Stockfish confirmou o mesmo sinal: 8 s na posicao inicial dao
+            // profundidade 21 sem extensao contra 19 com ela. `KESTREL_EXT_XEQUE=1`
+            // repoe o comportamento antigo para efeitos de comparacao.
+            let extend = if in_check && ext_xeque() {
                 1
             } else if Some(mv) == se_candidate {
                 se_extension
@@ -3391,6 +3441,17 @@ impl<'a> Searcher<'a> {
                         + capture_adj;
                     // ONE division, at the end. Clamped in milli-plies first so
                     // the ceiling means the same thing it did before.
+                    //
+                    // MEASURED AND REJECTED (2026-08-16): letting the floor go
+                    // negative -- a reduction that becomes a small extension for
+                    // very well-ordered moves, as the reference does -- read
+                    // 50.2% over 555 games at 5+0.05. Dead. Worth recording
+                    // because the case for it looked strong on paper: we reduce
+                    // 165k moves by 2.70 plies on average and only 0.4% ever
+                    // come back above alpha, which reads like blind pruning. It
+                    // is not; the ordering is simply good enough that what gets
+                    // reduced deserved it. Do not retry without new evidence.
+                    //
                     r_milli.clamp(0, (depth - 1) * LMR_ESCALA) / LMR_ESCALA
                 } else {
                     0
@@ -4715,4 +4776,18 @@ impl MovePicker {
         }
         None
     }
+}
+
+/// Repoe a extensao incondicional de xeque (`KESTREL_EXT_XEQUE=1`), desligada
+/// por omissao. Lido uma vez: consultas ao ambiente no caminho quente custam
+/// caro -- medido, um `env::var_os` por avaliacao valia ~25% do tempo.
+pub fn ext_xeque() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("KESTREL_EXT_XEQUE").is_some())
+}
+
+/// Limpa os killers do ply seguinte a cada no' (`KESTREL_KILLER_RESET=1`).
+pub fn limpa_killers_filho() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("KESTREL_KILLER_RESET").is_some())
 }

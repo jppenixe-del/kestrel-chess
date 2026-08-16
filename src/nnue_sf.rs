@@ -1,0 +1,2057 @@
+//! Reader for the official Stockfish-master NNUE network format
+//! (HalfKAv2_hm + Full_Threats + PP_3Wide, SFNNv13-class: L1=1024,
+//! L2=32, L3=32, 8 output buckets/LayerStacks, double activation with a
+//! raw-difference skip term). Reads the actual GPL-3.0 released .nnue
+//! file directly -- format understood by reading Stockfish's own source
+//! (GPL-3.0, no copyleft issue for running/adapting), values are that
+//! network's own trained weights, used as-is on the project owner's
+//! explicit instruction, same footing as the PlentyChess and Triumviratus
+//! reference imports this session.
+//!
+//! Gated behind `KESTREL_NNUE_SF`; unset, this module does nothing.
+
+use crate::attacks::Attacks;
+use crate::board::Board;
+use crate::types::{Color, PieceType, Square};
+use std::sync::OnceLock;
+
+const PIECE_DIM: usize = 22528; // HalfKAv2_hm
+const THREAT_DIM: usize = 59808; // Full_Threats
+const PAIR_DIM: usize = 4560; // PP_3Wide (96*95/2)
+const PAIR_BASE: usize = THREAT_DIM; // pawn-pair indices offset AFTER threats
+const INPUT_DIM: usize = PIECE_DIM + THREAT_DIM + PAIR_DIM;
+
+const L1: usize = 1024;
+const L2: usize = 32; // FC_0_OUTPUTS
+const L3: usize = 32; // FC_1_OUTPUTS
+const NB: usize = 8; // LayerStacks / PSQTBuckets
+
+const WEIGHT_SCALE_BITS: i32 = 6;
+const HIDDEN_ONE_VAL: i64 = 128;
+const OUTPUT_SCALE: i64 = 16;
+const FT_SHIFT: u32 = 6; // matches SF's WeightScaleBits used for the FT clamp (0..127 post-shift)
+const FT_MAX_VAL: i32 = 255; // FtMaxVal in nnue_common.h
+
+#[rustfmt::skip]
+const KING_BUCKETS_BASE: [i32; 64] = [
+    28,29,30,31, 31,30,29,28,
+    24,25,26,27, 27,26,25,24,
+    20,21,22,23, 23,22,21,20,
+    16,17,18,19, 19,18,17,16,
+    12,13,14,15, 15,14,13,12,
+     8, 9,10,11, 11,10, 9, 8,
+     4, 5, 6, 7,  7, 6, 5, 4,
+     0, 1, 2, 3,  3, 2, 1, 0,
+];
+
+#[rustfmt::skip]
+const ORIENT_HALFKA: [i32; 64] = {
+    // files a-d (0-3) -> flip by 7 (SQ_H1) so the king ends on e-h;
+    // files e-h (4-7) -> no flip (SQ_A1 = 0). Row-major, rank0=rank1.
+    let h = 7; let a = 0;
+    [
+    h,h,h,h, a,a,a,a,
+    h,h,h,h, a,a,a,a,
+    h,h,h,h, a,a,a,a,
+    h,h,h,h, a,a,a,a,
+    h,h,h,h, a,a,a,a,
+    h,h,h,h, a,a,a,a,
+    h,h,h,h, a,a,a,a,
+    h,h,h,h, a,a,a,a,
+    ]
+};
+
+#[rustfmt::skip]
+const ORIENT_THREATS: [i32; 64] = {
+    // Full_Threats/PP_3Wide's own OrientTBL: opposite sense from HalfKAv2_hm
+    // (files a-d -> SQ_A1=0, e-h -> SQ_H1=7) -- kept as a separate table on
+    // purpose, conflating the two cost real time earlier today (PlentyChess).
+    let h = 7; let a = 0;
+    [
+    a,a,a,a, h,h,h,h,
+    a,a,a,a, h,h,h,h,
+    a,a,a,a, h,h,h,h,
+    a,a,a,a, h,h,h,h,
+    a,a,a,a, h,h,h,h,
+    a,a,a,a, h,h,h,h,
+    a,a,a,a, h,h,h,h,
+    a,a,a,a, h,h,h,h,
+    ]
+};
+
+// PieceSquareIndex[relative_color][piece_type] * 64 -- own pieces first
+// (planes 0..5 excluding king), then enemy (planes 5..10 excluding king),
+// king (own or enemy, both map to plane 10) never actually queried for the
+// side's own king in practice.
+#[inline]
+fn piece_plane(piece: PieceType, relative_enemy: bool) -> i32 {
+    let base = match piece {
+        PieceType::Pawn => 0,
+        PieceType::Knight => 2,
+        PieceType::Bishop => 4,
+        PieceType::Rook => 6,
+        PieceType::Queen => 8,
+        PieceType::King => 10,
+    };
+    if piece == PieceType::King {
+        10
+    } else if relative_enemy {
+        base + 1
+    } else {
+        base
+    }
+}
+
+#[rustfmt::skip]
+const PIECE_INTERACTION_MAP: [[i32; 6]; 6] = [
+    [-1, 0, -1,  1, -1, -1],
+    [ 0, 1,  2,  3,  4, -1],
+    [ 0, 1,  2,  3, -1, -1],
+    [ 0, 1,  2,  3, -1, -1],
+    [ 0, 1,  2,  3,  4, -1],
+    [-1,-1, -1, -1, -1, -1],
+];
+const PIECE_TARGET_COUNT: [i32; 6] = [4, 10, 8, 8, 10, 0];
+
+const PIECE_TYPES: [PieceType; 6] = [
+    PieceType::Pawn,
+    PieceType::Knight,
+    PieceType::Bishop,
+    PieceType::Rook,
+    PieceType::Queen,
+    PieceType::King,
+];
+
+fn pseudo_attacks_empty(atk: &Attacks, piece: usize, origin: usize, color: usize) -> u64 {
+    let sq = origin as Square;
+    match piece {
+        0 => {
+            if (8..56).contains(&origin) {
+                atk.pawn[color][origin]
+            } else {
+                0
+            }
+        }
+        1 => atk.knight[origin],
+        5 => atk.king[origin],
+        2 => crate::attacks::bishop_attacks(sq, 0),
+        3 => crate::attacks::rook_attacks(sq, 0),
+        _ => crate::attacks::bishop_attacks(sq, 0) | crate::attacks::rook_attacks(sq, 0),
+    }
+}
+
+struct ThreatTables {
+    piece_offset: Vec<Vec<Vec<i32>>>,
+    attack_index: Vec<Vec<Vec<Vec<i32>>>>,
+    pair_lookup: Vec<Vec<Vec<Vec<(bool, bool, i32)>>>>,
+}
+
+fn build_threat_tables() -> ThreatTables {
+    let atk = Attacks::new();
+    let mut piece_offset = vec![vec![vec![0i32; 64]; 2]; 6];
+    let mut cumulative_piece_offset = [[0i32; 2]; 6];
+    let mut cumulative_offset = [[0i32; 2]; 6];
+    let mut running = 0i32;
+    for color in 0..2 {
+        for piece in 0..6 {
+            let mut cum = 0i32;
+            for origin in 0..64 {
+                piece_offset[piece][color][origin] = cum;
+                if piece != 0 || (8..56).contains(&origin) {
+                    let a = pseudo_attacks_empty(&atk, piece, origin, color);
+                    cum += a.count_ones() as i32;
+                }
+            }
+            cumulative_piece_offset[piece][color] = cum;
+            cumulative_offset[piece][color] = running;
+            running += PIECE_TARGET_COUNT[piece] * cum;
+        }
+    }
+    debug_assert_eq!(running as usize, THREAT_DIM);
+
+    let mut attack_index = vec![vec![vec![vec![0i32; 64]; 64]; 2]; 6];
+    for color in 0..2 {
+        for piece in 0..6 {
+            for origin in 0..64 {
+                let a = pseudo_attacks_empty(&atk, piece, origin, color);
+                let mut m = a;
+                while m != 0 {
+                    let target = m.trailing_zeros() as usize;
+                    m &= m - 1;
+                    let below = a & ((1u64 << target) - 1);
+                    attack_index[piece][color][origin][target] = below.count_ones() as i32;
+                }
+            }
+        }
+    }
+
+    let mut pair_lookup = vec![vec![vec![vec![(true, false, 0i32); 2]; 6]; 2]; 6];
+    for ap in 0..6 {
+        for ac in 0..2 {
+            for tp in 0..6 {
+                for tc in 0..2 {
+                    let map = PIECE_INTERACTION_MAP[ap][tp];
+                    let mut feature_base = cumulative_offset[ap][ac]
+                        + (tc as i32 * (PIECE_TARGET_COUNT[ap] / 2) + map)
+                            * cumulative_piece_offset[ap][ac];
+                    let enemy = ac != tc;
+                    let semi_excluded = ap == tp && (enemy || ap != 0);
+                    let excluded = map < 0;
+                    if excluded {
+                        feature_base = 0;
+                    }
+                    pair_lookup[ap][ac][tp][tc] = (excluded, semi_excluded, feature_base);
+                }
+            }
+        }
+    }
+    ThreatTables { piece_offset, attack_index, pair_lookup }
+}
+
+static THREAT_TABLES: OnceLock<ThreatTables> = OnceLock::new();
+fn threat_tables() -> &'static ThreatTables {
+    THREAT_TABLES.get_or_init(build_threat_tables)
+}
+
+#[inline]
+fn is_pair_excluded(excluded: bool, semi_excluded: bool, attacking_sq: i32, attacked_sq: i32) -> bool {
+    let less_than = if attacking_sq < attacked_sq { 1u8 } else { 0 };
+    let data = ((semi_excluded && !excluded) as u8) | ((excluded as u8) << 1);
+    ((data.wrapping_add(less_than)) & 2) != 0
+}
+
+fn get_threat_feature(
+    pov: usize,
+    attacking_piece: usize,
+    attacking_color: usize,
+    attacked_piece: usize,
+    attacked_color: usize,
+    attacking_square: i32,
+    attacked_square: i32,
+    mirrored: bool,
+) -> i32 {
+    let square_flip = (if mirrored { 7 } else { 0 }) ^ (if pov == 1 { 56 } else { 0 });
+    let a_sq = attacking_square ^ square_flip;
+    let d_sq = attacked_square ^ square_flip;
+    let a_c = attacking_color ^ pov;
+    let d_c = attacked_color ^ pov;
+    let t = threat_tables();
+    let (excluded, semi_excluded, base) = t.pair_lookup[attacking_piece][a_c][attacked_piece][d_c];
+    if is_pair_excluded(excluded, semi_excluded, a_sq, d_sq) {
+        return THREAT_DIM as i32;
+    }
+    base + t.piece_offset[attacking_piece][a_c][a_sq as usize]
+        + t.attack_index[attacking_piece][a_c][a_sq as usize][d_sq as usize]
+}
+
+fn pp_mask(sq: usize) -> u64 {
+    const FILE_A: u64 = 0x0101010101010101;
+    let file = (sq & 7) as u32;
+    let mut mask = FILE_A << file;
+    if file > 0 {
+        mask |= FILE_A << (file - 1);
+    }
+    if file < 7 {
+        mask |= FILE_A << (file + 1);
+    }
+    mask & !(0xFFu64 | (0xFFu64 << 56)) & !(1u64 << sq)
+}
+
+#[inline]
+fn pawn_pair_index(id_a: i32, id_b: i32) -> usize {
+    let (lo, hi) = if id_a < id_b { (id_a, id_b) } else { (id_b, id_a) };
+    (hi * (hi - 1) / 2 + lo) as usize
+}
+
+#[inline]
+fn pawn_id(square: usize, color_offset: i32, square_flip: usize) -> i32 {
+    color_offset + (square ^ square_flip) as i32 - 8
+}
+
+// ---- LEB128 (Stockfish's own: standard signed LEB128, sign-extended from
+// the last byte's bit 6 -- NOT the zigzag scheme our own .li11 format uses,
+// despite sharing the "COMPRESSED_LEB128" magic string). ----
+const LEB_MAGIC: &[u8] = b"COMPRESSED_LEB128";
+
+fn leb_decode_one(bytes: &[u8], pos: &mut usize, bits: u32) -> i64 {
+    let mut result: i64 = 0;
+    let mut shift: u32 = 0;
+    loop {
+        let byte = bytes[*pos];
+        *pos += 1;
+        result |= ((byte & 0x7f) as i64) << (shift % 32);
+        shift += 7;
+        if byte & 0x80 == 0 {
+            if shift < bits && (byte & 0x40) != 0 {
+                result |= -1i64 << shift;
+            }
+            break;
+        }
+    }
+    result
+}
+
+fn read_leb_i16(bytes: &[u8], off: &mut usize, n: usize) -> Vec<i16> {
+    // consume magic + u32 byte count (informational, not re-checked here)
+    *off += LEB_MAGIC.len();
+    let _byte_count = u32::from_le_bytes(bytes[*off..*off + 4].try_into().unwrap());
+    *off += 4;
+    let mut v = Vec::with_capacity(n);
+    for _ in 0..n {
+        v.push(leb_decode_one(bytes, off, 16) as i16);
+    }
+    v
+}
+
+fn read_leb_i32(bytes: &[u8], off: &mut usize, n: usize) -> Vec<i32> {
+    *off += LEB_MAGIC.len();
+    let _byte_count = u32::from_le_bytes(bytes[*off..*off + 4].try_into().unwrap());
+    *off += 4;
+    let mut v = Vec::with_capacity(n);
+    for _ in 0..n {
+        v.push(leb_decode_one(bytes, off, 32) as i32);
+    }
+    v
+}
+
+fn read_le_i16(bytes: &[u8], off: &mut usize, n: usize) -> Vec<i16> {
+    let mut v = Vec::with_capacity(n);
+    for i in 0..n {
+        v.push(i16::from_le_bytes([bytes[*off + i * 2], bytes[*off + i * 2 + 1]]));
+    }
+    *off += n * 2;
+    v
+}
+
+fn read_le_i8(bytes: &[u8], off: &mut usize, n: usize) -> Vec<i8> {
+    let v: Vec<i8> = bytes[*off..*off + n].iter().map(|&b| b as i8).collect();
+    *off += n;
+    v
+}
+
+struct LayerStack {
+    // fc_0: (2*L1) -> L2, dense. Layer-local WeightType is i8 here, NOT the
+    // feature transformer's own (global) i16 WeightType -- two classes,
+    // two independent typedefs, found the hard way by an offset that ran
+    // out of file about halfway through the 8 layer stacks.
+    fc0w: Vec<i8>,
+    fc0b: Vec<i32>,
+    // fc_1: (2*L2) -> L3, dense
+    fc1w: Vec<i8>,
+    fc1b: Vec<i32>,
+    // fc_2: (2*L2 + 2*L3) -> 1, dense
+    fc2w: Vec<i8>,
+    fc2b: i32,
+}
+
+fn read_dense_layer(bytes: &[u8], off: &mut usize, in_dim: usize, out_dim: usize) -> (Vec<i8>, Vec<i32>) {
+    let bias = read_le_i32_plain(bytes, off, out_dim);
+    let w = read_le_i8(bytes, off, in_dim * out_dim);
+    (w, bias)
+}
+
+fn read_le_i32_plain(bytes: &[u8], off: &mut usize, n: usize) -> Vec<i32> {
+    let mut v = Vec::with_capacity(n);
+    for i in 0..n {
+        v.push(i32::from_le_bytes(bytes[*off + i * 4..*off + i * 4 + 4].try_into().unwrap()));
+    }
+    *off += n * 4;
+    v
+}
+
+pub struct RedeSf {
+    ft_bias: Vec<i16>,          // [L1]
+    ft_threat_w: Vec<i8>,       // [THREAT_DIM * L1]
+    ft_pair_w: Vec<i8>,         // [PAIR_DIM * L1]
+    ft_piece_w: Vec<i16>,       // [PIECE_DIM * L1]
+    ft_piece_psqt: Vec<i32>,    // [PIECE_DIM * NB]
+    ft_threat_psqt: Vec<i32>,   // [THREAT_DIM * NB]
+    ft_pair_psqt: Vec<i32>,     // [PAIR_DIM * NB]
+    stacks: Vec<LayerStack>,    // [NB]
+    // Header fields, kept verbatim so a net can be written back out in SF's
+    // own format. The two u32 hashes are computed by SF from the architecture
+    // and verified on load -- a net we serialise must carry the same ones or
+    // Stockfish refuses it.
+    version: u32,
+    hash: u32,
+    desc: Vec<u8>,
+    ft_header: [u8; 4],
+    stack_headers: Vec<[u8; 4]>,
+}
+
+fn carrega(bytes: &[u8]) -> Option<RedeSf> {
+    let mut o = 0usize;
+    // header: version(4) hash(4) size(4) desc(size)
+    let version = u32::from_le_bytes(bytes[o..o + 4].try_into().ok()?);
+    o += 4;
+    let hash = u32::from_le_bytes(bytes[o..o + 4].try_into().ok()?);
+    o += 4;
+    let size = u32::from_le_bytes(bytes[o..o + 4].try_into().ok()?) as usize;
+    o += 4;
+    let desc = bytes[o..o + size].to_vec();
+    o += size;
+
+    let ft_header: [u8; 4] = bytes[o..o + 4].try_into().ok()?;
+    o += 4; // feature transformer's own inner header (hash check, unused here)
+    let dbg = std::env::var_os("KESTREL_SF_DEBUG").is_some();
+
+    // Order confirmed from nnue_feature_transformer.h::read_parameters:
+    let mut ft_bias = read_leb_i16(bytes, &mut o, L1);
+    if dbg { eprintln!("DBG after ft_bias: o={o} bias[0..4]={:?}", &ft_bias[..4]); }
+    let mut ft_threat_w = read_le_i8(bytes, &mut o, THREAT_DIM * L1);
+    if dbg { eprintln!("DBG after threat_w: o={o}"); }
+    let ft_threat_psqt = read_leb_i32(bytes, &mut o, THREAT_DIM * NB);
+    if dbg { eprintln!("DBG after threat_psqt: o={o}"); }
+    let mut ft_pair_w = read_le_i8(bytes, &mut o, PAIR_DIM * L1);
+    if dbg { eprintln!("DBG after pair_w: o={o}"); }
+    let ft_pair_psqt = read_leb_i32(bytes, &mut o, PAIR_DIM * NB);
+    if dbg { eprintln!("DBG after pair_psqt: o={o}"); }
+    let mut ft_piece_w = read_leb_i16(bytes, &mut o, PIECE_DIM * L1);
+    if dbg { eprintln!("DBG after piece_w: o={o}"); }
+    let ft_piece_psqt = read_leb_i32(bytes, &mut o, PIECE_DIM * NB);
+    if dbg { eprintln!("DBG after piece_psqt: o={o} total={}", bytes.len()); }
+
+    // SF's AVX2 build permutes biases/weights in RAM after loading
+    // (permute_weights(), PackusEpi16Order) purely so its own packus-based
+    // pairwise-activation SIMD trick reads them in the right lanes -- a
+    // non-SIMD/scalar build applies no permutation at all and produces the
+    // IDENTICAL x[]/fc0_out (verified directly against both builds). Since
+    // this reader does the plain scalar computation, it must use the file's
+    // raw (canonical) order throughout -- no permutation here.
+    if dbg {
+        eprintln!("DBG post-permute ft_bias[0..16]={:?}", &ft_bias[..16]);
+        eprintln!("DBG post-permute w[king20408][0..16]={:?}", &ft_piece_w[20408 * L1..20408 * L1 + 16]);
+        eprintln!("DBG post-permute w[knight19840][0..16]={:?}", &ft_piece_w[19840 * L1..19840 * L1 + 16]);
+    }
+
+    let mut stacks = Vec::with_capacity(NB);
+    let mut stack_headers = Vec::with_capacity(NB);
+    for bi in 0..NB {
+        stack_headers.push(bytes[o..o + 4].try_into().ok()?);
+        o += 4; // layer stack's own inner header
+        let (fc0w, fc0b) = read_dense_layer(bytes, &mut o, L1, L2);
+        let (fc1w, fc1b) = read_dense_layer(bytes, &mut o, 2 * L2, L3);
+        let (fc2w, fc2b_vec) = read_dense_layer(bytes, &mut o, 2 * L2 + 2 * L3, 1);
+        if dbg && bi == 0 {
+            eprintln!("DBG fc0 biases[0..4]={:?}", &fc0b[..4]);
+            eprintln!("DBG fc0 W(out=0,in=0..8)={:?}", &fc0w[0 * L1..0 * L1 + 8]);
+            eprintln!("DBG fc0 W(out=1,in=0..8)={:?}", &fc0w[1 * L1..1 * L1 + 8]);
+            let wsum0: i64 = fc0w[0..L1].iter().enumerate().map(|(i, &v)| (i as i64 + 1) * v as i64).sum();
+            let wsum1: i64 = fc0w[L1..2 * L1].iter().enumerate().map(|(i, &v)| (i as i64 + 1) * v as i64).sum();
+            eprintln!("DBG fc0 W(out=0) wsum={} W(out=1) wsum={}", wsum0, wsum1);
+            eprintln!("DBG fc1 biases[0..4]={:?}", &fc1b[..4]);
+            eprintln!("DBG fc1 W(out=0,in=0..8)={:?}", &fc1w[0 * (2 * L2)..0 * (2 * L2) + 8]);
+            eprintln!("DBG fc1 W(out=1,in=0..8)={:?}", &fc1w[1 * (2 * L2)..1 * (2 * L2) + 8]);
+            eprintln!("DBG fc2 bias={}", fc2b_vec[0]);
+            eprintln!("DBG fc2 W(in=0..16)={:?}", &fc2w[0..16]);
+        }
+        stacks.push(LayerStack { fc0w, fc0b, fc1w, fc1b, fc2w, fc2b: fc2b_vec[0] });
+    }
+
+    eprintln!(
+        "nnue-sf: rede oficial do Stockfish carregada ({} bytes, {} de sobra)",
+        bytes.len(),
+        bytes.len() as i64 - o as i64
+    );
+    Some(RedeSf {
+        ft_bias, ft_threat_w, ft_pair_w, ft_piece_w, ft_piece_psqt, ft_threat_psqt, ft_pair_psqt,
+        stacks, version, hash, desc, ft_header, stack_headers,
+    })
+}
+
+/// Parse a Stockfish net from raw bytes (for tooling; the engine itself goes
+/// through `rede()`).
+pub fn carrega_pub(bytes: &[u8]) -> Option<RedeSf> {
+    carrega(bytes)
+}
+
+// ---- Writing SF's own format ----
+//
+// Mirrors write_leb_128 in nnue_common.h exactly: canonical minimal signed
+// LEB128 -- keep emitting 7-bit groups until the value is fully represented
+// AND the last group's bit 6 carries the correct sign.
+fn leb_encode_one(mut value: i64, out: &mut Vec<u8>) {
+    loop {
+        let byte = (value & 0x7f) as u8;
+        value >>= 7;
+        let done = if byte & 0x40 == 0 { value == 0 } else { value == -1 };
+        if done {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+fn write_leb_block<T: Copy + Into<i64>>(vals: &[T], out: &mut Vec<u8>) {
+    out.extend_from_slice(LEB_MAGIC);
+    let mut body = Vec::new();
+    for &v in vals {
+        leb_encode_one(v.into(), &mut body);
+    }
+    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    out.extend_from_slice(&body);
+}
+
+fn write_dense_layer(w: &[i8], b: &[i32], out: &mut Vec<u8>) {
+    for &v in b {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    for &v in w {
+        out.push(v as u8);
+    }
+}
+
+/// Serialise back into Stockfish's own .nnue format, byte for byte.
+pub fn escreve(net: &RedeSf) -> Vec<u8> {
+    let mut out = Vec::with_capacity(96 * 1024 * 1024);
+    out.extend_from_slice(&net.version.to_le_bytes());
+    out.extend_from_slice(&net.hash.to_le_bytes());
+    out.extend_from_slice(&(net.desc.len() as u32).to_le_bytes());
+    out.extend_from_slice(&net.desc);
+
+    out.extend_from_slice(&net.ft_header);
+    // Same field order as read_parameters().
+    write_leb_block(&net.ft_bias, &mut out);
+    for &v in &net.ft_threat_w {
+        out.push(v as u8);
+    }
+    write_leb_block(&net.ft_threat_psqt, &mut out);
+    for &v in &net.ft_pair_w {
+        out.push(v as u8);
+    }
+    write_leb_block(&net.ft_pair_psqt, &mut out);
+    write_leb_block(&net.ft_piece_w, &mut out);
+    write_leb_block(&net.ft_piece_psqt, &mut out);
+
+    for (i, st) in net.stacks.iter().enumerate() {
+        out.extend_from_slice(&net.stack_headers[i]);
+        write_dense_layer(&st.fc0w, &st.fc0b, &mut out);
+        write_dense_layer(&st.fc1w, &st.fc1b, &mut out);
+        write_dense_layer(&st.fc2w, &[st.fc2b], &mut out);
+    }
+    out
+}
+
+fn board_para_posbb(board: &Board) -> crate::sf_features::PosBB {
+    let mut p = crate::sf_features::PosBB::default();
+    for c in 0..2 {
+        for t in 0..6 {
+            p.pieces[c][t] = board.pieces[c][t];
+        }
+    }
+    p
+}
+
+// The three feature families live in `sf_features` so the trainer can use the
+// exact same mapping; these wrappers only adapt the engine's Board to it.
+fn add_piece_features(board: &Board, pov: usize, feats: &mut Vec<(usize, i32)>) {
+    let mut v = Vec::with_capacity(32);
+    crate::sf_features::piece_features(&board_para_posbb(board), pov, &mut v);
+    for idx in v {
+        feats.push((idx, 0));
+    }
+}
+
+/// The engine's magic bitboards, injected into the shared feature code. The
+/// portable ray loops it falls back to were ~10% of search time.
+const MAGIC: crate::sf_features::Deslizantes = crate::sf_features::Deslizantes {
+    bispo: |sq, occ| crate::attacks::bishop_attacks(sq as crate::types::Square, occ),
+    torre: |sq, occ| crate::attacks::rook_attacks(sq as crate::types::Square, occ),
+};
+
+fn add_threat_features(_atk: &Attacks, board: &Board, pov: usize, feats: &mut Vec<usize>) {
+    crate::sf_features::threat_features_com(&board_para_posbb(board), pov, feats, MAGIC);
+}
+
+fn add_pair_features(board: &Board, pov: usize, feats: &mut Vec<usize>) {
+    crate::sf_features::pair_features(&board_para_posbb(board), pov, feats);
+}
+
+// SF's SqrClippedReLU (scalar path): min(127, (x*x) >> (2*WeightScaleBitsLocal+7)),
+// no pre-clamp before squaring.
+#[inline]
+fn clipped_sq(x: i32, weight_scale_bits_local: u32) -> i32 {
+    let shift = 2 * weight_scale_bits_local + 7;
+    let v = ((x as i64) * (x as i64)) >> shift;
+    v.min(127) as i32
+}
+// SF's ClippedReLU (scalar path): clamp(x >> WeightScaleBitsLocal, 0, 127).
+#[inline]
+fn clipped_lin(x: i32, weight_scale_bits_local: u32) -> i32 {
+    (x >> weight_scale_bits_local).clamp(0, 127)
+}
+
+pub fn evaluate(net: &RedeSf, atk: &Attacks, board: &mut Board) -> i32 {
+    let stm = board.side as usize;
+    let nstm = 1 - stm;
+
+    let build_acc = |pov: usize| -> (Vec<i16>, Vec<(usize, i32)>, Vec<usize>, Vec<usize>) {
+        // i16, not i32: the weights are i16/i8, and widening each one on the
+        // way in stops the compiler vectorising the hot loop -- which is where
+        // ~90% of the time goes (110 features x 1024 x 2 perspectives). SF
+        // keeps its accumulator in i16 for exactly this reason.
+        let mut acc = vec![0i16; L1];
+        acc.copy_from_slice(&net.ft_bias);
+        let mut piece_feats = Vec::with_capacity(32);
+        add_piece_features(board, pov, &mut piece_feats);
+        let mut threat_feats = Vec::with_capacity(64);
+        add_threat_features(atk, board, pov, &mut threat_feats);
+        let mut pair_feats = Vec::new();
+        add_pair_features(board, pov, &mut pair_feats);
+
+        for &(f, _) in &piece_feats {
+            let row = &net.ft_piece_w[f * L1..(f + 1) * L1];
+            for (a, &w) in acc.iter_mut().zip(row.iter()) {
+                *a = a.wrapping_add(w);
+            }
+        }
+        for &f in &threat_feats {
+            let row = &net.ft_threat_w[f * L1..(f + 1) * L1];
+            for (a, &w) in acc.iter_mut().zip(row.iter()) {
+                *a = a.wrapping_add(w as i16);
+            }
+        }
+        for &f in &pair_feats {
+            let pf = f - PAIR_BASE;
+            let row = &net.ft_pair_w[pf * L1..(pf + 1) * L1];
+            for (a, &w) in acc.iter_mut().zip(row.iter()) {
+                *a = a.wrapping_add(w as i16);
+            }
+        }
+        (acc, piece_feats, threat_feats, pair_feats)
+    };
+
+    let n = board.occ_all.count_ones() as i32;
+    let bucket = (((n - 1) / 4).clamp(0, NB as i32 - 1)) as usize;
+
+    // psqt needs the bucket, redo cleanly per perspective. Threat/pair
+    // active features ALSO contribute to psqt via threatAndPpPsqtWeights,
+    // always added (apply_psqt<+1> on the "active" list in SF's own
+    // refresh-cache code) -- not just piece features.
+    let psqt_de = |piece_feats: &[(usize, i32)], threat_feats: &[usize], pair_feats: &[usize]| -> i64 {
+        let mut s: i64 = 0;
+        for &(f, _) in piece_feats {
+            s += net.ft_piece_psqt[f * NB + bucket] as i64;
+        }
+        for &f in threat_feats {
+            s += net.ft_threat_psqt[f * NB + bucket] as i64;
+        }
+        for &f in pair_feats {
+            let pf = f - PAIR_BASE;
+            s += net.ft_pair_psqt[pf * NB + bucket] as i64;
+        }
+        s
+    };
+
+    // Incremental path: reuse the cached accumulator and apply only the
+    // feature diff. `build_acc` stays as the reference implementation and is
+    // what the correctness test compares against.
+    let _ = &build_acc;
+    let (psqt_s, psqt_n) = ESTADO.with(|c| {
+        let mut st = c.borrow_mut();
+        let _ = acc_incremental(net, atk, board, stm, &mut st);
+        let _ = acc_incremental(net, atk, board, nstm, &mut st);
+        st.valido = true;
+        // PSQT from the same unified lists, so threats and pairs are not
+        // silently dropped -- the official net does carry those weights.
+        // psqt vem do acumulado por perspectiva: o caminho rapido nao
+        // mantem as listas de features, logo nao pode somar por cima delas
+        // guardar os bitboards DEPOIS dos acc_incremental: sao eles que
+        // comparam contra o estado anterior para derivar o lance
+        for c in 0..2 {
+            for t in 0..6 {
+                st.bb[c][t] = board.pieces[c][t];
+            }
+        }
+
+        let ps = st.psqt[stm][bucket];
+        let pn = st.psqt[nstm][bucket];
+
+        // Pairwise activation done here, straight out of the cached
+        // accumulators into a reused buffer -- cloning two 1024-wide
+        // accumulators per call was showing up as 14% of runtime in memset.
+        let half = L1 / 2;
+        let mut x = std::mem::take(&mut st.x);
+        for j in 0..half {
+            let s0 = (st.acc[stm][j] as i32).clamp(0, FT_MAX_VAL);
+            let s1 = (st.acc[stm][j + half] as i32).clamp(0, FT_MAX_VAL);
+            x[j] = ((s0 * s1) / 512) as u8;
+        }
+        for j in 0..half {
+            let s0 = (st.acc[nstm][j] as i32).clamp(0, FT_MAX_VAL);
+            let s1 = (st.acc[nstm][j + half] as i32).clamp(0, FT_MAX_VAL);
+            x[half + j] = ((s0 * s1) / 512) as u8;
+        }
+        st.x = x;
+        (ps, pn)
+    });
+    // SF's transform(): psqt = (psqtAccum[stm][bucket] - psqtAccum[ntm][bucket]) / 2.
+    let psqt = (psqt_s - psqt_n) / 2;
+
+    if std::env::var_os("KESTREL_SF_DEBUG").is_some() {
+        let mut pf_stm = Vec::new();
+        add_piece_features(board, stm, &mut pf_stm);
+        ESTADO.with(|c| {
+            let st = c.borrow();
+            eprintln!("DBG n={} bucket={} acc_stm[0..16]={:?} acc_ntm[0..16]={:?} psqt={}",
+                board.occ_all.count_ones(), bucket, &st.acc[stm][0..16], &st.acc[nstm][0..16], psqt);
+        });
+    }
+
+    let stack = &net.stacks[bucket];
+    let x = ESTADO.with(|c| std::mem::take(&mut c.borrow_mut().x));
+
+    // fc_0 input: SF's FeatureTransformer::transform pairwise activation.
+    // Each perspective's own L1-wide accumulator is split into two
+    // HalfDimensions/2 halves, each clamped to [0, FtMaxVal], multiplied
+    // together and divided by 512 -- producing L1/2 outputs per
+    // perspective, concatenated to L1 total (not 2*L1).
+    let half = L1 / 2;
+
+    // Weights are stored output-major on disk (file position i = output*InDim
+    // + input) -- the get_weight_index_scrambled() SIMD permutation in SF's
+    // source only affects the in-RAM destination slot during load, not the
+    // sequential file byte order, so a plain scalar reader never needs to
+    // replicate it.
+    // Uma saida de cada vez, apesar de reler `x` 32 vezes: processar 4 em
+    // paralelo foi MEDIDO e ficou 40% PIOR (8,6s vs 6,1s por 300k nos) --
+    // quatro linhas de pesos ao mesmo tempo enchem a cache mais do que a
+    // reutilizacao de `x` poupa. Nao repetir sem medir.
+    let mut fc0_out = [0i32; L2];
+    for o in 0..L2 {
+        let mut s: i64 = 0;
+        let row = &stack.fc0w[o * L1..(o + 1) * L1];
+        let mut acc32: i32 = 0;
+        for (&xi, &wi) in x.iter().zip(row.iter()) {
+            acc32 += xi as i32 * wi as i32;
+        }
+        s += acc32 as i64;
+        fc0_out[o] = (s as i32) + stack.fc0b[o];
+    }
+
+    // ac_sqr_0 / ac_0 use WeightScaleBits+1 (SF: SqrClippedReLU<..,
+    // WeightScaleBits+1> ac_sqr_0; ClippedReLU<.., WeightScaleBits+1> ac_0;).
+    let wsb0 = WEIGHT_SCALE_BITS as u32 + 1;
+    let mut concat1 = [0i32; 2 * L2];
+    for o in 0..L2 {
+        concat1[o] = clipped_sq(fc0_out[o], wsb0);
+        concat1[L2 + o] = clipped_lin(fc0_out[o], wsb0);
+    }
+
+    let mut fc1_out = [0i32; L3];
+    for o in 0..L3 {
+        let mut s: i64 = 0;
+        let row = &stack.fc1w[o * (2 * L2)..(o + 1) * (2 * L2)];
+        for i in 0..2 * L2 {
+            s += concat1[i] as i64 * row[i] as i64;
+        }
+        fc1_out[o] = (s as i32) + stack.fc1b[o];
+    }
+
+    // ac_sqr_1 / ac_1 use plain WeightScaleBits.
+    let wsb1 = WEIGHT_SCALE_BITS as u32;
+    let mut concat2 = [0i32; 2 * L2 + 2 * L3];
+    concat2[..2 * L2].copy_from_slice(&concat1);
+    for o in 0..L3 {
+        concat2[2 * L2 + o] = clipped_sq(fc1_out[o], wsb1);
+        concat2[2 * L2 + L3 + o] = clipped_lin(fc1_out[o], wsb1);
+    }
+
+    let mut s: i64 = 0;
+    for i in 0..2 * L2 + 2 * L3 {
+        s += concat2[i] as i64 * stack.fc2w[i] as i64;
+    }
+    let fc2_out = (s as i32) + stack.fc2b;
+
+    let skip_0 = fc0_out[L2 - 2] - fc0_out[L2 - 1];
+    let fwd_out = (fc2_out + skip_0) as i64;
+
+    if std::env::var_os("KESTREL_SF_DEBUG").is_some() {
+        eprintln!("DBG fc0_out[0..4]={:?} fc1_out[0..4]={:?} fc2_out={} skip_0={} fwd_out={}",
+            &fc0_out[0..4], &fc1_out[0..4], fc2_out, skip_0, fwd_out);
+    }
+
+    ESTADO.with(|c| c.borrow_mut().x = x);
+
+    let multiplier: i64 = 600 * OUTPUT_SCALE;
+    let denominator: i64 = HIDDEN_ONE_VAL * (1i64 << WEIGHT_SCALE_BITS) * 2;
+    let positional = fwd_out * multiplier / denominator;
+
+    ((psqt / OUTPUT_SCALE) + (positional / OUTPUT_SCALE)) as i32
+}
+
+static REDE: OnceLock<Option<RedeSf>> = OnceLock::new();
+
+pub fn rede() -> Option<&'static RedeSf> {
+    REDE.get_or_init(|| {
+        let path = std::env::var("KESTREL_NNUE_SF").ok()?;
+        let bytes = std::fs::read(&path).ok()?;
+        carrega(&bytes)
+    })
+    .as_ref()
+}
+
+pub fn active() -> bool {
+    rede().is_some()
+}
+
+// ---- Converting bullet's raw f32 weights into an SF network ----
+
+/// Quantisation scales. The feature transformer's scale is fixed by the
+/// format: SF clamps the accumulator to FtMaxVal=255 and its pairwise step
+/// divides by 512, so 255 is "one". The dense layers use 64, matching
+/// WeightScaleBits=6.
+pub const CONV_QA: f32 = 256.0;
+/// Per-layer weight scales -- they are NOT all the same: fc1 uses half the
+/// others. Biases scale by their own layer's weight scale times the hidden
+/// quantisation (128).
+pub const CONV_W_FC0: f32 = 128.0;
+pub const CONV_W_FC1: f32 = 64.0;
+pub const CONV_W_FC2: f32 = 128.0;
+const HIDDEN_QUANT_ONE: f32 = 128.0;
+pub const CONV_B_FC0: f32 = CONV_W_FC0 * HIDDEN_QUANT_ONE;
+pub const CONV_B_FC1: f32 = CONV_W_FC1 * HIDDEN_QUANT_ONE;
+pub const CONV_B_FC2: f32 = CONV_W_FC2 * HIDDEN_QUANT_ONE;
+/// PSQT: nnue2score (600) * weight_scale_out (16).
+pub const CONV_PSQT: f32 = 600.0 * 16.0;
+
+fn quant_round(v: f32, scale: f32) -> f32 {
+    (v * scale).round()
+}
+
+/// Build an SF network from bullet's raw (f32) tensors, using `molde` for the
+/// header fields so Stockfish's architecture-hash check passes.
+///
+/// `l0w` is feature-major: 1024 contiguous weights per input row, laid out as
+/// [factor(704) | dustbin(1) | pieces(22528) | threats(59808) | pairs(4560)].
+///
+/// Two things are load-bearing here:
+///  * The factoriser is FOLDED IN. bullet trains a shared 704-row piece-square
+///    factor alongside the king-bucketed rows and does NOT merge it on save;
+///    SF's format has no factoriser, so each piece row must become
+///    row + factor_row. Skipping this silently wrecks the network.
+///  * Threat and pair rows are stored as i8 in SF, so they are clipped to
+///    +-127. Measured on a real checkpoint only ~0.02% of them are affected.
+#[allow(clippy::too_many_arguments)]
+pub fn de_bullet(
+    molde: &RedeSf,
+    l0w: &[f32], l0b: &[f32],
+    fc0w: &[f32], fc0b: &[f32],
+    fc1w: &[f32], fc1b: &[f32],
+    fc2w: &[f32], fc2b: &[f32],
+    psqtw: &[f32],
+    fc0fw: &[f32], fc0fb: &[f32],
+    fc1fw: &[f32], fc1fb: &[f32],
+    fc2fw: &[f32], fc2fb: &[f32],
+) -> RedeSf {
+    const FACT: usize = 704;
+    const BASE: usize = FACT + 1; // factor rows + dustbin
+
+    let mut clipados = 0usize;
+    let mut ft_bias = vec![0i16; L1];
+    for k in 0..L1 {
+        ft_bias[k] = quant_round(l0b[k], CONV_QA) as i16;
+    }
+
+    // Pieces: fold the factor row in, keep i16.
+    let mut ft_piece_w = vec![0i16; PIECE_DIM * L1];
+    for f in 0..PIECE_DIM {
+        let fact = f % FACT;
+        for k in 0..L1 {
+            let v = l0w[(BASE + f) * L1 + k] + l0w[fact * L1 + k];
+            ft_piece_w[f * L1 + k] = quant_round(v, CONV_QA) as i16;
+        }
+    }
+
+    // Threats and pairs: no factor, and they must fit in i8.
+    // Two different scales share this: the feature transformer's threat/pair
+    // rows use QA, the dense layers use QB. Passing the wrong one is silent --
+    // the net still loads, just evaluates nonsense.
+    let mut clip_i8 = |v: f32, escala: f32, clipados: &mut usize| -> i8 {
+        let q = quant_round(v, escala);
+        if q > 127.0 { *clipados += 1; 127 } else if q < -127.0 { *clipados += 1; -127 } else { q as i8 }
+    };
+    let mut ft_threat_w = vec![0i8; THREAT_DIM * L1];
+    for f in 0..THREAT_DIM {
+        for k in 0..L1 {
+            ft_threat_w[f * L1 + k] = clip_i8(l0w[(BASE + PIECE_DIM + f) * L1 + k], CONV_QA, &mut clipados);
+        }
+    }
+    let mut ft_pair_w = vec![0i8; PAIR_DIM * L1];
+    for f in 0..PAIR_DIM {
+        for k in 0..L1 {
+            ft_pair_w[f * L1 + k] =
+                clip_i8(l0w[(BASE + PIECE_DIM + THREAT_DIM + f) * L1 + k], CONV_QA, &mut clipados);
+        }
+    }
+
+    // PSQT, now trained. Layout is column-major like the rest: psqtw is
+    // [NB x NIN], so feature f lives at psqtw[f * NB + b]. The factor rows
+    // fold into the piece rows here too.
+    const NIN: usize = FACT + 1 + PIECE_DIM + THREAT_DIM + PAIR_DIM;
+    let _ = NIN;
+    // SF divides psqt by OutputScale (16) and the training used eval_scale
+    // 400, so one unit of the trained psqt is 16*400 internal units.
+    // QA*QB (32640) was 5x too big and swamped low-piece positions.
+    let escala_psqt: f32 = if std::env::var_os("KESTREL_SEM_PSQT").is_some() { 0.0 } else { CONV_PSQT };
+    let mut ft_piece_psqt = vec![0i32; PIECE_DIM * NB];
+    for f in 0..PIECE_DIM {
+        let fact = f % FACT;
+        for b in 0..NB {
+            let v = psqtw[(BASE + f) * NB + b] + psqtw[fact * NB + b];
+            ft_piece_psqt[f * NB + b] = quant_round(v, escala_psqt) as i32;
+        }
+    }
+    let mut ft_threat_psqt = vec![0i32; THREAT_DIM * NB];
+    for f in 0..THREAT_DIM {
+        for b in 0..NB {
+            ft_threat_psqt[f * NB + b] =
+                quant_round(psqtw[(BASE + PIECE_DIM + f) * NB + b], escala_psqt) as i32;
+        }
+    }
+    let mut ft_pair_psqt = vec![0i32; PAIR_DIM * NB];
+    for f in 0..PAIR_DIM {
+        for b in 0..NB {
+            ft_pair_psqt[f * NB + b] = quant_round(
+                psqtw[(BASE + PIECE_DIM + THREAT_DIM + f) * NB + b], escala_psqt) as i32;
+        }
+    }
+
+    // bullet stores each dense layer as [out_total, in]; SF wants one stack
+    // per bucket, output-major.
+    let mut stacks = Vec::with_capacity(NB);
+    for b in 0..NB {
+        let mut s_fc0w = vec![0i8; L2 * L1];
+        let mut s_fc0b = vec![0i32; L2];
+        for o in 0..L2 {
+            let src = b * L2 + o;
+            s_fc0b[o] = quant_round(fc0b[src] + fc0fb[o], CONV_B_FC0) as i32;
+            for i in 0..L1 {
+                let v = fc0w[i * (L2 * NB) + src] + fc0fw[i * L2 + o];
+                s_fc0w[o * L1 + i] = clip_i8(v, CONV_W_FC0, &mut clipados);
+            }
+        }
+        let mut s_fc1w = vec![0i8; L3 * (2 * L2)];
+        let mut s_fc1b = vec![0i32; L3];
+        for o in 0..L3 {
+            let src = b * L3 + o;
+            s_fc1b[o] = quant_round(fc1b[src] + fc1fb[o], CONV_B_FC1) as i32;
+            for i in 0..2 * L2 {
+                let v = fc1w[i * (L3 * NB) + src] + fc1fw[i * L3 + o];
+                s_fc1w[o * (2 * L2) + i] = clip_i8(v, CONV_W_FC1, &mut clipados);
+            }
+        }
+        let n2 = 2 * L2 + 2 * L3;
+        let mut s_fc2w = vec![0i8; n2];
+        for i in 0..n2 {
+            s_fc2w[i] = clip_i8(fc2w[i * NB + b] + fc2fw[i], CONV_W_FC2, &mut clipados);
+        }
+        let s_fc2b = quant_round(fc2b[b] + fc2fb[0], CONV_B_FC2) as i32;
+
+        stacks.push(LayerStack {
+            fc0w: s_fc0w, fc0b: s_fc0b, fc1w: s_fc1w, fc1b: s_fc1b, fc2w: s_fc2w, fc2b: s_fc2b,
+        });
+    }
+
+    eprintln!("nnue-sf: convertido do bullet ({} pesos clipados para i8)", clipados);
+
+    RedeSf {
+        ft_bias, ft_threat_w, ft_pair_w, ft_piece_w,
+        ft_piece_psqt, ft_threat_psqt, ft_pair_psqt, stacks,
+        version: molde.version,
+        hash: molde.hash,
+        desc: molde.desc.clone(),
+        ft_header: molde.ft_header,
+        stack_headers: molde.stack_headers.clone(),
+    }
+}
+
+// ---- Incremental accumulator ----
+//
+// Measured: the reader was spending ~90% of its time reading ~290 KB of
+// weights per node (110 features x 1024 x 2 perspectives), against a 95 MB
+// network -- every feature a cache miss. Recomputing that per node caps us at
+// ~26k NPS while the bot's own net does 467k.
+//
+// This is Stockfish's idea, not its code: keep the previous position's
+// accumulator and touch only the rows whose features changed. Nodes handed to
+// evaluate() in an alpha-beta search are usually one to three moves apart, so
+// the diff is small even though the position is not literally the parent.
+//
+// It deliberately does NOT hook into make/unmake: a single cached state keeps
+// the search untouched and the failure mode safe -- a miss just costs a full
+// rebuild, never a wrong answer.
+
+/// Unified feature index so the three families can share one diff.
+/// [0, PIECE_DIM) pieces | [PIECE_DIM, +THREAT_DIM) threats | then pairs.
+const U_THREAT: usize = PIECE_DIM;
+const U_PAIR: usize = PIECE_DIM + THREAT_DIM;
+
+/// 1024 i16 add/sub with AVX2: 16 lanes per instruction against the 8 the
+/// autovectoriser was settling for. Profiling put this at ~15% of search time.
+
+/// Same, widening i8 weights to i16 on the way in.
+
+/// One weight of one feature row, whichever family `u` falls in. Only used by
+/// the delta verifier, to identify a feature from the damage it did.
+fn linha_peso(net: &RedeSf, u: usize, i: usize) -> i16 {
+    if u < U_THREAT {
+        net.ft_piece_w[u * L1 + i]
+    } else if u < U_PAIR {
+        net.ft_threat_w[(u - U_THREAT) * L1 + i] as i16
+    } else {
+        net.ft_pair_w[(u - U_PAIR) * L1 + i] as i16
+    }
+}
+
+#[inline]
+fn aplica_linha(net: &RedeSf, acc: &mut [i16], u: usize, somar: bool) {
+    if u < U_THREAT {
+        let row = &net.ft_piece_w[u * L1..(u + 1) * L1];
+        if somar {
+            for (a, &w) in acc.iter_mut().zip(row) { *a = a.wrapping_add(w); }
+        } else {
+            for (a, &w) in acc.iter_mut().zip(row) { *a = a.wrapping_sub(w); }
+        }
+    } else {
+        let (f, row) = if u < U_PAIR {
+            let f = u - U_THREAT;
+            (f, &net.ft_threat_w[f * L1..(f + 1) * L1])
+        } else {
+            let f = u - U_PAIR;
+            (f, &net.ft_pair_w[f * L1..(f + 1) * L1])
+        };
+        let _ = f;
+        if somar {
+            for (a, &w) in acc.iter_mut().zip(row) { *a = a.wrapping_add(w as i16); }
+        } else {
+            for (a, &w) in acc.iter_mut().zip(row) { *a = a.wrapping_sub(w as i16); }
+        }
+    }
+}
+
+/// Active features for one perspective, as sorted unified indices.
+fn feats_unificadas(
+    atk: &Attacks, board: &Board, pov: usize,
+    pecas: &mut Vec<(usize, i32)>, out: &mut Vec<u32>,
+    t: &mut Vec<usize>, pr: &mut Vec<usize>,
+) {
+    pecas.clear();
+    out.clear();
+    t.clear();
+    pr.clear();
+
+    // The three families occupy disjoint index ranges (pieces < threats <
+    // pairs), so sorting each one and concatenating gives a sorted whole --
+    // cheaper than one sort over all ~91, which profiling put at ~5%.
+    add_piece_features(board, pov, pecas);
+    let ini = out.len();
+    for &(f, _) in pecas.iter() {
+        out.push(f as u32);
+    }
+    out[ini..].sort_unstable();
+
+    add_threat_features(atk, board, pov, t);
+    let ini = out.len();
+    for &f in t.iter() {
+        out.push((U_THREAT + f) as u32);
+    }
+    out[ini..].sort_unstable();
+
+    add_pair_features(board, pov, pr);
+    let ini = out.len();
+    for &f in pr.iter() {
+        out.push((U_PAIR + (f - PAIR_BASE)) as u32);
+    }
+    out[ini..].sort_unstable();
+}
+
+struct EstadoAcc {
+    valido: bool,
+    acc: [Vec<i16>; 2],
+    feats: [Vec<u32>; 2],
+    // scratch, reused to keep this off the allocator in the hot path
+    novas: Vec<u32>,
+    pecas: Vec<(usize, i32)>,
+    bb: [[u64; 6]; 2],
+    scratch_t: Vec<usize>,
+    scratch_p: Vec<usize>,
+    x: Vec<u8>,
+    psqt: [[i64; NB]; 2],
+    /// Cache de refresh por casa de rei ("finny tables"): para cada
+    /// (casa do rei, perspectiva) guarda o acumulador SO' com features de
+    /// peca e os bitboards que o geraram. Reconstruir passa a ser aplicar a
+    /// diferenca de pecas contra a entrada, em vez de somar as ~32 do zero.
+    /// As ameacas e os pares ficam de fora de proposito -- mudam de mais
+    /// para valer a pena cachear, e sao somados por cima depois.
+    cache: Vec<EntradaCache>,
+}
+
+#[derive(Clone)]
+struct EntradaCache {
+    acc: Vec<i16>,
+    psqt: [i64; NB],
+    bb: [[u64; 6]; 2],
+    valido: bool,
+}
+
+impl EstadoAcc {
+    fn novo() -> Self {
+        EstadoAcc {
+            valido: false,
+            acc: [vec![0i16; L1], vec![0i16; L1]],
+            feats: [Vec::with_capacity(192), Vec::with_capacity(192)],
+            novas: Vec::with_capacity(192),
+            pecas: Vec::with_capacity(32),
+            bb: [[0u64; 6]; 2],
+            scratch_t: Vec::with_capacity(128),
+            scratch_p: Vec::with_capacity(32),
+            x: vec![0u8; L1],
+            psqt: [[0i64; NB]; 2],
+            cache: vec![
+                EntradaCache { acc: Vec::new(), psqt: [0; NB], bb: [[0; 6]; 2], valido: false };
+                64 * 2
+            ],
+        }
+    }
+}
+
+thread_local! {
+    static ESTADO: std::cell::RefCell<EstadoAcc> = std::cell::RefCell::new(EstadoAcc::novo());
+}
+
+/// Rebuild `acc` for one perspective from the cached state, applying only the
+/// difference. Returns the piece features (the caller needs them for PSQT).
+/// Threat deltas straight from the move, using the two board instants the
+/// occupancy demands: the piece leaving is evaluated on the OLD board, the
+/// piece arriving on the NEW one. Returns false when the change is not a
+/// simple move, and the caller rebuilds instead.
+fn delta_por_lance(
+    net: &RedeSf, board: &Board, pov: usize, st: &mut EstadoAcc,
+    ev: &[(usize, usize, usize, bool)],
+) -> bool {
+    let agora = board_para_posbb(board);
+    let mut antes = agora;
+    // desfazer os eventos para reconstruir o tabuleiro anterior
+    for &(sq, t, c, add) in ev {
+        if add { antes.pieces[c][t] &= !(1u64 << sq); } else { antes.pieces[c][t] |= 1u64 << sq; }
+    }
+
+    let mut deltas = Vec::with_capacity(64);
+    // sem_raios = {from,to} nas saidas, para nao contar duas vezes a mesma
+    // descoberta que a chamada da entrada ja' trata
+    let mut casas = 0u64;
+    for &(sq, _, _, _) in ev { casas |= 1u64 << sq; }
+
+    // Sequential, exactly as the reference does it: the threats are updated
+    // piece by piece as the board changes, not from two fixed snapshots.
+    //
+    // The distinction is not cosmetic. Take `Qxf6`: the knight leaves f6, which
+    // reveals f7 to the queen on f3 -- and then the queen itself lands on f6 and
+    // blocks it again. The revealing and the re-blocking happen at DIFFERENT
+    // board states, and the intermediate one (f6 empty, queen still on f3) is
+    // where they cancel. Reading only "before" and "after", that state does not
+    // exist, and no ray guard can recover it: we emitted the reveal and never
+    // the re-block.
+    //
+    // So the board is walked through the move instead. Removals are evaluated
+    // with the piece still on the board and then cleared; additions are placed
+    // first and then evaluated -- the order `remove_piece`/`put_piece` impose.
+    // The captured piece comes off FIRST, before the piece that moves leaves
+    // its square -- `do_move` runs `remove_piece(to)` and only then
+    // `move_piece(from, to)`. A removal whose square also receives an addition
+    // is the capture; the order between the two is not free, and getting it
+    // backwards leaves a stale threat on `dxe5`-shaped moves.
+    // A removal is a CAPTURE when its colour is not the colour that is putting
+    // pieces down -- not when "its square also receives a piece". The square
+    // test looks right and breaks on en passant, where the captured pawn stands
+    // on neither `from` nor `to`: it was then taken for the moving piece, came
+    // off in the wrong order and was handed `fromTo`, which belongs only to the
+    // piece that moves.
+    // the king square of THIS perspective, taken from the final board and held
+    // fixed while the move is walked (see `eventos_ameaca`)
+    let ksq_pov = agora.king_sq(pov);
+    let mut cor_que_entra = 2usize;
+    for &(_, _, c, add) in ev {
+        if add {
+            cor_que_entra = c;
+        }
+    }
+    let mut corrente = antes;
+    for capturada in [true, false] {
+        for &(sq, t, c, add) in ev {
+            if !add && (c != cor_que_entra) == capturada {
+                // `noRaysContaining` belongs to the piece that MOVES, and only
+                // to it: the original passes `fromTo` on the two halves of
+                // `move_piece` and nothing at all on the `remove_piece` of a
+                // capture. Passing it everywhere suppresses the capture's half
+                // of a discovery while the move's half still fires, which is
+                // how `Bxf6` was left holding a threat between a bishop on e7
+                // and a bishop on g5 -- a pair that is blocked in both real
+                // positions and exists only in the intermediate one.
+                let sem = if capturada { !0u64 } else { casas };
+                crate::sf_features::eventos_ameaca(
+                    &corrente, pov, false, c, t, sq, sem, MAGIC, &mut deltas, ksq_pov);
+                corrente.pieces[c][t] &= !(1u64 << sq);
+            }
+        }
+    }
+    for &(sq, t, c, add) in ev {
+        if add {
+            corrente.pieces[c][t] |= 1u64 << sq;
+            crate::sf_features::eventos_ameaca(
+                &corrente, pov, true, c, t, sq, casas, MAGIC, &mut deltas, ksq_pov);
+        }
+    }
+
+    // Collapse to at most one change per feature. The active features are a
+    // SET, so a feature's delta can only be -1, 0 or +1 -- any other total is a
+    // move whose several events each touched the same threat.
+    //
+    // `Nxf6` is the plain case: the threat (knight e4 -> knight f6) is emitted
+    // once as "what the departing knight attacked" and again as "who attacked
+    // the captured piece". Two removals of one feature subtract its weight row
+    // twice, and the accumulator drifts a little further from the truth with
+    // every capture searched -- silently, because nothing downstream can tell a
+    // wrong accumulator from a right one.
+    deltas.sort_unstable_by_key(|d| d.idx);
+    let mut i = 0;
+    while i < deltas.len() {
+        let idx = deltas[i].idx;
+        let mut soma = 0i32;
+        while i < deltas.len() && deltas[i].idx == idx {
+            soma += if deltas[i].adicionar { 1 } else { -1 };
+            i += 1;
+        }
+        if soma != 0 {
+            let somar = soma > 0;
+            aplica_linha(net, &mut st.acc[pov], U_THREAT + idx, somar);
+            let sinal = if somar { 1i64 } else { -1 };
+            for b in 0..NB {
+                st.psqt[pov][b] += sinal * net.ft_threat_psqt[idx * NB + b] as i64;
+            }
+        }
+    }
+    // Pawn pairs. These were not handled here AT ALL: a plain `a2-a3` changes
+    // which pawns pair with which, and the fast path walked straight past it,
+    // so every pawn move left the accumulator holding the previous position's
+    // pairs. Cheap to redo properly -- the feature only reads the two pawn
+    // bitboards, so it is skipped entirely unless a pawn actually moved.
+    let mexeu_peao = ev.iter().any(|&(_, t, _, _)| t == 0);
+    if mexeu_peao {
+        let (mut pa, mut pb) = (Vec::new(), Vec::new());
+        crate::sf_features::pair_features(&antes, pov, &mut pa);
+        crate::sf_features::pair_features(&agora, pov, &mut pb);
+        pa.sort_unstable();
+        pb.sort_unstable();
+        let (mut i, mut j) = (0, 0);
+        while i < pa.len() || j < pb.len() {
+            let (sai, entra) = match (pa.get(i), pb.get(j)) {
+                (Some(&x), Some(&y)) if x == y => {
+                    i += 1;
+                    j += 1;
+                    continue;
+                }
+                (Some(&x), Some(&y)) if x < y => {
+                    i += 1;
+                    (Some(x), None)
+                }
+                (Some(_), Some(&y)) => {
+                    j += 1;
+                    (None, Some(y))
+                }
+                (Some(&x), None) => {
+                    i += 1;
+                    (Some(x), None)
+                }
+                (None, Some(&y)) => {
+                    j += 1;
+                    (None, Some(y))
+                }
+                (None, None) => break,
+            };
+            for (f, somar) in [(sai, false), (entra, true)] {
+                if let Some(f) = f {
+                    let u = U_PAIR + (f - PAIR_BASE);
+                    aplica_linha(net, &mut st.acc[pov], u, somar);
+                    let sinal = if somar { 1i64 } else { -1 };
+                    for b in 0..NB {
+                        st.psqt[pov][b] +=
+                            sinal * net.ft_pair_psqt[(f - PAIR_BASE) * NB + b] as i64;
+                    }
+                }
+            }
+        }
+    }
+
+    // features de peca: indice calculado directamente (o rei desta
+    // perspectiva nao mexeu -- o chamador ja' o garantiu)
+    let ksq = agora.king_sq(pov);
+    for &(sq, t, c, add) in ev {
+        let u = crate::sf_features::indice_peca(ksq, pov, sq, t, c);
+        aplica_linha(net, &mut st.acc[pov], u, add);
+        let sinal = if add { 1i64 } else { -1 };
+        for b in 0..NB {
+            st.psqt[pov][b] += sinal * net.ft_piece_psqt[u * NB + b] as i64;
+        }
+    }
+    true
+}
+
+fn acc_incremental(
+    net: &RedeSf, atk: &Attacks, board: &Board, pov: usize, st: &mut EstadoAcc,
+) {
+    // Caminho rapido: se a mudanca desde a ultima avaliacao e' um lance simples
+    // e o rei desta perspectiva nao mexeu, os deltas saem do lance -- sem
+    // enumerar as ~91 features activas nem ordenar. Cai para o caminho lento
+    // (sempre correcto) em qualquer outro caso.
+    static SEM_DELTA: OnceLock<bool> = OnceLock::new();
+    let sem_delta = *SEM_DELTA.get_or_init(|| std::env::var_os("KESTREL_SEM_DELTA").is_some());
+    // Verificacao do delta contra o refresh (`KESTREL_VERIFICA_DELTA=1`).
+    // Custa uma reconstrucao por avaliacao, logo so' para depuracao -- mas e'
+    // a unica forma de apanhar a posicao EXACTA onde o incremental mente, e o
+    // teste das 278 nao o faz (corre a depth 1, onde o delta mal e' usado).
+    static VERIFICA: OnceLock<bool> = OnceLock::new();
+    let verifica = *VERIFICA.get_or_init(|| std::env::var_os("KESTREL_VERIFICA_DELTA").is_some());
+    if verifica && st.valido && !sem_delta {
+        if let Some(ev) = eventos_de_casa(&st.bb, &board.pieces) {
+            if !rei_invalida_indices(&ev, pov, st, board) {
+                let acc_antes = st.acc[pov].clone();
+                let psqt_antes = st.psqt[pov];
+                let bb_antes = st.bb;
+                if delta_por_lance(net, board, pov, st, &ev) {
+                    let acc_delta = st.acc[pov].clone();
+                    let psqt_delta = st.psqt[pov];
+                    st.acc[pov] = acc_antes;
+                    st.psqt[pov] = psqt_antes;
+                    st.bb = bb_antes;
+                    st.valido = false;
+                    acc_incremental(net, atk, board, pov, st);
+                    if st.acc[pov] != acc_delta || st.psqt[pov] != psqt_delta {
+                        // Name the feature instead of counting lanes: the
+                        // difference between the two accumulators is a sum of
+                        // whole weight rows, so search for the row that matches
+                        // it. One hit means one feature wrongly added (or
+                        // missed) -- and it says which family and which index.
+                        let d: Vec<i32> = st.acc[pov]
+                            .iter()
+                            .zip(acc_delta.iter())
+                            .map(|(c, x)| *c as i32 - *x as i32)
+                            .collect();
+                        let mut achou = Vec::new();
+                        for u in 0..INPUT_DIM {
+                            let bate_pos = (0..L1).all(|i| d[i] == linha_peso(net, u, i) as i32);
+                            let bate_neg = (0..L1).all(|i| d[i] == -(linha_peso(net, u, i) as i32));
+                            if bate_pos || bate_neg {
+                                let fam = if u < U_THREAT { "peca" }
+                                    else if u < U_PAIR { "ameaca" } else { "par" };
+                                achou.push(format!(
+                                    "{} {} {}", if bate_pos { "FALTA" } else { "A-MAIS" }, fam, u));
+                                if achou.len() >= 4 { break; }
+                            }
+                        }
+                        let acc_dif = st.acc[pov] != acc_delta;
+                        let psqt_dif = st.psqt[pov] != psqt_delta;
+                        let maxd = d.iter().map(|x| x.abs()).max().unwrap_or(0);
+                        let _ = (acc_dif, psqt_dif, maxd);
+                        let mut quem = String::new();
+                        for a in &achou {
+                            if let Some(n) = a.split_whitespace().last().and_then(|x| x.parse::<usize>().ok()) {
+                                if n >= U_THREAT && n < U_PAIR {
+                                    let f = n - U_THREAT;
+                                    'busca: for ap in 0..6 { for ac in 0..2 { for dp in 0..6 { for dc in 0..2 {
+                                        for asq in 0..64 { for dsq in 0..64 {
+                                            for hm in [false, true] {
+                                                let tf = crate::sf_features::get_threat_feature(
+                                                    pov, ap, ac, dp, dc, asq as i32, dsq as i32, hm);
+                                                if tf >= 0 && tf as usize == f {
+                                                    quem = format!("p{} c{} em {} -> p{} c{} em {} hm={}",
+                                                        ap, ac, asq, dp, dc, dsq, hm);
+                                                    break 'busca;
+                                                }
+                                            }
+                                        }}
+                                    }}}}
+                                }
+                            }
+                        }
+                        eprintln!("DELTA-MAU pov={} fen={} ev={:?} => {:?} [{}]",
+                            pov, board.to_fen(), ev, achou, quem);
+                    }
+                    st.feats[pov].clear();
+                    return;
+                }
+            }
+        }
+    }
+    if st.valido && !sem_delta {
+        if let Some(ev) = eventos_de_casa(&st.bb, &board.pieces) {
+            if !rei_invalida_indices(&ev, pov, st, board) && delta_por_lance(net, board, pov, st, &ev) {
+                // as listas ficam desactualizadas de proposito: enquanto o
+                // caminho rapido pegar, nao sao precisas (o psqt agora e'
+                // acumulado). Marca-se para o caminho lento as reconstruir.
+                st.feats[pov].clear();
+                return;
+            }
+        }
+    }
+
+    let mut pecas = std::mem::take(&mut st.pecas);
+    let mut novas = std::mem::take(&mut st.novas);
+    let mut t = std::mem::take(&mut st.scratch_t);
+    let mut pr = std::mem::take(&mut st.scratch_p);
+    feats_unificadas(atk, board, pov, &mut pecas, &mut novas, &mut t, &mut pr);
+
+    // `st.feats[pov]` empty means the fast path ran and deliberately let the
+    // lists go stale -- it does not mean "no features were active". Feeding an
+    // empty list to the sorted merge below made it ADD every feature of the new
+    // position on top of an accumulator that already held the old ones, with
+    // nothing subtracted: the accumulator silently doubled.
+    //
+    // This is what made a single king move poison everything after it. The fast
+    // path handles king moves by declining them, so the slow path runs -- and
+    // the slow path was the one that broke, not the king logic. A search with no
+    // king move never takes this transition, which is exactly why it matched the
+    // rebuild on all 18 positions while one `Ke1-f1` diverged from that move on.
+    if !st.valido || st.feats[pov].is_empty() {
+        // Refresh pela cache da casa de rei: em vez de somar as ~32 features
+        // de peca do zero, partir do acumulador guardado para esta casa e
+        // aplicar so' as pecas que mudaram desde entao. As ameacas e os pares
+        // sao sempre somados por cima (mudam de mais para cachear).
+        let ksq = board.king_sq(if pov == 0 { Color::White } else { Color::Black }) as usize;
+        let idx = ksq * 2 + pov;
+        let mut base_acc;
+        let mut base_psqt;
+        {
+            let e = &st.cache[idx];
+            if e.valido {
+                base_acc = e.acc.clone();
+                base_psqt = e.psqt;
+                // diferenca de pecas contra o que gerou a entrada
+                for c in 0..2 {
+                    for t in 0..6 {
+                        let saiu = e.bb[c][t] & !board.pieces[c][t];
+                        let entrou = board.pieces[c][t] & !e.bb[c][t];
+                        for (mut bb, add) in [(saiu, false), (entrou, true)] {
+                            while bb != 0 {
+                                let sq = bb.trailing_zeros() as usize;
+                                bb &= bb - 1;
+                                let u = crate::sf_features::indice_peca(ksq, pov, sq, t, c);
+                                aplica_linha(net, &mut base_acc, u, add);
+                                let sinal = if add { 1i64 } else { -1 };
+                                for b in 0..NB {
+                                    base_psqt[b] += sinal * net.ft_piece_psqt[u * NB + b] as i64;
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                base_acc = net.ft_bias.clone();
+                base_psqt = [0i64; NB];
+                for &(f, _) in pecas.iter() {
+                    aplica_linha(net, &mut base_acc, f, true);
+                    for b in 0..NB {
+                        base_psqt[b] += net.ft_piece_psqt[f * NB + b] as i64;
+                    }
+                }
+            }
+        }
+        // guardar a entrada actualizada (so' pecas)
+        {
+            let e = &mut st.cache[idx];
+            e.acc.clear();
+            e.acc.extend_from_slice(&base_acc);
+            e.psqt = base_psqt;
+            for c in 0..2 {
+                for t in 0..6 {
+                    e.bb[c][t] = board.pieces[c][t];
+                }
+            }
+            e.valido = true;
+        }
+        // ameacas e pares por cima
+        st.acc[pov].copy_from_slice(&base_acc);
+        st.psqt[pov] = base_psqt;
+        for &u in novas.iter() {
+            let u = u as usize;
+            if u >= U_THREAT {
+                aplica_linha(net, &mut st.acc[pov], u, true);
+            }
+        }
+    } else {
+        // Sorted merge: what is in `novas` and not in `feats` gets added,
+        // what is in `feats` and not in `novas` gets subtracted. Duplicates
+        // are handled by advancing both sides together.
+        let velhas = &st.feats[pov];
+        let (mut i, mut j) = (0usize, 0usize);
+        let mut mudou = 0usize;
+        let acc = &mut st.acc[pov];
+        while i < velhas.len() && j < novas.len() {
+            match velhas[i].cmp(&novas[j]) {
+                std::cmp::Ordering::Equal => { i += 1; j += 1; }
+                std::cmp::Ordering::Less => {
+                    aplica_linha(net, acc, velhas[i] as usize, false);
+                    i += 1; mudou += 1;
+                }
+                std::cmp::Ordering::Greater => {
+                    aplica_linha(net, acc, novas[j] as usize, true);
+                    j += 1; mudou += 1;
+                }
+            }
+        }
+        while i < velhas.len() {
+            aplica_linha(net, acc, velhas[i] as usize, false); i += 1; mudou += 1;
+        }
+        while j < novas.len() {
+            aplica_linha(net, acc, novas[j] as usize, true); j += 1; mudou += 1;
+        }
+        if std::env::var_os("KESTREL_SF_DIFF").is_some() {
+            use std::sync::atomic::{AtomicUsize, Ordering as O};
+            static N: AtomicUsize = AtomicUsize::new(0);
+            static SOMA: AtomicUsize = AtomicUsize::new(0);
+            static TOT: AtomicUsize = AtomicUsize::new(0);
+            let n = N.fetch_add(1, O::Relaxed) + 1;
+            SOMA.fetch_add(mudou, O::Relaxed);
+            TOT.fetch_add(novas.len(), O::Relaxed);
+            if n % 200_000 == 0 {
+                eprintln!("DIFF media={:.1} de {:.1} features",
+                    SOMA.load(O::Relaxed) as f64 / n as f64,
+                    TOT.load(O::Relaxed) as f64 / n as f64);
+            }
+        }
+    }
+
+    st.feats[pov].clear();
+    st.feats[pov].extend_from_slice(&novas);
+    st.psqt[pov] = [0i64; NB];
+    for &u in novas.iter() {
+        let u = u as usize;
+        for b in 0..NB {
+            st.psqt[pov][b] += if u < U_THREAT {
+                net.ft_piece_psqt[u * NB + b] as i64
+            } else if u < U_PAIR {
+                net.ft_threat_psqt[(u - U_THREAT) * NB + b] as i64
+            } else {
+                net.ft_pair_psqt[(u - U_PAIR) * NB + b] as i64
+            };
+        }
+    }
+    st.novas = novas;
+    st.pecas = pecas;
+    st.scratch_t = t;
+    st.scratch_p = pr;
+}
+
+// ---- Move-anchored delta ----
+//
+// The diff above still enumerates all ~91 features per node just to discover
+// which changed. The delta is derivable from the move itself: which squares
+// gained or lost a piece. This is step one -- pieces only, which are exact and
+// cheap; threats follow the same event model (direct, incoming, discovered)
+// but need the two board instants, so they stay on the enumerate path until
+// this is proven.
+
+/// Squares whose occupancy changed, as (square, piece, colour, added).
+/// Returns None when the change is not expressible as a small set of square
+/// events (a rebuild is then cheaper and always correct).
+/// The squares that changed between two positions -- but ONLY when they are a
+/// single legal move apart.
+///
+/// The old bound was "at most 6 squares", which let two or more moves through as
+/// one event list. That is not a smaller version of the same problem, it is a
+/// different one: the sequential replay below walks the board through `remove`
+/// then `put`, and `fromTo` names the piece that moves -- both meaningless once
+/// two pieces have moved. It produced event lists like four black squares at
+/// once (a knight AND a bishop having moved), and the deltas built from them
+/// were wrong in a way no ordering could fix.
+///
+/// So the shape is checked, not just the count: exactly one piece is put down,
+/// and it belongs to the side that just played. Anything else falls back to the
+/// full rebuild, which is always right.
+fn eventos_de_casa(
+    antes: &[[u64; 6]; 2], agora: &[[u64; 6]; 2],
+) -> Option<Vec<(usize, usize, usize, bool)>> {
+    let mut ev = Vec::with_capacity(4);
+    for c in 0..2 {
+        for t in 0..6 {
+            let mut saiu = antes[c][t] & !agora[c][t];
+            let mut entrou = agora[c][t] & !antes[c][t];
+            while saiu != 0 {
+                let sq = saiu.trailing_zeros() as usize;
+                saiu &= saiu - 1;
+                ev.push((sq, t, c, false));
+                if ev.len() > 6 { return None; }
+            }
+            while entrou != 0 {
+                let sq = entrou.trailing_zeros() as usize;
+                entrou &= entrou - 1;
+                ev.push((sq, t, c, true));
+                if ev.len() > 6 { return None; }
+            }
+        }
+    }
+    if ev.is_empty() {
+        return None;
+    }
+    let mut adicoes = 0;
+    let mut cor_add = 2usize;
+    for &(_, _, c, add) in &ev {
+        if add {
+            adicoes += 1;
+            cor_add = c;
+        }
+    }
+    // one piece lands (a castle lands two, and is left to the slow path), and
+    // every removal is either that piece leaving or an enemy piece captured
+    if adicoes != 1 {
+        return None;
+    }
+    let saidas_proprias = ev.iter().filter(|&&(_, _, c, add)| !add && c == cor_add).count();
+    if saidas_proprias != 1 || ev.len() > 3 {
+        return None;
+    }
+    // No king moves on the fast path -- EITHER king, not just this
+    // perspective's. Measured: a search with no king move reproduces the full
+    // rebuild exactly (0 of 18 positions differ); insert a single `Ke1-f1` and
+    // it diverges from that move on (6 of 14), identically whether the
+    // perspective whose king moved rebuilds or not. So the fault is in what the
+    // delta does with a king as a MOVING PIECE, on the side that keeps its
+    // indices -- and it is not the piece features (the PSQT matches exactly)
+    // nor the pairs. Until it is found, correctness wins: the rebuild is always
+    // right, and it is what the engine does for king moves today anyway.
+    if ev.iter().any(|&(_, t, _, _)| t == 5) {
+        return None;
+    }
+    // And the piece that moves must actually be ABLE to make the move.
+    //
+    // Counting events is not enough. The stored state can be several plies away
+    // from the board being evaluated -- make/unmake walks the tree, it does not
+    // walk a game -- so the difference between the two positions is not always
+    // one move. When it happens to be "one piece of type T left d2, one piece
+    // of type T arrived on d4", the shape test passes and the sequential replay
+    // runs on something that never was a move: a knight does not go d2-d4, and
+    // neither does a bishop. Both showed up in the residual failures.
+    let mut de = 64usize;
+    let mut para = 64usize;
+    let mut tipo_de = 6usize;
+    let mut tipo_para = 6usize;
+    for &(sq, t, c, add) in &ev {
+        if c != cor_add {
+            continue;
+        }
+        if add {
+            para = sq;
+            tipo_para = t;
+        } else {
+            de = sq;
+            tipo_de = t;
+        }
+    }
+    if de >= 64 || para >= 64 {
+        return None;
+    }
+    // same piece, or a pawn promoting
+    if tipo_de != tipo_para && !(tipo_de == 0 && tipo_para != 0) {
+        return None;
+    }
+    let mut occ = 0u64;
+    for c in 0..2 {
+        for t in 0..6 {
+            occ |= agora[c][t];
+        }
+    }
+    occ &= !(1u64 << para);
+    let alcanca = if tipo_de == 0 {
+        let df = (de as i32 & 7) - (para as i32 & 7);
+        let dr = (para as i32 >> 3) - (de as i32 >> 3);
+        let frente = if cor_add == 0 { dr } else { -dr };
+        df.abs() <= 1 && (frente == 1 || (frente == 2 && df == 0))
+    } else {
+        crate::sf_features::alcanca_pseudo(tipo_de, de, para, occ, MAGIC)
+    };
+    if !alcanca {
+        return None;
+    }
+    Some(ev)
+}
+
+/// Does this perspective's piece indexing still hold after the move?
+///
+/// The old test was "did this side's king move" -- and that is too strong. The
+/// king square does not enter the indices directly; it enters through exactly
+/// three lookups, and every one of them is a step function that is constant
+/// over large parts of the board:
+///
+///   * `ORIENT_HALFKA[ksq]`  -- the mirror applied to piece squares
+///   * `KING_BUCKETS_BASE[ksq ^ flip]` -- which of the 704-row blocks is used
+///   * `ORIENT_THREATS[ksq]` -- the mirror applied to threat and pair indices
+///
+/// If all three read the same for the old and the new square, then EVERY index
+/// this perspective produces is unchanged, and the ordinary per-move delta is
+/// valid exactly as it stands. Measured on the old test: 8.0% of evaluations
+/// in the opening fell back to a full rebuild because the king moved, and 57.1%
+/// in a pawn endgame -- of which ~83% kept the same orientation. Nearly half of
+/// all evaluations in an endgame were rebuilding three feature tables from
+/// scratch to arrive at the numbers they already had.
+fn rei_invalida_indices(
+    ev: &[(usize, usize, usize, bool)], pov: usize, st: &EstadoAcc, board: &Board,
+) -> bool {
+    if !ev.iter().any(|&(_, t, c, _)| t == 5 && c == pov) {
+        return false;
+    }
+    if std::env::var_os("KESTREL_REI_ANTIGO").is_some() { return true; }
+    let novo = board.king_sq(if pov == 0 { Color::White } else { Color::Black }) as usize;
+    let velho = st.bb[pov][5].trailing_zeros() as usize;
+    if velho >= 64 || novo >= 64 {
+        return true;
+    }
+    let flip = if pov == 1 { 56 } else { 0 };
+    ORIENT_HALFKA[velho] != ORIENT_HALFKA[novo]
+        || ORIENT_THREATS[velho] != ORIENT_THREATS[novo]
+        || crate::sf_features::KING_BUCKETS_BASE[velho ^ flip]
+            != crate::sf_features::KING_BUCKETS_BASE[novo ^ flip]
+}
+
+#[cfg(test)]
+mod testes_delta {
+    use super::*;
+
+    /// Do the per-move threat deltas reproduce the true set difference?
+    ///
+    /// `delta_bate_com_enumeracao` in `sf_features` already checks that ONE
+    /// event produces the right removals. This checks the thing that actually
+    /// runs: a whole move, whose several events are composed. The composition
+    /// is where a feature touched by two events gets counted twice, and no
+    /// existing test could see it -- the 278-position suite runs at depth 1,
+    /// where the incremental path is barely used.
+    fn deltas_do_lance(
+        antes: &crate::sf_features::PosBB, agora: &crate::sf_features::PosBB, pov: usize,
+        ev: &[(usize, usize, usize, bool)],
+    ) -> std::collections::HashMap<usize, i32> {
+        let mut casas = 0u64;
+        for &(sq, _, _, _) in ev {
+            casas |= 1u64 << sq;
+        }
+        let mut saida = Vec::new();
+        let ksq_pov = agora.king_sq(pov);
+        let mut cor_que_entra = 2usize;
+        for &(_, _, c, add) in ev {
+            if add {
+                cor_que_entra = c;
+            }
+        }
+        let mut corrente = *antes;
+        for capturada in [true, false] {
+            for &(sq, t, c, add) in ev {
+                if !add && (c != cor_que_entra) == capturada {
+                    let sem = if capturada { !0u64 } else { casas };
+                    crate::sf_features::eventos_ameaca(
+                        &corrente, pov, false, c, t, sq, sem, MAGIC, &mut saida, ksq_pov);
+                    corrente.pieces[c][t] &= !(1u64 << sq);
+                }
+            }
+        }
+        for &(sq, t, c, add) in ev {
+            if add {
+                corrente.pieces[c][t] |= 1u64 << sq;
+                crate::sf_features::eventos_ameaca(
+                    &corrente, pov, true, c, t, sq, casas, MAGIC, &mut saida, ksq_pov);
+            }
+        }
+        let _ = agora;
+        let mut m = std::collections::HashMap::new();
+        for d in &saida {
+            *m.entry(d.idx).or_insert(0) += if d.adicionar { 1 } else { -1 };
+        }
+        m.retain(|_, v| *v != 0);
+        for v in m.values_mut() {
+            *v = (*v).clamp(-1, 1);
+        }
+        m
+    }
+
+    fn verdade(
+        antes: &crate::sf_features::PosBB, agora: &crate::sf_features::PosBB, pov: usize,
+    ) -> std::collections::HashMap<usize, i32> {
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        crate::sf_features::threat_features(antes, pov, &mut a);
+        crate::sf_features::threat_features(agora, pov, &mut b);
+        let mut m = std::collections::HashMap::new();
+        for f in &a {
+            *m.entry(*f).or_insert(0) -= 1;
+        }
+        for f in &b {
+            *m.entry(*f).or_insert(0) += 1;
+        }
+        m.retain(|_, v| *v != 0);
+        m
+    }
+
+    #[test]
+    fn dama_ameacada_por_nao_dama() {
+    // can_slider_threat no SF: uma dama so' conta como ameacada por outra dama.
+    // Se `get_threat_feature` nao filtra isso, geramos features que o SF nao tem.
+    let mut fora = 0;
+    let mut dentro = 0;
+    for slider in [2usize, 3, 4] {
+        for sc in 0..2 {
+            for dc in 0..2 {
+                for a in 0..64 {
+                    for d in 0..64 {
+                        let tf = crate::sf_features::get_threat_feature(
+                            0, slider, sc, 4, dc, a as i32, d as i32, false);
+                        if tf >= 0 && (tf as usize) < 59808 {
+                            if slider == 4 { dentro += 1 } else { fora += 1 }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    eprintln!("dama ameacada por bispo/torre: {fora} indices validos; por dama: {dentro}");
+    assert_eq!(fora, 0, "geramos ameacas a dama vindas de nao-damas que o SF filtra");
+}
+
+    #[test]
+    fn delta_do_lance_bate_com_a_verdade() {
+        let fens = [
+            "r1bqk2r/ppp1bppp/n4n2/3Pp1B1/4N3/P7/1PP1NPPP/R2QKB1R w KQkq - 0 1",
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+            "rn1qkb1r/5ppp/bpn1p3/p1ppP3/3P1P2/N1P1BN2/PP4PP/R2QKB1R w KQkq - 0 1",
+            "r2qkb1r/ppp2ppp/3p1nb1/8/2nBPP2/2N5/PPP3PP/R2QK1NR w KQkq - 0 1",
+            "r2qkb1r/ppp2ppp/3p1nb1/4n3/2BBP3/2N2P2/PPP3PP/R2QK1NR w KQkq - 0 1",
+            "rn1qr1k1/1bppppbp/pp3np1/6B1/2PP4/2NBPN2/PP3PPP/R2Q1RK1 w - - 0 1",
+        ];
+        let atk = crate::attacks::Attacks::new();
+        let mut mau = 0;
+        let mut total = 0;
+        for f in fens {
+            let mut board = crate::board::Board::from_fen(f);
+            let lances = crate::movegen::generate_legal(&mut board, &atk);
+            for mv in &lances {
+                let antes_bb = board_para_posbb(&board);
+                let undo = board.make_move(mv);
+                let agora_bb = board_para_posbb(&board);
+                let ev = match eventos_de_casa(
+                    &[antes_bb.pieces[0], antes_bb.pieces[1]],
+                    &[agora_bb.pieces[0], agora_bb.pieces[1]],
+                ) {
+                    Some(e) => e,
+                    None => {
+                        board.unmake_move(mv, &undo);
+                        continue;
+                    }
+                };
+                for pov in 0..2 {
+                    if rei_mexeu_teste(&ev, pov) {
+                        continue;
+                    }
+                    total += 1;
+                    let d = deltas_do_lance(&antes_bb, &agora_bb, pov, &ev);
+                    let v = verdade(&antes_bb, &agora_bb, pov);
+                    if d != v {
+                        mau += 1;
+                        if mau <= 3 {
+                            let mut faltam: Vec<_> =
+                                v.iter().filter(|(k, val)| d.get(k) != Some(val)).collect();
+                            faltam.sort();
+                            let mut sobram: Vec<_> =
+                                d.iter().filter(|(k, val)| v.get(k) != Some(val)).collect();
+                            sobram.sort();
+                            let (mut fa, mut fb) = (Vec::new(), Vec::new());
+                            crate::sf_features::threat_features(&antes_bb, pov, &mut fa);
+                            crate::sf_features::threat_features(&agora_bb, pov, &mut fb);
+                            for (k, _) in sobram.iter() {
+                                for ap in 0..6 { for ac in 0..2 { for dp in 0..6 { for dc in 0..2 {
+                                for a in 0..64 { for dsq in 0..64 {
+                                    let tf = crate::sf_features::get_threat_feature(
+                                        pov, ap, ac, dp, dc, a as i32, dsq as i32, false);
+                                    let tf2 = crate::sf_features::get_threat_feature(
+                                        pov, ap, ac, dp, dc, a as i32, dsq as i32, true);
+                                    for (t, hm) in [(tf, false), (tf2, true)] {
+                                        if t >= 0 && t as usize == **k {
+                                            eprintln!("  idx {} = atacante(p{} c{}) em {} -> alvo(p{} c{}) em {} [hm={}]",
+                                                k, ap, ac, a, dp, dc, dsq, hm);
+                                        }
+                                    }
+                                }}}}}}
+                            }
+                            let onde: Vec<String> = sobram
+                                .iter()
+                                .map(|(k, v)| {
+                                    format!(
+                                        "idx {} ({:+}) antes={} agora={}",
+                                        k, v, fa.contains(k), fb.contains(k)
+                                    )
+                                })
+                                .collect();
+                            eprintln!(
+                                "\nlance {:?} pov={} eventos={:?}\n  verdade diz: {:?}\n  delta  diz: {:?}",
+                                mv, pov, ev, faltam, onde
+                            );
+                        }
+                    }
+                }
+                board.unmake_move(mv, &undo);
+            }
+        }
+        assert_eq!(mau, 0, "{mau} de {total} (lance, perspectiva) com delta errado");
+    }
+
+    /// The same check, but over ALL three families at once.
+    ///
+    /// The threats-only version passes while whole moves still diverge, so the
+    /// error is in one of the other two: the delta is simulated as a SET here
+    /// -- start from the features of the previous position, apply exactly what
+    /// `delta_por_lance` would apply, and the result must be the feature set of
+    /// the new position. No network needed, and it names the wrong feature
+    /// instead of leaving 1019 differing accumulator lanes to interpret.
+    #[test]
+    fn delta_completo_bate_com_a_verdade() {
+        let fens = [
+            "r2qkb1r/ppp2ppp/3p1nb1/8/2nBPP2/2N5/PPP3PP/R2QK1NR w KQkq - 0 1",
+            "r2qkb1r/ppp2ppp/3p1nb1/4n3/2BBP3/2N2P2/PPP3PP/R2QK1NR w KQkq - 0 1",
+            "rn1qr1k1/1bppppbp/pp3np1/6B1/2PP4/2NBPN2/PP3PPP/R2Q1RK1 w - - 0 1",
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        ];
+        let atk = crate::attacks::Attacks::new();
+        let (mut mau, mut total) = (0, 0);
+        for f in fens {
+            let mut board = crate::board::Board::from_fen(f);
+            let lances = crate::movegen::generate_legal(&mut board, &atk);
+            for mv in &lances {
+                let antes_bb = board_para_posbb(&board);
+                let undo = board.make_move(mv);
+                let agora_bb = board_para_posbb(&board);
+                let ev = match eventos_de_casa(
+                    &[antes_bb.pieces[0], antes_bb.pieces[1]],
+                    &[agora_bb.pieces[0], agora_bb.pieces[1]],
+                ) {
+                    Some(e) => e,
+                    None => {
+                        board.unmake_move(mv, &undo);
+                        continue;
+                    }
+                };
+                for pov in 0..2 {
+                    // The engine's own condition, not "did the king move" --
+                    // the whole point of `rei_invalida_indices` is that most
+                    // king moves keep every index, and those DO take the delta.
+                    if rei_invalida_indices_teste(&ev, pov, &antes_bb, &agora_bb) {
+                        continue;
+                    }
+                    total += 1;
+                    let mut conj: std::collections::BTreeSet<usize> =
+                        conjunto_unificado(&antes_bb, pov);
+                    let alvo = conjunto_unificado(&agora_bb, pov);
+
+                    // threats, exactly as delta_por_lance composes them
+                    for (idx, soma) in deltas_do_lance(&antes_bb, &agora_bb, pov, &ev) {
+                        if soma > 0 {
+                            conj.insert(U_THREAT + idx);
+                        } else {
+                            conj.remove(&(U_THREAT + idx));
+                        }
+                    }
+                    // pairs, only when a pawn moved
+                    if ev.iter().any(|&(_, t, _, _)| t == 0) {
+                        let (mut pa, mut pb) = (Vec::new(), Vec::new());
+                        crate::sf_features::pair_features(&antes_bb, pov, &mut pa);
+                        crate::sf_features::pair_features(&agora_bb, pov, &mut pb);
+                        for f in &pa {
+                            if !pb.contains(f) {
+                                conj.remove(&(U_PAIR + (f - PAIR_BASE)));
+                            }
+                        }
+                        for f in &pb {
+                            if !pa.contains(f) {
+                                conj.insert(U_PAIR + (f - PAIR_BASE));
+                            }
+                        }
+                    }
+                    // pieces
+                    let ksq = agora_bb.king_sq(pov);
+                    for &(sq, t, c, add) in &ev {
+                        let u = crate::sf_features::indice_peca(ksq, pov, sq, t, c);
+                        if add {
+                            conj.insert(u);
+                        } else {
+                            conj.remove(&u);
+                        }
+                    }
+
+                    if conj != alvo {
+                        mau += 1;
+                        if mau <= 3 {
+                            let fam = |u: &usize| {
+                                if *u < U_THREAT { "peca" }
+                                else if *u < U_PAIR { "ameaca" }
+                                else { "par" }
+                            };
+                            let sobra: Vec<String> = conj.difference(&alvo)
+                                .map(|u| format!("{} {}", fam(u), u)).collect();
+                            let falta: Vec<String> = alvo.difference(&conj)
+                                .map(|u| format!("{} {}", fam(u), u)).collect();
+                            eprintln!("\nlance {:?} pov={} ev={:?}\n  a mais: {:?}\n  a menos: {:?}",
+                                mv, pov, ev, sobra, falta);
+                        }
+                    }
+                }
+                board.unmake_move(mv, &undo);
+            }
+        }
+        assert_eq!(mau, 0, "{mau} de {total} com o delta completo errado");
+    }
+
+    fn conjunto_unificado(
+        pos: &crate::sf_features::PosBB, pov: usize,
+    ) -> std::collections::BTreeSet<usize> {
+        let mut out = std::collections::BTreeSet::new();
+        let ksq = pos.king_sq(pov);
+        for c in 0..2 {
+            for t in 0..6 {
+                let mut bb = pos.pieces[c][t];
+                while bb != 0 {
+                    let sq = bb.trailing_zeros() as usize;
+                    bb &= bb - 1;
+                    out.insert(crate::sf_features::indice_peca(ksq, pov, sq, t, c));
+                }
+            }
+        }
+        let mut v = Vec::new();
+        crate::sf_features::threat_features(pos, pov, &mut v);
+        for f in &v {
+            out.insert(U_THREAT + f);
+        }
+        v.clear();
+        crate::sf_features::pair_features(pos, pov, &mut v);
+        for f in &v {
+            out.insert(U_PAIR + (f - PAIR_BASE));
+        }
+        out
+    }
+
+    fn rei_invalida_indices_teste(
+        ev: &[(usize, usize, usize, bool)], pov: usize,
+        antes: &crate::sf_features::PosBB, agora: &crate::sf_features::PosBB,
+    ) -> bool {
+        if !ev.iter().any(|&(_, t, c, _)| t == 5 && c == pov) {
+            return false;
+        }
+        let (velho, novo) = (antes.king_sq(pov), agora.king_sq(pov));
+        if velho >= 64 || novo >= 64 {
+            return true;
+        }
+        let flip = if pov == 1 { 56 } else { 0 };
+        ORIENT_HALFKA[velho] != ORIENT_HALFKA[novo]
+            || ORIENT_THREATS[velho] != ORIENT_THREATS[novo]
+            || crate::sf_features::KING_BUCKETS_BASE[velho ^ flip]
+                != crate::sf_features::KING_BUCKETS_BASE[novo ^ flip]
+    }
+
+    fn rei_mexeu_teste(ev: &[(usize, usize, usize, bool)], pov: usize) -> bool {
+        ev.iter().any(|&(_, t, c, _)| t == 5 && c == pov)
+    }
+}
