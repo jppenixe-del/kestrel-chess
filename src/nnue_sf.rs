@@ -1120,6 +1120,15 @@ fn linha_peso(net: &RedeSf, u: usize, i: usize) -> i16 {
 }
 
 #[inline]
+/// Uma passagem pelo acumulador por cada linha de peso.
+///
+/// Fundir as passagens -- manter um pedaco do acumulador em registos enquanto
+/// as ~12 linhas de um lance lhe passam por cima, como o Stockfish faz -- foi
+/// escrito e MEDIDO: 98184 contra 97506 nps em cinco rondas, ou seja empate,
+/// com os melhores tempos tambem empatados. O acumulador sao 2 KiB e ja' fica
+/// em L1 entre as chamadas; o que custa e' percorrer as linhas de peso, e
+/// nenhuma arrumacao das passagens evita esse trafego. Nao repetir sem uma
+/// razao nova.
 fn aplica_linha(net: &RedeSf, acc: &mut [i16], u: usize, somar: bool) {
     if u < U_THREAT {
         let row = &net.ft_piece_w[u * L1..(u + 1) * L1];
