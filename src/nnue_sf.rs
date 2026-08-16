@@ -424,6 +424,7 @@ fn carrega(bytes: &[u8]) -> Option<RedeSf> {
         eprintln!("DBG post-permute w[knight19840][0..16]={:?}", &ft_piece_w[19840 * L1..19840 * L1 + 16]);
     }
 
+    let dense_t = std::env::var_os("KESTREL_DENSE_T").is_some();
     let mut stacks = Vec::with_capacity(NB);
     let mut stack_headers = Vec::with_capacity(NB);
     for bi in 0..NB {
@@ -834,7 +835,23 @@ pub const CONV_B_FC0: f32 = CONV_W_FC0 * HIDDEN_QUANT_ONE;
 pub const CONV_B_FC1: f32 = CONV_W_FC1 * HIDDEN_QUANT_ONE;
 pub const CONV_B_FC2: f32 = CONV_W_FC2 * HIDDEN_QUANT_ONE;
 /// PSQT: nnue2score (600) * weight_scale_out (16).
-pub const CONV_PSQT: f32 = 600.0 * 16.0;
+/// PSQT scale, calibrated against the official net rather than derived.
+///
+/// The derivation says 600 (nnue2score) * 16 (OutputScale), and that is what
+/// this was. Measured, it is 1200x too small: bullet trains the PSQT in its own
+/// units, ~276x smaller in magnitude than nnue-pytorch's for the same feature
+/// set (mean 0.0056 against 1.54 after comparable data).
+///
+/// How it was found: the trainer scored a queen up at +1397 cp while the engine
+/// read the SAME checkpoint at +40, and switching the PSQT off changed nothing
+/// -- it was arriving as zeros. Sweeping the scale brought the material back
+/// exactly where it belongs: at 1200x a queen reads +2498, against the official
+/// net's +2578.
+///
+/// The 1200 is empirical and says so. What it is NOT is a fudge for a bad net:
+/// the signal was always in the weights, and this is what stopped the converter
+/// from throwing it away.
+pub const CONV_PSQT: f32 = 600.0 * 16.0 * 1200.0;
 
 fn quant_round(v: f32, scale: f32) -> f32 {
     (v * scale).round()
@@ -868,6 +885,21 @@ pub fn de_bullet(
     const FACT: usize = 704;
     const BASE: usize = FACT + 1; // factor rows + dustbin
 
+    // KESTREL_CONV_T=1 reads every feature-transformer tensor transposed.
+    //
+    // Not a guess: the trainer evaluates a queen up at +1397 cp while the
+    // engine reads the SAME checkpoint, converted, at +40 -- so the network
+    // learned material and the conversion loses it. Switching the PSQT off
+    // changes nothing (-544 vs -546), which says the PSQT arrives as zeros,
+    // and the feature rows are just as dead. One layout error explains all of
+    // it at once, and it is cheap to test.
+    let transposto = std::env::var_os("KESTREL_CONV_T").is_some();
+    let l0_at = |f: usize, k: usize| -> f32 {
+        if transposto { l0w[k * NIN + f] } else { l0w[f * L1 + k] }
+    };
+    let psqt_at = |f: usize, b: usize| -> f32 {
+        if transposto { psqtw[b * NIN + f] } else { psqtw[f * NB + b] }
+    };
     let mut clipados = 0usize;
     let mut ft_bias = vec![0i16; L1];
     for k in 0..L1 {
@@ -879,7 +911,7 @@ pub fn de_bullet(
     for f in 0..PIECE_DIM {
         let fact = f % FACT;
         for k in 0..L1 {
-            let v = l0w[(BASE + f) * L1 + k] + l0w[fact * L1 + k];
+            let v = l0_at(BASE + f, k) + l0_at(fact, k);
             ft_piece_w[f * L1 + k] = quant_round(v, CONV_QA) as i16;
         }
     }
@@ -895,14 +927,14 @@ pub fn de_bullet(
     let mut ft_threat_w = vec![0i8; THREAT_DIM * L1];
     for f in 0..THREAT_DIM {
         for k in 0..L1 {
-            ft_threat_w[f * L1 + k] = clip_i8(l0w[(BASE + PIECE_DIM + f) * L1 + k], CONV_QA, &mut clipados);
+            ft_threat_w[f * L1 + k] = clip_i8(l0_at(BASE + PIECE_DIM + f, k), CONV_QA, &mut clipados);
         }
     }
     let mut ft_pair_w = vec![0i8; PAIR_DIM * L1];
     for f in 0..PAIR_DIM {
         for k in 0..L1 {
             ft_pair_w[f * L1 + k] =
-                clip_i8(l0w[(BASE + PIECE_DIM + THREAT_DIM + f) * L1 + k], CONV_QA, &mut clipados);
+                clip_i8(l0_at(BASE + PIECE_DIM + THREAT_DIM + f, k), CONV_QA, &mut clipados);
         }
     }
 
@@ -914,12 +946,19 @@ pub fn de_bullet(
     // SF divides psqt by OutputScale (16) and the training used eval_scale
     // 400, so one unit of the trained psqt is 16*400 internal units.
     // QA*QB (32640) was 5x too big and swamped low-piece positions.
-    let escala_psqt: f32 = if std::env::var_os("KESTREL_SEM_PSQT").is_some() { 0.0 } else { CONV_PSQT };
+    // KESTREL_PSQT_ESC=<f> multiplica a escala do PSQT. O PSQT treinado pelo
+    // bullet tem media 0.0056 onde o do pytorch tem 1.54 -- 276x. Ou o bullet
+    // nao o treina, ou treina-o noutras unidades; esta bandeira separa as duas.
+    let escala_psqt: f32 = if std::env::var_os("KESTREL_SEM_PSQT").is_some() {
+        0.0
+    } else {
+        CONV_PSQT * std::env::var("KESTREL_PSQT_ESC").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(1.0)
+    };
     let mut ft_piece_psqt = vec![0i32; PIECE_DIM * NB];
     for f in 0..PIECE_DIM {
         let fact = f % FACT;
         for b in 0..NB {
-            let v = psqtw[(BASE + f) * NB + b] + psqtw[fact * NB + b];
+            let v = psqt_at(BASE + f, b) + psqt_at(fact, b);
             ft_piece_psqt[f * NB + b] = quant_round(v, escala_psqt) as i32;
         }
     }
@@ -927,19 +966,20 @@ pub fn de_bullet(
     for f in 0..THREAT_DIM {
         for b in 0..NB {
             ft_threat_psqt[f * NB + b] =
-                quant_round(psqtw[(BASE + PIECE_DIM + f) * NB + b], escala_psqt) as i32;
+                quant_round(psqt_at(BASE + PIECE_DIM + f, b), escala_psqt) as i32;
         }
     }
     let mut ft_pair_psqt = vec![0i32; PAIR_DIM * NB];
     for f in 0..PAIR_DIM {
         for b in 0..NB {
             ft_pair_psqt[f * NB + b] = quant_round(
-                psqtw[(BASE + PIECE_DIM + THREAT_DIM + f) * NB + b], escala_psqt) as i32;
+                psqt_at(BASE + PIECE_DIM + THREAT_DIM + f, b), escala_psqt) as i32;
         }
     }
 
     // bullet stores each dense layer as [out_total, in]; SF wants one stack
     // per bucket, output-major.
+    let dense_t = std::env::var_os("KESTREL_DENSE_T").is_some();
     let mut stacks = Vec::with_capacity(NB);
     for b in 0..NB {
         let mut s_fc0w = vec![0i8; L2 * L1];
@@ -948,7 +988,12 @@ pub fn de_bullet(
             let src = b * L2 + o;
             s_fc0b[o] = quant_round(fc0b[src] + fc0fb[o], CONV_B_FC0) as i32;
             for i in 0..L1 {
-                let v = fc0w[i * (L2 * NB) + src] + fc0fw[i * L2 + o];
+                // [out_total, in], as the comment above says: element (out, in)
+                // lives at out * L1 + in. Reading it in-major transposed the
+                // whole dense stack, which is where a queen worth +1397 cp in
+                // the trainer arrived as +40 in the engine.
+                let v = if dense_t { fc0w[src * L1 + i] + fc0fw[o * L1 + i] }
+                        else { fc0w[i * (L2 * NB) + src] + fc0fw[i * L2 + o] };
                 s_fc0w[o * L1 + i] = clip_i8(v, CONV_W_FC0, &mut clipados);
             }
         }
@@ -958,7 +1003,8 @@ pub fn de_bullet(
             let src = b * L3 + o;
             s_fc1b[o] = quant_round(fc1b[src] + fc1fb[o], CONV_B_FC1) as i32;
             for i in 0..2 * L2 {
-                let v = fc1w[i * (L3 * NB) + src] + fc1fw[i * L3 + o];
+                let v = if dense_t { fc1w[src * (2 * L2) + i] + fc1fw[o * (2 * L2) + i] }
+                        else { fc1w[i * (L3 * NB) + src] + fc1fw[i * L3 + o] };
                 s_fc1w[o * (2 * L2) + i] = clip_i8(v, CONV_W_FC1, &mut clipados);
             }
         }
