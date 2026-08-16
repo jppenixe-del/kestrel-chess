@@ -583,7 +583,27 @@ fn clipped_lin(x: i32, weight_scale_bits_local: u32) -> i32 {
 }
 
 pub fn evaluate(net: &RedeSf, atk: &Attacks, board: &mut Board) -> i32 {
-    let stm = board.side as usize;
+    // `KESTREL_TROCA_POV=1` swaps the two perspectives in the forward pass.
+    // A diagnostic, not an option, and it has already answered its question:
+    // NO. Our trained nets score a queen up for White as WORSE than the same
+    // position without it, which looks like a perspective swap between training
+    // and inference. It is not. Swapping here merely exchanges the two results
+    // with each other -- on our nets AND on the official one, which is the
+    // symmetry you would expect -- so the forward pass reads `us` correctly.
+    //
+    // 2026-08-16, official net vs ours at superbatch 10 (start position, then
+    // White a queen up, then Black a queen up):
+    //     official   9   +2578   -1885      swapped:   9   -1885   +2578
+    //     v3-sb10 -112    -206     -50      swapped: -112     -50    -206
+    // The official net separates the two by ~4400; ours by ~150, in either
+    // orientation. The net did not learn material at all -- the fault is
+    // upstream of the forward pass, in training. Kept so the question is not
+    // asked twice.
+    let troca = {
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| std::env::var_os("KESTREL_TROCA_POV").is_some())
+    };
+    let stm = if troca { 1 - board.side as usize } else { board.side as usize };
     let nstm = 1 - stm;
 
     let build_acc = |pov: usize| -> (Vec<i16>, Vec<(usize, i32)>, Vec<usize>, Vec<usize>) {
