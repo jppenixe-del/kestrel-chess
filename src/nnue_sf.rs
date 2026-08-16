@@ -749,14 +749,8 @@ pub fn evaluate(net: &RedeSf, atk: &Attacks, board: &mut Board) -> i32 {
     // reutilizacao de `x` poupa. Nao repetir sem medir.
     let mut fc0_out = [0i32; L2];
     for o in 0..L2 {
-        let mut s: i64 = 0;
         let row = &stack.fc0w[o * L1..(o + 1) * L1];
-        let mut acc32: i32 = 0;
-        for (&xi, &wi) in x.iter().zip(row.iter()) {
-            acc32 += xi as i32 * wi as i32;
-        }
-        s += acc32 as i64;
-        fc0_out[o] = (s as i32) + stack.fc0b[o];
+        fc0_out[o] = produto_u8_i8(&x[..L1], row) + stack.fc0b[o];
     }
 
     // ac_sqr_0 / ac_0 use WeightScaleBits+1 (SF: SqrClippedReLU<..,
@@ -1433,6 +1427,60 @@ fn delta_por_lance(
         }
     }
     true
+}
+
+/// Produto interno de um vector de `u8` por um de `i8`.
+///
+/// O compilador resolvia isto com `vpmovsxbw`, que alarga oito bytes de cada
+/// vez para os poder multiplicar em 16 bits. A `vpmaddubsw` faz exactamente
+/// esta operacao -- `u8` vezes `i8`, pares somados -- sobre 32 bytes de uma so'
+/// vez, e nao ha forma de a pedir sem a escrever.
+///
+/// Nao satura: `x` nunca passa de 127 (e' `(255*255) >> 9`) e os pesos estao em
+/// [-128, 127], logo a soma de dois produtos nao passa de 32512. E' esta
+/// margem que torna a instrucao utilizavel, e e' por isso que a rede e'
+/// quantizada assim.
+///
+/// A versao generica fica como referencia e e' a que corre onde nao houver
+/// AVX2 -- ao contrario do `aplica_linha`, onde escrever SIMD a mao ja' foi
+/// MEDIDO como pior do que deixar o autovectorizador trabalhar.
+#[inline]
+fn produto_u8_i8(x: &[u8], w: &[i8]) -> i32 {
+    debug_assert_eq!(x.len(), w.len());
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        if x.len() % 32 == 0 {
+            return unsafe { produto_u8_i8_avx2(x, w) };
+        }
+    }
+    let mut acc: i32 = 0;
+    for (&xi, &wi) in x.iter().zip(w.iter()) {
+        acc += xi as i32 * wi as i32;
+    }
+    acc
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[target_feature(enable = "avx2")]
+unsafe fn produto_u8_i8_avx2(x: &[u8], w: &[i8]) -> i32 {
+    use std::arch::x86_64::*;
+    let uns = _mm256_set1_epi16(1);
+    let mut soma = _mm256_setzero_si256();
+    let n = x.len() / 32;
+    for i in 0..n {
+        let a = _mm256_loadu_si256(x.as_ptr().add(i * 32) as *const __m256i);
+        let b = _mm256_loadu_si256(w.as_ptr().add(i * 32) as *const __m256i);
+        // u8 x i8 -> pares somados em i16, depois alargados a i32 com `uns`
+        let p = _mm256_maddubs_epi16(a, b);
+        soma = _mm256_add_epi32(soma, _mm256_madd_epi16(p, uns));
+    }
+    // reduzir as oito pistas de 32 bits
+    let lo = _mm256_castsi256_si128(soma);
+    let hi = _mm256_extracti128_si256(soma, 1);
+    let mut r = _mm_add_epi32(lo, hi);
+    r = _mm_add_epi32(r, _mm_shuffle_epi32(r, 0b01_00_11_10));
+    r = _mm_add_epi32(r, _mm_shuffle_epi32(r, 0b00_01_00_01));
+    _mm_cvtsi128_si32(r)
 }
 
 /// Poe no estado de trabalho o acumulador do pai, quando ele existe.
