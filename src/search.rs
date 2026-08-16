@@ -2209,7 +2209,7 @@ impl<'a> Searcher<'a> {
         // hits) have expensive evaluations, which is exactly the condition
         // that makes it worthwhile.
         let stand_pat = crate::evaluation::amortece_rule50(
-            crate::evaluation::evaluate_fast(board),
+            crate::evaluation::evaluate_fast(board, ply),
             board.halfmove,
         );
         self.quiescence_from(board, alpha, beta, ply, stand_pat)
@@ -2223,7 +2223,7 @@ impl<'a> Searcher<'a> {
     /// search (negamax calls quiescence()/quiescence_from(), unchanged)
     /// -- purely additive, zero behavior change for the live engine.
     pub fn quiescence_leaf(&mut self, board: &mut Board, alpha: i32, beta: i32, ply: usize) -> (i32, Board) {
-        let stand_pat = crate::evaluation::evaluate_fast(board);
+        let stand_pat = crate::evaluation::evaluate_fast(board, ply);
         self.quiescence_leaf_from(board, alpha, beta, ply, stand_pat)
     }
 
@@ -2487,7 +2487,7 @@ impl<'a> Searcher<'a> {
         // didn't.
         if ply >= MAX_PLY - 1 {
             return crate::evaluation::amortece_rule50(
-                crate::evaluation::evaluate_fast(board),
+                crate::evaluation::evaluate_fast(board, ply),
                 board.halfmove,
             );
         }
@@ -2656,7 +2656,7 @@ impl<'a> Searcher<'a> {
                 .filter(|e| e.static_eval != crate::tt::TT_EVAL_NONE)
             {
                 Some(e) => e.static_eval as i32,
-                None => evaluate(board),
+                None => evaluate(board, ply),
             };
             // Scaled at THIS node's halfmove, whether the raw value came
             // fresh or from a TT entry stored at some other node's halfmove
@@ -2685,7 +2685,7 @@ impl<'a> Searcher<'a> {
         } else if let Some(e) = tt_entry_captured.filter(|e| e.static_eval != crate::tt::TT_EVAL_NONE) {
             e.static_eval as i32
         } else {
-            crate::evaluation::evaluate(board)
+            crate::evaluation::evaluate(board, ply)
         };
         // Halfmove-scaled before correction (see `evaluation::amortece_rule50`
         // for why this has to happen here and not inside `evaluate()`

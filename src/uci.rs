@@ -1184,7 +1184,7 @@ impl Engine {
                 let mut best_r: Option<(crate::moves::Move, i32)> = None;
                 for r in &his {
                     let u2 = self.board.make_move(r);
-                    let v = -crate::evaluation::evaluate(&mut self.board);
+                    let v = -crate::evaluation::evaluate(&mut self.board, 0);
                     self.board.unmake_move(r, &u2);
                     if best_r.map_or(true, |(_, b)| v > b) {
                         best_r = Some((*r, v));
@@ -1227,7 +1227,7 @@ impl Engine {
                     // Threat-aware, at one ply of cost. The static value of
                     // our move, minus what he still threatens if we did not
                     // deal with it.
-                    let base = -crate::evaluation::evaluate(&mut self.board);
+                    let base = -crate::evaluation::evaluate(&mut self.board, 0);
                     if threat_survives {
                         base.saturating_sub(idle.map_or(0, |i| (base - i).max(0)))
                     } else {
@@ -1240,7 +1240,7 @@ impl Engine {
                         // that throws the whole game away.
                         -terminal_value(&self.board, &self.atk)
                     } else {
-                        -crate::evaluation::evaluate(&mut self.board)
+                        -crate::evaluation::evaluate(&mut self.board, 0)
                     }
                 } else {
                     let replies = crate::movegen::generate_legal(&mut self.board, &self.atk);
@@ -1258,7 +1258,7 @@ impl Engine {
                                 // stalemates us out of a won game.
                                 -terminal_value(&self.board, &self.atk)
                             } else {
-                                -crate::evaluation::evaluate(&mut self.board)
+                                -crate::evaluation::evaluate(&mut self.board, 0)
                             };
                             self.board.unmake_move(r, &u2);
                             if v > his_best {
@@ -1422,7 +1422,7 @@ impl Engine {
         // depth-1 search already mixes in a best-move choice.
         if std::env::var_os("KESTREL_EVAL_ONLY").is_some() {
             let mut b = self.board.clone();
-            let v = crate::evaluation::evaluate(&mut b);
+            let v = crate::evaluation::evaluate(&mut b, 0);
             let _ = writeln!(out, "info string eval_only {}", v);
             let _ = out.flush();
             return;
@@ -2230,7 +2230,7 @@ impl Engine {
                     // do lado das brancas -- daqui NAO se copia esse flip,
                     // ou fica-se com o dobro dele, que e' voltar ao ponto
                     // de partida disfarcado de resposta.
-                    let seen = crate::evaluation::evaluate(&mut self.board);
+                    let seen = crate::evaluation::evaluate(&mut self.board, 0);
                     let _ = writeln!(out, "{}", crate::evaluation::score_normalizado(seen));
                 }
                 "quit" => break,
