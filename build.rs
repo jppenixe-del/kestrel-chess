@@ -85,4 +85,22 @@ fn main() {
             std::fs::write(&saida, []).unwrap();
         }
     }
+    liga_ponte_sf();
+}
+
+/// Liga a ponte para o forward NNUE do Stockfish, quando compilada.
+///
+/// ATENÇÃO À LICENÇA: essa biblioteca contém código de inferência do
+/// Stockfish (GPLv3). Ligá-la torna o binário resultante GPLv3 e obriga a
+/// preservar os avisos de copyright do Stockfish. Sem a biblioteca o motor
+/// compila na mesma e usa o caminho em Rust, que é todo nosso.
+fn liga_ponte_sf() {
+    let lib = std::path::Path::new("sfbridge/libsfbridge.a");
+    println!("cargo:rerun-if-changed=sfbridge/libsfbridge.a");
+    if lib.exists() {
+        println!("cargo:rustc-link-search=native=sfbridge");
+        println!("cargo:rustc-link-lib=static=sfbridge");
+        println!("cargo:rustc-link-lib=dylib=stdc++");
+        println!("cargo:rustc-cfg=tem_sfbridge");
+    }
 }
