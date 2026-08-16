@@ -2705,7 +2705,10 @@ impl<'a> Searcher<'a> {
             let raw_full_stand_pat = match tt_entry_captured
                 .filter(|e| e.static_eval != crate::tt::TT_EVAL_NONE)
             {
-                Some(e) => e.static_eval as i32,
+                Some(e) => {
+                    crate::nnue_sf::garante_camada(self.atk, board);
+                    e.static_eval as i32
+                }
                 None => evaluate(board),
             };
             // Scaled at THIS node's halfmove, whether the raw value came
@@ -2731,8 +2734,13 @@ impl<'a> Searcher<'a> {
         // applied fresh below every time since it can change between
         // visits even for the same board.
         let raw_static_eval = if in_check {
+            // Sem avaliacao, mas o acumulador tem de continuar a seguir o
+            // caminho -- senao os filhos deste no' ficam sem pai. Ver
+            // `nnue_sf::garante_camada`.
+            crate::nnue_sf::garante_camada(self.atk, board);
             0
         } else if let Some(e) = tt_entry_captured.filter(|e| e.static_eval != crate::tt::TT_EVAL_NONE) {
+            crate::nnue_sf::garante_camada(self.atk, board);
             e.static_eval as i32
         } else {
             crate::evaluation::evaluate(board)

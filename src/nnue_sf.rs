@@ -1429,6 +1429,42 @@ fn delta_por_lance(
     true
 }
 
+/// Poe a camada desta posicao em dia sem calcular a avaliacao.
+///
+/// A busca nao chama `evaluate` em todos os nos: quando a TT ja' tem a
+/// avaliacao estatica desta posicao, salta-a -- e com ela saltava tambem o
+/// acumulador, deixando os filhos sem pai. Medido a profundidade 14: a camada
+/// do pai existia mas era de outro ramo em 56% das avaliacoes, e nessas o
+/// motor reconstruia do zero.
+///
+/// Pagar aqui um delta (~12 linhas de pesos) evita aos filhos uma
+/// reconstrucao (~35 linhas mais a enumeracao das features), e um no' que
+/// chega aqui vai mesmo procurar filhos -- os cortes por TT ja' retornaram
+/// antes. E' o mesmo principio do `find_last_usable_accumulator` do
+/// Stockfish, sem precisar de guardar as pecas sujas de cada ply: em vez de
+/// remontar a cadeia quando falta, nao a deixamos partir.
+pub fn garante_camada(atk: &Attacks, board: &mut Board) {
+    let net = match rede() {
+        Some(n) if active() => n,
+        _ => return,
+    };
+    ESTADO.with(|c| {
+        let mut st = c.borrow_mut();
+        if carrega_do_pai(&mut st, board) {
+            return;
+        }
+        acc_incremental(net, atk, board, 0, &mut st);
+        acc_incremental(net, atk, board, 1, &mut st);
+        st.valido = true;
+        for c in 0..2 {
+            for t in 0..6 {
+                st.bb[c][t] = board.pieces[c][t];
+            }
+        }
+        guarda_na_pilha(&mut st, board);
+    });
+}
+
 /// Produto interno de um vector de `u8` por um de `i8`.
 ///
 /// O compilador resolvia isto com `vpmovsxbw`, que alarga oito bytes de cada
