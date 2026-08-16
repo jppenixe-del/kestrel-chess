@@ -671,8 +671,10 @@ pub fn evaluate(net: &RedeSf, atk: &Attacks, board: &mut Board) -> i32 {
     let _ = &build_acc;
     let (psqt_s, psqt_n) = ESTADO.with(|c| {
         let mut st = c.borrow_mut();
-        let _ = acc_incremental(net, atk, board, stm, &mut st);
-        let _ = acc_incremental(net, atk, board, nstm, &mut st);
+        if !carrega_do_pai(&mut st, board) {
+            acc_incremental(net, atk, board, stm, &mut st);
+            acc_incremental(net, atk, board, nstm, &mut st);
+        }
         st.valido = true;
         // PSQT from the same unified lists, so threats and pairs are not
         // silently dropped -- the official net does carry those weights.
@@ -685,6 +687,7 @@ pub fn evaluate(net: &RedeSf, atk: &Attacks, board: &mut Board) -> i32 {
                 st.bb[c][t] = board.pieces[c][t];
             }
         }
+        guarda_na_pilha(&mut st, board);
 
         let ps = st.psqt[stm][bucket];
         let pn = st.psqt[nstm][bucket];
@@ -1198,7 +1201,34 @@ struct EstadoAcc {
     /// As ameacas e os pares ficam de fora de proposito -- mudam de mais
     /// para valer a pena cachear, e sao somados por cima depois.
     cache: Vec<EntradaCache>,
+    /// Um acumulador por lance de profundidade, indexado por `board.prof_acc`.
+    ///
+    /// A sonda que motivou isto: com um so' estado, o "pai" da proxima
+    /// avaliacao esta' la' em 28% dos casos, e um anel dos ultimos 16 estados
+    /// so' chega a 58% -- porque o pai nao esta' poucas avaliacoes atras, esta'
+    /// um ply acima no caminho, e a busca desce e sobe entre as duas. Por ply,
+    /// esta' sempre.
+    pilha: Vec<Camada>,
 }
+
+/// Uma camada da pilha: o acumulador de uma posicao do caminho actual.
+///
+/// Guarda-se `bb` com ele porque e' a prova de a que posicao pertence -- e'
+/// isso que permite aceitar uma camada deixada por outro ramo a mesma
+/// profundidade: o delta reconstroi o tabuleiro antigo a partir do actual mais
+/// os eventos, portanto so' exige que a diferenca seja o deslocamento de uma
+/// peca, nao que tenha sido o lance realmente jogado.
+#[derive(Clone)]
+struct Camada {
+    acc: [Vec<i16>; 2],
+    psqt: [[i64; NB]; 2],
+    bb: [[u64; 6]; 2],
+    valido: bool,
+}
+
+/// Fundo maximo coberto pela pilha. Acima disto o motor volta ao comportamento
+/// de um so' estado, que e' sempre correcto, so' mais lento.
+const MAX_CAMADAS: usize = 256;
 
 #[derive(Clone)]
 struct EntradaCache {
@@ -1224,6 +1254,15 @@ impl EstadoAcc {
             cache: vec![
                 EntradaCache { acc: Vec::new(), psqt: [0; NB], bb: [[0; 6]; 2], valido: false };
                 64 * 2
+            ],
+            pilha: vec![
+                Camada {
+                    acc: [vec![0i16; L1], vec![0i16; L1]],
+                    psqt: [[0i64; NB]; 2],
+                    bb: [[0u64; 6]; 2],
+                    valido: false,
+                };
+                MAX_CAMADAS
             ],
         }
     }
@@ -1409,6 +1448,56 @@ fn delta_por_lance(
         }
     }
     true
+}
+
+/// Poe no estado de trabalho o acumulador do pai, quando ele existe.
+///
+/// Devolve `true` se a camada desta profundidade JA' e' esta posicao -- caso em
+/// que nao ha nada a calcular e as duas perspectivas ja' estao prontas.
+fn carrega_do_pai(st: &mut EstadoAcc, board: &Board) -> bool {
+    let d = board.prof_acc;
+    if d >= MAX_CAMADAS {
+        return false;
+    }
+    if st.pilha[d].valido && st.pilha[d].bb == board.pieces {
+        for pov in 0..2 {
+            st.acc[pov].copy_from_slice(&st.pilha[d].acc[pov]);
+        }
+        st.psqt = st.pilha[d].psqt;
+        st.bb = st.pilha[d].bb;
+        st.valido = true;
+        st.feats[0].clear();
+        st.feats[1].clear();
+        return true;
+    }
+    if d > 0 && st.pilha[d - 1].valido {
+        for pov in 0..2 {
+            st.acc[pov].copy_from_slice(&st.pilha[d - 1].acc[pov]);
+        }
+        st.psqt = st.pilha[d - 1].psqt;
+        st.bb = st.pilha[d - 1].bb;
+        st.valido = true;
+        // As listas de features deixam de corresponder ao acumulador. Vazias e'
+        // o estado que o caminho lento le' como "reconstroi", que e' o correcto
+        // -- alimentar-lhe uma lista de outra posicao somava tudo duas vezes.
+        st.feats[0].clear();
+        st.feats[1].clear();
+    }
+    false
+}
+
+fn guarda_na_pilha(st: &mut EstadoAcc, board: &Board) {
+    let d = board.prof_acc;
+    if d >= MAX_CAMADAS {
+        return;
+    }
+    for pov in 0..2 {
+        let (origem, destino) = (&st.acc[pov], &mut st.pilha[d].acc[pov]);
+        destino.copy_from_slice(origem);
+    }
+    st.pilha[d].psqt = st.psqt;
+    st.pilha[d].bb = board.pieces;
+    st.pilha[d].valido = true;
 }
 
 fn acc_incremental(

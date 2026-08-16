@@ -11,6 +11,17 @@ pub const CASTLE_BQ: u8 = 8;
 #[derive(Clone)]
 pub struct Board {
     pub pieces: [[Bitboard; 6]; 2], // [color][piece_type]
+    /// Quantos lances fundos estamos no caminho actual.
+    ///
+    /// Mantido aqui, e so' por `make_move`/`unmake_move` e pelo lance nulo,
+    /// porque e' aqui que a posicao muda. A pilha de acumuladores da rede SF
+    /// indexa-se por ele -- e a razao de nao existir um contador proprio para
+    /// isso e' que uma tentativa anterior teve dois indices (o de `make_move`
+    /// para gravar, o ply da busca para ler), discordaram, e o motor jogou
+    /// 0-58-0 com um acumulador errado que nenhum teste de posicao apanhava.
+    /// Com um so' indice, mantido junto da posicao, esse desencontro nao tem
+    /// onde acontecer.
+    pub prof_acc: usize,
     pub occ_color: [Bitboard; 2],
     pub occ_all: Bitboard,
     pub side: Color,
@@ -151,6 +162,7 @@ impl Board {
         let fullmove = parts.get(5).and_then(|s| s.parse().ok()).unwrap_or(1);
 
         let mut b = Board {
+            prof_acc: 0,
             pieces,
             occ_color: [0, 0],
             occ_all: 0,
@@ -370,6 +382,7 @@ impl Board {
     /// Aplica um lance PSEUDO-LEGAL (a legalidade -- nao ficar em xeque --
     /// e' verificada por quem gera os lances, chamando in_check depois).
     pub fn make_move(&mut self, mv: &Move) -> Undo {
+        self.prof_acc += 1;
         let us = self.side;
         let them = us.opp();
         let (moving_pt, _) = self.piece_at(mv.from).expect("make_move: nada em from");
@@ -563,6 +576,7 @@ impl Board {
     /// So' altera `side` e limpa `ep_square`; tudo o resto fica intacto.
     /// NUNCA chamar em xeque (o rei poderia ser "capturado" na resposta).
     pub fn make_null_move(&mut self) -> NullUndo {
+        self.prof_acc += 1;
         let undo = NullUndo { ep_square: self.ep_square, hash: self.hash };
         self.side = self.side.opp();
         self.ep_square = NO_SQUARE;
@@ -575,12 +589,14 @@ impl Board {
     }
 
     pub fn unmake_null_move(&mut self, undo: &NullUndo) {
+        self.prof_acc -= 1;
         self.side = self.side.opp();
         self.ep_square = undo.ep_square;
         self.hash = undo.hash;
     }
 
     pub fn unmake_move(&mut self, mv: &Move, undo: &Undo) {
+        self.prof_acc -= 1;
         let them = self.side; // side that is about to move again = the one who just moved's opponent... wait: after make_move, self.side = opponent of mover. So "us" (who made mv) = self.side.opp()
         let us = them.opp();
         self.side = us;
