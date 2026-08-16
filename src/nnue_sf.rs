@@ -697,15 +697,20 @@ pub fn evaluate(net: &RedeSf, atk: &Attacks, board: &mut Board) -> i32 {
         // accumulators per call was showing up as 14% of runtime in memset.
         let half = L1 / 2;
         let mut x = std::mem::take(&mut st.x);
-        for j in 0..half {
-            let s0 = (st.acc[stm][j] as i32).clamp(0, FT_MAX_VAL);
-            let s1 = (st.acc[stm][j + half] as i32).clamp(0, FT_MAX_VAL);
-            x[j] = ((s0 * s1) / 512) as u8;
-        }
-        for j in 0..half {
-            let s0 = (st.acc[nstm][j] as i32).clamp(0, FT_MAX_VAL);
-            let s1 = (st.acc[nstm][j + half] as i32).clamp(0, FT_MAX_VAL);
-            x[half + j] = ((s0 * s1) / 512) as u8;
+        // Em `u16`, nao em `i32`. Os dois factores estao presos a [0, 255],
+        // logo o produto nao passa de 65025 e cabe inteiro em 16 bits -- subir
+        // a 32 obrigava o compilador a metade das pistas por instrucao e a um
+        // `imull` escalar por saida, que era o que o perfil mostrava. O
+        // deslocamento de 9 substitui a divisao por 512: com factores nao
+        // negativos e' a mesma operacao.
+        const TETO: i16 = FT_MAX_VAL as i16;
+        for (pov, base) in [(stm, 0usize), (nstm, half)] {
+            let (a, b) = st.acc[pov].split_at(half);
+            for (j, (&lo, &hi)) in a.iter().zip(b.iter()).enumerate() {
+                let s0 = lo.clamp(0, TETO) as u16;
+                let s1 = hi.clamp(0, TETO) as u16;
+                x[base + j] = (s0.wrapping_mul(s1) >> 9) as u8;
+            }
         }
         st.x = x;
         (ps, pn)
