@@ -583,8 +583,7 @@ fn clipped_lin(x: i32, weight_scale_bits_local: u32) -> i32 {
     (x >> weight_scale_bits_local).clamp(0, 127)
 }
 
-pub fn evaluate(net: &RedeSf, atk: &Attacks, board: &mut Board, ply: usize) -> i32 {
-
+pub fn evaluate(net: &RedeSf, atk: &Attacks, board: &mut Board) -> i32 {
     // `KESTREL_TROCA_POV=1` swaps the two perspectives in the forward pass.
     // A diagnostic, not an option, and it has already answered its question:
     // NO. Our trained nets score a queen up for White as WORSE than the same
@@ -672,8 +671,8 @@ pub fn evaluate(net: &RedeSf, atk: &Attacks, board: &mut Board, ply: usize) -> i
     let _ = &build_acc;
     let (psqt_s, psqt_n) = ESTADO.with(|c| {
         let mut st = c.borrow_mut();
-        let _ = acc_incremental(net, atk, board, stm, &mut st, ply);
-        let _ = acc_incremental(net, atk, board, nstm, &mut st, ply);
+        let _ = acc_incremental(net, atk, board, stm, &mut st);
+        let _ = acc_incremental(net, atk, board, nstm, &mut st);
         st.valido = true;
         // PSQT from the same unified lists, so threats and pairs are not
         // silently dropped -- the official net does carry those weights.
@@ -685,18 +684,6 @@ pub fn evaluate(net: &RedeSf, atk: &Attacks, board: &mut Board, ply: usize) -> i
             for t in 0..6 {
                 st.bb[c][t] = board.pieces[c][t];
             }
-        }
-
-        // e guardar este ply, para os filhos derivarem dele
-        if ply < MAX_PLY_ACC {
-            let st: &mut EstadoAcc = &mut st;
-            let EstadoAcc { pilha, acc, psqt, bb, .. } = st;
-            let e = &mut pilha[ply];
-            e.bb = *bb;
-            e.acc[0].copy_from_slice(&acc[0]);
-            e.acc[1].copy_from_slice(&acc[1]);
-            e.psqt = *psqt;
-            e.valido = true;
         }
 
         let ps = st.psqt[stm][bucket];
@@ -1110,10 +1097,6 @@ pub fn de_bullet(
 
 /// Unified feature index so the three families can share one diff.
 /// [0, PIECE_DIM) pieces | [PIECE_DIM, +THREAT_DIM) threats | then pairs.
-/// Plies suportados pela pilha de acumuladores. 128 x 2 x 1024 x 2 bytes = 512 KB
-/// por thread -- mais do que a busca alguma vez usa, e alocado uma unica vez.
-const MAX_PLY_ACC: usize = 128;
-
 const U_THREAT: usize = PIECE_DIM;
 const U_PAIR: usize = PIECE_DIM + THREAT_DIM;
 
@@ -1215,25 +1198,6 @@ struct EstadoAcc {
     /// As ameacas e os pares ficam de fora de proposito -- mudam de mais
     /// para valer a pena cachear, e sao somados por cima depois.
     cache: Vec<EntradaCache>,
-    /// Um estado por ply da busca.
-    ///
-    /// O acumulador vivia num unico estado comparado com o tabuleiro a avaliar.
-    /// So' que a busca percorre uma ARVORE: ao voltar da sub-arvore de um filho,
-    /// esse estado pertence a outro ramo, a muitos plies de distancia, e nao ha'
-    /// lance nenhum de onde derivar -- o delta rendia 1.15x. Indexado por ply, o
-    /// pai esta' SEMPRE em `ply - 1`, por construcao da busca.
-    ///
-    /// A ideia e' a `AccumulatorStack` do Stockfish; a implementacao e' nossa. A
-    /// busca continua a ser inteiramente nossa -- daqui so' vem como LER a rede.
-    pilha: Vec<EstadoPly>,
-}
-
-#[derive(Clone)]
-struct EstadoPly {
-    bb: [[u64; 6]; 2],
-    acc: [Vec<i16>; 2],
-    psqt: [[i64; NB]; 2],
-    valido: bool,
 }
 
 #[derive(Clone)]
@@ -1257,15 +1221,6 @@ impl EstadoAcc {
             scratch_p: Vec::with_capacity(32),
             x: vec![0u8; L1],
             psqt: [[0i64; NB]; 2],
-            pilha: vec![
-                EstadoPly {
-                    bb: [[0u64; 6]; 2],
-                    acc: [vec![0i16; L1], vec![0i16; L1]],
-                    psqt: [[0i64; NB]; 2],
-                    valido: false,
-                };
-                MAX_PLY_ACC
-            ],
             cache: vec![
                 EntradaCache { acc: Vec::new(), psqt: [0; NB], bb: [[0; 6]; 2], valido: false };
                 64 * 2
@@ -1276,40 +1231,6 @@ impl EstadoAcc {
 
 thread_local! {
     static ESTADO: std::cell::RefCell<EstadoAcc> = std::cell::RefCell::new(EstadoAcc::novo());
-    /// Bitboards por ply, gravados pelo `make_move` mesmo quando o no' nunca e'
-    /// avaliado.
-    ///
-    /// Sem isto a pilha de acumuladores so' resolve metade do problema: a busca
-    /// faz ~0.65 avaliacoes por no', portanto o pai de um no' avaliado
-    /// frequentemente NAO foi avaliado, e nao ha' acumulador de onde derivar.
-    /// Com os bitboards de cada ply pode-se encadear os deltas desde o
-    /// antepassado mais recente que tenha acumulador -- e' o que o
-    /// `find_last_usable_accumulator` do Stockfish faz.
-    ///
-    /// 96 bytes por ply e uma copia por `make_move`: barato ao pe' de um
-    /// refresh, que le' ~91 linhas de 1024 pesos.
-    pub static BB_PLY: std::cell::RefCell<Vec<[[u64; 6]; 2]>> =
-        std::cell::RefCell::new(vec![[[0u64; 6]; 2]; MAX_PLY_ACC]);
-    /// Profundidade actual, contada pelo par make/unmake.
-    pub static PROF: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-/// Chamado pelo `Board::make_move`: regista o tabuleiro deste ply.
-#[inline]
-pub fn regista_ply(pieces: &[[u64; 6]; 2]) {
-    PROF.with(|d| {
-        let p = d.get() + 1;
-        d.set(p);
-        if p < MAX_PLY_ACC {
-            BB_PLY.with(|b| b.borrow_mut()[p] = *pieces);
-        }
-    });
-}
-
-/// Chamado pelo `Board::unmake_move`.
-#[inline]
-pub fn desregista_ply() {
-    PROF.with(|d| d.set(d.get().saturating_sub(1)));
 }
 
 /// Rebuild `acc` for one perspective from the cached state, applying only the
@@ -1322,24 +1243,7 @@ fn delta_por_lance(
     net: &RedeSf, board: &Board, pov: usize, st: &mut EstadoAcc,
     ev: &[(usize, usize, usize, bool)],
 ) -> bool {
-    let bb = board.pieces;
-    delta_por_lance_bb(net, &bb, pov, st, ev)
-}
-
-/// O mesmo, a partir dos bitboards em vez do `Board`.
-///
-/// Preciso para encadear deltas atraves de plies que nunca foram avaliados: ai'
-/// nao ha' `Board`, so' os bitboards que o `make_move` registou.
-fn delta_por_lance_bb(
-    net: &RedeSf, pieces: &[[u64; 6]; 2], pov: usize, st: &mut EstadoAcc,
-    ev: &[(usize, usize, usize, bool)],
-) -> bool {
-    let mut agora = crate::sf_features::PosBB::default();
-    for c in 0..2 {
-        for t in 0..6 {
-            agora.pieces[c][t] = pieces[c][t];
-        }
-    }
+    let agora = board_para_posbb(board);
     let mut antes = agora;
     // desfazer os eventos para reconstruir o tabuleiro anterior
     for &(sq, t, c, add) in ev {
@@ -1508,69 +1412,8 @@ fn delta_por_lance_bb(
 }
 
 fn acc_incremental(
-    net: &RedeSf, atk: &Attacks, board: &Board, pov: usize, st: &mut EstadoAcc, ply: usize,
+    net: &RedeSf, atk: &Attacks, board: &Board, pov: usize, st: &mut EstadoAcc,
 ) {
-    // Partir do PAI (ply - 1), nao do ultimo tabuleiro avaliado. Numa busca em
-    // profundidade o ultimo avaliado pode ser de outro ramo; o pai e' sempre um
-    // lance atras, por construcao da propria busca.
-    static SEM_DELTA_G: OnceLock<bool> = OnceLock::new();
-    let sem_delta = *SEM_DELTA_G.get_or_init(|| std::env::var_os("KESTREL_SEM_DELTA").is_some());
-
-    // Procurar para tras o antepassado mais recente COM acumulador, e encadear
-    // os deltas ply a ply ate' aqui.
-    //
-    // So' olhar para o pai nao chega: a busca faz ~0.65 avaliacoes por no', por
-    // isso o pai muitas vezes nunca foi avaliado. Os bitboards de cada ply
-    // existem na mesma (`regista_ply`, chamado pelo `make_move`), portanto ha'
-    // sempre por onde encadear -- e' o `find_last_usable_accumulator` do
-    // Stockfish, com a nossa estrutura.
-    if ply > 0 && ply < MAX_PLY_ACC && !sem_delta {
-        let mut origem = None;
-        for k in (0..ply).rev() {
-            if st.pilha[k].valido {
-                origem = Some(k);
-                break;
-            }
-            if ply - k > 4 {
-                break; // mais do que isto e' mais barato reconstruir
-            }
-        }
-        if let Some(k) = origem {
-            st.bb = st.pilha[k].bb;
-            for p in 0..2 {
-                st.acc[p].copy_from_slice(&st.pilha[k].acc[p]);
-                st.psqt[p] = st.pilha[k].psqt[p];
-            }
-            st.feats[0].clear();
-            st.feats[1].clear();
-            st.valido = true;
-            // Aplicar os lances intermedios, um de cada vez, sem alocar: um
-            // `Vec` por avaliacao pagaria mais do que o refresh que se evita.
-            let mut buf = [[[0u64; 6]; 2]; 4];
-            let n_int = (ply - k - 1).min(4);
-            BB_PLY.with(|b| {
-                let b = b.borrow();
-                for (i, slot) in buf.iter_mut().enumerate().take(n_int) {
-                    *slot = b[k + 1 + i];
-                }
-            });
-            for &bb in buf.iter().take(n_int) {
-                if let Some(ev) = eventos_de_casa(&st.bb, &bb) {
-                    if rei_invalida_indices(&ev, pov, st, board)
-                        || !delta_por_lance_bb(net, &bb, pov, st, &ev)
-                    {
-                        st.valido = false;
-                        break;
-                    }
-                    st.bb = bb;
-                } else {
-                    st.valido = false;
-                    break;
-                }
-            }
-            let _ = n_int;
-        }
-    }
     // Caminho rapido: se a mudanca desde a ultima avaliacao e' um lance simples
     // e o rei desta perspectiva nao mexeu, os deltas saem do lance -- sem
     // enumerar as ~91 features activas nem ordenar. Cai para o caminho lento
@@ -1596,7 +1439,7 @@ fn acc_incremental(
                     st.psqt[pov] = psqt_antes;
                     st.bb = bb_antes;
                     st.valido = false;
-                    acc_incremental(net, atk, board, pov, st, ply);
+                    acc_incremental(net, atk, board, pov, st);
                     if st.acc[pov] != acc_delta || st.psqt[pov] != psqt_delta {
                         // Name the feature instead of counting lanes: the
                         // difference between the two accumulators is a sum of
@@ -2325,56 +2168,5 @@ mod testes_delta {
 
     fn rei_mexeu_teste(ev: &[(usize, usize, usize, bool)], pov: usize) -> bool {
         ev.iter().any(|&(_, t, c, _)| t == 5 && c == pov)
-    }
-}
-
-#[cfg(test)]
-mod testes_dustbin {
-    use super::*;
-
-    /// Quantas ameacas existem numa perspectiva e nao na outra?
-    ///
-    /// Sao essas que forcam o dustbin no treinador: o bullet quer pares
-    /// alinhados, e uma ameaca excluida de um lado nao tem par. Se forem
-    /// poucas, descarta-las custa pouco e elimina uma feature que o treino usa
-    /// e o motor nao tem.
-    #[test]
-    fn quantas_ameacas_sao_assimetricas() {
-        let fens = [
-            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
-            "r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 0 1",
-            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
-            "rnbq1rk1/ppp1bppp/4pn2/3p4/2PP4/2N1PN2/PP3PPP/R1BQKB1R w KQ - 0 1",
-            "8/5k2/3p4/1p1Pp2p/pP2Pp1P/P4P1K/8/8 w - - 0 1",
-        ];
-        let (mut tot, mut assim) = (0usize, 0usize);
-        for f in fens {
-            let mut b = crate::board::Board::from_fen(f);
-            let p = board_para_posbb(&b);
-            let (mut a0, mut a1) = (Vec::new(), Vec::new());
-            crate::sf_features::threat_features(&p, 0, &mut a0);
-            crate::sf_features::threat_features(&p, 1, &mut a1);
-            // Quantas o pov 0 tem que o pov 1 nao tem, e vice-versa. Os indices
-            // sao por perspectiva, portanto compara-se o TAMANHO das listas:
-            // uma ameaca que exista nas duas aparece uma vez em cada.
-            let _ = (&a0, &a1, &mut b);
-            // O que conta e' o que o treinador emite: as listas COM padding,
-            // onde uma exclusao vira dustbin. Comparar tamanhos nao chega --
-            // duas listas do mesmo tamanho podem ter dustbins em sitios
-            // diferentes.
-            const DB: usize = usize::MAX;
-            let (mut p0, mut p1) = (Vec::new(), Vec::new());
-            crate::sf_features::threat_features_padded(&p, 0, DB, &mut p0);
-            crate::sf_features::threat_features_padded(&p, 1, DB, &mut p1);
-            assert_eq!(p0.len(), p1.len(), "as listas com padding tem de alinhar");
-            tot += p0.len();
-            assim += p0.iter().zip(p1.iter())
-                .filter(|(x, y)| **x == DB || **y == DB)
-                .count();
-        }
-        eprintln!(
-            "ameacas: {tot} no total, {assim} sem par ({:.2}%)",
-            100.0 * assim as f64 / tot as f64
-        );
     }
 }

@@ -32,11 +32,7 @@ use crate::board::Board;
 /// Takes `&mut Board` because the piece-square accumulator is lazy: the values
 /// it holds are only brought up to date here, at the one moment a score is
 /// actually wanted. See `nnue::Accumulator`.
-/// `ply` e' a profundidade do no' na busca, e serve so' ao acumulador da rede
-/// SF: e' com ele que o estado do pai se encontra em O(1) em vez de se
-/// comparar bitboards com um estado que pode ser de outro ramo da arvore.
-/// Fora da busca (analise, UCI) passa-se 0.
-pub fn evaluate(board: &mut Board, ply: usize) -> i32 {
+pub fn evaluate(board: &mut Board) -> i32 {
     // napv10 (our own network, ported from a related project) takes
     // priority over li11 when both are loaded -- the two should not be in
     // real use at the same time, but the order has to be something. See
@@ -62,7 +58,7 @@ pub fn evaluate(board: &mut Board, ply: usize) -> i32 {
     }
     if crate::nnue_sf::active() {
         if let Some(net) = crate::nnue_sf::rede() {
-            return crate::nnue_sf::evaluate(net, atk(), board, ply);
+            return crate::nnue_sf::evaluate(net, atk(), board);
         }
     }
     if crate::nnue_q900::active() {
@@ -131,8 +127,8 @@ pub fn evaluate(board: &mut Board, ply: usize) -> i32 {
 /// one evaluation and it is already cheap, so the distinction is now a
 /// courtesy to the call sites rather than two different functions.
 #[inline]
-pub fn evaluate_fast(board: &mut Board, ply: usize) -> i32 {
-    evaluate(board, ply)
+pub fn evaluate_fast(board: &mut Board) -> i32 {
+    evaluate(board)
 }
 
 /// `v -= v * rule50 / 199`, ported literally from `Eval::evaluate` in
@@ -290,7 +286,7 @@ pub fn atk() -> &'static crate::attacks::Attacks {
 /// piece per call, so it belongs in a diagnostic run, never in a real game.
 pub fn valores_das_pecas(board: &mut Board) -> Vec<(crate::types::PieceType, i32, usize)> {
     use crate::types::PieceType;
-    let base = evaluate(board, 0);
+    let base = evaluate(board);
     let them = board.side.opp();
     let mut out = Vec::new();
     for pt in [
@@ -311,7 +307,7 @@ pub fn valores_das_pecas(board: &mut Board) -> Vec<(crate::types::PieceType, i32
             // The accumulator carries pending changes; a fresh evaluate on the
             // clone folds them in. Clearing it instead would rebuild from
             // scratch and measure something else.
-            soma += (evaluate(&mut copia, 0) - base) as i64;
+            soma += (evaluate(&mut copia) - base) as i64;
             n += 1;
         }
         if n > 0 {

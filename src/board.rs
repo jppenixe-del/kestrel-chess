@@ -483,11 +483,6 @@ impl Board {
         // accumulator under the OLD bucket, so that perspective has to be
         // rebuilt -- but from the cache, not from nothing. See CacheRefresh.
         self.corrige_bucket();
-        // Regista este ply para o acumulador da rede SF: ele precisa do
-        // tabuleiro de CADA ply, nao so' dos que a busca avalia -- sem isso nao
-        // ha' como encadear deltas atraves de nos nunca avaliados, e a busca so'
-        // avalia ~0.65 nos por no'.
-        crate::nnue_sf::regista_ply(&self.pieces);
         undo
     }
 
@@ -586,7 +581,6 @@ impl Board {
     }
 
     pub fn unmake_move(&mut self, mv: &Move, undo: &Undo) {
-        crate::nnue_sf::desregista_ply();
         let them = self.side; // side that is about to move again = the one who just moved's opponent... wait: after make_move, self.side = opponent of mover. So "us" (who made mv) = self.side.opp()
         let us = them.opp();
         self.side = us;
