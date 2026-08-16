@@ -1621,9 +1621,12 @@ fn eventos_de_casa(
     // indices -- and it is not the piece features (the PSQT matches exactly)
     // nor the pairs. Until it is found, correctness wins: the rebuild is always
     // right, and it is what the engine does for king moves today anyway.
-    if ev.iter().any(|&(_, t, _, _)| t == 5) {
-        return None;
-    }
+    // King moves are allowed back on the fast path. They were banned while the
+    // fault was thought to be king logic; it was the fast->slow transition the
+    // king forced, and with that fixed the ban only costs speed --
+    // `rei_invalida_indices` already checks the three lookups that decide
+    // whether this perspective's indices survive. Castling is still excluded
+    // by the single-addition rule above.
     // And the piece that moves must actually be ABLE to make the move.
     //
     // Counting events is not enough. The stored state can be several plies away
