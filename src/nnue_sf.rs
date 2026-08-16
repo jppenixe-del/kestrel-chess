@@ -835,23 +835,19 @@ pub const CONV_B_FC0: f32 = CONV_W_FC0 * HIDDEN_QUANT_ONE;
 pub const CONV_B_FC1: f32 = CONV_W_FC1 * HIDDEN_QUANT_ONE;
 pub const CONV_B_FC2: f32 = CONV_W_FC2 * HIDDEN_QUANT_ONE;
 /// PSQT: nnue2score (600) * weight_scale_out (16).
-/// PSQT scale, calibrated against the official net rather than derived.
+/// PSQT scale: the derived 600 (nnue2score) * 16 (OutputScale), times 4.
 ///
-/// The derivation says 600 (nnue2score) * 16 (OutputScale), and that is what
-/// this was. Measured, it is 1200x too small: bullet trains the PSQT in its own
-/// units, ~276x smaller in magnitude than nnue-pytorch's for the same feature
-/// set (mean 0.0056 against 1.54 after comparable data).
+/// The 4 is the piece that is still empirical, and it is small enough to be
+/// honest about. What it replaces is a factor of 1200, which was not a scale at
+/// all -- it was compensating for a PSQT that the trainer initialised 300x too
+/// small. With `psqt` given its own initialisation (stdev 0.5 instead of the
+/// generic affine's sqrt(2/87601) = 0.0048), the weights land in the right
+/// range on their own and this drops back to something close to the derivation.
 ///
-/// How it was found: the trainer scored a queen up at +1397 cp while the engine
-/// read the SAME checkpoint at +40, and switching the PSQT off changed nothing
-/// -- it was arriving as zeros. Sweeping the scale brought the material back
-/// exactly where it belongs: at 1200x a queen reads +2498, against the official
-/// net's +2578.
-///
-/// The 1200 is empirical and says so. What it is NOT is a fudge for a bad net:
-/// the signal was always in the weights, and this is what stopped the converter
-/// from throwing it away.
-pub const CONV_PSQT: f32 = 600.0 * 16.0 * 1200.0;
+/// Measured at superbatch 3 (30M positions): a queen for White reads +3144 and
+/// for Black -1787, against the official net's +2578 and -1885, with the start
+/// position and a bare-kings ending both near zero.
+pub const CONV_PSQT: f32 = 600.0 * 16.0 * 4.0;
 
 fn quant_round(v: f32, scale: f32) -> f32 {
     (v * scale).round()
