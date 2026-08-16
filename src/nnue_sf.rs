@@ -799,7 +799,57 @@ pub fn evaluate(net: &RedeSf, atk: &Attacks, board: &mut Board) -> i32 {
     let denominator: i64 = HIDDEN_ONE_VAL * (1i64 << WEIGHT_SCALE_BITS) * 2;
     let positional = fwd_out * multiplier / denominator;
 
-    ((psqt / OUTPUT_SCALE) + (positional / OUTPUT_SCALE)) as i32
+    let bruto = ((psqt / OUTPUT_SCALE) + (positional / OUTPUT_SCALE)) as i32;
+
+    // O motor tem UMA escala de avaliacao, e nao e' a desta rede.
+    //
+    // Medido: uma dama a mais vale 2578 nesta rede e 1161 na que o motor tinha
+    // quando as margens da busca foram calibradas -- factor 2.22. Todas essas
+    // margens (RFP, futility, os termos do LMR, o corte de "lance obvio" a
+    // 150cp) comparam contra SCORES, portanto com evals 2.2x maiores disparam
+    // 2.2x mais cedo do que foram afinadas para disparar. Nao e' que estejam
+    // erradas: e' que estao a ler outra regua.
+    //
+    // Dividir aqui poe a rede na escala do motor. E' uma transformacao
+    // monotona -- nao muda a ordem de nenhum par de posicoes, logo nao muda a
+    // qualidade da avaliacao; muda o que as margens veem.
+    //
+    // Relacao com `KESTREL_ESCALA` (build.rs): essa ja' existia e diz ao WDL
+    // quantas unidades internas valem um peao -- 200, medido para a rede
+    // antiga. Nao serve aqui sozinha porque as margens de poda NAO a consultam:
+    // sao centipeoes fixos no codigo, como o proprio build.rs explica. Ou seja,
+    // ha' duas leituras da mesma escala e so' uma delas e' configuravel. Este
+    // factor poe o eval na escala que as margens ja' esperam, em vez de mexer
+    // nas dezenas de constantes que teriam de mudar todas juntas.
+    //
+    // `KESTREL_EVAL_FACTOR` em centesimos (222 = 2.22, o factor medido). A 100
+    // nao faz nada, que e' o comportamento antigo, para o SPRT medir os dois.
+    let fator = eval_factor();
+    if fator == 100 { bruto } else { (bruto as i64 * 100 / fator as i64) as i32 }
+}
+
+/// Escala da rede em centesimos, por `setoption name EvalFactor value N` ou
+/// `KESTREL_EVAL_FACTOR`. Atomica e nao `OnceLock`: o bot troca de rede sem
+/// reiniciar, e a escala tem de poder acompanhar.
+static FATOR_ESCALA: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+pub fn set_eval_factor(v: i32) {
+    FATOR_ESCALA.store(v.clamp(20, 500), std::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+pub fn eval_factor() -> i32 {
+    let v = FATOR_ESCALA.load(std::sync::atomic::Ordering::Relaxed);
+    if v > 0 {
+        return v;
+    }
+    let d = std::env::var("KESTREL_EVAL_FACTOR")
+        .ok()
+        .and_then(|x| x.parse::<i32>().ok())
+        .filter(|x| *x >= 20 && *x <= 500)
+        .unwrap_or(100);
+    FATOR_ESCALA.store(d, std::sync::atomic::Ordering::Relaxed);
+    d
 }
 
 static REDE: OnceLock<Option<RedeSf>> = OnceLock::new();

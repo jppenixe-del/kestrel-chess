@@ -1975,6 +1975,14 @@ impl Engine {
                     let _ = writeln!(out, "option name Move Overhead type spin default {} min 0 max 5000", MOVE_OVERHEAD_DEFAULT_MS);
                     let _ = writeln!(out, "option name OnlineTablebase type check default false");
                     let _ = writeln!(out, "option name Contempt type spin default 20 min -200 max 200");
+                    // Escala da rede, em centesimos. Uma rede que avalia material
+                    // ao dobro faz TODAS as margens de poda dispararem ao dobro
+                    // da velocidade, porque elas sao centipeoes fixos. Medido:
+                    // uma dama vale 2578 na rede do Stockfish contra 1161 na
+                    // nossa antiga, para a qual as margens foram afinadas -- dai'
+                    // 222. Por opcao em vez de por compilacao, para o bot poder
+                    // trocar de rede sem recompilar.
+                    let _ = writeln!(out, "option name EvalFactor type spin default 100 min 20 max 500");
                     let _ = writeln!(out, "option name LazyVote type check default true");
                     let _ = writeln!(out, "option name Threats type check default true");
                     let _ = writeln!(
@@ -2104,6 +2112,12 @@ impl Engine {
                         // about two plies and nobody has ever fitted it.
                         if let Ok(v) = tokens[4].parse::<i32>() {
                             crate::nnue::set_escala(v);
+                        }
+                    } else if tokens.len() >= 5 && tokens[1] == "name" && tokens[2] == "EvalFactor"
+                        && tokens[3] == "value"
+                    {
+                        if let Ok(v) = tokens[4].parse::<i32>() {
+                            crate::nnue_sf::set_eval_factor(v);
                         }
                     } else if tokens.len() >= 5 && tokens[1] == "name" && tokens[2] == "LI11EvalScale"
                         && tokens[3] == "value" {

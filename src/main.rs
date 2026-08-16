@@ -12,6 +12,11 @@ mod nnue_threats;
 mod nnue_li11;
 mod nnue_napv10_ffi;
 mod nnue_q900;
+mod nnue_sf256;
+mod nnue_juntas;
+mod nnue_sf;
+mod nnue_sf_ffi;
+mod sf_features;
 mod nnue_plenty;
 mod nnue_v3;
 mod evaluation;
@@ -755,6 +760,122 @@ fn main() {
         let t: usize = args.get(5).and_then(|s| s.parse().ok())
             .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4));
         bullet_data(&args[2], &args[3], d, t);
+        return;
+    }
+    if args.len() >= 5 && args[1] == "sfconvert" {
+        // sfconvert <raw.bin do bullet> <molde.nnue> <saida.nnue>
+        //
+        // bullet's raw.bin is the source of truth: plain f32 tensors, written
+        // in the store's alphabetical order (fc0b, fc0w, fc1b, fc1w, fc2b,
+        // fc2w, l0b, l0w). The mould supplies the header fields so
+        // Stockfish's architecture-hash check passes.
+        const FACT: usize = 704;
+        const DUST: usize = 1;
+        const FEAT: usize = 86896;
+        const NIN: usize = FACT + FEAT + DUST;
+        const L1: usize = 1024;
+        const L2: usize = 32;
+        const L3: usize = 32;
+        const NB: usize = 8;
+
+        let raw = match std::fs::read(&args[2]) {
+            Ok(b) => b,
+            Err(e) => { eprintln!("nao consegui ler {}: {e}", args[2]); return; }
+        };
+        let f32s: Vec<f32> = raw
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        // Alphabetical, as the trainer's weight store emits them. The
+        // per-layer factorisers (fc0f/fc1f/fc2f) are shared across buckets and
+        // must be folded into every bucket here -- the .nnue format has no
+        // notion of them.
+        let tam = [
+            ("fc0b", L2 * NB), ("fc0fb", L2), ("fc0fw", L2 * L1), ("fc0w", L2 * NB * L1),
+            ("fc1b", L3 * NB), ("fc1fb", L3), ("fc1fw", L3 * 2 * L2), ("fc1w", L3 * NB * 2 * L2),
+            ("fc2b", NB), ("fc2fb", 1), ("fc2fw", 2 * L2 + 2 * L3), ("fc2w", NB * (2 * L2 + 2 * L3)),
+            ("l0b", L1), ("l0w", L1 * NIN),
+            ("psqtb", NB), ("psqtw", NB * NIN),
+        ];
+        let total: usize = tam.iter().map(|(_, n)| n).sum();
+        if f32s.len() != total {
+            eprintln!("raw.bin tem {} valores, esperava {total} -- arquitectura diferente?", f32s.len());
+            return;
+        }
+        let mut o = 0usize;
+        let mut get = |n: usize| -> &[f32] { let s = &f32s[o..o + n]; o += n; s };
+        let fc0b = get(L2 * NB).to_vec();
+        let fc0fb = get(L2).to_vec();
+        let fc0fw = get(L2 * L1).to_vec();
+        let fc0w = get(L2 * NB * L1).to_vec();
+        let fc1b = get(L3 * NB).to_vec();
+        let fc1fb = get(L3).to_vec();
+        let fc1fw = get(L3 * 2 * L2).to_vec();
+        let fc1w = get(L3 * NB * 2 * L2).to_vec();
+        let fc2b = get(NB).to_vec();
+        let fc2fb = get(1).to_vec();
+        let fc2fw = get(2 * L2 + 2 * L3).to_vec();
+        let fc2w = get(NB * (2 * L2 + 2 * L3)).to_vec();
+        let l0b = get(L1).to_vec();
+        let l0w = get(L1 * NIN).to_vec();
+        let _psqtb = get(NB).to_vec();
+        let psqtw = get(NB * NIN).to_vec();
+
+        let molde_bytes = match std::fs::read(&args[3]) {
+            Ok(b) => b,
+            Err(e) => { eprintln!("nao consegui ler o molde {}: {e}", args[3]); return; }
+        };
+        let molde = match nnue_sf::carrega_pub(&molde_bytes) {
+            Some(n) => n,
+            None => { eprintln!("molde invalido"); return; }
+        };
+
+        let net = nnue_sf::de_bullet(&molde, &l0w, &l0b, &fc0w, &fc0b, &fc1w, &fc1b, &fc2w, &fc2b, &psqtw,
+            &fc0fw, &fc0fb, &fc1fw, &fc1fb, &fc2fw, &fc2fb);
+        let saida = nnue_sf::escreve(&net);
+        match std::fs::write(&args[4], &saida) {
+            Ok(()) => println!("escrito: {} ({} bytes)", args[4], saida.len()),
+            Err(e) => eprintln!("nao consegui escrever: {e}"),
+        }
+        return;
+    }
+    if args.len() >= 3 && args[1] == "sfroundtrip" {
+        // sfroundtrip <rede.nnue> [saida.nnue]
+        //
+        // Reads a Stockfish net with our own reader and writes it straight
+        // back out. If the bytes come out identical to the input, the
+        // serialiser reproduces SF's format exactly -- which is the
+        // precondition for writing a net Stockfish will accept.
+        let entrada = &args[2];
+        let bytes = match std::fs::read(entrada) {
+            Ok(b) => b,
+            Err(e) => { eprintln!("nao consegui ler {entrada}: {e}"); return; }
+        };
+        let net = match nnue_sf::carrega_pub(&bytes) {
+            Some(n) => n,
+            None => { eprintln!("nao consegui interpretar {entrada}"); return; }
+        };
+        let saida_bytes = nnue_sf::escreve(&net);
+        println!("entrada: {} bytes", bytes.len());
+        println!("saida:   {} bytes", saida_bytes.len());
+        if saida_bytes == bytes {
+            println!("IDENTICO -- o serializador reproduz o formato do SF byte a byte");
+        } else {
+            println!("DIFERENTE");
+            let n = bytes.len().min(saida_bytes.len());
+            let primeiro = (0..n).find(|&i| bytes[i] != saida_bytes[i]);
+            match primeiro {
+                Some(i) => println!("  primeiro byte diferente no offset {i}"),
+                None => println!("  prefixo igual, comprimentos diferentes"),
+            }
+        }
+        if let Some(dest) = args.get(3) {
+            if let Err(e) = std::fs::write(dest, &saida_bytes) {
+                eprintln!("nao consegui escrever {dest}: {e}");
+            } else {
+                println!("escrito: {dest}");
+            }
+        }
         return;
     }
     if args.len() >= 4 && args[1] == "accdump" {

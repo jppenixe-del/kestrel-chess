@@ -574,11 +574,22 @@ pub fn evaluate(net: &RedeLi11, board: &Board) -> i32 {
             + (fc0_raw[i] - net.fc0_b[i]) as f32 * dequant_fc0;
     }
 
+    // TEMP DIAGNOSTIC (KESTREL_LI11_SQRRELU): tests whether a given
+    // checkpoint was trained before or after the sqrrelu->screlu fix
+    // documented in napk9_train_li11.rs, by trying the OLD unbounded
+    // relu(x)^2 reading instead of the current clamp(x,0,1)^2. Remove once
+    // the checkpoints in question are sorted.
+    let sqrrelu_sem_limite = std::env::var_os("KESTREL_LI11_SQRRELU").is_some();
     let mut concat64 = [0f32; 64];
     for i in 0..FC0_REAL {
-        let c = fc0_out[i].clamp(0.0, 1.0);
-        concat64[i] = c * c; // screlu: clamp(x,0,1)^2
-        concat64[FC0_REAL + i] = c; // crelu: clamp(x,0,1)
+        let lin = fc0_out[i].clamp(0.0, 1.0);
+        concat64[i] = if sqrrelu_sem_limite {
+            let c = fc0_out[i].max(0.0);
+            c * c // relu(x)^2, no upper bound
+        } else {
+            lin * lin // screlu: clamp(x,0,1)^2
+        };
+        concat64[FC0_REAL + i] = lin; // crelu: clamp(x,0,1)
     }
 
     let bias_dequant_fc1 = 1.0 / net.qb_fc;

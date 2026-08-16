@@ -43,6 +43,24 @@ pub fn evaluate(board: &mut Board) -> i32 {
             return crate::nnue_plenty::evaluate(net, atk(), board);
         }
     }
+    if crate::nnue_sf256::active() {
+        if let Some(net) = crate::nnue_sf256::rede() {
+            return crate::nnue_sf256::evaluate(net, board);
+        }
+    }
+    if crate::nnue_juntas::active() {
+        if let Some(net) = crate::nnue_juntas::rede() {
+            return crate::nnue_juntas::evaluate(net, board);
+        }
+    }
+    if crate::nnue_sf_ffi::activo() {
+        return crate::nnue_sf_ffi::evaluate(board);
+    }
+    if crate::nnue_sf::active() {
+        if let Some(net) = crate::nnue_sf::rede() {
+            return crate::nnue_sf::evaluate(net, atk(), board);
+        }
+    }
     if crate::nnue_q900::active() {
         if let Some(net) = crate::nnue_q900::rede() {
             return crate::nnue_q900::evaluate(net, board);
