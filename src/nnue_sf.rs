@@ -1192,6 +1192,10 @@ struct EstadoAcc {
     bb: [[u64; 6]; 2],
     scratch_t: Vec<usize>,
     scratch_p: Vec<usize>,
+    /// Buffers do delta dos pares de peoes, reaproveitados: `Vec::new()` por
+    /// lance de peao aparecia como `_int_malloc` no perfil.
+    par_sai: Vec<usize>,
+    par_entra: Vec<usize>,
     x: Vec<u8>,
     psqt: [[i64; NB]; 2],
     /// Cache de refresh por casa de rei ("finny tables"): para cada
@@ -1249,6 +1253,8 @@ impl EstadoAcc {
             bb: [[0u64; 6]; 2],
             scratch_t: Vec::with_capacity(128),
             scratch_p: Vec::with_capacity(32),
+            par_sai: Vec::with_capacity(32),
+            par_entra: Vec::with_capacity(32),
             x: vec![0u8; L1],
             psqt: [[0i64; NB]; 2],
             cache: vec![
@@ -1391,49 +1397,23 @@ fn delta_por_lance(
     // bitboards, so it is skipped entirely unless a pawn actually moved.
     let mexeu_peao = ev.iter().any(|&(_, t, _, _)| t == 0);
     if mexeu_peao {
-        let (mut pa, mut pb) = (Vec::new(), Vec::new());
-        crate::sf_features::pair_features(&antes, pov, &mut pa);
-        crate::sf_features::pair_features(&agora, pov, &mut pb);
-        pa.sort_unstable();
-        pb.sort_unstable();
-        let (mut i, mut j) = (0, 0);
-        while i < pa.len() || j < pb.len() {
-            let (sai, entra) = match (pa.get(i), pb.get(j)) {
-                (Some(&x), Some(&y)) if x == y => {
-                    i += 1;
-                    j += 1;
-                    continue;
-                }
-                (Some(&x), Some(&y)) if x < y => {
-                    i += 1;
-                    (Some(x), None)
-                }
-                (Some(_), Some(&y)) => {
-                    j += 1;
-                    (None, Some(y))
-                }
-                (Some(&x), None) => {
-                    i += 1;
-                    (Some(x), None)
-                }
-                (None, Some(&y)) => {
-                    j += 1;
-                    (None, Some(y))
-                }
-                (None, None) => break,
-            };
-            for (f, somar) in [(sai, false), (entra, true)] {
-                if let Some(f) = f {
-                    let u = U_PAIR + (f - PAIR_BASE);
-                    aplica_linha(net, &mut st.acc[pov], u, somar);
-                    let sinal = if somar { 1i64 } else { -1 };
-                    for b in 0..NB {
-                        st.psqt[pov][b] +=
-                            sinal * net.ft_pair_psqt[(f - PAIR_BASE) * NB + b] as i64;
-                    }
+        let mut sai = std::mem::take(&mut st.par_sai);
+        let mut entra = std::mem::take(&mut st.par_entra);
+        sai.clear();
+        entra.clear();
+        crate::sf_features::pair_delta(&antes, &agora, pov, &mut sai, &mut entra);
+        for (lista, somar) in [(&sai, false), (&entra, true)] {
+            for &f in lista.iter() {
+                let u = U_PAIR + (f - PAIR_BASE);
+                aplica_linha(net, &mut st.acc[pov], u, somar);
+                let sinal = if somar { 1i64 } else { -1 };
+                for b in 0..NB {
+                    st.psqt[pov][b] += sinal * net.ft_pair_psqt[(f - PAIR_BASE) * NB + b] as i64;
                 }
             }
         }
+        st.par_sai = sai;
+        st.par_entra = entra;
     }
 
     // features de peca: indice calculado directamente (o rei desta

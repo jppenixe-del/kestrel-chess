@@ -640,6 +640,56 @@ pub fn pair_features(pos: &PosBB, pov: usize, feats: &mut Vec<usize>) {
     }
 }
 
+/// So' os pares de peoes que MUDARAM entre duas posicoes.
+///
+/// A versao anterior enumerava todos os pares das duas posicoes, ordenava as
+/// duas listas e cruzava-as -- duas alocacoes, dois `sort` e uma fusao por cada
+/// lance de peao da busca. Um par so' pode mudar se envolver uma casa onde os
+/// bitboards de peao diferem, e essas sao tipicamente duas.
+///
+/// Um par com as duas casas alteradas seria emitido duas vezes; a mascara
+/// `mudou & abaixo(s)` deixa-o sair so' quando se processa a casa mais baixa.
+pub fn pair_delta(
+    antes: &PosBB, agora: &PosBB, pov: usize,
+    saem: &mut Vec<usize>, entram: &mut Vec<usize>,
+) {
+    let king_sq = agora.king_sq(pov);
+    if king_sq >= 64 {
+        return;
+    }
+    let mirrored = ORIENT_THREATS[king_sq] != 0;
+    let square_flip = (if mirrored { 7 } else { 0 }) ^ (if pov == 1 { 56 } else { 0 });
+
+    let (fa, ea) = (antes.pieces[pov][0], antes.pieces[1 - pov][0]);
+    let (fb, eb) = (agora.pieces[pov][0], agora.pieces[1 - pov][0]);
+    let mudou = (fa ^ fb) | (ea ^ eb);
+    if mudou == 0 {
+        return;
+    }
+
+    for (amigos, inimigos, saida) in [(fa, ea, &mut *saem), (fb, eb, &mut *entram)] {
+        let peoes = amigos | inimigos;
+        let mut m = mudou;
+        while m != 0 {
+            let s = m.trailing_zeros() as usize;
+            m &= m - 1;
+            if (peoes >> s) & 1 == 0 {
+                continue;
+            }
+            let meu = (amigos >> s) & 1 != 0;
+            let id_a = pawn_id(s, if meu { 0 } else { 48 }, square_flip);
+            let ja_feitos = mudou & ((1u64 << s) - 1);
+            let mut p = PP_MASK[s] & peoes & !ja_feitos;
+            while p != 0 {
+                let s2 = p.trailing_zeros() as usize;
+                p &= p - 1;
+                let off = if (amigos >> s2) & 1 != 0 { 0 } else { 48 };
+                saida.push(PAIR_BASE + pawn_pair_index(id_a, pawn_id(s2, off, square_flip)));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
