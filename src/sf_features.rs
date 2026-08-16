@@ -231,10 +231,55 @@ fn pseudo_attacks_empty(piece: usize, origin: usize, color: usize) -> u64 {
     }
 }
 
+/// Tabelas de indexacao das ameacas, achatadas.
+///
+/// A versao anterior era `Vec<Vec<Vec<Vec<i32>>>>`: ler uma entrada custava
+/// quatro saltos de ponteiro encadeados, nenhum deles capaz de comecar antes
+/// do anterior chegar da memoria, sobre 768 alocacoes de 256 bytes espalhadas
+/// pelo heap. Em C ninguem escreveria isto -- escrever-se-ia
+/// `int attack_index[6][2][64][64]`, contiguo. A forma "idiomatica" em Rust
+/// era, aqui, a pior escolha possivel de layout, e esta funcao corre ~90 vezes
+/// por reconstrucao do acumulador.
+///
+/// Agora sao dois blocos contiguos, com o `piece_offset` ja' somado dentro do
+/// `attack_index` -- o que era duas leituras dispersas passa a ser uma.
 pub struct ThreatTables {
-    piece_offset: Vec<Vec<Vec<i32>>>,
-    attack_index: Vec<Vec<Vec<Vec<i32>>>>,
-    pair_lookup: Vec<Vec<Vec<Vec<(bool, bool, i32)>>>>,
+    /// [peca][cor][origem][alvo], 6*2*64*64 = 49152 entradas. Ja' inclui o
+    /// `piece_offset` da origem.
+    ///
+    /// `i16` e nao `i32`: o maior valor possivel e' a soma dos ataques da dama
+    /// sobre as 64 origens, ~1400, muito dentro de 32767. Metade da largura
+    /// significa 96 KiB em vez de 192 -- o dobro da tabela por linha de cache,
+    /// e o conjunto todo cabe folgado na L2.
+    attack_index: Box<[i16]>,
+    /// [atacante][cor_at][alvo][cor_alvo], 6*2*6*2 = 144 entradas.
+    ///
+    /// Os dois booleanos vivem nos dois bits de baixo do proprio inteiro: a
+    /// tupla `(bool, bool, i32)` gastava 8 bytes por causa do alinhamento, e
+    /// esta forma gasta 4. A base cabe: o maximo e' `THREAT_DIM` (59808), que
+    /// deslocado 2 bits ainda e' um quarto de milhao.
+    pair_lookup: Box<[i32]>,
+}
+
+/// Empacota (excluido, semi-excluido, base) num so' inteiro.
+#[inline(always)]
+const fn empacota_par(excluido: bool, semi: bool, base: i32) -> i32 {
+    (base << 2) | ((semi as i32) << 1) | (excluido as i32)
+}
+
+#[inline(always)]
+const fn desempacota_par(v: i32) -> (bool, bool, i32) {
+    ((v & 1) != 0, (v & 2) != 0, v >> 2)
+}
+
+#[inline(always)]
+const fn idx_ataque(peca: usize, cor: usize, origem: usize, alvo: usize) -> usize {
+    ((peca * 2 + cor) * 64 + origem) * 64 + alvo
+}
+
+#[inline(always)]
+const fn idx_par(ap: usize, ac: usize, tp: usize, tc: usize) -> usize {
+    ((ap * 2 + ac) * 6 + tp) * 2 + tc
 }
 
 fn build_threat_tables() -> ThreatTables {
@@ -258,23 +303,30 @@ fn build_threat_tables() -> ThreatTables {
     }
     debug_assert_eq!(running as usize, THREAT_DIM);
 
-    let mut attack_index = vec![vec![vec![vec![0i32; 64]; 64]; 2]; 6];
+    // O `piece_offset` da origem entra aqui: a linha inteira nasce com ele, e
+    // os alvos atacados somam-lhe a contagem. Uma leitura em vez de duas.
+    let mut attack_index = vec![0i16; 6 * 2 * 64 * 64].into_boxed_slice();
     for color in 0..2 {
         for piece in 0..6 {
             for origin in 0..64 {
+                let base = piece_offset[piece][color][origin] as i16;
+                let ini = idx_ataque(piece, color, origin, 0);
+                for v in attack_index[ini..ini + 64].iter_mut() {
+                    *v = base;
+                }
                 let a = pseudo_attacks_empty(piece, origin, color);
                 let mut m = a;
                 while m != 0 {
                     let target = m.trailing_zeros() as usize;
                     m &= m - 1;
                     let below = a & ((1u64 << target) - 1);
-                    attack_index[piece][color][origin][target] = below.count_ones() as i32;
+                    attack_index[ini + target] += below.count_ones() as i16;
                 }
             }
         }
     }
 
-    let mut pair_lookup = vec![vec![vec![vec![(true, false, 0i32); 2]; 6]; 2]; 6];
+    let mut pair_lookup = vec![empacota_par(true, false, 0); 6 * 2 * 6 * 2].into_boxed_slice();
     for ap in 0..6 {
         for ac in 0..2 {
             for tp in 0..6 {
@@ -289,12 +341,13 @@ fn build_threat_tables() -> ThreatTables {
                     if excluded {
                         feature_base = 0;
                     }
-                    pair_lookup[ap][ac][tp][tc] = (excluded, semi_excluded, feature_base);
+                    pair_lookup[idx_par(ap, ac, tp, tc)] =
+                        empacota_par(excluded, semi_excluded, feature_base);
                 }
             }
         }
     }
-    ThreatTables { piece_offset, attack_index, pair_lookup }
+    ThreatTables { attack_index, pair_lookup }
 }
 
 static THREAT_TABLES: std::sync::OnceLock<ThreatTables> = std::sync::OnceLock::new();
@@ -325,16 +378,50 @@ pub fn get_threat_feature(
     let d_sq = attacked_square ^ square_flip;
     let a_c = attacking_color ^ pov;
     let d_c = attacked_color ^ pov;
-    let t = threat_tables();
-    let (excluded, semi_excluded, base) = t.pair_lookup[attacking_piece][a_c][attacked_piece][d_c];
+    get_threat_feature_t(threat_tables(), pov, attacking_piece, attacking_color,
+        attacked_piece, attacked_color, attacking_square, attacked_square, mirrored)
+}
+
+/// Variante com a tabela ja' na mao, para quem chama isto em ciclo: poupa um
+/// `OnceLock::get_or_init` (carga atomica mais salto) por chamada, e a
+/// enumeracao das ameacas chama-o dezenas de vezes por posicao.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub fn get_threat_feature_t(
+    t: &ThreatTables,
+    pov: usize,
+    attacking_piece: usize,
+    attacking_color: usize,
+    attacked_piece: usize,
+    attacked_color: usize,
+    attacking_square: i32,
+    attacked_square: i32,
+    mirrored: bool,
+) -> i32 {
+    let square_flip = (if mirrored { 7 } else { 0 }) ^ (if pov == 1 { 56 } else { 0 });
+    let a_sq = attacking_square ^ square_flip;
+    let d_sq = attacked_square ^ square_flip;
+    let a_c = attacking_color ^ pov;
+    let d_c = attacked_color ^ pov;
+    // Indices por construcao dentro dos limites: peca < 6, cor < 2, casas < 64.
+    // Os `debug_assert` guardam-no nos testes; em release nao ha verificacao,
+    // que e' o que separa este acesso do equivalente em C.
+    debug_assert!(attacking_piece < 6 && attacked_piece < 6);
+    debug_assert!((0..64).contains(&a_sq) && (0..64).contains(&d_sq));
+    let (excluded, semi_excluded, base) = desempacota_par(unsafe {
+        *t.pair_lookup
+            .get_unchecked(idx_par(attacking_piece, a_c, attacked_piece, d_c))
+    });
     if is_pair_excluded(excluded, semi_excluded, a_sq, d_sq) {
         return THREAT_DIM as i32;
     }
-    base + t.piece_offset[attacking_piece][a_c][a_sq as usize]
-        + t.attack_index[attacking_piece][a_c][a_sq as usize][d_sq as usize]
+    base + unsafe {
+        *t.attack_index
+            .get_unchecked(idx_ataque(attacking_piece, a_c, a_sq as usize, d_sq as usize))
+    } as i32
 }
 
-fn pp_mask(sq: usize) -> u64 {
+const fn pp_mask_calc(sq: usize) -> u64 {
     let file = (sq & 7) as u32;
     let mut mask = FILE_A << file;
     if file > 0 {
@@ -345,6 +432,18 @@ fn pp_mask(sq: usize) -> u64 {
     }
     mask & !(0xFFu64 | (0xFFu64 << 56)) & !(1u64 << sq)
 }
+
+/// Mascara das casas que emparelham com cada casa, calculada na compilacao.
+/// Era recalculada dentro do ciclo, uma vez por peao e por chamada.
+static PP_MASK: [u64; 64] = {
+    let mut t = [0u64; 64];
+    let mut i = 0;
+    while i < 64 {
+        t[i] = pp_mask_calc(i);
+        i += 1;
+    }
+    t
+};
 
 #[inline]
 fn pawn_pair_index(id_a: i32, id_b: i32) -> usize {
@@ -478,6 +577,17 @@ pub fn threat_features_padded_com(
 }
 
 /// PP_3Wide indices for `pov`, already offset by PAIR_BASE.
+/// Os pares de peoes activos.
+///
+/// A versao anterior materializava duas `Vec` de casas por chamada (duas
+/// alocacoes no heap, numa funcao que corre uma vez por reconstrucao e duas
+/// por lance de peao) e depois cruzava-as com um ciclo duplo, testando cada
+/// combinacao contra a mascara. Aqui a mascara faz o trabalho: intersecta-se
+/// com o bitboard e so' se visitam os pares que existem mesmo.
+///
+/// Para os pares da mesma cor, `& !((1 << s) - 1)` deixa so' as casas acima de
+/// `s`, que e' o que impede contar o mesmo par duas vezes -- a mascara ja' nao
+/// contem `s`.
 pub fn pair_features(pos: &PosBB, pov: usize, feats: &mut Vec<usize>) {
     let king_sq = pos.king_sq(pov);
     if king_sq >= 64 {
@@ -489,42 +599,43 @@ pub fn pair_features(pos: &PosBB, pov: usize, feats: &mut Vec<usize>) {
     let friendly = pos.pieces[pov][0];
     let enemy = pos.pieces[1 - pov][0];
 
-    let squares = |mut bb: u64| -> Vec<usize> {
-        let mut v = Vec::with_capacity(8);
-        while bb != 0 {
-            v.push(bb.trailing_zeros() as usize);
-            bb &= bb - 1;
-        }
-        v
-    };
-    let friendly_list = squares(friendly);
-    let enemy_list = squares(enemy);
-
-    for (i, &s) in friendly_list.iter().enumerate() {
+    let mut bb = friendly;
+    while bb != 0 {
+        let s = bb.trailing_zeros() as usize;
+        bb &= bb - 1;
         let id_a = pawn_id(s, 0, square_flip);
-        let mask = pp_mask(s);
-        for &s2 in &friendly_list[i + 1..] {
-            if mask & (1u64 << s2) != 0 {
-                feats.push(PAIR_BASE + pawn_pair_index(id_a, pawn_id(s2, 0, square_flip)));
-            }
+        let mask = PP_MASK[s];
+        let acima = !((1u64 << s) - 1);
+        let mut m = mask & friendly & acima;
+        while m != 0 {
+            let s2 = m.trailing_zeros() as usize;
+            m &= m - 1;
+            feats.push(PAIR_BASE + pawn_pair_index(id_a, pawn_id(s2, 0, square_flip)));
         }
     }
-    for &s in &friendly_list {
+    let mut bb = friendly;
+    while bb != 0 {
+        let s = bb.trailing_zeros() as usize;
+        bb &= bb - 1;
         let id_a = pawn_id(s, 0, square_flip);
-        let mask = pp_mask(s);
-        for &s2 in &enemy_list {
-            if mask & (1u64 << s2) != 0 {
-                feats.push(PAIR_BASE + pawn_pair_index(id_a, pawn_id(s2, 48, square_flip)));
-            }
+        let mut m = PP_MASK[s] & enemy;
+        while m != 0 {
+            let s2 = m.trailing_zeros() as usize;
+            m &= m - 1;
+            feats.push(PAIR_BASE + pawn_pair_index(id_a, pawn_id(s2, 48, square_flip)));
         }
     }
-    for (i, &s) in enemy_list.iter().enumerate() {
+    let mut bb = enemy;
+    while bb != 0 {
+        let s = bb.trailing_zeros() as usize;
+        bb &= bb - 1;
         let id_a = pawn_id(s, 48, square_flip);
-        let mask = pp_mask(s);
-        for &s2 in &enemy_list[i + 1..] {
-            if mask & (1u64 << s2) != 0 {
-                feats.push(PAIR_BASE + pawn_pair_index(id_a, pawn_id(s2, 48, square_flip)));
-            }
+        let acima = !((1u64 << s) - 1);
+        let mut m = PP_MASK[s] & enemy & acima;
+        while m != 0 {
+            let s2 = m.trailing_zeros() as usize;
+            m &= m - 1;
+            feats.push(PAIR_BASE + pawn_pair_index(id_a, pawn_id(s2, 48, square_flip)));
         }
     }
 }

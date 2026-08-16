@@ -505,6 +505,34 @@ pub struct SearchParams {
     /// coefficient that maps OUR curve onto that shape is ~31, half the value
     /// that engine applies to its own differently-shaped base curve. 0 = off.
     pub lmr_move_linear: i32,
+    /// MILLI-PLIES removed when the move is a killer (a refutation). 0 = off.
+    ///
+    /// A move that refuted a sibling is not a late move in spirit, whatever its
+    /// index says. We already give killers an ordering slot; this says the LMR
+    /// should know about them too.
+    pub lmr_killer: i32,
+    /// MILLI-PLIES added per time alpha has already been raised at this node.
+    ///
+    /// Each raise means the remaining moves have a higher bar to clear, so the
+    /// later ones are progressively less likely to matter. Ours had no notion
+    /// of this at all.
+    pub lmr_alpha_raise: i32,
+    /// MILLI-PLIES removed when the move gives check, INSTEAD of exempting it.
+    ///
+    /// We exclude checks from LMR outright, which is a switch where the others
+    /// use a dial -- our own counters put 1% of quiets escaping through it.
+    /// Reducing them less is strictly more expressive than not reducing them.
+    /// 0 = off (keeps the exemption).
+    pub lmr_check: i32,
+    /// Extra MILLI-PLY reduction when the TT move is a capture. 0 = off.
+    pub lmr_ttcapture: i32,
+    /// MILLI-PLIES of reduction REMOVED at a PV node (subtracted). 0 = off.
+    pub lmr_pvnode: i32,
+    /// Multiplicative scaling of the whole reduction at an ALL node:
+    /// `r += r * g / (256 * depth + 285)`. Multiplicative because an all-node
+    /// expects every move to fail low, so the deeper the search the more the
+    /// reduction can grow -- an additive term cannot say that. 0 = off.
+    pub lmr_allnode: i32,
     /// Extra LMR reduction at a cutnode, in MILLI-PLIES.
     ///
     /// A cutnode is where a fail-high is expected, so it is the one place a
@@ -634,7 +662,18 @@ impl Default for SearchParams {
             hist_malus_max: 992,
             lmr_hist_divisor: 36000,
             lmr_move_linear: 0,
-            lmr_cutnode: 0,
+            // Ligavel por ambiente para o SPRT poder medir os dois lados sem
+            // dois binarios. O de referencia usa 3687 milesimos aqui e chama-lhe
+            // "o desnivel numero 1" -- mas a curva base deles nao e' a nossa,
+            // portanto o valor tem de sair de medicao nossa, nao de copia.
+            lmr_cutnode: std::env::var("KESTREL_LMR_CUTNODE")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+            lmr_ttcapture: 0,
+            lmr_pvnode: 0,
+            lmr_allnode: 0,
+            lmr_killer: 0,
+            lmr_alpha_raise: 0,
+            lmr_check: 0,
             // Not zero, but not borrowed either: -LMR_ESCALA is the same
             // "exactly one ply" step every other threshold term here uses
             // (ttpv_adj, corrplexity_adj, non_imp_adj), applied to captures
@@ -838,6 +877,16 @@ impl SearchParams {
             rfp_step: v[50],
             lmr_move_linear: v[51],
             lmr_cutnode: v[52],
+            // Fora do vector do SPSA de proposito: o vector e' indexado por
+            // posicao e inserir campos a meio desloca tudo o que vem depois,
+            // que e' exactamente como se invalida uma afinacao inteira sem dar
+            // por isso. Entram quando um SPRT os justificar.
+            lmr_ttcapture: 0,
+            lmr_pvnode: 0,
+            lmr_allnode: 0,
+            lmr_killer: 0,
+            lmr_alpha_raise: 0,
+            lmr_check: 0,
             lmr_capture_base: v[53],
             lmr_capture_hist_divisor: v[54],
         }
@@ -2525,6 +2574,7 @@ impl<'a> Searcher<'a> {
         let excluded = self.excluded_move;
 
         let orig_alpha = alpha;
+        let mut subidas_alpha: i32 = 0;
         let mut tt_move = None;
         // Standard PVS convention: a null/scout window (beta == alpha+1)
         // means this is not a PV node. Used below for the extended TT
@@ -3414,6 +3464,50 @@ impl<'a> Searcher<'a> {
                     // variable was set, so the default binary is unchanged.
                     let cutnode_adj = if cutnode { sp_lmr.lmr_cutnode } else { 0 };
                     let move_linear_adj = -sp_lmr.lmr_move_linear * (i as i32 + 1);
+
+                    // Three more signals the fine-grained shape wants, and that
+                    // we did not have. The point of milli-plies is to fuse many
+                    // weak signals; with only a handful of terms the resolution
+                    // buys nothing, which is why our own instrumentation showed
+                    // reductions that essentially never come back (0.4%
+                    // re-search rate) -- we were cutting uniformly instead of
+                    // cutting hard where it is safe.
+                    //
+                    // All default to 0, so the binary is unchanged until an
+                    // SPRT says otherwise.
+
+                    // The TT move being a capture says the position is sharp
+                    // and the quiet alternatives are likelier to be noise.
+                    let ttcap_adj = if sp_lmr.lmr_ttcapture != 0
+                        && tt_entry_captured.and_then(|e| e.best).map(|m| m.is_capture()).unwrap_or(false)
+                    {
+                        sp_lmr.lmr_ttcapture
+                    } else {
+                        0
+                    };
+
+                    // A PV node has earned more trust than a scout node: cut it
+                    // less. We already do this for ttPv; this is the node type
+                    // itself.
+                    let pv_adj = if is_pv { -sp_lmr.lmr_pvnode } else { 0 };
+
+                    // Killer: refutou um irmao, portanto nao e' um lance tardio
+                    // em espirito, diga o indice o que disser.
+                    let killer_adj = if Some(mv) == killers[0] || Some(mv) == killers[1] {
+                        -sp_lmr.lmr_killer
+                    } else {
+                        0
+                    };
+                    let alpha_raise_adj = subidas_alpha * sp_lmr.lmr_alpha_raise;
+                    // Xeque: reduzir MENOS em vez de isentar. So' tem efeito se
+                    // `lmr_check` estiver ligado -- com 0 mantem-se a isencao.
+                    let check_adj = if gives_check { -sp_lmr.lmr_check } else { 0 };
+
+                    // ALL-node scaling, and it is MULTIPLICATIVE rather than a
+                    // flat term: at an all-node every move is expected to fail
+                    // low, so the deeper the search the more the whole reduction
+                    // can grow. Additive terms cannot express that.
+                    let all_node = !is_pv && !cutnode;
                     // Captures reduced under `capture_ok_for_lmr` never
                     // touch `hist_adj` above -- that table is keyed by
                     // (from, to) and only ever written for quiets, so
@@ -3430,7 +3524,7 @@ impl<'a> Searcher<'a> {
                         ),
                         _ => (hist_adj, 0),
                     };
-                    let r_milli = base
+                    let mut r_milli = base
                         + hist_adj
                         + cont_adj
                         + ttpv_adj
@@ -3438,7 +3532,15 @@ impl<'a> Searcher<'a> {
                         + non_imp_adj
                         + cutnode_adj
                         + move_linear_adj
-                        + capture_adj;
+                        + capture_adj
+                        + ttcap_adj
+                        + pv_adj
+                        + killer_adj
+                        + alpha_raise_adj
+                        + check_adj;
+                    if all_node && sp_lmr.lmr_allnode != 0 {
+                        r_milli += r_milli * sp_lmr.lmr_allnode / (256 * depth + 285);
+                    }
                     // ONE division, at the end. Clamped in milli-plies first so
                     // the ceiling means the same thing it did before.
                     //
@@ -3626,6 +3728,10 @@ impl<'a> Searcher<'a> {
             }
             if score > alpha {
                 alpha = score;
+                // Cada subida de alpha levanta a fasquia para os lances que
+                // faltam: os seguintes tem menos hipoteses de importar. E' um
+                // sinal que a nossa LMR nao tinha.
+                subidas_alpha += 1;
             }
             if alpha >= beta {
                 // Move-ordering telemetry. The share of beta cutoffs produced
