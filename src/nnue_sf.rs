@@ -723,7 +723,16 @@ pub fn evaluate(net: &RedeSf, atk: &Attacks, board: &mut Board) -> i32 {
         (ps, pn)
     });
     // SF's transform(): psqt = (psqtAccum[stm][bucket] - psqtAccum[ntm][bucket]) / 2.
-    let psqt = (psqt_s - psqt_n) / 2;
+    //
+    // `KESTREL_ZERA_PSQT=1` anula-o em tempo de leitura, para qualquer rede.
+    // Serve para separar o que o CORPO aprendeu do que vem do PSQT: numa rede
+    // nossa de 12 superbatches o corpo correlaciona -0,05 com a oficial e a
+    // rede toda 0,70, ou seja o material e' tudo e o resto ainda nao existe.
+    let psqt = if std::env::var_os("KESTREL_ZERA_PSQT").is_some() {
+        0
+    } else {
+        (psqt_s - psqt_n) / 2
+    };
 
     if std::env::var_os("KESTREL_SF_DEBUG").is_some() {
         let mut pf_stm = Vec::new();
