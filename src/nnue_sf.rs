@@ -711,6 +711,21 @@ pub fn evaluate(net: &RedeSf, atk: &Attacks, board: &mut Board) -> i32 {
         // deslocamento de 9 substitui a divisao por 512: com factores nao
         // negativos e' a mesma operacao.
         const TETO: i16 = FT_MAX_VAL as i16;
+        // KESTREL_SATURA=1 conta que fraccao do acumulador bate no tecto do
+        // crelu. Onde tudo satura o gradiente morre, e posicoes de muitas pecas
+        // tem mais features activas -- se a nossa rede saturar muito mais do que
+        // a de referencia, e' esse o defeito e nao o treino.
+        if std::env::var_os("KESTREL_SATURA").is_some() {
+            let (mut alto, mut zero, mut tot) = (0u64, 0u64, 0u64);
+            for pov in 0..2 {
+                for &v in st.acc[pov].iter() {
+                    tot += 1;
+                    if v >= TETO { alto += 1 } else if v <= 0 { zero += 1 }
+                }
+            }
+            eprintln!("satura {:.1} zeros {:.1}", 100.0 * alto as f64 / tot as f64,
+                100.0 * zero as f64 / tot as f64);
+        }
         for (pov, base) in [(stm, 0usize), (nstm, half)] {
             let (a, b) = st.acc[pov].split_at(half);
             for (j, (&lo, &hi)) in a.iter().zip(b.iter()).enumerate() {
