@@ -1085,24 +1085,48 @@ pub fn eventos_ameaca(
     pos: &PosBB, pov: usize, add: bool, color: usize, piece: usize, s: usize,
     sem_raios: u64, d: Deslizantes, out: &mut Vec<DeltaAmeaca>, king_sq: usize,
 ) {
-    // `king_sq` comes from the caller and is NOT read off `pos`. Walking a move
-    // means the board passes through a state where the king has been taken off
-    // its old square and not yet put on the new one -- for `Ke1-f1`, a board
-    // with no white king at all. Deriving it here made every call in that window
-    // hit `king_sq >= 64` and return in silence, so the whole move contributed
-    // nothing to the opponent's perspective. The orientation is guaranteed
-    // unchanged by the caller, so the final square is the right one throughout.
-    if king_sq >= 64 {
-        return;
-    }
-    let hm = ORIENT_THREATS[king_sq] != 0;
+    let mut rels = Vec::with_capacity(32);
+    relacoes_ameaca(pos, add, color, piece, s, sem_raios, d, &mut rels);
+    relacoes_para_deltas(&rels, pov, king_sq, out);
+}
+
+/// One threat relation -- attacker piece/colour/square against target
+/// piece/colour/square -- with no perspective baked in.
+///
+/// The costly half of a threat update is finding these: attacks out of the
+/// square, the sliders aligned through it, and what each ray reveals or blocks.
+/// None of it depends on which side we are looking from; only the feature
+/// INDEX does, via `get_threat_feature`'s `pov` and the horizontal mirror of
+/// that side's king. We were running the whole enumeration once per
+/// perspective, which is why threats cost 19% of search time here against 2%
+/// in the reference for the same job -- not a worse algorithm, the same
+/// algorithm run twice. Splitting it lets the caller enumerate once and index
+/// twice.
+#[derive(Clone, Copy)]
+pub struct RelAmeaca {
+    pub adicionar: bool,
+    pub ap: u8,
+    pub ac: u8,
+    pub a_sq: u8,
+    pub dp: u8,
+    pub dc: u8,
+    pub d_sq: u8,
+}
+
+/// The perspective-free half: which threat relations change.
+#[allow(clippy::too_many_arguments)]
+pub fn relacoes_ameaca(
+    pos: &PosBB, add: bool, color: usize, piece: usize, s: usize,
+    sem_raios: u64, d: Deslizantes, out: &mut Vec<RelAmeaca>,
+) {
     let occ = pos.occ();
 
     let mut empurra = |flag: bool, ap: usize, ac: usize, a_sq: usize, dp: usize, dc: usize, d_sq: usize| {
-        let tf = get_threat_feature(pov, ap, ac, dp, dc, a_sq as i32, d_sq as i32, hm);
-        if (tf as usize) < THREAT_DIM {
-            out.push(DeltaAmeaca { idx: tf as usize, adicionar: flag, a_sq, d_sq });
-        }
+        out.push(RelAmeaca {
+            adicionar: flag,
+            ap: ap as u8, ac: ac as u8, a_sq: a_sq as u8,
+            dp: dp as u8, dc: dc as u8, d_sq: d_sq as u8,
+        });
     };
 
     let reis = pos.pieces[0][5] | pos.pieces[1][5];
@@ -1160,22 +1184,25 @@ pub fn eventos_ameaca(
     }
 
     let cavalos = pos.pieces[0][1] | pos.pieces[1][1];
-    let peoes_nossos = pos.pieces[pov][0];
-    let peoes_deles = pos.pieces[1 - pov][0];
+    // The pawn terms below LOOK perspective-dependent and are not. `meus` was
+    // `if color == pov { pawn_attacks_from(pov) } else { pawn_attacks_from(1-pov) }`,
+    // which is `pawn_attacks_from(color)` in both branches; and `incoming` was
+    // the union of the two directions against the two pawn sets, a set that is
+    // symmetric under swapping `pov`. Writing them by COLOUR says the same
+    // thing and drops the last reason this enumeration needed a perspective.
+    let peoes = [pos.pieces[0][0], pos.pieces[1][0]];
 
     let mut ameacados = ataques_de(piece, color, s, occ, d) & occ_sem_reis;
     let mut incoming = (knight_attacks(s) & cavalos) | (king_attacks(s) & reis);
 
     if piece == 0 {
         // pawns also threaten (and are threatened by) pushes
-        let att_nossos = pawn_attacks_from(pov, s) | (1u64 << s) << 8 | (1u64 << s) >> 8;
-        let att_deles = pawn_attacks_from(1 - pov, s) | (1u64 << s) << 8 | (1u64 << s) >> 8;
-        let meus = if color == pov { att_nossos } else { att_deles };
-        ameacados |= meus & (pos.pieces[0][0] | pos.pieces[1][0]);
-        incoming |= (att_nossos & peoes_deles) | (att_deles & peoes_nossos);
+        let empurroes = (1u64 << s) << 8 | (1u64 << s) >> 8;
+        ameacados |= (pawn_attacks_from(color, s) | empurroes) & (peoes[0] | peoes[1]);
+        incoming |= ((pawn_attacks_from(0, s) | empurroes) & peoes[1])
+            | ((pawn_attacks_from(1, s) | empurroes) & peoes[0]);
     } else {
-        incoming |= (pawn_attacks_from(pov, s) & peoes_deles)
-            | (pawn_attacks_from(1 - pov, s) & peoes_nossos);
+        incoming |= (pawn_attacks_from(0, s) & peoes[1]) | (pawn_attacks_from(1, s) & peoes[0]);
     }
 
     while ameacados != 0 {
@@ -1195,6 +1222,51 @@ pub fn eventos_ameaca(
             empurra(add, sp, sc, src, piece, color, s);
         }
     }
+}
+
+/// The perspective-dependent half: relations -> feature indices for one side.
+///
+/// `king_sq` comes from the caller and is NOT read off the position. Walking a
+/// move means the board passes through a state where the king has been taken
+/// off its old square and not yet put on the new one -- for `Ke1-f1`, a board
+/// with no white king at all. Deriving it here made every call in that window
+/// hit `king_sq >= 64` and return in silence, so the whole move contributed
+/// nothing to the opponent's perspective. The orientation is guaranteed
+/// unchanged by the caller, so the final square is the right one throughout.
+pub fn relacoes_para_deltas(
+    rels: &[RelAmeaca], pov: usize, king_sq: usize, out: &mut Vec<DeltaAmeaca>,
+) {
+    if king_sq >= 64 {
+        return;
+    }
+    let hm = hm_de_rei(king_sq);
+    for r in rels {
+        let tf = indice_relacao(r, pov, hm);
+        if tf < THREAT_DIM {
+            out.push(DeltaAmeaca {
+                idx: tf,
+                adicionar: r.adicionar,
+                a_sq: r.a_sq as usize,
+                d_sq: r.d_sq as usize,
+            });
+        }
+    }
+}
+
+/// Horizontal mirror for a perspective, from its king square.
+#[inline(always)]
+pub fn hm_de_rei(king_sq: usize) -> bool {
+    ORIENT_THREATS[king_sq] != 0
+}
+
+/// Feature index of one relation for one perspective. `THREAT_DIM` or above
+/// means the pair is excluded and the relation contributes nothing.
+#[inline(always)]
+pub fn indice_relacao(r: &RelAmeaca, pov: usize, hm: bool) -> usize {
+    get_threat_feature(
+        pov, r.ap as usize, r.ac as usize, r.dp as usize, r.dc as usize,
+        r.a_sq as i32, r.d_sq as i32, hm,
+    ) as usize
 }
 
 #[cfg(test)]

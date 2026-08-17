@@ -1452,6 +1452,19 @@ struct EstadoAcc {
     /// lance de peao aparecia como `_int_malloc` no perfil.
     par_sai: Vec<usize>,
     par_entra: Vec<usize>,
+    /// As relacoes de ameaca deste lance, partilhadas pelas duas perspectivas.
+    ///
+    /// `evaluate` chama `acc_incremental` uma vez por perspectiva sobre o MESMO
+    /// tabuleiro (o `st.bb` so' e' actualizado depois das duas), portanto as
+    /// duas chamadas enumeravam exactamente as mesmas relacoes -- o trabalho
+    /// caro feito a dobrar para depois so' o indice diferir. A chave sao os
+    /// dois tabuleiros que geraram a lista; qualquer outro par reconstroi.
+    rels: Vec<crate::sf_features::RelAmeaca>,
+    rels_chave: Option<([[u64; 6]; 2], [[u64; 6]; 2])>,
+    /// Contador por feature de ameaca para o colapso, permanentemente a zero
+    /// entre avaliacoes, com a lista das entradas tocadas para o repor.
+    conta: Vec<i8>,
+    tocadas: Vec<u32>,
     x: Vec<u8>,
     psqt: [[i64; NB]; 2],
     /// Cache de refresh por casa de rei ("finny tables"): para cada
@@ -1511,6 +1524,10 @@ impl EstadoAcc {
             scratch_p: Vec::with_capacity(32),
             par_sai: Vec::with_capacity(32),
             par_entra: Vec::with_capacity(32),
+            rels: Vec::with_capacity(256),
+            rels_chave: None,
+            conta: vec![0i8; THREAT_DIM],
+            tocadas: Vec::with_capacity(256),
             x: vec![0u8; L1],
             psqt: [[0i64; NB]; 2],
             cache: vec![
@@ -1551,7 +1568,6 @@ fn delta_por_lance(
         if add { antes.pieces[c][t] &= !(1u64 << sq); } else { antes.pieces[c][t] |= 1u64 << sq; }
     }
 
-    let mut deltas = Vec::with_capacity(64);
     // sem_raios = {from,to} nas saidas, para nao contar duas vezes a mesma
     // descoberta que a chamada da entrada ja' trata
     let mut casas = 0u64;
@@ -1591,6 +1607,12 @@ fn delta_por_lance(
             cor_que_entra = c;
         }
     }
+    // Enumerar as relacoes uma vez para as duas perspectivas. A segunda
+    // chamada de `acc_incremental` chega aqui com o mesmo `antes`/`agora` --
+    // `st.bb` so' avanca depois das duas -- e antes refazia todo este passeio
+    // para obter a mesma lista.
+    if st.rels_chave != Some((antes.pieces, agora.pieces)) {
+    st.rels.clear();
     let mut corrente = antes;
     for capturada in [true, false] {
         for &(sq, t, c, add) in ev {
@@ -1604,8 +1626,8 @@ fn delta_por_lance(
                 // and a bishop on g5 -- a pair that is blocked in both real
                 // positions and exists only in the intermediate one.
                 let sem = if capturada { !0u64 } else { casas };
-                crate::sf_features::eventos_ameaca(
-                    &corrente, pov, false, c, t, sq, sem, MAGIC, &mut deltas, ksq_pov);
+                crate::sf_features::relacoes_ameaca(
+                    &corrente, false, c, t, sq, sem, MAGIC, &mut st.rels);
                 corrente.pieces[c][t] &= !(1u64 << sq);
             }
         }
@@ -1613,14 +1635,41 @@ fn delta_por_lance(
     for &(sq, t, c, add) in ev {
         if add {
             corrente.pieces[c][t] |= 1u64 << sq;
-            crate::sf_features::eventos_ameaca(
-                &corrente, pov, true, c, t, sq, casas, MAGIC, &mut deltas, ksq_pov);
+            crate::sf_features::relacoes_ameaca(
+                &corrente, true, c, t, sq, casas, MAGIC, &mut st.rels);
         }
     }
+        st.rels_chave = Some((antes.pieces, agora.pieces));
+    }
+    // Collapse to at most one change per feature WITHOUT sorting or
+    // allocating: a counter array that lives across evaluations, plus the list
+    // of entries this move touched so it can be zeroed again in O(changes)
+    // rather than O(59808).
+    //
+    // What was here before -- `Vec::with_capacity(64)` and
+    // `sort_unstable_by_key` over ~100 structs of 32 bytes, once per
+    // perspective per evaluation -- was the bulk of `delta_por_lance`'s own
+    // 17.5% in the profile. The reference does no sorting here either.
+    let rels = std::mem::take(&mut st.rels);
+    let mut tocadas = std::mem::take(&mut st.tocadas);
+    tocadas.clear();
+    if ksq_pov < 64 {
+        let hm = crate::sf_features::hm_de_rei(ksq_pov);
+        for r in rels.iter() {
+            let idx = crate::sf_features::indice_relacao(r, pov, hm);
+            if idx < THREAT_DIM {
+                if st.conta[idx] == 0 {
+                    tocadas.push(idx as u32);
+                }
+                st.conta[idx] += if r.adicionar { 1 } else { -1 };
+            }
+        }
+    }
+    st.rels = rels;
 
-    // Collapse to at most one change per feature. The active features are a
-    // SET, so a feature's delta can only be -1, 0 or +1 -- any other total is a
-    // move whose several events each touched the same threat.
+    // The active features are a SET, so a feature's total can only be -1, 0 or
+    // +1 -- any other total is a move whose several events each touched the
+    // same threat.
     //
     // `Nxf6` is the plain case: the threat (knight e4 -> knight f6) is emitted
     // once as "what the departing knight attacked" and again as "who attacked
@@ -1628,15 +1677,10 @@ fn delta_por_lance(
     // twice, and the accumulator drifts a little further from the truth with
     // every capture searched -- silently, because nothing downstream can tell a
     // wrong accumulator from a right one.
-    deltas.sort_unstable_by_key(|d| d.idx);
-    let mut i = 0;
-    while i < deltas.len() {
-        let idx = deltas[i].idx;
-        let mut soma = 0i32;
-        while i < deltas.len() && deltas[i].idx == idx {
-            soma += if deltas[i].adicionar { 1 } else { -1 };
-            i += 1;
-        }
+    for &t in tocadas.iter() {
+        let idx = t as usize;
+        let soma = st.conta[idx];
+        st.conta[idx] = 0;
         if soma != 0 {
             let somar = soma > 0;
             aplica_linha(net, &mut st.acc[pov], U_THREAT + idx, somar);
@@ -1646,6 +1690,7 @@ fn delta_por_lance(
             }
         }
     }
+    st.tocadas = tocadas;
     // Pawn pairs. These were not handled here AT ALL: a plain `a2-a3` changes
     // which pawns pair with which, and the fast path walked straight past it,
     // so every pawn move left the accumulator holding the previous position's
