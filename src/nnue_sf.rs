@@ -424,7 +424,11 @@ fn carrega(bytes: &[u8]) -> Option<RedeSf> {
         eprintln!("DBG post-permute w[knight19840][0..16]={:?}", &ft_piece_w[19840 * L1..19840 * L1 + 16]);
     }
 
-    let dense_t = std::env::var_os("KESTREL_DENSE_T").is_some();
+    // `var_os(..).is_some()` dava-se por ligado com `=0`, porque a variavel
+    // fica DEFINIDA. Uma grelha inteira de testes correu com ele ligado nas
+    // dezasseis celulas e so' se percebeu porque as linhas que so' diferiam
+    // nele davam numeros identicos. Mesma convencao das outras: `=0` desliga.
+    let dense_t = match std::env::var("KESTREL_DENSE_T") { Ok(v) => v != "0", Err(_) => false };
     let mut stacks = Vec::with_capacity(NB);
     let mut stack_headers = Vec::with_capacity(NB);
     for bi in 0..NB {
@@ -1081,7 +1085,11 @@ pub fn de_bullet(
     // Estava ao contrario, e por isso TODAS as redes que convertemos ate' aqui
     // sairam mal sem nunca dar erro. Ver o comentario do `negar` para a
     // medicao que o decidiu.
-    let transposto = match std::env::var("KESTREL_CONV_T") { Ok(v) => v != "0", Err(_) => true };
+    // DESLIGADO por omissao outra vez, e desta vez com razao: com a ordem dos
+    // tensores corrigida, a leitura coluna-maior dos documentos do treinador e'
+    // a que mede melhor. Estava ligado porque a ordem errada fazia qualquer
+    // leitura parecer meio certa.
+    let transposto = match std::env::var("KESTREL_CONV_T") { Ok(v) => v != "0", Err(_) => false };
     let l0_at = |f: usize, k: usize| -> f32 {
         if transposto { l0w[k * NIN + f] } else { l0w[f * L1 + k] }
     };
@@ -1093,10 +1101,13 @@ pub fn de_bullet(
     // factor de escala diferente por posicao (so' reis queria +1, rei+dama
     // -0,39, uma abertura -0,05), que e' o que se ve quando as features leem
     // valores umas das outras.
-    let psqt_t = match std::env::var("KESTREL_PSQT_T") {
-        Ok(v) => v != "0",
-        Err(_) => transposto,
-    };
+    // Tambem desligado. A preferencia medida pela leitura contraria vinha de
+    // NOS escrevermos o `psqt_base.bin` em linha-maior: o bullet carregava-o
+    // permutado, e o conversor desfazia a permutacao ao le'-lo da mesma maneira
+    // errada. Os dois erros cancelavam-se e nada disto aparecia -- excepto que
+    // a semente entrava com os valores das pecas espalhados por linhas de
+    // factores e de ameacas, que era o que ela existia para evitar.
+    let psqt_t = match std::env::var("KESTREL_PSQT_T") { Ok(v) => v != "0", Err(_) => false };
     let psqt_at = |f: usize, b: usize| -> f32 {
         if psqt_t { psqtw[b * NIN + f] } else { psqtw[f * NB + b] }
     };
@@ -1202,7 +1213,11 @@ pub fn de_bullet(
 
     // bullet stores each dense layer as [out_total, in]; SF wants one stack
     // per bucket, output-major.
-    let dense_t = std::env::var_os("KESTREL_DENSE_T").is_some();
+    // `var_os(..).is_some()` dava-se por ligado com `=0`, porque a variavel
+    // fica DEFINIDA. Uma grelha inteira de testes correu com ele ligado nas
+    // dezasseis celulas e so' se percebeu porque as linhas que so' diferiam
+    // nele davam numeros identicos. Mesma convencao das outras: `=0` desliga.
+    let dense_t = match std::env::var("KESTREL_DENSE_T") { Ok(v) => v != "0", Err(_) => false };
     let mut stacks = Vec::with_capacity(NB);
     for b in 0..NB {
         let mut s_fc0w = vec![0i8; L2 * L1];
