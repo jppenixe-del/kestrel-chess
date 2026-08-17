@@ -804,22 +804,33 @@ fn main() {
         }
         let mut o = 0usize;
         let mut get = |n: usize| -> &[f32] { let s = &f32s[o..o + n]; o += n; s };
-        let fc0b = get(L2 * NB).to_vec();
-        let fc0fb = get(L2).to_vec();
-        let fc0fw = get(L2 * L1).to_vec();
-        let fc0w = get(L2 * NB * L1).to_vec();
-        let fc1b = get(L3 * NB).to_vec();
-        let fc1fb = get(L3).to_vec();
-        let fc1fw = get(L3 * 2 * L2).to_vec();
-        let fc1w = get(L3 * NB * 2 * L2).to_vec();
-        let fc2b = get(NB).to_vec();
-        let fc2fb = get(1).to_vec();
-        let fc2fw = get(2 * L2 + 2 * L3).to_vec();
-        let fc2w = get(NB * (2 * L2 + 2 * L3)).to_vec();
-        let l0b = get(L1).to_vec();
+        // A ORDEM E' A DA LISTA `SavedFormat`, nao alfabetica.
+        //
+        // `save_unquantised` percorre `for fmt in saved_format` e escreve os
+        // tensores por essa ordem, tal como estao no optimizador -- sem aplicar
+        // `.transpose()` nem `.round()`, que so' valem para o `quantised.bin`.
+        //
+        // Liamos isto por ordem alfabetica, portanto TODOS os tensores vinham
+        // do sitio errado. Foi isso que obrigou a inventar uma negacao da saida
+        // e que deixou a transposicao a parecer ambigua: nao havia layout
+        // nenhum que salvasse a leitura, porque o problema era estarmos a ler
+        // os pesos uns dos outros.
         let l0w = get(L1 * NIN).to_vec();
-        let _psqtb = get(NB).to_vec();
+        let l0b = get(L1).to_vec();
+        let fc0w = get(L2 * NB * L1).to_vec();
+        let fc0b = get(L2 * NB).to_vec();
+        let fc1w = get(L3 * NB * 2 * L2).to_vec();
+        let fc1b = get(L3 * NB).to_vec();
+        let fc2w = get(NB * (2 * L2 + 2 * L3)).to_vec();
+        let fc2b = get(NB).to_vec();
+        let fc0fw = get(L2 * L1).to_vec();
+        let fc0fb = get(L2).to_vec();
+        let fc1fw = get(L3 * 2 * L2).to_vec();
+        let fc1fb = get(L3).to_vec();
+        let fc2fw = get(2 * L2 + 2 * L3).to_vec();
+        let fc2fb = get(1).to_vec();
         let psqtw = get(NB * NIN).to_vec();
+        let _psqtb = get(NB).to_vec();
 
         let molde_bytes = match std::fs::read(&args[3]) {
             Ok(b) => b,
