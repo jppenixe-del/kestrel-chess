@@ -719,9 +719,69 @@ pub fn pair_delta(
     }
 }
 
+/// Pares de peoes para uma rede de 768 entradas, sem espelho horizontal.
+///
+/// O `pair_features` espelha na horizontal conforme a casa do rei, porque a
+/// arquitectura de onde veio tem baldes de rei e as features de peca ja' vem
+/// espelhadas. Uma rede `768x2` nao tem baldes nenhuns: a unica transformacao
+/// de perspectiva e' `sq ^ 56`. Espelhar so' os pares deixaria as duas familias
+/// a discordar sobre o que e' a mesma posicao.
+///
+/// Devolve indices em [0, PAIR_DIM), sem deslocamento -- quem chama poe-nos
+/// onde quiser no seu espaco de entradas.
+///
+/// As duas perspectivas produzem SEMPRE o mesmo numero de pares (o conjunto de
+/// peoes e' o mesmo, so' muda a numeracao), portanto isto encaixa numa API que
+/// exige um indice por lado sem precisar de almofada nenhuma. E' essa a
+/// diferenca em relacao as ameacas, e e' o que torna esta feature barata.
+pub fn pair_features_768(pos: &PosBB, pov: usize, feats: &mut Vec<usize>) {
+    let flip = if pov == 1 { 56 } else { 0 };
+    let amigos = pos.pieces[pov][0];
+    let inimigos = pos.pieces[1 - pov][0];
+    let peoes = amigos | inimigos;
+
+    let mut bb = peoes;
+    while bb != 0 {
+        let s = bb.trailing_zeros() as usize;
+        bb &= bb - 1;
+        let meu = (amigos >> s) & 1 != 0;
+        let id_a = pawn_id(s, if meu { 0 } else { 48 }, flip);
+        // so' as casas acima de `s`, para cada par sair uma vez
+        let mut m = PP_MASK[s] & peoes & !((1u64 << s) - 1);
+        while m != 0 {
+            let s2 = m.trailing_zeros() as usize;
+            m &= m - 1;
+            let off = if (amigos >> s2) & 1 != 0 { 0 } else { 48 };
+            feats.push(pawn_pair_index(id_a, pawn_id(s2, off, flip)));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pares_768_alinham_entre_perspectivas() {
+        // A propriedade que a API do treinador exige: mesmo numero de features
+        // dos dois lados, para cada par poder ser emitido como um so' `f(a,b)`.
+        for fen in [
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "4k3/pp1p1ppp/8/2pPp3/2P1P3/8/PP3PPP/4K3 w - c6 0 1",
+            "8/2p1p1p1/1p1p1p1p/8/8/P1P1P1P1/1P1P1P1P/8 w - - 0 1",
+            "8/8/4k3/8/8/4K3/8/8 w - - 0 1",
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        ] {
+            let p = from_fen(fen);
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            pair_features_768(&p, 0, &mut a);
+            pair_features_768(&p, 1, &mut b);
+            assert_eq!(a.len(), b.len(), "contagens diferentes em {fen}");
+            for &i in a.iter().chain(b.iter()) {
+                assert!(i < PAIR_DIM, "indice {i} fora de {PAIR_DIM} em {fen}");
+            }
+        }
+    }
 
     fn from_fen(fen: &str) -> PosBB {
         let mut p = PosBB::default();

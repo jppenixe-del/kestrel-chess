@@ -393,7 +393,7 @@ fn carrega(bytes: &[u8]) -> Option<RedeSf> {
 
     let ft_header: [u8; 4] = bytes[o..o + 4].try_into().ok()?;
     o += 4; // feature transformer's own inner header (hash check, unused here)
-    let dbg = std::env::var_os("KESTREL_SF_DEBUG").is_some();
+    let dbg = bandeira("KESTREL_SF_DEBUG");
 
     // Order confirmed from nnue_feature_transformer.h::read_parameters:
     let mut ft_bias = read_leb_i16(bytes, &mut o, L1);
@@ -594,6 +594,32 @@ fn clipped_lin(x: i32, weight_scale_bits_local: u32) -> i32 {
     (x >> weight_scale_bits_local).clamp(0, 127)
 }
 
+/// As bandeiras de diagnostico, lidas UMA vez.
+///
+/// Estavam a ser lidas com `env::var_os` dentro do `evaluate`, ou seja uma
+/// chamada a `getenv` por avaliacao. Aparecia no perfil a 1,67% -- mais do que
+/// varias funcoes que fazem trabalho a serio. Uma sonda que so' se liga para
+/// depurar nao pode custar nada quando esta' desligada.
+fn bandeira(nome: &'static str) -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    // um byte por bandeira, 0 = por ler, 1 = desligada, 2 = ligada
+    static CACHE: [AtomicU8; 4] = [AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0)];
+    let i = match nome {
+        "KESTREL_SF_DEBUG" => 0,
+        "KESTREL_SATURA" => 1,
+        "KESTREL_ZERA_PSQT" => 2,
+        _ => 3,
+    };
+    match CACHE[i].load(Ordering::Relaxed) {
+        0 => {
+            let v = if std::env::var_os(nome).is_some() { 2 } else { 1 };
+            CACHE[i].store(v, Ordering::Relaxed);
+            v == 2
+        }
+        v => v == 2,
+    }
+}
+
 pub fn evaluate(net: &RedeSf, atk: &Attacks, board: &mut Board) -> i32 {
     // `KESTREL_TROCA_POV=1` swaps the two perspectives in the forward pass.
     // A diagnostic, not an option, and it has already answered its question:
@@ -719,7 +745,7 @@ pub fn evaluate(net: &RedeSf, atk: &Attacks, board: &mut Board) -> i32 {
         // crelu. Onde tudo satura o gradiente morre, e posicoes de muitas pecas
         // tem mais features activas -- se a nossa rede saturar muito mais do que
         // a de referencia, e' esse o defeito e nao o treino.
-        if std::env::var_os("KESTREL_SATURA").is_some() {
+        if bandeira("KESTREL_SATURA") {
             let (mut alto, mut zero, mut tot) = (0u64, 0u64, 0u64);
             for pov in 0..2 {
                 for &v in st.acc[pov].iter() {
@@ -747,13 +773,13 @@ pub fn evaluate(net: &RedeSf, atk: &Attacks, board: &mut Board) -> i32 {
     // Serve para separar o que o CORPO aprendeu do que vem do PSQT: numa rede
     // nossa de 12 superbatches o corpo correlaciona -0,05 com a oficial e a
     // rede toda 0,70, ou seja o material e' tudo e o resto ainda nao existe.
-    let psqt = if std::env::var_os("KESTREL_ZERA_PSQT").is_some() {
+    let psqt = if bandeira("KESTREL_ZERA_PSQT") {
         0
     } else {
         (psqt_s - psqt_n) / 2
     };
 
-    if std::env::var_os("KESTREL_SF_DEBUG").is_some() {
+    if bandeira("KESTREL_SF_DEBUG") {
         let mut pf_stm = Vec::new();
         add_piece_features(board, stm, &mut pf_stm);
         ESTADO.with(|c| {
@@ -825,7 +851,7 @@ pub fn evaluate(net: &RedeSf, atk: &Attacks, board: &mut Board) -> i32 {
     let skip_0 = fc0_out[L2 - 2] - fc0_out[L2 - 1];
     let fwd_out = (fc2_out + skip_0) as i64;
 
-    if std::env::var_os("KESTREL_SF_DEBUG").is_some() {
+    if bandeira("KESTREL_SF_DEBUG") {
         eprintln!("DBG fc0_out[0..4]={:?} fc1_out[0..4]={:?} fc2_out={} skip_0={} fwd_out={}",
             &fc0_out[0..4], &fc1_out[0..4], fc2_out, skip_0, fwd_out);
     }
