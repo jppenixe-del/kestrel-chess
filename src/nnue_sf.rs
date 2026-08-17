@@ -938,7 +938,9 @@ fn quant_round(v: f32, scale: f32) -> f32 {
 /// nenhum pelo meio a poder ser culpado.
 ///
 /// As linhas do factorizador e o dustbin vao a zero, que e' o que uma fusao
-/// correcta produziria. Repare-se que o `de_bullet` nem sequer LE' a linha do
+/// correcta produziria. Os tensores sao escritos no layout TRANSPOSTO e com a
+/// saida negada, que e' o que o `de_bullet` passou a assumir por omissao --
+/// esta funcao tem de acompanhar esses dois omissos ou deixa de provar nada. Repare-se que o `de_bullet` nem sequer LE' a linha do
 /// dustbin: as pecas lem `BASE + f` e os factores `f % FACT`, e o dustbin fica
 /// no indice `FACT`, entre os dois. E' isso a raiz do problema -- treinado de
 /// um lado, invisivel do outro.
@@ -954,17 +956,17 @@ pub fn roundtrip_bullet(net: &RedeSf) -> RedeSf {
     }
     for f in 0..PIECE_DIM {
         for k in 0..L1 {
-            l0w[(BASE + f) * L1 + k] = net.ft_piece_w[f * L1 + k] as f32 / CONV_QA;
+            l0w[k * NIN + BASE + f] = net.ft_piece_w[f * L1 + k] as f32 / CONV_QA;
         }
     }
     for f in 0..THREAT_DIM {
         for k in 0..L1 {
-            l0w[(BASE + PIECE_DIM + f) * L1 + k] = net.ft_threat_w[f * L1 + k] as f32 / CONV_QA;
+            l0w[k * NIN + BASE + PIECE_DIM + f] = net.ft_threat_w[f * L1 + k] as f32 / CONV_QA;
         }
     }
     for f in 0..PAIR_DIM {
         for k in 0..L1 {
-            l0w[(BASE + PIECE_DIM + THREAT_DIM + f) * L1 + k] =
+            l0w[k * NIN + BASE + PIECE_DIM + THREAT_DIM + f] =
                 net.ft_pair_w[f * L1 + k] as f32 / CONV_QA;
         }
     }
@@ -972,19 +974,19 @@ pub fn roundtrip_bullet(net: &RedeSf) -> RedeSf {
     let mut psqtw = vec![0f32; NIN * NB];
     for f in 0..PIECE_DIM {
         for b in 0..NB {
-            psqtw[(BASE + f) * NB + b] = net.ft_piece_psqt[f * NB + b] as f32 / CONV_PSQT;
+            psqtw[b * NIN + BASE + f] = -(net.ft_piece_psqt[f * NB + b] as f32) / CONV_PSQT;
         }
     }
     for f in 0..THREAT_DIM {
         for b in 0..NB {
-            psqtw[(BASE + PIECE_DIM + f) * NB + b] =
-                net.ft_threat_psqt[f * NB + b] as f32 / CONV_PSQT;
+            psqtw[b * NIN + BASE + PIECE_DIM + f] =
+                -(net.ft_threat_psqt[f * NB + b] as f32) / CONV_PSQT;
         }
     }
     for f in 0..PAIR_DIM {
         for b in 0..NB {
-            psqtw[(BASE + PIECE_DIM + THREAT_DIM + f) * NB + b] =
-                net.ft_pair_psqt[f * NB + b] as f32 / CONV_PSQT;
+            psqtw[b * NIN + BASE + PIECE_DIM + THREAT_DIM + f] =
+                -(net.ft_pair_psqt[f * NB + b] as f32) / CONV_PSQT;
         }
     }
 
@@ -1012,9 +1014,9 @@ pub fn roundtrip_bullet(net: &RedeSf) -> RedeSf {
             }
         }
         for i in 0..n2 {
-            fc2w[i * NB + b] = st.fc2w[i] as f32 / CONV_W_FC2;
+            fc2w[i * NB + b] = -(st.fc2w[i] as f32) / CONV_W_FC2;
         }
-        fc2b[b] = st.fc2b as f32 / CONV_B_FC2;
+        fc2b[b] = -(st.fc2b as f32) / CONV_B_FC2;
     }
 
     // Factorizador a zero: e' o que a fusao deve deixar.
@@ -1051,13 +1053,51 @@ pub fn de_bullet(
     // changes nothing (-544 vs -546), which says the PSQT arrives as zeros,
     // and the feature rows are just as dead. One layout error explains all of
     // it at once, and it is cheap to test.
-    let transposto = std::env::var_os("KESTREL_CONV_T").is_some();
+    // LIGADO por omissao desde 2026-08-17, e `KESTREL_CONV_T=0` desliga-o.
+    // Estava ao contrario, e por isso TODAS as redes que convertemos ate' aqui
+    // sairam mal sem nunca dar erro. Ver o comentario do `negar` para a
+    // medicao que o decidiu.
+    let transposto = match std::env::var("KESTREL_CONV_T") { Ok(v) => v != "0", Err(_) => true };
     let l0_at = |f: usize, k: usize| -> f32 {
         if transposto { l0w[k * NIN + f] } else { l0w[f * L1 + k] }
     };
-    let psqt_at = |f: usize, b: usize| -> f32 {
-        if transposto { psqtw[b * NIN + f] } else { psqtw[f * NB + b] }
+    // O PSQT tem bandeira PROPRIA, e a razao e' que os dois tensores nao sao
+    // declarados da mesma maneira no treinador: o `l0` sai de `new_affine`, o
+    // `psqtw` de `new_weights("psqtw", (NB, NIN))` com a forma escrita a mao.
+    // Prender os dois ao mesmo interruptor obrigava-os a partilhar uma
+    // convencao que nunca partilharam -- e o sintoma era o PSQT a pedir um
+    // factor de escala diferente por posicao (so' reis queria +1, rei+dama
+    // -0,39, uma abertura -0,05), que e' o que se ve quando as features leem
+    // valores umas das outras.
+    let psqt_t = match std::env::var("KESTREL_PSQT_T") {
+        Ok(v) => v != "0",
+        Err(_) => transposto,
     };
+    let psqt_at = |f: usize, b: usize| -> f32 {
+        if psqt_t { psqtw[b * NIN + f] } else { psqtw[f * NB + b] }
+    };
+    // KESTREL_CONV_NEG=1 nega a saida da rede: a camada final e o PSQT, que sao
+    // os dois caminhos por onde o resultado sai. Nao e' uma opcao, e' uma
+    // sonda: com CONV_T=1 a rede convertida correlaciona -0,70 com a oficial e
+    // o declive do ajuste e' -0,87, ou seja esta' certa mas ao contrario. Se
+    // negar poe a correlacao em +0,70, o defeito e' um sinal e nao o mapeamento.
+    // LIGADO por omissao, `KESTREL_CONV_NEG=0` desliga.
+    //
+    // Medido sobre 50 posicoes do bench, contra a rede oficial, com o
+    // checkpoint de 12 superbatches:
+    //
+    //   como estava (CONV_T=0, sem negar)   correlacao -0,18
+    //   so' com a transposicao              correlacao -0,70, declive -0,87
+    //   com a transposicao e o sinal        correlacao +0,70, declive +0,87
+    //
+    // O -0,70 e' o que diz o que se passava: a rede convertida nao era lixo,
+    // era a avaliacao certa ao contrario. O treinador da' o sinal certo no
+    // mesmo checkpoint (+895,6 cp para rei+dama contra rei), logo a inversao
+    // nasce aqui. Falta ainda apurar QUAL das convencoes difere -- a saida do
+    // bullet ou a nossa leitura dela -- mas a conversao passa a funcionar e a
+    // medicao fica registada para quem for a esse fundo.
+    let negar = match std::env::var("KESTREL_CONV_NEG") { Ok(v) => v != "0", Err(_) => true };
+    let sinal_saida: f32 = if negar { -1.0 } else { 1.0 };
     let mut clipados = 0usize;
     let mut ft_bias = vec![0i16; L1];
     for k in 0..L1 {
@@ -1110,7 +1150,8 @@ pub fn de_bullet(
     let escala_psqt: f32 = if std::env::var_os("KESTREL_SEM_PSQT").is_some() {
         0.0
     } else {
-        CONV_PSQT * std::env::var("KESTREL_PSQT_ESC").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(1.0)
+        sinal_saida * CONV_PSQT
+            * std::env::var("KESTREL_PSQT_ESC").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(1.0)
     };
     let mut ft_piece_psqt = vec![0i32; PIECE_DIM * NB];
     for f in 0..PIECE_DIM {
@@ -1169,9 +1210,10 @@ pub fn de_bullet(
         let n2 = 2 * L2 + 2 * L3;
         let mut s_fc2w = vec![0i8; n2];
         for i in 0..n2 {
-            s_fc2w[i] = clip_i8(fc2w[i * NB + b] + fc2fw[i], CONV_W_FC2, &mut clipados);
+            s_fc2w[i] = clip_i8(
+                sinal_saida * (fc2w[i * NB + b] + fc2fw[i]), CONV_W_FC2, &mut clipados);
         }
-        let s_fc2b = quant_round(fc2b[b] + fc2fb[0], CONV_B_FC2) as i32;
+        let s_fc2b = quant_round(sinal_saida * (fc2b[b] + fc2fb[0]), CONV_B_FC2) as i32;
 
         stacks.push(LayerStack {
             fc0w: s_fc0w, fc0b: s_fc0b, fc1w: s_fc1w, fc1b: s_fc1b, fc2w: s_fc2w, fc2b: s_fc2b,
