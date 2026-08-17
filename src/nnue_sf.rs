@@ -971,9 +971,15 @@ fn quant_round(v: f32, scale: f32) -> f32 {
 /// nenhum pelo meio a poder ser culpado.
 ///
 /// As linhas do factorizador e o dustbin vao a zero, que e' o que uma fusao
-/// correcta produziria. Os tensores sao escritos no layout TRANSPOSTO e com a
-/// saida negada, que e' o que o `de_bullet` passou a assumir por omissao --
-/// esta funcao tem de acompanhar esses dois omissos ou deixa de provar nada. Repare-se que o `de_bullet` nem sequer LE' a linha do
+/// correcta produziria. Os tensores vao em coluna-maior e sem negacao nenhuma,
+/// que sao os omissos actuais -- esta funcao tem de acompanhar os omissos ou
+/// deixa de provar seja o que for.
+///
+/// E convem lembrar o que ela prova E O QUE NAO PROVA: como o inverso e'
+/// escrito a partir das formulas do proprio `de_bullet`, uma convencao errada
+/// aparece nos dois lados e cancela-se. Isto mostra que a conversao e'
+/// INVERTIVEL, nao que corresponde ao que o treinador grava. Para isso o
+/// arbitro e' o `SF_EVAL` do treinador. Repare-se que o `de_bullet` nem sequer LE' a linha do
 /// dustbin: as pecas lem `BASE + f` e os factores `f % FACT`, e o dustbin fica
 /// no indice `FACT`, entre os dois. E' isso a raiz do problema -- treinado de
 /// um lado, invisivel do outro.
@@ -989,17 +995,17 @@ pub fn roundtrip_bullet(net: &RedeSf) -> RedeSf {
     }
     for f in 0..PIECE_DIM {
         for k in 0..L1 {
-            l0w[k * NIN + BASE + f] = net.ft_piece_w[f * L1 + k] as f32 / CONV_QA;
+            l0w[(BASE + f) * L1 + k] = net.ft_piece_w[f * L1 + k] as f32 / CONV_QA;
         }
     }
     for f in 0..THREAT_DIM {
         for k in 0..L1 {
-            l0w[k * NIN + BASE + PIECE_DIM + f] = net.ft_threat_w[f * L1 + k] as f32 / CONV_QA;
+            l0w[(BASE + PIECE_DIM + f) * L1 + k] = net.ft_threat_w[f * L1 + k] as f32 / CONV_QA;
         }
     }
     for f in 0..PAIR_DIM {
         for k in 0..L1 {
-            l0w[k * NIN + BASE + PIECE_DIM + THREAT_DIM + f] =
+            l0w[(BASE + PIECE_DIM + THREAT_DIM + f) * L1 + k] =
                 net.ft_pair_w[f * L1 + k] as f32 / CONV_QA;
         }
     }
@@ -1007,19 +1013,19 @@ pub fn roundtrip_bullet(net: &RedeSf) -> RedeSf {
     let mut psqtw = vec![0f32; NIN * NB];
     for f in 0..PIECE_DIM {
         for b in 0..NB {
-            psqtw[b * NIN + BASE + f] = -(net.ft_piece_psqt[f * NB + b] as f32) / CONV_PSQT;
+            psqtw[(BASE + f) * NB + b] = net.ft_piece_psqt[f * NB + b] as f32 / CONV_PSQT;
         }
     }
     for f in 0..THREAT_DIM {
         for b in 0..NB {
-            psqtw[b * NIN + BASE + PIECE_DIM + f] =
-                -(net.ft_threat_psqt[f * NB + b] as f32) / CONV_PSQT;
+            psqtw[(BASE + PIECE_DIM + f) * NB + b] =
+                net.ft_threat_psqt[f * NB + b] as f32 / CONV_PSQT;
         }
     }
     for f in 0..PAIR_DIM {
         for b in 0..NB {
-            psqtw[b * NIN + BASE + PIECE_DIM + THREAT_DIM + f] =
-                -(net.ft_pair_psqt[f * NB + b] as f32) / CONV_PSQT;
+            psqtw[(BASE + PIECE_DIM + THREAT_DIM + f) * NB + b] =
+                net.ft_pair_psqt[f * NB + b] as f32 / CONV_PSQT;
         }
     }
 
