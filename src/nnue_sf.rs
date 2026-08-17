@@ -934,7 +934,12 @@ pub const CONV_B_FC2: f32 = CONV_W_FC2 * HIDDEN_QUANT_ONE;
 /// Measured at superbatch 3 (30M positions): a queen for White reads +3144 and
 /// for Black -1787, against the official net's +2578 and -1885, with the start
 /// position and a bare-kings ending both near zero.
-pub const CONV_PSQT: f32 = 600.0 * 16.0 * 4.0;
+/// O `*4` que aqui estava era compensacao, nao escala.
+///
+/// Medido com um `raw.bin` sintetico que tem SO' a semente e zeros em tudo o
+/// resto: com `600*16` o valor da dama sai a 2538, que e' exactamente o que a
+/// semente traz. Com o `*4` saia 10152.
+pub const CONV_PSQT: f32 = 600.0 * 16.0;
 
 fn quant_round(v: f32, scale: f32) -> f32 {
     (v * scale).round()
@@ -1042,9 +1047,9 @@ pub fn roundtrip_bullet(net: &RedeSf) -> RedeSf {
             }
         }
         for i in 0..n2 {
-            fc2w[i * NB + b] = -(st.fc2w[i] as f32) / CONV_W_FC2;
+            fc2w[i * NB + b] = st.fc2w[i] as f32 / CONV_W_FC2;
         }
-        fc2b[b] = -(st.fc2b as f32) / CONV_B_FC2;
+        fc2b[b] = st.fc2b as f32 / CONV_B_FC2;
     }
 
     // Factorizador a zero: e' o que a fusao deve deixar.
@@ -1131,8 +1136,22 @@ pub fn de_bullet(
     // nasce aqui. Falta ainda apurar QUAL das convencoes difere -- a saida do
     // bullet ou a nossa leitura dela -- mas a conversao passa a funcionar e a
     // medicao fica registada para quem for a esse fundo.
-    let negar = match std::env::var("KESTREL_CONV_NEG") { Ok(v) => v != "0", Err(_) => true };
-    let sinal_saida: f32 = if negar { -1.0 } else { 1.0 };
+    // A negacao aplica-se SO' ao PSQT, e nunca a` camada final.
+    //
+    // Negava as duas, e estava a corrigir uma e a estragar a outra. Medido no
+    // corpo sozinho, com o PSQT anulado dos dois lados: sem negacao
+    // correlaciona 0,7172, com negacao 0,5315. O PSQT e' que a quer -- a
+    // semente que o inicializa nasceu com o sinal ao contrario do que o motor
+    // espera, e o motor esta' certo, porque le' a rede oficial ao bit contra o
+    // codigo do Stockfish.
+    //
+    // Isto explica o tecto: metade da rede vinha invertida em todas as
+    // conversoes que fizemos, e a metade que estava bem era a que eu negava.
+    // DESLIGADA por omissao: a semente passou a ser escrita com o sinal certo,
+    // portanto nao ha' nada a compensar. Fica a bandeira para converter
+    // checkpoints treinados com a semente antiga.
+    let negar_psqt = match std::env::var("KESTREL_CONV_NEG") { Ok(v) => v != "0", Err(_) => false };
+    let sinal_psqt: f32 = if negar_psqt { -1.0 } else { 1.0 };
     let mut clipados = 0usize;
     let mut ft_bias = vec![0i16; L1];
     for k in 0..L1 {
@@ -1185,7 +1204,7 @@ pub fn de_bullet(
     let escala_psqt: f32 = if std::env::var_os("KESTREL_SEM_PSQT").is_some() {
         0.0
     } else {
-        sinal_saida * CONV_PSQT
+        sinal_psqt * CONV_PSQT
             * std::env::var("KESTREL_PSQT_ESC").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(1.0)
     };
     let mut ft_piece_psqt = vec![0i32; PIECE_DIM * NB];
@@ -1249,10 +1268,9 @@ pub fn de_bullet(
         let n2 = 2 * L2 + 2 * L3;
         let mut s_fc2w = vec![0i8; n2];
         for i in 0..n2 {
-            s_fc2w[i] = clip_i8(
-                sinal_saida * (fc2w[i * NB + b] + fc2fw[i]), CONV_W_FC2, &mut clipados);
+            s_fc2w[i] = clip_i8(fc2w[i * NB + b] + fc2fw[i], CONV_W_FC2, &mut clipados);
         }
-        let s_fc2b = quant_round(sinal_saida * (fc2b[b] + fc2fb[0]), CONV_B_FC2) as i32;
+        let s_fc2b = quant_round(fc2b[b] + fc2fb[0], CONV_B_FC2) as i32;
 
         stacks.push(LayerStack {
             fc0w: s_fc0w, fc0b: s_fc0b, fc1w: s_fc1w, fc1b: s_fc1b, fc2w: s_fc2w, fc2b: s_fc2b,
