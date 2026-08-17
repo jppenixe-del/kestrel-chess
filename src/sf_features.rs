@@ -382,6 +382,26 @@ pub fn get_threat_feature(
         attacked_piece, attacked_color, attacking_square, attacked_square, mirrored)
 }
 
+/// Este par de tipos/cores esta' excluido em AMBAS as perspectivas?
+///
+/// `excluded` sai de `PIECE_INTERACTION_MAP[atacante][alvo] < 0`, que so'
+/// depende dos tipos de peca. As cores entram no indice ja' rodadas pela
+/// perspectiva (`cor ^ pov`), mas o mapa nao as consulta -- logo o valor e' o
+/// mesmo visto dos dois lados. E' isso que permite saltar estes pares nas duas
+/// listas ao mesmo tempo sem lhes perder o alinhamento.
+///
+/// O que NAO e' invariante e' o `semi_excluded`: depende de `a_sq < d_sq` em
+/// coordenadas ja' viradas pela perspectiva, e e' de la' que vem a assimetria.
+/// Medido no bench: 39,4% das ameacas caiam no dustbin, e so' 1,06% eram
+/// assimetricas -- ou seja 97% do dustbin nao era preciso para nada.
+#[inline]
+pub fn par_excluido_dos_dois_lados(pov: usize, ap: usize, ac: usize, tp: usize, tc: usize) -> bool {
+    let t = threat_tables();
+    let (excluido, _, _) =
+        desempacota_par(t.pair_lookup[idx_par(ap, ac ^ pov, tp, tc ^ pov)]);
+    excluido
+}
+
 /// Variante com a tabela ja' na mao, para quem chama isto em ciclo: poupa um
 /// `OnceLock::get_or_init` (carga atomica mais salto) por chamada, e a
 /// enumeracao das ameacas chama-o dezenas de vezes por posicao.
@@ -566,6 +586,15 @@ pub fn threat_features_padded_com(
                         Some(v) => v,
                         None => continue,
                     };
+                    // Um par excluido nas DUAS perspectivas nao precisa de
+                    // almofada: salta-se dos dois lados e o alinhamento 1:1
+                    // mantem-se. Isto tira ~97% do dustbin (39,4% -> 1,06% das
+                    // ameacas) sem o motor mudar nada -- ele ja' ignora estas.
+                    // Fica so' a assimetria verdadeira, que e' a unica que
+                    // OBRIGA a uma entrada de um lado sem par do outro.
+                    if par_excluido_dos_dois_lados(pov, ap, ac, piece, side) {
+                        continue;
+                    }
                     let tf = get_threat_feature(
                         pov, ap, ac, piece, side, a_sq as i32, index_sq as i32, hm,
                     );

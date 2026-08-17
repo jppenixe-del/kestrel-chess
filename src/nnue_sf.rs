@@ -504,6 +504,13 @@ fn write_dense_layer(w: &[i8], b: &[i32], out: &mut Vec<u8>) {
 }
 
 /// Serialise back into Stockfish's own .nnue format, byte for byte.
+/// Acesso ao mapeamento de features para o comando `dustbin`.
+pub fn board_para_posbb_pub(b: &Board) -> crate::sf_features::PosBB { board_para_posbb(b) }
+pub fn threats_pad_pub(p: &crate::sf_features::PosBB, pov: usize, v: &mut Vec<usize>) {
+    crate::sf_features::threat_features_padded_com(p, pov, THREAT_DIM, v, MAGIC);
+}
+pub fn threat_dim_pub() -> usize { THREAT_DIM }
+
 pub fn escreve(net: &RedeSf) -> Vec<u8> {
     let mut out = Vec::with_capacity(96 * 1024 * 1024);
     out.extend_from_slice(&net.version.to_le_bytes());

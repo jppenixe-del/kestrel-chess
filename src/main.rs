@@ -839,6 +839,53 @@ fn main() {
         }
         return;
     }
+    if args.len() >= 2 && args[1] == "dustbin" {
+        // Quanto e' que o dustbin pesa, em numeros e nao em opiniao.
+        //
+        // Para cada posicao do bench conta, por perspectiva, as features de
+        // ameaca reais e as que caem no dustbin -- e sobretudo as ASSIMETRICAS,
+        // que sao reais de um lado e dustbin do outro. E' a assimetria que
+        // impede o dustbin de ser uma constante absorvivel.
+        let mut t_reais = 0u64;
+        let mut t_dust = 0u64;
+        let mut t_assim = 0u64;
+        let mut pos_com_assim = 0u64;
+        let mut n = 0u64;
+        let mut pior = 0usize;
+        for fen in BENCH_FENS.iter() {
+            let mut b = board::Board::from_fen(fen);
+            let pb = nnue_sf::board_para_posbb_pub(&mut b);
+            let mut f0 = Vec::new();
+            let mut f1 = Vec::new();
+            nnue_sf::threats_pad_pub(&pb, 0, &mut f0);
+            nnue_sf::threats_pad_pub(&pb, 1, &mut f1);
+            let dust = nnue_sf::threat_dim_pub();
+            let d0 = f0.iter().filter(|&&x| x == dust).count();
+            let d1 = f1.iter().filter(|&&x| x == dust).count();
+            // As listas vem alinhadas por construcao (e' para isso que existe o
+            // dustbin), logo o par i e' a mesma ameaca vista dos dois lados.
+            let mut assim = 0usize;
+            for i in 0..f0.len().min(f1.len()) {
+                if (f0[i] == dust) != (f1[i] == dust) { assim += 1; }
+            }
+            t_reais += (f0.len() - d0 + f1.len() - d1) as u64;
+            t_dust += (d0 + d1) as u64;
+            t_assim += 2 * assim as u64;
+            if assim > 0 { pos_com_assim += 1; }
+            if assim > pior { pior = assim; }
+            n += 1;
+        }
+        let tot = t_reais + t_dust;
+        println!("{n} posicoes do bench");
+        println!("features de ameaca (as duas perspectivas): {tot}");
+        println!("  reais:      {t_reais} ({:.1}%)", 100.0 * t_reais as f64 / tot as f64);
+        println!("  no dustbin: {t_dust} ({:.1}%)", 100.0 * t_dust as f64 / tot as f64);
+        println!("  ASSIMETRICAS (real de um lado, dustbin do outro): {t_assim} ({:.2}%)",
+            100.0 * t_assim as f64 / tot as f64);
+        println!("posicoes com pelo menos uma assimetrica: {pos_com_assim} de {n}");
+        println!("pior posicao: {pior} ameacas assimetricas");
+        return;
+    }
     if args.len() >= 4 && args[1] == "sfbulletrt" {
         // sfbulletrt <rede.nnue> <saida.nnue>
         //
