@@ -919,6 +919,109 @@ fn quant_round(v: f32, scale: f32) -> f32 {
 ///  * Threat and pair rows are stored as i8 in SF, so they are clipped to
 ///    +-127. Measured on a real checkpoint only ~0.02% of them are affected.
 #[allow(clippy::too_many_arguments)]
+/// A rede oficial escrita no layout do bullet, para voltar a entrar pelo
+/// `de_bullet` e sair igual.
+///
+/// A ideia veio de querermos destilar a rede oficial: professor e aluno tem a
+/// MESMA arquitectura, portanto o aluno pode representar o professor
+/// exactamente. Aqui leva-se isso ao limite -- em vez de treinar, escrevem-se
+/// os pesos da oficial no formato que o treinador produz e passam-se pelo
+/// conversor. A resposta certa e' conhecida: tem de sair a rede de partida,
+/// byte a byte. Qualquer diferenca e' um bug do `de_bullet`, e nao ha' treino
+/// nenhum pelo meio a poder ser culpado.
+///
+/// As linhas do factorizador e o dustbin vao a zero, que e' o que uma fusao
+/// correcta produziria. Repare-se que o `de_bullet` nem sequer LE' a linha do
+/// dustbin: as pecas lem `BASE + f` e os factores `f % FACT`, e o dustbin fica
+/// no indice `FACT`, entre os dois. E' isso a raiz do problema -- treinado de
+/// um lado, invisivel do outro.
+pub fn roundtrip_bullet(net: &RedeSf) -> RedeSf {
+    const FACT: usize = 704;
+    const BASE: usize = FACT + 1;
+    const NIN: usize = BASE + INPUT_DIM;
+
+    let mut l0w = vec![0f32; NIN * L1];
+    let mut l0b = vec![0f32; L1];
+    for k in 0..L1 {
+        l0b[k] = net.ft_bias[k] as f32 / CONV_QA;
+    }
+    for f in 0..PIECE_DIM {
+        for k in 0..L1 {
+            l0w[(BASE + f) * L1 + k] = net.ft_piece_w[f * L1 + k] as f32 / CONV_QA;
+        }
+    }
+    for f in 0..THREAT_DIM {
+        for k in 0..L1 {
+            l0w[(BASE + PIECE_DIM + f) * L1 + k] = net.ft_threat_w[f * L1 + k] as f32 / CONV_QA;
+        }
+    }
+    for f in 0..PAIR_DIM {
+        for k in 0..L1 {
+            l0w[(BASE + PIECE_DIM + THREAT_DIM + f) * L1 + k] =
+                net.ft_pair_w[f * L1 + k] as f32 / CONV_QA;
+        }
+    }
+
+    let mut psqtw = vec![0f32; NIN * NB];
+    for f in 0..PIECE_DIM {
+        for b in 0..NB {
+            psqtw[(BASE + f) * NB + b] = net.ft_piece_psqt[f * NB + b] as f32 / CONV_PSQT;
+        }
+    }
+    for f in 0..THREAT_DIM {
+        for b in 0..NB {
+            psqtw[(BASE + PIECE_DIM + f) * NB + b] =
+                net.ft_threat_psqt[f * NB + b] as f32 / CONV_PSQT;
+        }
+    }
+    for f in 0..PAIR_DIM {
+        for b in 0..NB {
+            psqtw[(BASE + PIECE_DIM + THREAT_DIM + f) * NB + b] =
+                net.ft_pair_psqt[f * NB + b] as f32 / CONV_PSQT;
+        }
+    }
+
+    // Densas, no layout que o `de_bullet` le' sem `KESTREL_DENSE_T`.
+    let n2 = 2 * L2 + 2 * L3;
+    let mut fc0w = vec![0f32; L1 * L2 * NB];
+    let mut fc0b = vec![0f32; L2 * NB];
+    let mut fc1w = vec![0f32; (2 * L2) * L3 * NB];
+    let mut fc1b = vec![0f32; L3 * NB];
+    let mut fc2w = vec![0f32; n2 * NB];
+    let mut fc2b = vec![0f32; NB];
+    for b in 0..NB {
+        let st = &net.stacks[b];
+        for o in 0..L2 {
+            fc0b[b * L2 + o] = st.fc0b[o] as f32 / CONV_B_FC0;
+            for i in 0..L1 {
+                fc0w[i * (L2 * NB) + b * L2 + o] = st.fc0w[o * L1 + i] as f32 / CONV_W_FC0;
+            }
+        }
+        for o in 0..L3 {
+            fc1b[b * L3 + o] = st.fc1b[o] as f32 / CONV_B_FC1;
+            for i in 0..2 * L2 {
+                fc1w[i * (L3 * NB) + b * L3 + o] =
+                    st.fc1w[o * (2 * L2) + i] as f32 / CONV_W_FC1;
+            }
+        }
+        for i in 0..n2 {
+            fc2w[i * NB + b] = st.fc2w[i] as f32 / CONV_W_FC2;
+        }
+        fc2b[b] = st.fc2b as f32 / CONV_B_FC2;
+    }
+
+    // Factorizador a zero: e' o que a fusao deve deixar.
+    let fc0fw = vec![0f32; L1 * L2];
+    let fc0fb = vec![0f32; L2];
+    let fc1fw = vec![0f32; (2 * L2) * L3];
+    let fc1fb = vec![0f32; L3];
+    let fc2fw = vec![0f32; n2];
+    let fc2fb = vec![0f32; 1];
+
+    de_bullet(net, &l0w, &l0b, &fc0w, &fc0b, &fc1w, &fc1b, &fc2w, &fc2b, &psqtw,
+        &fc0fw, &fc0fb, &fc1fw, &fc1fb, &fc2fw, &fc2fb)
+}
+
 pub fn de_bullet(
     molde: &RedeSf,
     l0w: &[f32], l0b: &[f32],
@@ -1129,6 +1232,13 @@ fn linha_peso(net: &RedeSf, u: usize, i: usize) -> i16 {
 /// em L1 entre as chamadas; o que custa e' percorrer as linhas de peso, e
 /// nenhuma arrumacao das passagens evita esse trafego. Nao repetir sem uma
 /// razao nova.
+/// Pedir as linhas a memoria antes de as usar (`_mm_prefetch` no inicio de cada
+/// uma, todas de uma vez antes de aplicar qualquer) foi escrito e MEDIDO:
+/// 121459 contra 121107 nps em quatro rondas, empate. As ~24 linhas estao
+/// espalhadas por ~112 MiB e quase nenhuma esta' em cache, mas o processador
+/// ja' as tinha em voo ao mesmo tempo por execucao fora de ordem -- as faltas
+/// nao estavam a acontecer em serie, como eu supus. Nao repetir sem uma razao
+/// nova.
 fn aplica_linha(net: &RedeSf, acc: &mut [i16], u: usize, somar: bool) {
     if u < U_THREAT {
         let row = &net.ft_piece_w[u * L1..(u + 1) * L1];

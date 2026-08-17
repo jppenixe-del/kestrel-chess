@@ -839,6 +839,35 @@ fn main() {
         }
         return;
     }
+    if args.len() >= 4 && args[1] == "sfbulletrt" {
+        // sfbulletrt <rede.nnue> <saida.nnue>
+        //
+        // Escreve a rede no layout do bullet e volta a le-la pelo `de_bullet`.
+        // A resposta certa e' conhecida -- tem de sair a rede de partida.
+        let bytes = match std::fs::read(&args[2]) {
+            Ok(b) => b,
+            Err(e) => { eprintln!("nao consegui ler {}: {e}", args[2]); return; }
+        };
+        let net = match nnue_sf::carrega_pub(&bytes) {
+            Some(n) => n,
+            None => { eprintln!("nao consegui interpretar {}", args[2]); return; }
+        };
+        let volta = nnue_sf::roundtrip_bullet(&net);
+        let saida = nnue_sf::escreve(&volta);
+        println!("entrada: {} bytes", bytes.len());
+        println!("saida:   {} bytes", saida.len());
+        if saida == bytes {
+            println!("IDENTICO -- o de_bullet reproduz a rede exactamente");
+        } else {
+            let n = bytes.len().min(saida.len());
+            let dif = (0..n).filter(|&i| bytes[i] != saida[i]).count();
+            let prim = (0..n).find(|&i| bytes[i] != saida[i]).unwrap_or(n);
+            println!("DIFERENTE: {} bytes diferentes de {}, o primeiro em {}", dif, n, prim);
+        }
+        let _ = std::fs::write(&args[3], &saida);
+        println!("escrito: {}", args[3]);
+        return;
+    }
     if args.len() >= 3 && args[1] == "sfroundtrip" {
         // sfroundtrip <rede.nnue> [saida.nnue]
         //
