@@ -1360,8 +1360,24 @@ fn linha_peso(net: &RedeSf, u: usize, i: usize) -> i16 {
     }
 }
 
+
 #[inline]
 /// Uma passagem pelo acumulador por cada linha de peso.
+///
+/// QUANTAS linhas, e de onde vem o custo delas (medido com contadores no
+/// `bench 9`, 1,14 M avaliacoes, as duas perspectivas somadas):
+///
+///   29,9 linhas por avaliacao = 5,5 pecas + 13,4 ameacas + 11,1 pares
+///
+/// Nenhuma delas e' desperdicio -- o colapso ja' deixa no maximo uma mudanca
+/// por feature -- e os pares so' mexem em lances de peao, mas ai' mexem em
+/// ~60 de uma vez, porque um peao emparelha com todos os outros.
+///
+/// O que decide o custo nao e' a contagem, e' o TAMANHO do bloco de onde a
+/// linha vem: pecas 46 MiB (i16), ameacas 61 MiB (i8), pares 4,7 MiB (i8).
+/// Os pares sao muitos e baratos -- o bloco inteiro cabe em L3 -- e as
+/// ameacas sao menos e caras. Quem quiser atacar isto ataca a localidade das
+/// ameacas, nao a contagem de linhas.
 ///
 /// Fundir as passagens -- manter um pedaco do acumulador em registos enquanto
 /// as ~12 linhas de um lance lhe passam por cima, como o Stockfish faz -- foi

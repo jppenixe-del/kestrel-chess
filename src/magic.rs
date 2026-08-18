@@ -133,25 +133,39 @@ fn find_magic_for_square(s: Square, dirs: &[(i32, i32)], rng: &mut Xorshift64) -
         atts.push(ray_attacks_slow(s, occ, dirs));
     }
 
+    // Um so' buffer para todas as tentativas, com marca de epoca em vez de
+    // limpeza. O que aqui estava -- `vec![None; size]` DENTRO do ciclo --
+    // alocava e zerava 64 KB por cada magic candidato, e sao precisos muitos
+    // candidatos ate' um servir: no perfil do bench, esta funcao e o `memset`
+    // que ela provoca somavam 9,5% do tempo todo. Uma entrada conta como vazia
+    // quando a sua marca nao e' a desta tentativa, portanto nao ha' nada a
+    // limpar entre tentativas.
+    let mut tabela: Vec<Bitboard> = vec![0; size];
+    let mut marca: Vec<u32> = vec![0; size];
+    let mut epoca: u32 = 0;
+
     loop {
         let magic = rng.sparse();
-        let mut table: Vec<Option<Bitboard>> = vec![None; size];
+        epoca += 1;
         let mut ok = true;
         for i in 0..size {
             let idx = ((occs[i].wrapping_mul(magic)) >> shift) as usize;
-            match table[idx] {
-                None => table[idx] = Some(atts[i]),
-                Some(existing) if existing == atts[i] => {} // constructive collision, fine
-                Some(_) => {
-                    ok = false;
-                    break;
-                }
+            if marca[idx] != epoca {
+                marca[idx] = epoca;
+                tabela[idx] = atts[i];
+            } else if tabela[idx] != atts[i] {
+                ok = false;
+                break;
             }
+            // colisao construtiva (mesmo ataque) e' aceitavel, como antes
         }
         if !ok {
             continue;
         }
-        let final_table: Vec<Bitboard> = table.into_iter().map(|o| o.unwrap_or(0)).collect();
+        // As entradas que esta tentativa nunca tocou ficam a zero, que e'
+        // exactamente o que o `unwrap_or(0)` produzia.
+        let final_table: Vec<Bitboard> =
+            (0..size).map(|i| if marca[i] == epoca { tabela[i] } else { 0 }).collect();
         return SquareMagic { mask, magic, shift, table: final_table };
     }
 }
