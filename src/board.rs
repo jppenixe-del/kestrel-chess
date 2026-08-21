@@ -505,7 +505,6 @@ impl Board {
     /// immediately, and with a bucketed one it does nothing unless a boundary
     /// was actually crossed -- measured at 16.5% of all moves, which is why it
     /// goes through the cache rather than rebuilding from the bias.
-    #[inline]
     fn corrige_bucket(&mut self) {
         // A guarda da rede SIMPLES nao pode barrar as outras.
         //
@@ -518,25 +517,6 @@ impl Board {
         //
         // Mesma familia do bug do `busy` na ponte e do `unmake_move` sem
         // correccao de bucket: uma condicao de UM caminho a decidir por todos.
-        //
-        // Saida rapida: esta correccao so' serve as redes `nnue`/`nnue_v3` (buckets
-        // de rei). A super rede `nnue_sf` (a do bot, por EvalFile) e o HCE nao
-        // precisam dela -- tem o seu proprio acumulador. Decidir uma vez e cachear
-        // evita 4 `rede()` + a copia das pecas por NO (make+unmake), ~4,3% do bench.
-        // A decisao e' estavel: as duas redes carregam por env no arranque, antes
-        // da busca real, e nao mudam (OnceLock).
-        if !precisa_corrigir_bucket() {
-            return;
-        }
-        self.corrige_bucket_slow();
-    }
-
-    /// O trabalho pesado do `corrige_bucket`, fora da linha para que o fast-path
-    /// (super rede `nnue_sf` ou HCE) inline no make_move/unmake_move so' a leitura
-    /// da bandeira e o `return` -- sem custo de chamada por NO.
-    #[cold]
-    #[inline(never)]
-    fn corrige_bucket_slow(&mut self) {
         let pecas = self.pieces;
         if let Some(net) = crate::nnue::rede().filter(|n| n.buckets > 1) {
             self.corrige_bucket_simples(net);
@@ -722,19 +702,4 @@ impl Board {
         s.push_str(&self.fullmove.to_string());
         s
     }
-}
-
-/// So' as redes `nnue`/`nnue_v3` (buckets de rei) precisam do `corrige_bucket`.
-/// A super rede `nnue_sf` (do bot, por EvalFile) e o HCE nao -- tem o seu proprio
-/// acumulador. Decidido UMA vez (as duas redes carregam por env no arranque, via
-/// OnceLock, e nao mudam depois) e cacheado, para o `corrige_bucket` sair cedo no
-/// caso comum. Ver o comentario no `corrige_bucket`.
-#[inline]
-fn precisa_corrigir_bucket() -> bool {
-    static DECISAO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *DECISAO.get_or_init(|| {
-        let nnue_buckets = crate::nnue::rede().map_or(false, |n| n.buckets > 1);
-        let v3 = crate::nnue_v3::rede().is_some();
-        nnue_buckets || v3
-    })
 }
