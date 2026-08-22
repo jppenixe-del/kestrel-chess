@@ -2053,6 +2053,11 @@ impl Engine {
                             "lmr_cutnode" => 3072,
                             "lmr_capture_base" => 3072,
                             "lmr_capture_hist_divisor" => 15000,
+                            // Mesma armadilha: `rfp_return_beta` e' uma fraccao
+                            // em 1024-avos com default 0, e a banda proporcional
+                            // dava-lhe 0..10 -- uma faixa onde nada do que o
+                            // afinador puser muda seja o que for.
+                            "rfp_return_beta" => 1024,
                             _ => (d.abs()).max(10),
                         };
                         // A default below zero exists (`hist_malus_offset`),
@@ -2218,6 +2223,12 @@ impl Engine {
                     self.cmd_go(&tokens[1..], &mut out);
                 }
                 "stop" => {}
+                "fen" => {
+                    // O FEN da posicao actual. Serve para gerar livros de
+                    // aberturas levando posicoes mais fundo com `position ...
+                    // moves ...` e lendo onde ficaram.
+                    let _ = writeln!(out, "{}", self.board.to_fen());
+                }
                 "evalraw" => {
                     // O numero pelado, na perspectiva do LADO A JOGAR --
                     // a mesma convencao usada por outros motores UCI, para

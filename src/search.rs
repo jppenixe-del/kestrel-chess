@@ -622,6 +622,34 @@ pub struct SearchParams {
     pub do_deeper_margin_base: i32,
     pub do_deeper_margin_depth: i32,
     pub do_shallower_margin: i32,
+    /// Quanto do valor devolvido pelo corte RFP vem de `beta` (em 1024), com o
+    /// resto a vir de `static_eval - margem`.
+    ///
+    /// Devolvíamos `static_eval - margem` inteiro. Isso é o valor mais
+    /// OPTIMISTA compatível com o corte: assume que a estimativa estática está
+    /// certa. Quando ela está errada -- e é para isso que existe margem -- o
+    /// erro sobe na árvore inteiro. `beta` é o que sabemos com certeza (o corte
+    /// prova >= beta); a eval é a estimativa. Puxar o valor devolvido para beta
+    /// mantém o corte e devolve menos ficção. 1024 = só beta, 0 = só a eval
+    /// (o comportamento antigo).
+    pub rfp_return_beta: i32,
+    /// Profundidade máxima onde o RFP dispara. Estava fixo em 6.
+    pub rfp_max_depth: i32,
+    /// 1 = não faz RFP em nós que a TT marca como tendo sido PV (0 = como antes).
+    ///
+    /// O bit TTPV diz que esta posição já foi procurada com janela completa,
+    /// ou seja já foi considerada importante. Já o usamos para reduzir menos no
+    /// LMR, pela mesma razão; não o usávamos para NÃO PODAR. Uma posição que
+    /// foi PV é precisamente onde uma poda por eval estática custa mais caro.
+    pub rfp_skip_ttpv: i32,
+    /// Divisor da magnitude da correcção somada à margem RFP (0 = desligado).
+    ///
+    /// A correcção mede o quanto a eval estática costuma errar nesta família de
+    /// posições. Onde ela é grande, a eval é pouco fiável -- e podar por eval
+    /// pouco fiável é o pior negócio. Com divisor 4, uma correcção de 100 cp
+    /// (grande, para o nosso grão) sobe a margem 25 cp, comparável ao termo de
+    /// depth-1; uma correcção pequena não faz praticamente nada.
+    pub rfp_corr_divisor: i32,
 }
 
 impl Default for SearchParams {
@@ -760,6 +788,17 @@ impl Default for SearchParams {
             do_deeper_margin_base: 81,
             do_deeper_margin_depth: 318,
             do_shallower_margin: 18,
+            // Ambos no comportamento ACTUAL, para cada ideia se medir sozinha:
+            // 0 = devolve `static_eval - margem` como antes; 6 = o tecto de sempre.
+            rfp_return_beta: 0,
+            // 10, nao 6: medido +22,5 +/- 15,2 Elo em 2000 jogos a 5+0.05
+            // (SPRT no server 5, mesma rede dos dois lados, so' esta opcao a
+            // mudar). O tecto de 6 vinha de nao ter sido testado mais alto --
+            // o SF poda ate' ~10 e o Reckless nao tem tecto nenhum. Medido a
+            // 10 poda mais SEM gastar mais nos.
+            rfp_max_depth: 10,
+            rfp_corr_divisor: 0,
+            rfp_skip_ttpv: 0,
         }
     }
 }
@@ -826,6 +865,11 @@ impl SearchParams {
             self.lmr_cutnode,
             self.lmr_capture_base,
             self.lmr_capture_hist_divisor,
+            // no FIM, para nao deslocar os indices ja' usados por opcoes UCI
+            self.rfp_return_beta,
+            self.rfp_max_depth,
+            self.rfp_corr_divisor,
+            self.rfp_skip_ttpv,
         ]
     }
     pub fn from_vec(v: &[i32]) -> Self {
@@ -889,6 +933,10 @@ impl SearchParams {
             lmr_check: 0,
             lmr_capture_base: v[53],
             lmr_capture_hist_divisor: v[54],
+            rfp_return_beta: v[55],
+            rfp_max_depth: v[56],
+            rfp_corr_divisor: v[57],
+            rfp_skip_ttpv: v[58],
         }
     }
 }
@@ -901,7 +949,7 @@ impl SearchParams {
 /// Generated from `to_vec`, never hand-written. A list that drifts out of
 /// order does not fail: it quietly sets the wrong parameter, and the sweep
 /// reports whatever that other parameter happens to do.
-pub const PARAM_NAMES: [&str; 55] = [
+pub const PARAM_NAMES: [&str; 59] = [
     "rfp_improving_base",
     "rfp_improving_slope",
     "rfp_not_improving_base",
@@ -957,6 +1005,10 @@ pub const PARAM_NAMES: [&str; 55] = [
     "lmr_cutnode",
     "lmr_capture_base",
     "lmr_capture_hist_divisor",
+    "rfp_return_beta",
+    "rfp_max_depth",
+    "rfp_corr_divisor",
+    "rfp_skip_ttpv",
 ];
 
 /// Overrides applied on top of the defaults, set over UCI before the first
@@ -2104,6 +2156,19 @@ impl<'a> Searcher<'a> {
     /// additions. `threats`/continuation-history terms deliberately
     /// not included here, see the field doc comment on
     /// `corr_hist_np_stm` for why.
+    /// Quanto e' que a correccao esta' a mexer na eval estatica, em centipeoes
+    /// e sem sinal.
+    ///
+    /// Serve para as margens de poda: uma correccao grande quer dizer que a
+    /// estimativa estatica ANDA A ERRAR nesta familia de posicoes -- e' isso
+    /// que as tabelas de correccao registam. Podar com base numa eval que
+    /// sabemos pouco fiavel e' o pior momento para poupar trabalho, portanto a
+    /// margem sobe com ela. Nao e' o valor corrigido (esse ja' entra no
+    /// `static_eval`), e' a CONFIANCA nele.
+    fn corr_magnitude(&self, board: &Board, raw: i32) -> i32 {
+        (self.corrected_static_eval(board, raw) - raw).abs()
+    }
+
     fn corrected_static_eval(&self, board: &Board, raw: i32) -> i32 {
         let pawn_idx = self.corr_idx(board, pawn_structure_hash(board));
         let np_stm_idx = self.corr_idx(board, non_pawn_hash(board, board.side));
@@ -2798,7 +2863,9 @@ impl<'a> Searcher<'a> {
         if !is_pv
             && !in_check
             && ply > 0
-            && depth <= 6
+            && depth <= search_params().rfp_max_depth
+            && (search_params().rfp_skip_ttpv == 0
+                || !tt_entry_captured.map(|e| e.pv).unwrap_or(false))
             && beta.abs() < MATE_SCORE - MAX_PLY as i32
         {
             let sp = search_params();
@@ -2825,10 +2892,23 @@ impl<'a> Searcher<'a> {
                 margin += prev_hist / sp.rfp_hist_divisor.max(1);
             }
 
+            // Quanto menos fiavel for a eval estatica aqui, maior a barra para
+            // a dispensar. Ver `rfp_corr_divisor` e `corr_magnitude`.
+            if sp.rfp_corr_divisor > 0 {
+                margin += self.corr_magnitude(board, raw_static_eval) / sp.rfp_corr_divisor;
+            }
+
             let margin = (margin.max(20) * eval_margin_scale()) / 100;
             if static_eval - margin >= beta {
                 self.cut_rfp += 1;
-                return static_eval - margin;
+                // O valor devolvido nao tem de ser o mais optimista compativel
+                // com o corte. `static_eval - margem` assume a estimativa
+                // estatica certa; `beta` e' o que o corte PROVA. Misturar os
+                // dois devolve menos ficcao a` arvore sem mudar quando cortamos.
+                // Ver `rfp_return_beta` (0 = comportamento antigo).
+                let w = search_params().rfp_return_beta.clamp(0, 1024);
+                let val = static_eval - margin;
+                return if w == 0 { val } else { (beta * w + val * (1024 - w)) / 1024 };
             }
         }
         // Null-move pruning: se mesmo passando a vez ao adversario ainda
