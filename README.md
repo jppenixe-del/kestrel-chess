@@ -15,7 +15,13 @@ continuation history and a history heuristic.
 
 Positions are scored by a trained network in Stockfish's SFNNv16 format. The
 format is theirs, and reading it is the one part of this engine derived from
-another — which is why this project is GPLv3. The weights are trained here.
+another — which is why this project is GPLv3.
+
+**No network ships with this repository, and the project's own SFNNv16
+network is still in training.** The engine reads whatever `.nnue` file it is
+pointed at; testing at present uses Stockfish's published network. Earlier
+networks, in this project's own smaller architectures, were trained here and
+are embedded in the binary.
 
 The engine is paired with a signature opening book drawn from 1825 real games
 by one of the sharpest attacking players in chess history.
@@ -73,8 +79,9 @@ one-sided.
   - *SFNNv16* — what the engine evaluates with today: `HalfKAv2_hm` +
     `Full_Threats` + `PP_3Wide`, 86896 inputs into a 1024-wide accumulator.
     This is Stockfish's network format, and reading it is the one part of
-    this engine derived from theirs — see [License](#-license). The weights
-    are trained by this project.
+    this engine derived from theirs — see [License](#-license). A network of
+    this project's own is in training; until it is finished and validated,
+    testing uses Stockfish's published one.
   - *piece-square* (earlier): `(768 → 512)x2 → 8`, twelve king buckets, eight output
     buckets by piece count. The accumulator is carried on the board and
     updated one piece at a time, with a refresh cache per king bucket — king
@@ -89,10 +96,11 @@ one-sided.
   - Hand-written terms survive only where they are not evaluation: piece
     values, which Static Exchange Evaluation needs before any score exists to
     judge, and game phase, which the search uses for time and reductions.
-- **Training** — the network is trained by this project's own pipeline, on
-  the Stockfish project's published 5000-node data, filtered here. The
-  weights are ours; the data is not, and is credited in
-  [NOTICES.md](NOTICES.md). Earlier networks were trained with
+- **Training** — an SFNNv16 network is being trained by this project's own
+  pipeline, on the Stockfish project's published 5000-node data, filtered
+  here. It is not finished, and nothing is claimed for it until it is
+  validated in play. The weights will be ours; the data is not, and is
+  credited in [NOTICES.md](NOTICES.md). Earlier networks were trained with
   [bullet](https://github.com/jw1912/bullet) on the engine's own self-play,
   which is what this section used to describe. Every candidate is validated
   by SPRT in real games before adoption; a lower training loss on its own has
@@ -137,11 +145,13 @@ Kestrel is meant to be an *original* engine, not a clone, and the line falls in
 a specific place. Concepts are drawn from the public chess-programming
 literature — the Chess Programming Wiki, forum discussions, published papers,
 and other open engines. The **search is written from scratch for this
-codebase**, and every weight is **trained by this project** and validated in
-play, never copied from another engine. The training *data* is a separate
-question and is credited in [NOTICES.md](NOTICES.md): the current network is
-trained on the Stockfish project's published positions, not on Kestrel's own
-games.
+codebase**, and every weight this project ships is **trained by this project**
+and validated in play, never copied from another engine — with the current
+state stated plainly: the SFNNv16 network is still training, and until it is
+done the engine is tested against Stockfish's published one. The training
+*data* is a separate question again, and is credited in
+[NOTICES.md](NOTICES.md): it is the Stockfish project's published positions,
+not Kestrel's own games.
 
 The exception, stated plainly because it is the kind of thing that should not
 have to be discovered: the **NNUE inference side is derived from Stockfish**.
@@ -170,9 +180,12 @@ definition of the input feature sets it is built on — `HalfKAv2_hm`,
 tables. **The search is the project's own**, and so is everything around it:
 board representation, move generation, and the whole of `search.rs`.
 
-**The network is the project's own.** It is trained by this project's own
-pipeline on its own filtered data; Stockfish supplies the *format* the weights
-are stored and evaluated in, not the weights.
+**The network will be the project's own**, and is not yet. One is being
+trained by this project's own pipeline; until it is finished and validated in
+play, the engine is run and tested against Stockfish's published network, and
+no network at all ships in this repository. Stockfish supplies the *format*
+the weights are stored and evaluated in — and, for now, a set of weights to
+test against.
 
 Because the engine incorporates Stockfish's GPL-licensed work, **the whole
 project is distributed under GPLv3**, with Stockfish's copyright notices
