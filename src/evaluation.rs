@@ -33,27 +33,12 @@ use crate::board::Board;
 /// it holds are only brought up to date here, at the one moment a score is
 /// actually wanted. See `nnue::Accumulator`.
 pub fn evaluate(board: &mut Board) -> i32 {
-    if crate::nnue_sf256::active() {
-        if let Some(net) = crate::nnue_sf256::rede() {
-            return crate::nnue_sf256::evaluate(net, board);
-        }
-    }
-    if crate::nnue_juntas::active() {
-        if let Some(net) = crate::nnue_juntas::rede() {
-            return crate::nnue_juntas::evaluate(net, board);
-        }
-    }
     if crate::nnue_sf_ffi::activo() {
         return crate::nnue_sf_ffi::evaluate(board);
     }
     if crate::nnue_sf::active() {
         if let Some(net) = crate::nnue_sf::rede() {
             return crate::nnue_sf::evaluate(net, atk(), board);
-        }
-    }
-    if crate::nnue_q900::active() {
-        if let Some(net) = crate::nnue_q900::rede() {
-            return crate::nnue_q900::evaluate(net, board);
         }
     }
     // The threats network takes precedence when one is loaded. Chosen by which
