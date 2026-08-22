@@ -1,12 +1,11 @@
-//! Livro de "assinatura" -- posicoes reais dos jogos da Judit Polgar
-//! (fonte: pgnmentor.com/players/PolgarJ.zip, 1825 partidas reais, 100%
-//! dela como jogadora, brancas ou pretas -- descarregado e documentado em
-//! 2026-07-20). NAO substitui a busca -- so' da' um empurraozinho de
-//! ordenacao/preferencia as jogadas que ela realmente jogou em posicoes
-//! identicas, para o kestrel puxar para o "estilo dela" quando a busca
-//! achar dois lances proximos em valor. Um lance claramente pior nunca
-//! vence so' por estar no livro (o bonus e' pequeno face aos valores de
-//! ordenacao normais -- ver search.rs).
+//! A "signature" book: real positions from a single strong player's games,
+//! built from a published PGN collection.
+//!
+//! It does NOT replace the search. All it does is nudge move ordering
+//! towards the moves actually played in identical positions, so that the
+//! engine leans that way when the search finds two moves close in value. A
+//! clearly worse move never wins on being in the book -- the bonus is small
+//! next to the ordinary ordering values (see search.rs).
 use crate::moves::Move;
 use crate::types::*;
 use std::fs::File;

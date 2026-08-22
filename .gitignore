@@ -15,3 +15,17 @@ tune_*.log
 selfplay_*.log
 resolvequiet.log
 datagen_*.log
+
+# Redes e leitores de OUTROS motores: uso interno de diagnostico, nunca
+# comitados. O Coda e' GPL-3.0 e a rede dele e' artefacto dele; serve para
+# responder "a fraqueza e' a nossa busca ou a nossa rede?", nao para andar
+# neste repositorio.
+*.nnue
+src/nnue_externo*.rs
+redes_externas/
+
+# Compiled bridge library: a GPL-derived object archive, ~93MB, and
+# optional -- build.rs links it only when present and falls back to the
+# Rust path when it is not. Distributing object code would oblige us to
+# ship its corresponding source; building it locally does not.
+sfbridge/

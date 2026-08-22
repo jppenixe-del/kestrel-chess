@@ -10,6 +10,16 @@ pub struct Attacks {
     /// generate_legal (a fast path that skips the make/unmake legality
     /// test for the common case; see movegen.rs). Built once at startup.
     pub between: [[Bitboard; 64]; 64],
+    /// ray_extension[a][b] = squares strictly beyond b, continuing the ray
+    /// a->b past b to the board edge, when a and b share a rank/file/
+    /// diagonal, else 0. `& occ` finds the first piece beyond b on that
+    /// ray in one table lookup instead of two magic-bitboard slider calls
+    /// (compute attacks from b with b's occupant present, then without,
+    /// and diff) -- used by the threats accumulator's discovered-attack
+    /// check (`nnue_threats::threat_deltas`), which does this once per
+    /// slider found among a changed square's attackers, on every piece
+    /// move the search makes. Same idea as Coda's `ray_extension` table.
+    pub ray_extension: [[Bitboard; 64]; 64],
 }
 
 fn between_from(a: Square, b: Square) -> Bitboard {
@@ -32,6 +42,28 @@ fn between_from(a: Square, b: Square) -> Bitboard {
         if !(0..8).contains(&f) || !(0..8).contains(&r) {
             return 0; // safety: shouldn't happen for aligned squares
         }
+        out |= bb(sq(f as u8, r as u8));
+        f += df;
+        r += dr;
+    }
+    out
+}
+
+fn ray_extension_from(a: Square, b: Square) -> Bitboard {
+    if a == b {
+        return 0;
+    }
+    let (af, ar) = (file_of(a) as i32, rank_of(a) as i32);
+    let (bf, br) = (file_of(b) as i32, rank_of(b) as i32);
+    let df = (bf - af).signum();
+    let dr = (br - ar).signum();
+    let aligned = af == bf || ar == br || (af - bf).abs() == (ar - br).abs();
+    if !aligned {
+        return 0;
+    }
+    let mut out = 0u64;
+    let (mut f, mut r) = (bf + df, br + dr);
+    while (0..8).contains(&f) && (0..8).contains(&r) {
         out |= bb(sq(f as u8, r as u8));
         f += df;
         r += dr;
@@ -103,12 +135,14 @@ impl Attacks {
             pawn[Color::Black.idx()][s as usize] = pawn_attacks_from(s, Color::Black);
         }
         let mut between = [[0u64; 64]; 64];
+        let mut ray_extension = [[0u64; 64]; 64];
         for a in 0..64u8 {
             for b in 0..64u8 {
                 between[a as usize][b as usize] = between_from(a, b);
+                ray_extension[a as usize][b as usize] = ray_extension_from(a, b);
             }
         }
-        Attacks { knight, king, pawn, between }
+        Attacks { knight, king, pawn, between, ray_extension }
     }
 }
 

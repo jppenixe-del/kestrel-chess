@@ -1,5 +1,13 @@
 # The board
 
+**Provenance.** Every image in this directory is the project's own: the piece
+sheet, the boards and the squares were generated for this project, not sourced
+from an existing piece set or photograph. This is stated because it is the kind
+of thing a reader would otherwise have to take on trust -- chess piece sets in
+particular are usually somebody else's (cburnett, merida and the rest carry
+their own licences), and these are not.
+
+
 The engine's own piece set and squares, kept in the repository because they are
 part of what the project looks like, and because a public HTTPS URL is what a
 browser will actually load.

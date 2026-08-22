@@ -343,6 +343,38 @@ pub const TOTAL_INPUTS_640:  usize = PIECE_FEATURES + THREAT_FEATURES_640; // 23
 /// mode 1 = peças (filtradas do full) + threats 640 gerados com o contrato clássico:
 ///   vítimas P..Q (sem rei), dir0 = MINHAS peças atacadas por eles, dir1 = as DELES
 ///   que eu ataco — iterando o threat FÍSICO 1× e emitindo o par (stm, ntm).
+/// Abaixo de quantas pecas as ameacas deixam de ser emitidas.
+///
+/// Medido sobre 214 posicoes reais: num final de oito pecas ha 4.6 ameacas
+/// activas, contra 50 numa abertura -- mas as 9216 colunas de ameaca ocupam
+/// 29% da primeira camada (2.4M de 8.1M pesos) esteja ou nao a haver ameacas
+/// na posicao. Num final isso e' capacidade tirada as pecas, que sao o que
+/// ali decide.
+///
+/// **Isto tem de ser identico no treino e no motor.** Uma rede fica presa ao
+/// conjunto de features com que foi treinada: aplicar esta regra so' de um
+/// lado nao a torna mais rapida, torna-a errada -- alimenta-a com entradas
+/// que nunca viu, e nada avisa. E' precisamente por isso que vive AQUI, no
+/// unico ficheiro que os dois lados partilham, e nao no `nnue_v3.rs`.
+///
+/// Doze e' o corte: e' onde a fraccao de ameacas cai abaixo de metade das
+/// features activas (48.5% a treze pecas, 42.6% a onze).
+pub const AMEACAS_MIN_PECAS: u32 = 12;
+
+/// Quantas pecas ha' no tabuleiro.
+#[inline]
+pub fn n_pecas(pos: &Pos) -> u32 {
+    pos.occ().count_ones()
+}
+
+/// Como `map_features_pairs_mode`, mas com as ameacas desligadas nos finais
+/// (ver `AMEACAS_MIN_PECAS`). O modo 2 passa a modo 0 quando ha' poucas
+/// pecas -- as de peca continuam todas, e sao as unicas.
+pub fn map_features_pairs_fase<F: FnMut(usize, usize)>(pos: &Pos, stm: usize, mode: u8, f: &mut F) {
+    let efectivo = if mode == 2 && n_pecas(pos) < AMEACAS_MIN_PECAS { 0 } else { mode };
+    map_features_pairs_mode(pos, stm, efectivo, f)
+}
+
 pub fn map_features_pairs_mode<F: FnMut(usize, usize)>(pos: &Pos, stm: usize, mode: u8, f: &mut F) {
     if mode == 2 { map_features_pairs(pos, stm, f); return; }
     map_pieces_pairs(pos, stm, f);

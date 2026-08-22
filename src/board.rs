@@ -11,6 +11,17 @@ pub const CASTLE_BQ: u8 = 8;
 #[derive(Clone)]
 pub struct Board {
     pub pieces: [[Bitboard; 6]; 2], // [color][piece_type]
+    /// Quantos lances fundos estamos no caminho actual.
+    ///
+    /// Mantido aqui, e so' por `make_move`/`unmake_move` e pelo lance nulo,
+    /// porque e' aqui que a posicao muda. A pilha de acumuladores da rede SF
+    /// indexa-se por ele -- e a razao de nao existir um contador proprio para
+    /// isso e' que uma tentativa anterior teve dois indices (o de `make_move`
+    /// para gravar, o ply da busca para ler), discordaram, e o motor jogou
+    /// 0-58-0 com um acumulador errado que nenhum teste de posicao apanhava.
+    /// Com um so' indice, mantido junto da posicao, esse desencontro nao tem
+    /// onde acontecer.
+    pub prof_acc: usize,
     pub occ_color: [Bitboard; 2],
     pub occ_all: Bitboard,
     pub side: Color,
@@ -23,6 +34,11 @@ pub struct Board {
     /// silently wrong only in rare positions. `None` until a network is
     /// loaded, so the hand-written evaluation costs nothing for it.
     pub acc: Option<Box<crate::nnue::Accumulator>>,
+    /// O mesmo para a rede v3 -- ver `nnue_v3::AccV3`. Independente do `acc`:
+    /// qual das arquitecturas o `evaluate` le' decide-se pelo ficheiro que foi
+    /// carregado, nao por uma bandeira de compilacao, portanto os dois
+    /// acumuladores mantem-se vivos.
+    pub acc_v3: Option<Box<crate::nnue_v3::AccV3>>,
     pub castling: u8,
     pub ep_square: Square,
     pub halfmove: u32,
@@ -146,10 +162,12 @@ impl Board {
         let fullmove = parts.get(5).and_then(|s| s.parse().ok()).unwrap_or(1);
 
         let mut b = Board {
+            prof_acc: 0,
             pieces,
             occ_color: [0, 0],
             occ_all: 0,
             acc: None,
+            acc_v3: None,
             side,
             castling,
             ep_square,
@@ -166,6 +184,9 @@ impl Board {
         // through add_piece/remove_piece and updates it a piece at a time.
         if let Some(net) = crate::nnue::rede() {
             b.acc = Some(Box::new(crate::nnue::Accumulator::fresh(net, &b)));
+        }
+        if let Some(net) = crate::nnue_v3::rede() {
+            b.acc_v3 = Some(Box::new(crate::nnue_v3::AccV3::fresh(net, &b)));
         }
         b
     }
@@ -315,7 +336,7 @@ impl Board {
         self.is_square_attacked(self.king_sq(color), color.opp(), atk)
     }
 
-    fn remove_piece(&mut self, pt: PieceType, c: Color, s: Square) {
+    pub(crate) fn remove_piece(&mut self, pt: PieceType, c: Color, s: Square) {
         self.pieces[c.idx()][pt.idx()] &= !bb(s);
         self.occ_color[c.idx()] &= !bb(s);
         self.occ_all &= !bb(s);
@@ -324,6 +345,9 @@ impl Board {
         let ph = pt.phase_inc();
         if let (Some(a), Some(net)) = (self.acc.as_mut(), crate::nnue::rede()) {
             a.push_dirty(net, c, pt, s, false);
+        }
+        if let (Some(a), Some(net)) = (self.acc_v3.as_mut(), crate::nnue_v3::rede()) {
+            a.remove_piece(net, pt, c, s, self.occ_all, self.pieces, self.mailbox);
         }
         // Os acumuladores por flanco so' sao LIDOS com a feature `psqtmirror`
         // ligada (ver `material_pst_white`). Sem ela isto era trabalho morto
@@ -343,6 +367,9 @@ impl Board {
         if let (Some(a), Some(net)) = (self.acc.as_mut(), crate::nnue::rede()) {
             a.push_dirty(net, c, pt, s, true);
         }
+        if let (Some(a), Some(net)) = (self.acc_v3.as_mut(), crate::nnue_v3::rede()) {
+            a.add_piece(net, pt, c, s, self.occ_all, self.pieces, self.mailbox);
+        }
         // Os acumuladores por flanco so' sao LIDOS com a feature `psqtmirror`
         // ligada (ver `material_pst_white`). Sem ela isto era trabalho morto
         // pago em cada peca colocada ou retirada, ou seja, em cada lance da
@@ -355,6 +382,7 @@ impl Board {
     /// Aplica um lance PSEUDO-LEGAL (a legalidade -- nao ficar em xeque --
     /// e' verificada por quem gera os lances, chamando in_check depois).
     pub fn make_move(&mut self, mv: &Move) -> Undo {
+        self.prof_acc += 1;
         let us = self.side;
         let them = us.opp();
         let (moving_pt, _) = self.piece_at(mv.from).expect("make_move: nada em from");
@@ -477,11 +505,48 @@ impl Board {
     /// immediately, and with a bucketed one it does nothing unless a boundary
     /// was actually crossed -- measured at 16.5% of all moves, which is why it
     /// goes through the cache rather than rebuilding from the bias.
+    #[inline]
     fn corrige_bucket(&mut self) {
-        let net = match crate::nnue::rede() {
-            Some(n) if n.buckets > 1 => n,
-            _ => return,
-        };
+        // A guarda da rede SIMPLES nao pode barrar as outras.
+        //
+        // Isto era `let net = match rede() { Some(n) if n.buckets > 1 => n,
+        // _ => return }` -- um `return` no topo. Sem `KESTREL_NNUE` definido a
+        // funcao saia na primeira linha e o `fix_bucket` da v3, que vive no
+        // fim, nunca corria: os buckets de rei dela nunca se corrigiam. 2849
+        // divergencias em 3906 lances, todas a partir do primeiro rei que sai
+        // da casa inicial.
+        //
+        // Mesma familia do bug do `busy` na ponte e do `unmake_move` sem
+        // correccao de bucket: uma condicao de UM caminho a decidir por todos.
+        //
+        // Saida rapida: esta correccao so' serve as redes `nnue`/`nnue_v3` (buckets
+        // de rei). A super rede `nnue_sf` (a do bot, por EvalFile) e o HCE nao
+        // precisam dela -- tem o seu proprio acumulador. Decidir uma vez e cachear
+        // evita 4 `rede()` + a copia das pecas por NO (make+unmake), ~4,3% do bench.
+        // A decisao e' estavel: as duas redes carregam por env no arranque, antes
+        // da busca real, e nao mudam (OnceLock).
+        if !precisa_corrigir_bucket() {
+            return;
+        }
+        self.corrige_bucket_slow();
+    }
+
+    /// O trabalho pesado do `corrige_bucket`, fora da linha para que o fast-path
+    /// (super rede `nnue_sf` ou HCE) inline no make_move/unmake_move so' a leitura
+    /// da bandeira e o `return` -- sem custo de chamada por NO.
+    #[cold]
+    #[inline(never)]
+    fn corrige_bucket_slow(&mut self) {
+        let pecas = self.pieces;
+        if let Some(net) = crate::nnue::rede().filter(|n| n.buckets > 1) {
+            self.corrige_bucket_simples(net);
+        }
+        if let (Some(net), Some(acc)) = (crate::nnue_v3::rede(), self.acc_v3.as_mut()) {
+            acc.fix_bucket(net, pecas);
+        }
+    }
+
+    fn corrige_bucket_simples(&mut self, net: &'static crate::nnue::Network) {
         // Read everything the refresh needs BEFORE taking the accumulator,
         // because the accumulator lives inside the same struct. Rust says so
         // and it is right to: reading the board through a stale copy taken
@@ -531,6 +596,7 @@ impl Board {
     /// So' altera `side` e limpa `ep_square`; tudo o resto fica intacto.
     /// NUNCA chamar em xeque (o rei poderia ser "capturado" na resposta).
     pub fn make_null_move(&mut self) -> NullUndo {
+        self.prof_acc += 1;
         let undo = NullUndo { ep_square: self.ep_square, hash: self.hash };
         self.side = self.side.opp();
         self.ep_square = NO_SQUARE;
@@ -543,12 +609,14 @@ impl Board {
     }
 
     pub fn unmake_null_move(&mut self, undo: &NullUndo) {
+        self.prof_acc -= 1;
         self.side = self.side.opp();
         self.ep_square = undo.ep_square;
         self.hash = undo.hash;
     }
 
     pub fn unmake_move(&mut self, mv: &Move, undo: &Undo) {
+        self.prof_acc -= 1;
         let them = self.side; // side that is about to move again = the one who just moved's opponent... wait: after make_move, self.side = opponent of mover. So "us" (who made mv) = self.side.opp()
         let us = them.opp();
         self.side = us;
@@ -654,4 +722,19 @@ impl Board {
         s.push_str(&self.fullmove.to_string());
         s
     }
+}
+
+/// So' as redes `nnue`/`nnue_v3` (buckets de rei) precisam do `corrige_bucket`.
+/// A super rede `nnue_sf` (do bot, por EvalFile) e o HCE nao -- tem o seu proprio
+/// acumulador. Decidido UMA vez (as duas redes carregam por env no arranque, via
+/// OnceLock, e nao mudam depois) e cacheado, para o `corrige_bucket` sair cedo no
+/// caso comum. Ver o comentario no `corrige_bucket`.
+#[inline]
+fn precisa_corrigir_bucket() -> bool {
+    static DECISAO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DECISAO.get_or_init(|| {
+        let nnue_buckets = crate::nnue::rede().map_or(false, |n| n.buckets > 1);
+        let v3 = crate::nnue_v3::rede().is_some();
+        nnue_buckets || v3
+    })
 }

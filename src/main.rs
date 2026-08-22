@@ -9,6 +9,10 @@ mod movegen;
 mod nnue;
 mod features;
 mod nnue_threats;
+mod nnue_sf;
+mod nnue_sf_ffi;
+mod sf_features;
+mod nnue_v3;
 mod evaluation;
 mod moves;
 mod perft;
@@ -27,6 +31,31 @@ use std::env;
 use std::io::{BufRead, Write};
 use std::time::Instant;
 use zobrist::Zobrist;
+
+/// Quantos neuronios das camadas escondidas nunca sairam de zero.
+///
+/// Sob SCReLU um neuronio que nunca passa de zero contribui exactamente zero
+/// para tudo o que vem a seguir. "Morto" e' contavel, nao e' uma opiniao --
+/// mas o numero depende de ONDE se conta: medido num percurso aleatorio a
+/// partir da posicao inicial da' menos mortos do que em posicoes de jogo a
+/// serio, porque metade das posicoes visitadas nao se parecem com xadrez.
+fn imprime_saude(vistas: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let v = crate::nnue_v3::VISITAS.load(Relaxed).max(1);
+    let conta = |a: &[std::sync::atomic::AtomicU64]| {
+        let vals: Vec<u64> = a.iter().map(|x| x.load(Relaxed)).collect();
+        let mortos = vals.iter().filter(|&&c| c == 0).count();
+        let raros = vals.iter().filter(|&&c| c > 0 && c * 100 < v).count();
+        (mortos, raros, vals)
+    };
+    let (m1, r1, v1) = conta(&crate::nnue_v3::ACTIVOU_H1);
+    let (m2, r2, v2) = conta(&crate::nnue_v3::ACTIVOU_H2);
+    let _ = vistas;
+    println!("{v} avaliacoes | fc1: {m1}/{} mortos ({r1} raros) | fc2: {m2}/{} mortos ({r2} raros)",
+             v1.len(), v2.len());
+    println!("  fc1 taxas%: {:?}", v1.iter().map(|c| (c * 100 / v) as u32).collect::<Vec<_>>());
+    println!("  fc2 taxas%: {:?}", v2.iter().map(|c| (c * 100 / v) as u32).collect::<Vec<_>>());
+}
 
 fn main() {
     // Buckets de PSQT: ligados por feature. Arrancam com as OITO tabelas
@@ -471,6 +500,230 @@ fn main() {
         }
         return;
     }
+    if args.len() >= 2 && args[1] == "contafeatures" {
+        // Quantas features ACTIVAS emite cada posicao, no modo das ameacas.
+        //
+        // O adaptador do treinador (`NapkChess::map_features`) corta a lista
+        // em `max_active()` = 192 pares. Se as posicoes reais passarem disso,
+        // o treinador aprende sobre uma posicao MUTILADA e o motor avalia
+        // sobre a inteira -- e nenhuma quantidade de treino aproxima as duas.
+        let atk = Attacks::new();
+        let mut n_max = 0usize;
+        let mut acima = 0usize;
+        let mut total = 0usize;
+        let mut soma = 0usize;
+        let caminho = args.get(2).map(|s| s.as_str()).unwrap_or("/root/kestrel_joao/UHO_4060_v2.epd");
+        let texto = std::fs::read_to_string(caminho).expect("sem epd");
+        let mut rng: u64 = 12345;
+        for linha in texto.lines().take(400) {
+            let fen = linha.split(';').next().unwrap_or("").trim();
+            if fen.is_empty() { continue; }
+            let mut b = Board::from_fen(fen);
+            // Alguns lances a partir da abertura, para apanhar meio-jogo a
+            // serio: e' la' que ha' mais ameacas.
+            for _ in 0..24 {
+                let legais = movegen::generate_legal(&mut b, &atk);
+                if legais.is_empty() { break; }
+                rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+                let mv = legais[(rng as usize) % legais.len()];
+                b.make_move(&mv);
+                let pos = features::Pos { pieces: b.pieces };
+                let mut n = 0usize;
+                features::map_features_pairs_mode(&pos, 0, 2, &mut |_a, _b| { n += 1; });
+                total += 1; soma += n;
+                if n > n_max { n_max = n; }
+                if n > 192 { acima += 1; }
+            }
+        }
+        println!("posicoes: {total}");
+        println!("features activas: media {:.1}, maximo {}", soma as f64 / total as f64, n_max);
+        println!("acima do corte de 192: {} ({:.1}%)", acima, 100.0 * acima as f64 / total as f64);
+        return;
+    }
+    if args.len() >= 2 && args[1] == "churn" {
+        // Quantas features MUDAM de um lance para o seguinte, separadas por
+        // metade (peca-casa contra ameacas).
+        //
+        // E' o numero que decide se vale a pena tornar algo incremental, e
+        // as quatro tentativas anteriores mediram-no so' para o conjunto
+        // todo. Uma metade pode compensar largamente e a outra nao: as
+        // features de peca mudam uma ou duas por lance (excepto quando o
+        // nosso rei muda de bucket, e ai mudam TODAS), enquanto mexer uma
+        // peca reescreve o mapa de ataque dela e com ele muitas ameacas.
+        // Somar as duas esconde exactamente a diferenca que interessa.
+        let atk = Attacks::new();
+        let caminho = args.get(2).map(|s| s.as_str()).unwrap_or("/root/kestrel_joao/UHO_4060_v2.epd");
+        let texto = std::fs::read_to_string(caminho).expect("sem epd");
+        let mut rng: u64 = 987_654_321;
+        let (mut n_lances, mut d_pecas, mut d_ameacas) = (0usize, 0usize, 0usize);
+        let (mut tot_pecas, mut tot_ameacas) = (0usize, 0usize);
+        let mut trocas_bucket = 0usize;
+        let recolhe = |b: &mut Board| -> (std::collections::HashSet<usize>, std::collections::HashSet<usize>) {
+            let pos = features::Pos { pieces: b.pieces };
+            let (mut p, mut a) = (std::collections::HashSet::new(), std::collections::HashSet::new());
+            features::map_features_pairs_mode(&pos, 0, 2, &mut |x, _y| {
+                if x < features::PIECE_FEATURES { p.insert(x); } else { a.insert(x); }
+            });
+            (p, a)
+        };
+        for linha in texto.lines().take(200) {
+            let fen = linha.split(';').next().unwrap_or("").trim();
+            if fen.is_empty() { continue; }
+            let mut b = Board::from_fen(fen);
+            let (mut p0, mut a0) = recolhe(&mut b);
+            for _ in 0..24 {
+                let ks_antes = b.pieces[0][5].trailing_zeros() as usize;
+                let legais = movegen::generate_legal(&mut b, &atk);
+                if legais.is_empty() { break; }
+                rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+                let mv = legais[(rng as usize) % legais.len()];
+                b.make_move(&mv);
+                let ks_depois = b.pieces[0][5].trailing_zeros() as usize;
+                if features::BUCKET_MAP[ks_antes] != features::BUCKET_MAP[ks_depois] {
+                    trocas_bucket += 1;
+                }
+                let (p1, a1) = recolhe(&mut b);
+                // Simetrica: entradas mais saidas, que e' o trabalho real de
+                // um acumulador incremental (uma coluna somada ou subtraida).
+                d_pecas += p0.symmetric_difference(&p1).count();
+                d_ameacas += a0.symmetric_difference(&a1).count();
+                tot_pecas += p1.len();
+                tot_ameacas += a1.len();
+                n_lances += 1;
+                p0 = p1; a0 = a1;
+            }
+        }
+        let n = n_lances as f64;
+        println!("lances medidos: {n_lances}");
+        println!("  PECAS   : {:5.1} activas, {:5.1} mudam por lance  ({:4.1}%)",
+                 tot_pecas as f64 / n, d_pecas as f64 / n, 100.0 * d_pecas as f64 / tot_pecas as f64);
+        println!("  AMEACAS : {:5.1} activas, {:5.1} mudam por lance  ({:4.1}%)",
+                 tot_ameacas as f64 / n, d_ameacas as f64 / n, 100.0 * d_ameacas as f64 / tot_ameacas as f64);
+        println!("  trocas de bucket do rei: {} ({:.1}% dos lances)",
+                 trocas_bucket, 100.0 * trocas_bucket as f64 / n);
+        return;
+    }
+    if args.len() >= 2 && args[1] == "saudev3" {
+        // Quantos neuronios das camadas escondidas estao mortos.
+        //
+        // O Coda documenta a morte de neuronios de fc1 por volta do SB40 sem
+        // aquecimento do LR, e o nosso treinador da v3 nao tem aquecimento
+        // nenhum -- cosseno desde o superbatch 1. Isto mede em vez de supor:
+        // sob SCReLU um neuronio que nunca passa de zero contribui zero.
+        let Some(net) = crate::nnue_v3::rede() else {
+            eprintln!("sem KESTREL_NNUE_V3");
+            return;
+        };
+        let n: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(3000);
+        crate::nnue_v3::SAUDE.store(true, std::sync::atomic::Ordering::Relaxed);
+        let atk = Attacks::new();
+        // Com um ficheiro EPD mede-se em posicoes REAIS. Sem ele o percurso
+        // aleatorio a partir da posicao inicial passa a maior parte do tempo
+        // em posicoes que nenhuma partida produz, e um neuronio que so'
+        // dispara em estruturas de meio-jogo a serio aparece morto sem o
+        // estar. Foi o erro da primeira medicao.
+        if let Some(caminho) = args.get(3) {
+            let texto = match std::fs::read_to_string(caminho) {
+                Ok(t) => t,
+                Err(e) => { eprintln!("nao consegui ler {caminho}: {e}"); return; }
+            };
+            let mut vistas = 0usize;
+            for linha in texto.lines().take(n) {
+                let fen = linha.split(';').next().unwrap_or("").trim();
+                if fen.is_empty() { continue; }
+                let mut b = Board::from_fen(fen);
+                // Alguns lances a partir de cada posicao: uma abertura sozinha
+                // e' meia duzia de estruturas, e o que interessa e' cobrir o
+                // meio-jogo que a rede vai mesmo ver.
+                for _ in 0..12 {
+                    if let Some(net3) = crate::nnue_v3::rede() {
+                        if let Some(acc) = b.acc_v3.as_ref() { let _ = acc.valor(net3, &b); vistas += 1; }
+                    }
+                    let legais = movegen::generate_legal(&mut b, &atk);
+                    if legais.is_empty() { break; }
+                    let mv = legais[vistas % legais.len()];
+                    b.make_move(&mv);
+                }
+            }
+            imprime_saude(vistas);
+            return;
+        }
+        let mut rng = 0x1234_5678_9abc_def0u64;
+        let mut board = Board::startpos();
+        let mut jogadas = 0usize;
+        while jogadas < n {
+            let mvs = movegen::generate_legal(&mut board, &atk);
+            if mvs.is_empty() {
+                board = Board::startpos();
+                continue;
+            }
+            let _ = board.acc_v3.as_ref().map(|a| a.valor(net, &board));
+            rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+            let mv = mvs[(rng as usize) % mvs.len()];
+            board.make_move(&mv);
+            jogadas += 1;
+            if board.halfmove >= 100 || board.occ_all.count_ones() <= 4 {
+                board = Board::startpos();
+            }
+        }
+        imprime_saude(0);
+        return;
+    }
+    if args.len() >= 2 && args[1] == "verificav3" {
+        // O acumulador incremental da v3 contra a recomputacao total, a cada
+        // ply de jogos REAIS -- e depois de cada undo.
+        //
+        // Posicoes soltas nao servem: o caminho incremental so' e' alimentado
+        // por add_piece/remove_piece, chamados de dentro de make_move e
+        // unmake_move. Uma lista de FENs testaria apenas o `fresh()`.
+        if nnue_v3::rede().is_none() {
+            eprintln!("precisa de KESTREL_NNUE_V3");
+            return;
+        }
+        let net = nnue_v3::rede().unwrap();
+        let atk = Attacks::new();
+        let n_jogos: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(60);
+        let plies: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(120);
+        let mut seed: u64 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(1);
+        let mut rng = move || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed };
+        let (mut n, mut mal, mut mal_undo) = (0usize, 0usize, 0usize);
+        for _ in 0..n_jogos {
+            let mut board = Board::startpos();
+            let mut hist: Vec<(moves::Move, board::Undo)> = Vec::new();
+            for _ in 0..plies {
+                let legais = movegen::generate_legal(&mut board, &atk);
+                if legais.is_empty() { break; }
+                let mv = legais[(rng() as usize) % legais.len()];
+                let undo = board.make_move(&mv);
+                n += 1;
+                let inc = board.acc_v3.as_ref().unwrap().valor(net, &board);
+                let cheio = nnue_v3::evaluate(net, &board);
+                if inc != cheio {
+                    mal += 1;
+                    if mal <= 3 {
+                        let (ca, np) = board.acc_v3.as_ref().unwrap().debug_fase();
+                        eprintln!("DIVERGE inc={} cheio={} | acc: com_ameacas={} n_pecas={} | tabuleiro: {} pecas | {}",
+                                  inc, cheio, ca, np, board.occ_all.count_ones(), board.to_fen());
+                    }
+                }
+                hist.push((mv, undo));
+                if hist.len() % 7 == 0 {
+                    let (m2, u2) = *hist.last().unwrap();
+                    board.unmake_move(&m2, &u2);
+                    let inc = board.acc_v3.as_ref().unwrap().valor(net, &board);
+                    let cheio = nnue_v3::evaluate(net, &board);
+                    if inc != cheio {
+                        mal_undo += 1;
+                        if mal_undo <= 3 { eprintln!("DIVERGE undo inc={} cheio={} {}", inc, cheio, board.to_fen()); }
+                    }
+                    board.make_move(&m2);
+                }
+            }
+        }
+        println!("v3: {} lances, {} divergencias make, {} divergencias unmake", n, mal, mal_undo);
+        if mal > 0 || mal_undo > 0 { std::process::exit(1); }
+        return;
+    }
     if args.len() >= 2 && args[1] == "verificacache" {
         // A cache de refresh contra a reconstrucao do zero, em posicoes reais.
         let net = match nnue::rede() {
@@ -501,6 +754,280 @@ fn main() {
         let t: usize = args.get(5).and_then(|s| s.parse().ok())
             .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4));
         bullet_data(&args[2], &args[3], d, t);
+        return;
+    }
+    if args.len() >= 5 && args[1] == "sfconvert" {
+        // sfconvert <raw.bin do bullet> <molde.nnue> <saida.nnue>
+        //
+        // bullet's raw.bin is the source of truth: plain f32 tensors, written
+        // in the store's alphabetical order (fc0b, fc0w, fc1b, fc1w, fc2b,
+        // fc2w, l0b, l0w). The mould supplies the header fields so
+        // Stockfish's architecture-hash check passes.
+        const FACT: usize = 704;
+        const DUST: usize = 1;
+        const FEAT: usize = 86896;
+        const NIN: usize = FACT + FEAT + DUST;
+        const L1: usize = 1024;
+        const L2: usize = 32;
+        const L3: usize = 32;
+        const NB: usize = 8;
+
+        let raw = match std::fs::read(&args[2]) {
+            Ok(b) => b,
+            Err(e) => { eprintln!("nao consegui ler {}: {e}", args[2]); return; }
+        };
+        let f32s: Vec<f32> = raw
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        // Alphabetical, as the trainer's weight store emits them. The
+        // per-layer factorisers (fc0f/fc1f/fc2f) are shared across buckets and
+        // must be folded into every bucket here -- the .nnue format has no
+        // notion of them.
+        let tam = [
+            ("fc0b", L2 * NB), ("fc0fb", L2), ("fc0fw", L2 * L1), ("fc0w", L2 * NB * L1),
+            ("fc1b", L3 * NB), ("fc1fb", L3), ("fc1fw", L3 * 2 * L2), ("fc1w", L3 * NB * 2 * L2),
+            ("fc2b", NB), ("fc2fb", 1), ("fc2fw", 2 * L2 + 2 * L3), ("fc2w", NB * (2 * L2 + 2 * L3)),
+            ("l0b", L1), ("l0w", L1 * NIN),
+            ("psqtb", NB), ("psqtw", NB * NIN),
+        ];
+        let total: usize = tam.iter().map(|(_, n)| n).sum();
+        if f32s.len() != total {
+            eprintln!("raw.bin tem {} valores, esperava {total} -- arquitectura diferente?", f32s.len());
+            return;
+        }
+        let mut o = 0usize;
+        let mut get = |n: usize| -> &[f32] { let s = &f32s[o..o + n]; o += n; s };
+        // A ORDEM E' A DA LISTA `SavedFormat`, nao alfabetica.
+        //
+        // `save_unquantised` percorre `for fmt in saved_format` e escreve os
+        // tensores por essa ordem, tal como estao no optimizador -- sem aplicar
+        // `.transpose()` nem `.round()`, que so' valem para o `quantised.bin`.
+        //
+        // Liamos isto por ordem alfabetica, portanto TODOS os tensores vinham
+        // do sitio errado. Foi isso que obrigou a inventar uma negacao da saida
+        // e que deixou a transposicao a parecer ambigua: nao havia layout
+        // nenhum que salvasse a leitura, porque o problema era estarmos a ler
+        // os pesos uns dos outros.
+        let l0w = get(L1 * NIN).to_vec();
+        let l0b = get(L1).to_vec();
+        let fc0w = get(L2 * NB * L1).to_vec();
+        let fc0b = get(L2 * NB).to_vec();
+        let fc1w = get(L3 * NB * 2 * L2).to_vec();
+        let fc1b = get(L3 * NB).to_vec();
+        let fc2w = get(NB * (2 * L2 + 2 * L3)).to_vec();
+        let fc2b = get(NB).to_vec();
+        let fc0fw = get(L2 * L1).to_vec();
+        let fc0fb = get(L2).to_vec();
+        let fc1fw = get(L3 * 2 * L2).to_vec();
+        let fc1fb = get(L3).to_vec();
+        let fc2fw = get(2 * L2 + 2 * L3).to_vec();
+        let fc2fb = get(1).to_vec();
+        let psqtw = get(NB * NIN).to_vec();
+        let _psqtb = get(NB).to_vec();
+
+        let molde_bytes = match std::fs::read(&args[3]) {
+            Ok(b) => b,
+            Err(e) => { eprintln!("nao consegui ler o molde {}: {e}", args[3]); return; }
+        };
+        let molde = match nnue_sf::carrega_pub(&molde_bytes) {
+            Some(n) => n,
+            None => { eprintln!("molde invalido"); return; }
+        };
+
+        let net = nnue_sf::de_bullet(&molde, &l0w, &l0b, &fc0w, &fc0b, &fc1w, &fc1b, &fc2w, &fc2b, &psqtw,
+            &fc0fw, &fc0fb, &fc1fw, &fc1fb, &fc2fw, &fc2fb);
+        let saida = nnue_sf::escreve(&net);
+        match std::fs::write(&args[4], &saida) {
+            Ok(()) => println!("escrito: {} ({} bytes)", args[4], saida.len()),
+            Err(e) => eprintln!("nao consegui escrever: {e}"),
+        }
+        return;
+    }
+    if args.len() >= 2 && args[1] == "dustbin" {
+        // Quanto e' que o dustbin pesa, em numeros e nao em opiniao.
+        //
+        // Para cada posicao do bench conta, por perspectiva, as features de
+        // ameaca reais e as que caem no dustbin -- e sobretudo as ASSIMETRICAS,
+        // que sao reais de um lado e dustbin do outro. E' a assimetria que
+        // impede o dustbin de ser uma constante absorvivel.
+        let mut t_reais = 0u64;
+        let mut t_dust = 0u64;
+        let mut t_assim = 0u64;
+        let mut pos_com_assim = 0u64;
+        let mut n = 0u64;
+        let mut pior = 0usize;
+        for fen in BENCH_FENS.iter() {
+            let mut b = board::Board::from_fen(fen);
+            let pb = nnue_sf::board_para_posbb_pub(&mut b);
+            let mut f0 = Vec::new();
+            let mut f1 = Vec::new();
+            nnue_sf::threats_pad_pub(&pb, 0, &mut f0);
+            nnue_sf::threats_pad_pub(&pb, 1, &mut f1);
+            let dust = nnue_sf::threat_dim_pub();
+            let d0 = f0.iter().filter(|&&x| x == dust).count();
+            let d1 = f1.iter().filter(|&&x| x == dust).count();
+            // As listas vem alinhadas por construcao (e' para isso que existe o
+            // dustbin), logo o par i e' a mesma ameaca vista dos dois lados.
+            let mut assim = 0usize;
+            for i in 0..f0.len().min(f1.len()) {
+                if (f0[i] == dust) != (f1[i] == dust) { assim += 1; }
+            }
+            t_reais += (f0.len() - d0 + f1.len() - d1) as u64;
+            t_dust += (d0 + d1) as u64;
+            t_assim += 2 * assim as u64;
+            if assim > 0 { pos_com_assim += 1; }
+            if assim > pior { pior = assim; }
+            n += 1;
+        }
+        let tot = t_reais + t_dust;
+        println!("{n} posicoes do bench");
+        println!("features de ameaca (as duas perspectivas): {tot}");
+        println!("  reais:      {t_reais} ({:.1}%)", 100.0 * t_reais as f64 / tot as f64);
+        println!("  no dustbin: {t_dust} ({:.1}%)", 100.0 * t_dust as f64 / tot as f64);
+        println!("  ASSIMETRICAS (real de um lado, dustbin do outro): {t_assim} ({:.2}%)",
+            100.0 * t_assim as f64 / tot as f64);
+        println!("posicoes com pelo menos uma assimetrica: {pos_com_assim} de {n}");
+        println!("pior posicao: {pior} ameacas assimetricas");
+        return;
+    }
+    if args.len() >= 4 && args[1] == "sfbulletrt" {
+        // sfbulletrt <rede.nnue> <saida.nnue>
+        //
+        // Escreve a rede no layout do bullet e volta a le-la pelo `de_bullet`.
+        // A resposta certa e' conhecida -- tem de sair a rede de partida.
+        let bytes = match std::fs::read(&args[2]) {
+            Ok(b) => b,
+            Err(e) => { eprintln!("nao consegui ler {}: {e}", args[2]); return; }
+        };
+        let net = match nnue_sf::carrega_pub(&bytes) {
+            Some(n) => n,
+            None => { eprintln!("nao consegui interpretar {}", args[2]); return; }
+        };
+        let volta = nnue_sf::roundtrip_bullet(&net);
+        let saida = nnue_sf::escreve(&volta);
+        println!("entrada: {} bytes", bytes.len());
+        println!("saida:   {} bytes", saida.len());
+        if saida == bytes {
+            println!("IDENTICO -- o de_bullet reproduz a rede exactamente");
+        } else {
+            let n = bytes.len().min(saida.len());
+            let dif = (0..n).filter(|&i| bytes[i] != saida[i]).count();
+            let prim = (0..n).find(|&i| bytes[i] != saida[i]).unwrap_or(n);
+            println!("DIFERENTE: {} bytes diferentes de {}, o primeiro em {}", dif, n, prim);
+        }
+        let _ = std::fs::write(&args[3], &saida);
+        println!("escrito: {}", args[3]);
+        return;
+    }
+    if args.len() >= 3 && args[1] == "sfroundtrip" {
+        // sfroundtrip <rede.nnue> [saida.nnue]
+        //
+        // Reads a Stockfish net with our own reader and writes it straight
+        // back out. If the bytes come out identical to the input, the
+        // serialiser reproduces SF's format exactly -- which is the
+        // precondition for writing a net Stockfish will accept.
+        let entrada = &args[2];
+        let bytes = match std::fs::read(entrada) {
+            Ok(b) => b,
+            Err(e) => { eprintln!("nao consegui ler {entrada}: {e}"); return; }
+        };
+        let net = match nnue_sf::carrega_pub(&bytes) {
+            Some(n) => n,
+            None => { eprintln!("nao consegui interpretar {entrada}"); return; }
+        };
+        let saida_bytes = nnue_sf::escreve(&net);
+        println!("entrada: {} bytes", bytes.len());
+        println!("saida:   {} bytes", saida_bytes.len());
+        if saida_bytes == bytes {
+            println!("IDENTICO -- o serializador reproduz o formato do SF byte a byte");
+        } else {
+            println!("DIFERENTE");
+            let n = bytes.len().min(saida_bytes.len());
+            let primeiro = (0..n).find(|&i| bytes[i] != saida_bytes[i]);
+            match primeiro {
+                Some(i) => println!("  primeiro byte diferente no offset {i}"),
+                None => println!("  prefixo igual, comprimentos diferentes"),
+            }
+        }
+        if let Some(dest) = args.get(3) {
+            if let Err(e) = std::fs::write(dest, &saida_bytes) {
+                eprintln!("nao consegui escrever {dest}: {e}");
+            } else {
+                println!("escrito: {dest}");
+            }
+        }
+        return;
+    }
+    if args.len() >= 4 && args[1] == "accdump" {
+        // accdump <fens.txt> <out.bin>
+        //
+        // Dumps, per position, the 1024 post-SCReLU activations that feed the
+        // output layer, plus the network's own score. For asking offline what
+        // a different READOUT could do with the features this network already
+        // computes -- fitting a per-king-zone weight vector against the single
+        // global one, say -- which answers an output-bucketing question
+        // without paying for a training run to find out.
+        //
+        // The score rides along as a checksum, not as a label: a fit that
+        // reproduces `evaluate()` from these activations and the network's own
+        // l1 weights proves the dumped matrix is the one the engine actually
+        // reads. Without that check a transposed or mis-ordered dump would
+        // still produce a plausible-looking regression against any target.
+        let Some(net) = nnue::rede() else {
+            eprintln!("accdump precisa de KESTREL_NNUE=<rede.bin>");
+            return;
+        };
+        let texto = match std::fs::read_to_string(&args[2]) {
+            Ok(t) => t,
+            Err(e) => { eprintln!("nao consegui ler {}: {e}", args[2]); return; }
+        };
+        let mut bin: Vec<u8> = Vec::new();
+        let mut fens_usadas = String::new();
+        let mut n = 0usize;
+        let mut saltadas = 0usize;
+        for linha in texto.lines() {
+            // EPD carries operations after a ';' and sometimes after the
+            // move-number fields; take the board part and let from_fen default
+            // the rest.
+            let fen = linha.split(';').next().unwrap_or("").trim();
+            if fen.is_empty() || fen.starts_with('#') {
+                continue;
+            }
+            let board = Board::from_fen(fen);
+            // A FEN that failed to parse leaves an empty board, which would
+            // otherwise enter the fit as a row of zeros and quietly drag every
+            // coefficient toward it.
+            if board.occ_all.count_ones() < 2 {
+                saltadas += 1;
+                continue;
+            }
+            for v in nnue::activacoes_saida(net, &board) {
+                bin.extend_from_slice(&v.to_le_bytes());
+            }
+            bin.extend_from_slice(&nnue::evaluate_board(net, &board).to_le_bytes());
+            fens_usadas.push_str(fen);
+            fens_usadas.push('\n');
+            n += 1;
+        }
+        if let Err(e) = std::fs::write(&args[3], &bin) {
+            eprintln!("nao consegui escrever {}: {e}", args[3]);
+            return;
+        }
+        let fens_path = format!("{}.fens", args[3]);
+        if let Err(e) = std::fs::write(&fens_path, &fens_usadas) {
+            eprintln!("nao consegui escrever {fens_path}: {e}");
+            return;
+        }
+        println!(
+            "accdump: {} posicoes ({} saltadas), {} valores por posicao + score -> {} ({:.1} MB) e {}",
+            n,
+            saltadas,
+            2 * nnue::HIDDEN,
+            args[3],
+            bin.len() as f64 / 1e6,
+            fens_path
+        );
         return;
     }
     let mut engine = uci::Engine::new();

@@ -120,6 +120,40 @@ const PREDADOR_FOLGADO_PCT: i64 = 130;
 /// A partir de que vantagem, em decimos do relogio dele, se considera folga.
 /// 13 = 1.3x o relogio dele.
 const PREDADOR_FOLGA_R10: i64 = 13;
+
+/// O outro lado do ritmo: quanto podemos pensar ACIMA do ritmo dele quando
+/// NAO temos folga de relogio, em percentagem do ritmo dele.
+///
+/// A regra do predador acima e' so' um PISO -- acompanha um adversario lento e
+/// nao faz nada contra um rapido. Medido em quatro partidas de blitz reais:
+/// gastamos 15-25% mais por lance do que o adversario e acabamos com muito
+/// menos relogio (21s contra 53s num 180+0), que e' onde aparecem os erros e
+/// as bandeiras.
+///
+/// Um tecto absoluto ja' foi tentado e era mau -- ver PREDADOR_PCT: apagava o
+/// investimento do meio-jogo sempre que ele respondesse depressa. A diferenca
+/// aqui e' o `folgado`: com o relogio a nosso favor nao se aplica nada e
+/// investe-se a vontade; so' quando estamos a par ou atras e' que se recusa a
+/// pensar varias vezes o que ele pensa.
+///
+/// 250 = podemos gastar 2.5x o ritmo dele. Nao corta o lance normal (andamos
+/// nos 1.25x); corta os picos -- sete segundos num lance contra um adversario
+/// que responde em 1.4s.
+///
+/// NAO E' UM VALOR AFINADO. Entra desligado (`RitmoTecto` a 0) precisamente
+/// para poder ser medido por SPRT antes de contar para alguma coisa, um valor
+/// de cada vez, como o HARD_CAP_BUDGET_MULT exige de si proprio.
+const TECTO_RITMO_PCT_OMISSAO: i64 = 0;
+static TECTO_RITMO: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(TECTO_RITMO_PCT_OMISSAO);
+
+pub fn tecto_ritmo() -> i64 {
+    TECTO_RITMO.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_tecto_ritmo(v: i64) {
+    TECTO_RITMO.store(v.clamp(0, 1000), std::sync::atomic::Ordering::Relaxed);
+}
 /// The hard ceiling, as a percentage of the remaining clock. Guards the game
 /// as a whole; on a healthy clock the ceiling below binds long before it.
 /// Corrigido de 45 para 25: o tecto real nunca passava dos 25%.
@@ -246,6 +280,7 @@ fn compute_time_budget(
     pieces_left: i64,
     game_ply: i64,
     opp_pace: Option<i64>,
+    relogio_inicial: Option<i64>,
 ) -> (i64, i64) {
     let safe_time = (my_time - move_overhead_ms()).max(1);
 
@@ -429,6 +464,19 @@ fn compute_time_budget(
             let fac = if folgado { PREDADOR_FOLGADO_PCT } else { PREDADOR_PCT };
             let predador = pace * fac / 100;
             soft = soft.max(predador.min(hard_cap));
+
+            // E o tecto, so' sem folga de relogio. Ver TECTO_RITMO_PCT_OMISSAO.
+            //
+            // Aplicado ao `soft` e nao ao `hard_cap`: uma posicao critica
+            // continua a poder pedir a extensao que merece, e o que se recusa
+            // e' gastar por rotina varias vezes o que ele gasta. Nunca abaixo
+            // do que a formula normal ja' daria sem ritmo nenhum, para um
+            // adversario que joga de livro instantaneamente nao nos deixar
+            // sem tempo para pensar.
+            let tecto = tecto_ritmo();
+            if tecto > 0 && !folgado {
+                soft = soft.min((pace * tecto / 100).max(base));
+            }
         }
     }
 
@@ -436,10 +484,25 @@ fn compute_time_budget(
     let clearly_winning = last_score.map(|s| s >= 400).unwrap_or(false);
     let clearly_losing = last_score.map(|s| s <= -400).unwrap_or(false);
 
-    // Nivel 2: relogio baixo (< 20s) e SEM vantagem clara -- corta mais
+    // Os patamares, escalados ao ritmo da partida.
+    //
+    // Eram 20s e 10s fixos. Um nono do relogio inicial da' exactamente esses
+    // vinte segundos num 180+0 -- o blitz nao muda nada -- e desce-os para
+    // oito num 60+0, onde vinte eram um terco da partida a ser jogada em modo
+    // de corte. O tecto de 20s mantem o comportamento de tudo o que seja mais
+    // lento do que blitz, onde a formula ja estava calibrada.
+    //
+    // Sem relogio inicial conhecido (analise, `go` sem tempos) fica-se pelos
+    // valores de sempre.
+    let limiar_corte = relogio_inicial
+        .map(|ini| (ini / 9).clamp(8_000, 20_000))
+        .unwrap_or(20_000);
+    let limiar_rajada = limiar_corte / 2;
+
+    // Nivel 2: relogio baixo e SEM vantagem clara -- corta mais
     // fundo do que a formula normal permitiria. So' se relaxa quando a
     // vantagem e' NOSSA (clearly_winning); nunca quando e' do adversario.
-    if safe_time < 20_000 && !clearly_winning {
+    if safe_time < limiar_corte && !clearly_winning {
         let cut = (safe_time / 25).clamp(20, 800);
         soft = soft.min(cut);
         hard_cap = hard_cap.min(cut);
@@ -459,7 +522,7 @@ fn compute_time_budget(
     // Ten seconds buys about eighty moves at this rate, which is more chess
     // than most positions have remaining. Kept clear of the panic tier below,
     // which is a different thing: this is playing fast, that is surviving.
-    if safe_time < 10_000 {
+    if safe_time < limiar_rajada {
         let burst = (safe_time / 80).clamp(15, 150);
         soft = soft.min(burst);
         // An increment is income, not savings. Whatever is spent up to it comes
@@ -643,6 +706,20 @@ pub struct Engine {
     /// Semente para escolher entre lances de livro. Ver escolhe_do_livro.
     book_rng: u64,
     opp_time_anterior: Option<i64>,
+    /// O relogio no inicio DESTA partida, estimado pelo maior valor ja visto.
+    ///
+    /// Existe porque os patamares de relogio baixo eram absolutos -- cortar
+    /// aos 20s e disparar aos 10s -- e vinte segundos nao querem dizer o mesmo
+    /// em todos os ritmos: num 180+0 sao o ultimo nono do relogio, num 60+0
+    /// sao um terco dele. O bullet entrava em modo de corte com um terco da
+    /// partida por jogar, que e' a origem do "primeiro lento de mais, depois
+    /// rapido de mais".
+    ///
+    /// Estimado e nao recebido: o UCI nao diz qual foi o relogio inicial, so'
+    /// o actual. O maior ja visto e' exacto desde o primeiro `go` da partida,
+    /// e se a ponte so' apanhar o jogo a meio erra para MENOS, o que torna os
+    /// patamares mais conservadores em vez de mais arriscados.
+    relogio_inicial: Option<i64>,
     opp_pace: Option<i64>,
     last_score: Option<i32>, // score (cp, nossa perspetiva) do ultimo "go" -- para os niveis 2/3 de compute_time_budget
     style_book: Option<crate::book::Book>, // "assinatura" da Judit Polgar -- ver book.rs
@@ -668,7 +745,22 @@ impl Engine {
     pub fn new() -> Self {
         let atk = Attacks::new();
         let zob = Zobrist::new();
-        let style_book = crate::book::Book::load(&default_style_book_path()).ok();
+        // DESLIGAR O LIVRO, e dizê-lo em voz alta.
+        //
+        // Já era possível ficar sem livro -- bastava o ficheiro não existir --
+        // mas isso acontece EM SILÊNCIO, e foi assim que o motor jogou dias
+        // inteiros a improvisar aberturas sem ninguém dar por isso, depois de
+        // o ficheiro ser renomeado. Uma ausência que se escolhe tem de se
+        // distinguir de uma ausência por acidente.
+        let sem_livro = std::env::var("KESTREL_SEM_LIVRO")
+            .map(|v| v != "0")
+            .unwrap_or(false);
+        let style_book = if sem_livro {
+            eprintln!("livro: DESLIGADO por KESTREL_SEM_LIVRO -- aberturas jogadas pela busca");
+            None
+        } else {
+            crate::book::Book::load(&default_style_book_path()).ok()
+        };
         // Build every lazily-initialised global now, while no clock is
         // running -- see evaluation::warmup().
         // Profile before warm-up: warm-up evaluates a position, which seals
@@ -696,6 +788,7 @@ impl Engine {
                 | 1,
             opp_time_anterior: None,
             opp_pace: None,
+            relogio_inicial: None,
             last_score: None,
             style_book,
             threads: 1,
@@ -925,6 +1018,12 @@ impl Engine {
         }
         if wtime > 0 || btime > 0 {
             self.opp_time_anterior = Some(opp_time);
+            // O maior relogio ja visto nesta partida e a melhor estimativa do
+            // inicial que o UCI permite. Ver `relogio_inicial`.
+            self.relogio_inicial = Some(match self.relogio_inicial {
+                Some(m) => m.max(my_time),
+                None => my_time,
+            });
         }
 
         let instant_book_ok = restrict_root.is_empty()
@@ -932,6 +1031,36 @@ impl Engine {
             && depth.is_none()
             && nodes.is_none()
             && std::env::var_os("KESTREL_NO_BOOK_INSTANT").is_none();
+
+        // UM so' lance legal: joga-se, nao se pensa.
+        //
+        // Nao havia atalho nenhum para isto -- uma recaptura obrigatoria ou uma
+        // saida de xeque unica pagavam a busca inteira, e num relogio de bullet
+        // isso e' orcamento gasto onde nao ha nada para decidir. Reportado com
+        // `time 0` e `nodes 0` porque e' a verdade: nao houve busca.
+        //
+        // A montante do livro e das tablebases de proposito: se so' ha um
+        // lance, nem vale a pena perguntar-lhes. Gerar os legais custa
+        // microsegundos contra os centenas de milissegundos que se poupam.
+        //
+        // Sem pontuacao inventada: a busca e' que sabe quanto vale a posicao e
+        // aqui nao correu, portanto anuncia-se cp 0. Quem le' o score para
+        // decidir empates (ver `lichess_bridge.py`) ve' um valor neutro, que e'
+        // preferivel a um numero com ar de opiniao que ninguem formou.
+        if instant_book_ok {
+            let legais = crate::movegen::generate_legal(&mut self.board, &self.atk);
+            if legais.len() == 1 {
+                let mv = legais[0];
+                let _ = writeln!(
+                    out,
+                    "info depth 1 multipv 1 score cp 0 nodes 0 nps 0 time 0 pv {}",
+                    mv.to_uci()
+                );
+                let _ = writeln!(out, "bestmove {}", mv.to_uci());
+                let _ = out.flush();
+                return;
+            }
+        }
         // Solved before it is searched.
         //
         // Same place as the book and for the same reason: if the answer already
@@ -1189,7 +1318,7 @@ impl Engine {
                 compute_time_budget(my_time, my_inc, opp_time, movestogo, self.last_score,
                                     pieces_left, (self.board.fullmove as i64 - 1) * 2
                                         + if side_white { 0 } else { 1 },
-                                    self.opp_pace);
+                                    self.opp_pace, self.relogio_inicial);
             // The opening is played, not calculated -- including the parts of
             // it the book does not reach.
             //
@@ -1268,6 +1397,36 @@ impl Engine {
         let max_depth = depth.unwrap_or(64);
         let limits = SearchLimits { deadline, max_depth, max_nodes: nodes, soft_budget };
         let board_now = self.board.clone();
+        // Per-move piece values, when asked for. Printed BEFORE the search
+        // so the numbers describe the position the engine is about to think
+        // about, not the one it already chose a move in.
+        if std::env::var_os("KESTREL_VALORES_PECAS").is_some() {
+            let mut b = self.board.clone();
+            let n = b.occ_all.count_ones() as usize;
+            let balde = (n.saturating_sub(2) / 4).min(7);
+            let vals = crate::evaluation::valores_das_pecas(&mut b);
+            let mut linha = format!(
+                "info string pecas balde={} n={} escala={}",
+                balde,
+                n,
+                crate::nnue::escala_pos(&b)
+            );
+            for (pt, v, cnt) in vals {
+                linha.push_str(&format!(" {:?}={}({})", pt, v, cnt));
+            }
+            let _ = writeln!(out, "{}", linha);
+            let _ = out.flush();
+        }
+        // Raw static eval, no search at all -- for cross-checking a reader
+        // against an external oracle position by position, where even a
+        // depth-1 search already mixes in a best-move choice.
+        if std::env::var_os("KESTREL_EVAL_ONLY").is_some() {
+            let mut b = self.board.clone();
+            let v = crate::evaluation::evaluate(&mut b);
+            let _ = writeln!(out, "info string eval_only {}", v);
+            let _ = out.flush();
+            return;
+        }
         let history_now = self.history.clone();
         let mut excluded_root_moves: Vec<crate::moves::Move> = Vec::new();
         // searchmoves is expressed through the root-exclusion list the
@@ -1587,11 +1746,21 @@ impl Engine {
                         report: ti == 0,
                         thread_idx: ti,
                     };
-                    scope.spawn(move || {
-                        let mut searcher = searcher;
-                        let (best, score, depth_reached, nodes) = searcher.iterative_deepening(&mut b);
-                        (best, score, depth_reached, nodes, searcher)
-                    })
+                    // The default stack (2MB) is enough for the Rust search
+                    // alone, but an evaluation that allocates its working
+                    // buffers on the stack multiplies them by the real
+                    // negamax recursion depth, and 2MB does not survive that.
+                    // 16MB is generous headroom and costs nothing but virtual
+                    // address space on a 64-bit system.
+                    std::thread::Builder::new()
+                        .stack_size(16 * 1024 * 1024)
+                        .spawn_scoped(scope, move || {
+                            let mut searcher = searcher;
+                            let (best, score, depth_reached, nodes) =
+                                searcher.iterative_deepening(&mut b);
+                            (best, score, depth_reached, nodes, searcher)
+                        })
+                        .expect("failed to spawn search thread")
                 })
                 .collect();
             // Weighted vote across threads, not a head count.
@@ -1655,8 +1824,16 @@ impl Engine {
                     // plays -- it simply does not get to outvote one that
                     // searched something through to an end.
                     let trusted = if pv_len[i] > 2 { 1i64 } else { 0i64 };
-                    ((r.1 - min_score + 14) as i64) * (r.2.max(1) as i64) * trusted
+                    // SEM o factor de profundidade. O Stockfish actual pesa
+                    // por `score - minScore + 14` e mais nada; o `* depth`
+                    // vinha de uma versao antiga, a par do esquema de saltos
+                    // que o acompanhava. Com as threads todas a percorrer as
+                    // mesmas profundidades (ver search.rs), multiplicar pela
+                    // profundidade so' amplifica ruido de quem chegou la'
+                    // primeiro.
+                    ((r.1 - min_score + 14) as i64) * trusted
                 };
+                let mut return_idx: Option<usize> = None;
                 let mut votes: Vec<(Option<crate::moves::Move>, i64)> = Vec::new();
                 for (i, r) in results.iter().enumerate() {
                     match votes.iter_mut().find(|(m, _)| *m == r.0) {
@@ -1668,6 +1845,50 @@ impl Engine {
                 // search and the one whose clock decisions end it, so when the
                 // pool is genuinely split, the move already being announced is
                 // the one to play.
+                // DUAS coisas que a votacao nunca pode fazer, e que ate' aqui
+                // podia. Ambas vem do `get_best_thread` do Stockfish, que as
+                // trata antes de contar votos (GPL-3.0, ver NOTICES.md):
+                //
+                //   1. Eleger um lance cuja PROPRIA pontuacao e' derrota
+                //      provada. Uma thread convencida de que esta perdida nao
+                //      deve poder arrastar as outras para la'.
+                //   2. Sobrepor-se a uma thread que ja' provou vitoria. Se ha'
+                //      mate visto, a decisao passa a ser "qual o mate mais
+                //      curto" e a votacao deixa de mandar.
+                //
+                // A primeira e' exactamente a avaria registada no comentario
+                // acima -- "a votacao sobrepos-se a um thread principal
+                // CORRECTO e jogou o lance perdedor em 2 de 20". O peso podia
+                // ser grande porque `score - min_score` e' grande justamente
+                // quando as OUTRAS threads estao ainda pior.
+                let limiar_decisivo = crate::search::MATE_SCORE - crate::search::MAX_PLY as i32;
+                let vitoria = |sc: i32| sc >= limiar_decisivo;
+                let derrota = |sc: i32| sc <= -limiar_decisivo;
+
+                // Ha' vitoria provada? Entao escolhe-se o mate mais curto e
+                // acabou -- pontuacao maior significa mate em menos lances.
+                if let Some((i, _)) = results
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, r)| vitoria(r.1))
+                    .max_by_key(|(_, r)| r.1)
+                {
+                    return_idx = Some(i);
+                }
+
+                // Lances que sao derrota provada saem da contagem. Se TODOS o
+                // forem, nao ha nada a salvar e a votacao segue como antes --
+                // recusar tudo deixaria a escolha sem candidatos.
+                let algum_salvavel = results.iter().any(|r| !derrota(r.1));
+                if algum_salvavel {
+                    let perdidos: Vec<Option<crate::moves::Move>> = results
+                        .iter()
+                        .filter(|r| derrota(r.1))
+                        .map(|r| r.0)
+                        .collect();
+                    votes.retain(|(m, _)| !perdidos.contains(m) || results[0].0 == *m);
+                }
+
                 let top = votes.iter().map(|(_, v)| *v).max().unwrap_or(0);
                 let winner = if votes.iter().any(|(m, v)| *v == top && *m == results[0].0) {
                     results[0].0
@@ -1681,10 +1902,15 @@ impl Engine {
                 // Among the threads that agree on the winning move, take the
                 // one with the strongest individual claim: its PV is the one
                 // worth reporting.
-                (0..results.len())
-                    .filter(|&i| results[i].0 == winner)
-                    .max_by_key(|&i| weight(i, &results[i]))
-                    .unwrap_or(0)
+                match return_idx {
+                    // Vitoria provada: ja' esta decidido, e a votacao nao
+                    // opina sobre mates.
+                    Some(i) => i,
+                    None => (0..results.len())
+                        .filter(|&i| results[i].0 == winner)
+                        .max_by_key(|&i| weight(i, &results[i]))
+                        .unwrap_or(0),
+                }
             };
             let nodes_total: u64 = results.iter().map(|r| r.3).sum();
             let (best, score, depth_reached, _, winner) = results.remove(best_idx);
@@ -1748,12 +1974,42 @@ impl Engine {
                     let _ = writeln!(out, "option name Move Overhead type spin default {} min 0 max 5000", MOVE_OVERHEAD_DEFAULT_MS);
                     let _ = writeln!(out, "option name OnlineTablebase type check default false");
                     let _ = writeln!(out, "option name Contempt type spin default 20 min -200 max 200");
+                    // Escala da rede, em centesimos. Uma rede que avalia material
+                    // ao dobro faz TODAS as margens de poda dispararem ao dobro
+                    // da velocidade, porque elas sao centipeoes fixos. Medido:
+                    // uma dama vale 2578 na rede do Stockfish contra 1161 na
+                    // nossa antiga, para a qual as margens foram afinadas -- dai'
+                    // 222. Por opcao em vez de por compilacao, para o bot poder
+                    // trocar de rede sem recompilar.
+                    let _ = writeln!(out, "option name EvalFactor type spin default 100 min 20 max 500");
                     let _ = writeln!(out, "option name LazyVote type check default true");
                     let _ = writeln!(out, "option name Threats type check default true");
                     let _ = writeln!(
                         out,
+                        "option name EscalaPorBalde type check default false"
+                    );
+                    let _ = writeln!(
+                        out,
+                        "option name LmrCaptures type check default false"
+                    );
+                    let _ = writeln!(
+                        out,
                         "option name EvalScale type spin default {} min 100 max 2000",
                         crate::nnue::escala()
+                    );
+                    // Tecto de tempo pelo ritmo do adversario. 0 = desligado,
+                    // que e' a omissao ate' um SPRT dizer o contrario.
+                    let _ = writeln!(
+                        out,
+                        "option name RitmoTecto type spin default {} min 0 max 1000",
+                        tecto_ritmo()
+                    );
+                    // A partir de que fila um peao deixa de ser reduzido pelo
+                    // LMR. 0 = desligado. Ver PEAO_FILA_SEM_LMR.
+                    let _ = writeln!(
+                        out,
+                        "option name PeaoSemLmr type spin default {} min 0 max 8",
+                        crate::search::peao_fila_sem_lmr()
                     );
                     // Every search parameter, announced as a spin so an SPSA
                     // harness can read the default and the band straight from
@@ -1773,7 +2029,25 @@ impl Engine {
                         .iter()
                         .zip(crate::search::SearchParams::default().to_vec())
                     {
-                        let band = (d.abs()).max(10);
+                        // The band is normally proportional to the default, but
+                        // a parameter that defaults to zero would get a range of
+                        // 0..10 -- and these two are measured in MILLI-plies
+                        // (1/1024 of a ply), where the interesting values are
+                        // ~31 and ~1500. A tuner handed 0..10 would sweep a
+                        // range in which nothing it can set changes anything,
+                        // and report that the parameter does not matter.
+                        let band = match *n {
+                            "lmr_move_linear" => 120,
+                            "lmr_cutnode" => 3072,
+                            "lmr_capture_base" => 3072,
+                            "lmr_capture_hist_divisor" => 15000,
+                            // Mesma armadilha: `rfp_return_beta` e' uma fraccao
+                            // em 1024-avos com default 0, e a banda proporcional
+                            // dava-lhe 0..10 -- uma faixa onde nada do que o
+                            // afinador puser muda seja o que for.
+                            "rfp_return_beta" => 1024,
+                            _ => (d.abs()).max(10),
+                        };
                         // A default below zero exists (`hist_malus_offset`),
                         // and clamping the floor to zero puts the default
                         // OUTSIDE its own declared range. A strict UCI client
@@ -1810,6 +2084,19 @@ impl Engine {
                     } else if tokens.len() >= 5 && tokens[1] == "name" && tokens[2] == "LazyVote"
                         && tokens[3] == "value" {
                         self.lazy_vote = tokens[4].eq_ignore_ascii_case("true") || tokens[4] == "1";
+                    } else if tokens.len() >= 5 && tokens[1] == "name" && tokens[2] == "PeaoSemLmr"
+                        && tokens[3] == "value" {
+                        if let Ok(v) = tokens[4].parse::<i32>() {
+                            crate::search::set_peao_fila_sem_lmr(v);
+                        }
+                    } else if tokens.len() >= 5 && tokens[1] == "name" && tokens[2] == "RitmoTecto"
+                        && tokens[3] == "value" {
+                        // Percentagem do ritmo do adversario que podemos gastar
+                        // por lance quando NAO temos folga de relogio. Ver
+                        // TECTO_RITMO_PCT_OMISSAO.
+                        if let Ok(v) = tokens[4].parse::<i64>() {
+                            set_tecto_ritmo(v);
+                        }
                     } else if tokens.len() >= 5 && tokens[1] == "name" && tokens[2] == "EvalScale"
                         && tokens[3] == "value" {
                         // Exposed so it can be fitted the way every other search
@@ -1819,7 +2106,13 @@ impl Engine {
                         if let Ok(v) = tokens[4].parse::<i32>() {
                             crate::nnue::set_escala(v);
                         }
-                    } else if tokens.len() >= 5 && tokens[1] == "name" && tokens[2] == "Hash" && tokens[3] == "value" {
+                    } else if tokens.len() >= 5 && tokens[1] == "name" && tokens[2] == "EvalFactor"
+                        && tokens[3] == "value"
+                    {
+                        if let Ok(v) = tokens[4].parse::<i32>() {
+                            crate::nnue_sf::set_eval_factor(v);
+                        }
+                                        } else if tokens.len() >= 5 && tokens[1] == "name" && tokens[2] == "Hash" && tokens[3] == "value" {
                         if let Ok(mb) = tokens[4].parse::<usize>() {
                             self.tt = TranspositionTable::new(mb.max(1));
                         }
@@ -1829,6 +2122,14 @@ impl Engine {
                             crate::search::CONTEMPT.store(v.clamp(-200, 200),
                                 std::sync::atomic::Ordering::Relaxed);
                         }
+                    } else if tokens.len() >= 5 && tokens[1] == "name" && tokens[2] == "EscalaPorBalde"
+                        && tokens[3] == "value" {
+                        let on = tokens[4].eq_ignore_ascii_case("true") || tokens[4] == "1";
+                        crate::nnue::set_escala_por_balde(on);
+                    } else if tokens.len() >= 5 && tokens[1] == "name" && tokens[2] == "LmrCaptures"
+                        && tokens[3] == "value" {
+                        let on = tokens[4].eq_ignore_ascii_case("true") || tokens[4] == "1";
+                        crate::search::set_lmr_captures(on);
                     } else if tokens.len() >= 5 && tokens[1] == "name" && tokens[2] == "OnlineTablebase"
                         && tokens[3] == "value" {
                         let on = tokens[4].eq_ignore_ascii_case("true") || tokens[4] == "1";
@@ -1896,6 +2197,7 @@ impl Engine {
                     self.last_score = None;
                     self.opp_time_anterior = None;
                     self.opp_pace = None;
+                    self.relogio_inicial = None;
                 }
                 "position" => {
                     self.set_position(&tokens[1..]);
@@ -1904,6 +2206,12 @@ impl Engine {
                     self.cmd_go(&tokens[1..], &mut out);
                 }
                 "stop" => {}
+                "fen" => {
+                    // O FEN da posicao actual. Serve para gerar livros de
+                    // aberturas levando posicoes mais fundo com `position ...
+                    // moves ...` e lendo onde ficaram.
+                    let _ = writeln!(out, "{}", self.board.to_fen());
+                }
                 "evalraw" => {
                     // O numero pelado, na perspectiva do LADO A JOGAR --
                     // a mesma convencao usada por outros motores UCI, para

@@ -2,7 +2,7 @@
   <img src="assets/banner.png" alt="Kestrel" width="100%">
 </p>
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License: GPLv3](https://img.shields.io/badge/license-GPLv3-blue.svg)](COPYING)
 [![Lichess Bot](https://img.shields.io/badge/lichess-KestrelStrike-brightgreen?logo=lichess&logoColor=white)](https://lichess.org/@/KestrelStrike)
 [![Rust](https://img.shields.io/badge/language-Rust-orange?logo=rust)](https://www.rust-lang.org/)
 
@@ -105,11 +105,19 @@ cargo build --release
 
 ## 🧭 Design principle
 
-Kestrel is meant to be an *original* engine, not a clone. Concepts are drawn
-from the public chess-programming literature — the Chess Programming Wiki,
-forum discussions, published papers, and other open engines — but every line
-of code is written from scratch for this codebase, and every weight is trained
-on Kestrel's own data and validated in play, never copied from another engine.
+Kestrel is meant to be an *original* engine, not a clone, and the line falls in
+a specific place. Concepts are drawn from the public chess-programming
+literature — the Chess Programming Wiki, forum discussions, published papers,
+and other open engines. The **search is written from scratch for this
+codebase**, and every weight is **trained on Kestrel's own data** and validated
+in play, never copied from another engine.
+
+The exception, stated plainly because it is the kind of thing that should not
+have to be discovered: the **NNUE inference side is derived from Stockfish**.
+Reading a network in the SFNNv16 format means implementing that format —
+its quantisation, its feature sets, their index mappings. That is Stockfish's
+work, it is GPLv3, and it is why this engine is GPLv3 too. See
+[License](#-license).
 
 Reading other engines and naming them is what makes that claim checkable, so
 [NOTICES.md](NOTICES.md) lists what was studied, under which licence, and
@@ -120,5 +128,32 @@ layout is computed from a stated rule rather than transcribed.
 
 ## 📄 License
 
-MIT — see [LICENSE](LICENSE). Provenance and third-party credit are in
-[NOTICES.md](NOTICES.md).
+[![License: GPLv3](https://img.shields.io/badge/license-GPLv3-blue.svg)](COPYING)
+
+**GPLv3** — see [`COPYING`](COPYING).
+
+Only the **NNUE inference side** is derived from **Stockfish** (GPLv3): the
+SFNNv16-class network format this engine reads, its quantisation, and the
+definition of the input feature sets it is built on — `HalfKAv2_hm`,
+`Full_Threats` and `PP_3Wide`, including their index mappings and orientation
+tables. **The search is the project's own**, and so is everything around it:
+board representation, move generation, and the whole of `search.rs`.
+
+**The network is the project's own.** It is trained by this project's own
+pipeline on its own filtered data; Stockfish supplies the *format* the weights
+are stored and evaluated in, not the weights.
+
+Because the engine incorporates Stockfish's GPL-licensed work, **the whole
+project is distributed under GPLv3**, with Stockfish's copyright notices
+preserved. Earlier public history carried an MIT notice, and that was correct
+at the time: it predates the SFNNv16 evaluation entirely. The licence changes
+here, in the same change that first publishes that code — not after it.
+
+**Input feature attribution.** The pawn-pair block (`PP_3Wide`, `4560` inputs,
+pairs of pawns at most one file apart) is **not an original idea of this
+project**. It was invented by **Jonathan Hallström** for
+[Pawnocchio](https://github.com/JonathanHallstrom/pawnocchio), was used by
+Stormphrax and Viridithas, and was adopted by Stockfish as `PP_3Wide`. This
+engine's implementation and its trained weights are its own; the idea is his.
+
+Provenance and third-party credit in full are in [NOTICES.md](NOTICES.md).

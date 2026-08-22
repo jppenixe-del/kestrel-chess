@@ -219,14 +219,26 @@ pub fn generate_legal(board: &mut Board, atk: &Attacks) -> Vec<Move> {
 }
 
 fn gera_legal<const APENAS_CAPTURAS: bool>(board: &mut Board, atk: &Attacks) -> Vec<Move> {
-    let mut pseudo = Vec::with_capacity(64);
+    // `pseudo`, the intermediate, is a reused thread-local scratch buffer, so
+    // that a Vec is not allocated and freed once per NODE -- malloc/free was
+    // ~4% of the profile. `legal` stays fresh, because the caller holds it
+    // across the search recursion. There is no re-entrancy here: the recursion
+    // calls gera_legal only AFTER this one returns, and the RefCell would
+    // panic outright if some re-entrant path had been missed.
+    std::thread_local! {
+        static PSEUDO: std::cell::RefCell<Vec<Move>> =
+            std::cell::RefCell::new(Vec::with_capacity(64));
+    }
+    PSEUDO.with(|cell| {
+    let mut pseudo = cell.borrow_mut();
+    pseudo.clear();
     gera_pseudo::<APENAS_CAPTURAS>(board, atk, &mut pseudo);
     let us = board.side;
     let king_sq = board.king_sq(us);
     let in_check = board.in_check(us, atk);
     let pinned = compute_pinned(board, atk, us, king_sq);
     let mut legal = Vec::with_capacity(pseudo.len());
-    for mv in pseudo {
+    for &mv in pseudo.iter() {
         // Fast path: when not in check, a move by a non-pinned piece
         // that is neither a king move nor en passant cannot leave our
         // own king in check -- accept it without a make/unmake test.
@@ -273,4 +285,5 @@ fn gera_legal<const APENAS_CAPTURAS: bool>(board: &mut Board, atk: &Attacks) -> 
         }
     }
     legal
+    })
 }

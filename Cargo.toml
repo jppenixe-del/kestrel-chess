@@ -2,6 +2,7 @@
 name = "kestrel"
 version = "0.1.0"
 edition = "2021"
+license = "GPL-3.0-or-later"
 
 [features]
 # The fitted weight set is the engine now: +152.7 Elo +/- 33.4 over the
@@ -44,7 +45,13 @@ fittedpsqtb8 = ["psqtbuckets"]
 # PSQT com dimensao de bucket: [bucket][peca][casa]. Ver PSQT_BUCKETS.
 psqtbuckets = []
 
+[lints.rust]
+unexpected_cfgs = { level = "allow" }
+
 [dependencies]
+
+[build-dependencies]
+cc = "1"
 
 [profile.release]
 opt-level = 3

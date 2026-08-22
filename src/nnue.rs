@@ -43,7 +43,15 @@ const QB: i32 = 64;
 ///
 /// Changing it detunes every margin at once, so a measured gain is the net of
 /// both effects, not the scale alone.
-static ESCALA: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(200);
+/// Omissao vinda da COMPILACAO (`KESTREL_ESCALA`, ver build.rs), para a
+/// escala viajar com a rede embutida em vez de depender de quem lanca o
+/// motor. Sem a variavel fica 200, que e' a escala da rede v1.
+const ESCALA_COMPILADA: i32 = match i32::from_str_radix(env!("KESTREL_ESCALA_COMPILADA"), 10) {
+    Ok(v) => v,
+    Err(_) => 200,
+};
+static ESCALA: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(ESCALA_COMPILADA);
 
 #[inline]
 pub fn escala() -> i32 {
@@ -52,6 +60,48 @@ pub fn escala() -> i32 {
 
 pub fn set_escala(v: i32) {
     ESCALA.store(v.clamp(1, 4000), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Per-bucket scale, measured rather than chosen.
+///
+/// One constant cannot serve both ends of the game. Fitted on 185k positions
+/// from our own archived games, the eval at which the pure-win rate reaches
+/// 50% -- Stockfish's definition of "one pawn" -- runs from 305 internal
+/// units with 2-5 pieces on the board down to 105 with 30-33. Reading all of
+/// them through a single 176 inflates the endgame roughly threefold: a drawn
+/// rook ending evaluates near zero, and near-zero times three still reads as
+/// near-zero until the margins built on it start firing, at which point the
+/// engine reports a loss in a position Stockfish calls a draw. That is not a
+/// hypothetical; it was watched happening in a live bullet game.
+///
+/// Same 8 buckets the network itself uses (`output_bucket`), so the scale and
+/// the weights that produced the number are indexed the same way.
+///
+/// Values are `176 * 100 / a`, i.e. the current scale corrected by how far
+/// each bucket's measured pawn differs from the one 176 assumes. Buckets are
+/// by piece count: 0 = 2-5 pieces, 7 = 30-33.
+const ESCALA_BALDE: [i32; 8] = [58, 95, 104, 121, 135, 160, 160, 168];
+
+/// Is the per-bucket scale on? Off by default -- it changes every pruning
+/// margin at once, so it goes in behind its own switch until measured.
+static ESCALA_POR_BALDE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_escala_por_balde(on: bool) {
+    ESCALA_POR_BALDE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The scale to read THIS position's evaluation with.
+///
+/// Falls back to the single `escala()` when the switch is off, so the default
+/// binary is unchanged.
+#[inline]
+pub fn escala_pos(board: &crate::board::Board) -> i32 {
+    if !ESCALA_POR_BALDE.load(std::sync::atomic::Ordering::Relaxed) {
+        return escala();
+    }
+    let n = board.occ_all.count_ones() as usize;
+    ESCALA_BALDE[(n.saturating_sub(2) / 4).min(7)]
 }
 
 /// Weights, in the layout `bullet` writes them.
@@ -624,11 +674,10 @@ fn empacota_leb128(valores: &[i16]) -> Vec<u8> {
 /// The first version of this called a second helper afterward just to
 /// re-decode the same stream and count its length -- for `l0w` (393216 of
 /// this network's 394753 values) that was the whole tensor parsed twice for
-/// no reason. Reading littleindian's own LEB128 reader in nnue_net.cpp
-/// (`lebOne`/`lebI16`) turned up nothing structurally faster -- same
-/// scalar, byte-at-a-time decode -- but its chunk format stores each
-/// chunk's byte length up front instead of re-deriving it, which is the
-/// actual fix: don't recompute what the first pass already knew.
+/// no reason. There is nothing structurally faster available for the decode
+/// itself -- it is scalar and byte-at-a-time either way. The fix is not to
+/// decode faster but to stop decoding twice: don't recompute what the first
+/// pass already knew.
 fn desempacota_leb128(bytes: &[u8], n: usize) -> Option<(Vec<i16>, usize)> {
     let mut out = Vec::with_capacity(n);
     let mut pos = 0;
@@ -697,6 +746,31 @@ pub fn evaluate_board(net: &Network, board: &Board) -> i32 {
     evaluate(net, &acc, board.side, output_bucket(net, board))
 }
 
+/// The `2 * HIDDEN` post-SCReLU activations that feed the output layer, in
+/// the exact order `evaluate` reads them: our perspective first, then theirs.
+///
+/// Exists for probing, not for play. `evaluate` collapses these against one
+/// weight vector; dumping them lets an offline fit ask what a DIFFERENT
+/// readout could have done with the same features -- e.g. whether a
+/// per-king-zone weight vector fits better than the single global one, which
+/// is the cheap way to test an output-bucketing idea without training a
+/// network to find out.
+///
+/// Deliberately returns the raw `i32` squares rather than anything scaled:
+/// the caller is fitting its own weights, and any scaling here would just be
+/// a constant it has to undo.
+pub fn activacoes_saida(net: &Network, board: &Board) -> Vec<i32> {
+    let acc = Accumulator::fresh(net, board);
+    let (us, them) = match board.side {
+        crate::types::Color::White => (&acc.white, &acc.black),
+        crate::types::Color::Black => (&acc.black, &acc.white),
+    };
+    let mut v = Vec::with_capacity(2 * HIDDEN);
+    v.extend((0..HIDDEN).map(|i| screlu(us[i])));
+    v.extend((0..HIDDEN).map(|i| screlu(them[i])));
+    v
+}
+
 /// The loaded network, if any.
 ///
 /// Read from the path in `KESTREL_NNUE` on first use. An env var rather than
@@ -708,6 +782,16 @@ static REDE: std::sync::OnceLock<Option<Network>> = std::sync::OnceLock::new();
 
 pub fn rede() -> Option<&'static Network> {
     REDE.get_or_init(|| {
+        // Rede embutida em tempo de compilacao, quando existe: e' o braco de
+        // um teste que decide e nao deve poder ser trocada por uma variavel
+        // de ambiente que nao chegou ao processo filho.
+        #[cfg(v1_embutida)]
+        {
+            const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rede_v1_embutida.bin"));
+            load(BYTES)
+        }
+        #[cfg(not(v1_embutida))]
+        {
         let path = std::env::var("KESTREL_NNUE").ok()?;
         let bytes = match std::fs::read(&path) {
             Ok(b) => b,
@@ -721,6 +805,7 @@ pub fn rede() -> Option<&'static Network> {
             eprintln!("nnue: rede carregada de {} (HIDDEN={})", path, HIDDEN);
         }
         n
+        }
     })
     .as_ref()
 }

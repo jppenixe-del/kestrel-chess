@@ -144,7 +144,92 @@ pub fn load(bytes: &[u8]) -> Option<RedeThreats> {
         return None;
     }
     let mut it = crus.into_iter();
-    let todos: Vec<i16> = (&mut it).take(TRAINER_INPUTS * HIDDEN).collect();
+    // O bloco do FACTORIZADOR, quando existe, vem a' frente e nao e' parcela.
+    //
+    // A rede das ameacas passou a ser treinada com factorizador (`Factorised::
+    // from_parts(NapkChess, Napk704Chess)`), para os 32 buckets de rei nao
+    // aprenderem cada um de raiz sobre um trinta-e-dois-avos dos dados. O
+    // treinador grava 704 linhas a mais, a' cabeca, e este leitor nao sabia
+    // que elas existiam: comecava a ler 704 linhas antes do sitio certo e
+    // tudo deslizava 360 448 valores. O que ele julgava serem os pesos das
+    // pecas era o factorizador.
+    //
+    // Sintoma medido: uma dama a mais valia 7 centipeoes (contra 1272 na rede
+    // de producao), amplitude media trinta vezes maior, e correlacao de 0.18
+    // com a rede de producao -- que e' a assinatura de um leitor partido e nao
+    // de uma rede por treinar. Uma rede fraca ainda sabe quanto vale uma dama.
+    //
+    // SOMAR, nao descartar. Esta linha ja' esteve dos dois lados, e as duas
+    // vezes anteriores o veredicto foi tirado da coisa errada.
+    //
+    // O que o trainer grava: `Factorised` poe as 704 linhas do factor a'
+    // frente e as reais a seguir, e o peso EFECTIVO de uma feature de peca e'
+    // a soma das duas -- e' assim que `Factorised::merge_factoriser` esta'
+    // escrito no proprio bullet:
+    //
+    //     merged[feat] = unmerged[offset + feat] + unmerged[derive(feat)]
+    //
+    // e NADA na arvore do bullet chama essa funcao. O ficheiro sai por fundir,
+    // sempre. A crenca de que "o treinador ja' fundiu" era so' isso.
+    //
+    // MEDIDO, contra Stockfish 18 a depth 12 em 4000 posicoes de jogos reais:
+    //
+    //     rede de producao                        correlacao 0.862
+    //     esta rede com o bloco DESCARTADO        correlacao 0.315
+    //     esta rede com o bloco SOMADO            correlacao 0.895
+    //
+    // O bloco tem amplitude media 25.6 contra 14.1 dos pesos por bucket: leva
+    // mais sinal do que a parte que se estava a guardar. Descartado, a
+    // avaliacao sai comprimida a um terco da escala (o "+6 onde o Stockfish
+    // diz +32" da nota do `funde`), o que detona todas as margens de poda de
+    // uma vez -- e foi isso, e nao a arquitectura, que perdeu 1136 jogos a nos
+    // fixos sem ganhar um.
+    //
+    // Porque e' que somar falhou antes: a tentativa da v2 somava na rede
+    // SIMPLES, cujo factorizador e' `Chess768` (768 linhas, derive = feat %
+    // 768), nao estas 704. Somar o bloco certo com a regra errada da' um
+    // desvio grande e constante, que foi exactamente o sintoma registado
+    // (~350cp que nao desciam com o treino). A regra tem de vir do
+    // `Factorises` que treinou a rede, e para esta arquitectura e'
+    // `Napk704Chess`: as features de peca colapsam em `feat % 704`, as de
+    // ameaca nao tem factor nenhum.
+    //
+    // Detectado pelo TAMANHO e nao por uma opcao: assim os dois formatos
+    // carregam, e uma rede antiga nao deixa de funcionar por causa disto.
+    let com_factorizador = (704 + TRAINER_INPUTS) * HIDDEN + cauda;
+    // KESTREL_THR_FACTOR=0 desliga a fusao, para se poder voltar a medir o
+    // antes e o depois com o mesmo binario em vez de dois.
+    let fundir = total >= com_factorizador
+        && std::env::var("KESTREL_THR_FACTOR").map(|v| v != "0").unwrap_or(true);
+    let factor: Vec<i16> = if total >= com_factorizador {
+        (&mut it).take(704 * HIDDEN).collect()
+    } else {
+        Vec::new()
+    };
+    let mut todos: Vec<i16> = (&mut it).take(TRAINER_INPUTS * HIDDEN).collect();
+    if fundir {
+        // So' as features de peca tem factor. Em i32 e com corte declarado:
+        // um estouro silencioso aqui seria indistinguivel de uma rede fraca,
+        // que e' precisamente o erro que esta seccao existe para nao repetir.
+        let mut cortados = 0usize;
+        for f in 0..crate::features::PIECE_FEATURES.min(TRAINER_INPUTS) {
+            let base_f = (f % 704) * HIDDEN;
+            for i in 0..HIDDEN {
+                let v = todos[f * HIDDEN + i] as i32 + factor[base_f + i] as i32;
+                if v > i16::MAX as i32 || v < i16::MIN as i32 {
+                    cortados += 1;
+                }
+                todos[f * HIDDEN + i] = v.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+            }
+        }
+        eprintln!(
+            "nnue-threats: factorizador de 704 linhas SOMADO nas features de peca{}",
+            if cortados > 0 { format!(" ({cortados} pesos cortados a i16)") } else { String::new() }
+        );
+    } else if !factor.is_empty() {
+        eprintln!("nnue-threats: factorizador DESCARTADO (KESTREL_THR_FACTOR=0)");
+    }
+    let todos = todos;
     // Split at the threat boundary. The leading slot the trainer reserves
     // stays with the piece block, which keeps the piece indices unchanged.
     let corte = (1 + crate::features::PIECE_FEATURES) * HIDDEN;
@@ -527,12 +612,25 @@ static REDE: std::sync::OnceLock<Option<RedeThreats>> = std::sync::OnceLock::new
 
 pub fn rede() -> Option<&'static RedeThreats> {
     REDE.get_or_init(|| {
-        let path = std::env::var("KESTREL_NNUE_THREATS").ok()?;
-        match std::fs::read(&path) {
-            Ok(b) => load(&b),
-            Err(e) => {
-                eprintln!("nnue-threats: nao consegui ler {}: {}", path, e);
-                None
+        // Rede embutida em tempo de compilacao, quando existe: e' o braco de
+        // um teste que decide e nao deve poder ser trocada por uma variavel
+        // de ambiente que nao chegou ao processo filho. Mesmo mecanismo de
+        // `nnue::rede`.
+        #[cfg(threats_embutida)]
+        {
+            const BYTES: &[u8] =
+                include_bytes!(concat!(env!("OUT_DIR"), "/rede_threats_embutida.bin"));
+            load(BYTES)
+        }
+        #[cfg(not(threats_embutida))]
+        {
+            let path = std::env::var("KESTREL_NNUE_THREATS").ok()?;
+            match std::fs::read(&path) {
+                Ok(b) => load(&b),
+                Err(e) => {
+                    eprintln!("nnue-threats: nao consegui ler {}: {}", path, e);
+                    None
+                }
             }
         }
     })

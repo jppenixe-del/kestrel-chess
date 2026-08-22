@@ -8,9 +8,8 @@ pub struct Zobrist {
     pub ep_file: [u64; 8],
 }
 
-// PRNG simples (splitmix64) so' para gerar as chaves uma vez no arranque --
-// determinismo entre execucoes nao importa aqui, so' que sejam bem
-// distribuidas.
+// A simple PRNG (splitmix64), only to generate the keys once at startup.
+// Determinism across runs does not matter here; good distribution does.
 fn splitmix64(state: &mut u64) -> u64 {
     *state = state.wrapping_add(0x9E3779B97F4A7C15);
     let mut z = *state;

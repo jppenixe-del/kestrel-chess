@@ -25,15 +25,37 @@
 
 use crate::board::Board;
 
-/// Score for the side to move.
+/// Score for the side to move. Halfmove-independent -- see
+/// `amortece_rule50` for why that has to be true and where the scaling
+/// happens instead.
 ///
 /// Takes `&mut Board` because the piece-square accumulator is lazy: the values
 /// it holds are only brought up to date here, at the one moment a score is
 /// actually wanted. See `nnue::Accumulator`.
 pub fn evaluate(board: &mut Board) -> i32 {
+    if crate::nnue_sf_ffi::activo() {
+        return crate::nnue_sf_ffi::evaluate(board);
+    }
+    if crate::nnue_sf::active() {
+        if let Some(net) = crate::nnue_sf::rede() {
+            return crate::nnue_sf::evaluate(net, atk(), board);
+        }
+    }
     // The threats network takes precedence when one is loaded. Chosen by which
     // file the caller supplied rather than by a build flag, so comparing the
     // two architectures compares two networks and not two binaries.
+    // v3 first when one is loaded: same rule as everywhere else here, the
+    // architecture is chosen by which file was given, never by a build flag,
+    // so comparing two of them compares networks and not binaries.
+    if let Some(net) = crate::nnue_v3::rede() {
+        // Through the accumulator when there is one, as with the simple
+        // network: recomputing the ~190 features on every evaluation cost 61%
+        // of total time in the profile, against ~16% for the simple net.
+        return match board.acc_v3.as_ref() {
+            Some(acc) => acc.valor(net, board),
+            None => crate::nnue_v3::evaluate(net, board),
+        };
+    }
     if let Some(net) = crate::nnue_threats::rede() {
         return crate::nnue_threats::evaluate(net, board);
     }
@@ -70,6 +92,33 @@ pub fn evaluate_fast(board: &mut Board) -> i32 {
     evaluate(board)
 }
 
+/// `v -= v * rule50 / 199`, ported literally from `Eval::evaluate` in
+/// Stockfish's `evaluate.cpp`. The network knows nothing about the 50-move
+/// clock -- it is not an input feature -- so without this the search always
+/// trusts the full advantage, even ten moves from bleeding out into a draw.
+/// The shrink is what gives the search a reason to prefer, when ahead, a
+/// move that zeroes the counter (the score snaps back to full) and to avoid
+/// zeroing when behind (that would hand the opponent's own score back to
+/// full too).
+///
+/// Deliberately NOT folded into `evaluate()` itself. `evaluate()`'s raw
+/// output is what the search caches -- TT's `static_eval` field and the
+/// improving heuristic's `static_evals[ply]` -- and reused across nodes that
+/// share a position but not a halfmove count. Baking the scale in there
+/// would freeze a value computed for one node's halfmove into a cache read
+/// back by a different node's, applying the wrong shrink. Coda hit this
+/// exact class of bug (their comment: "apply this at the point of use,
+/// never before storing to TT") and their own conversion-failure study
+/// traced won-position draws to an earlier, more aggressive version of this
+/// same formula -- worth remembering before touching the constant here.
+/// Callers apply this to a raw eval (freshly computed OR read back from a
+/// cache) immediately before using it for a decision, with THIS node's
+/// `board.halfmove`, never before storing it.
+#[inline]
+pub fn amortece_rule50(v: i32, halfmove: u32) -> i32 {
+    v - v * halfmove as i32 / 199
+}
+
 /// Said once, on the first evaluation with no network loaded.
 ///
 /// Loudly, and every path that could evaluate goes through here: an engine
@@ -94,7 +143,15 @@ fn sem_rede() {
 /// training target was a win probability put through a sigmoid at this scale,
 /// so inverting it recovers the probability the network was actually fitted
 /// to.
+pub fn win_draw_loss_pos(score: i32, board: &Board) -> (i32, i32, i32) {
+    wdl_com_escala(score, crate::nnue::escala_pos(board))
+}
+
 pub fn win_draw_loss(score: i32) -> (i32, i32, i32) {
+    wdl_com_escala(score, crate::nnue::escala())
+}
+
+fn wdl_com_escala(score: i32, escala_i: i32) -> (i32, i32, i32) {
     // The same scale the score itself is on, read rather than written down.
     //
     // It was the constant 400, which was right for exactly as long as the
@@ -107,7 +164,7 @@ pub fn win_draw_loss(score: i32) -> (i32, i32, i32) {
     // winning by, and every pruning margin in the search is denominated in the
     // same units. Let the two drift apart and the engine reports a confidence
     // it does not act on.
-    let escala = crate::nnue::escala() as f64;
+    let escala = escala_i as f64;
     let w = 1.0 / (1.0 + (-(score as f64) / escala).exp());
     let l = 1.0 / (1.0 + ((score as f64) / escala).exp());
     // Draws are what is left. Modelling them separately needs a second fitted
@@ -137,7 +194,18 @@ pub fn score_normalizado(interno: i32) -> i32 {
 /// think about nothing. This is called once when the engine starts.
 pub fn warmup() {
     let _ = atk();
+    // EVERY architecture, not just the piece-square one. Each `rede()` is a
+    // separate OnceLock, so loading one leaves the others to be decoded
+    // inside the first search that asks for a score -- and the threats
+    // network is 16.7 MB of LEB128, measured at ~1.6s to decode. A bullet
+    // game cannot pay that on its first move, which is the same failure that
+    // once cost six losses a day when the warmup did not run at all.
+    //
+    // Cheap when a network is absent: `rede()` returns None without reading
+    // anything when its variable is unset and nothing is embedded.
     let _ = crate::nnue::rede();
+    let _ = crate::nnue_threats::rede();
+    let _ = crate::nnue_v3::rede();
 }
 
 /// The attack tables, built once.
@@ -149,4 +217,56 @@ static ATTACKS: std::sync::OnceLock<crate::attacks::Attacks> = std::sync::OnceLo
 
 pub fn atk() -> &'static crate::attacks::Attacks {
     ATTACKS.get_or_init(crate::attacks::Attacks::new)
+}
+
+/// What this position says each piece is worth, measured the only way an
+/// NNUE can be asked: take the piece off, evaluate again, look at the
+/// difference.
+///
+/// Done in-process on a real `Board`, never by editing a FEN string. An
+/// earlier attempt at this rewrote the board part of the FEN and forgot to
+/// leave an empty square behind, which produced invalid positions that both
+/// engines happily scored -- and reported a knight as worth as much as a
+/// queen. The lesson stands: manipulate the position through the same code
+/// the search uses, or do not manipulate it at all.
+///
+/// Values are from the side to move's point of view: how much BETTER the
+/// position gets when the opponent loses that piece. Averaged over every
+/// copy of the piece on the board, because the first one found is not
+/// representative -- a rook on an open file and a rook boxed in a corner are
+/// not the same rook.
+///
+/// Switched on with `KESTREL_VALORES_PECAS=1`. Costs one full evaluation per
+/// piece per call, so it belongs in a diagnostic run, never in a real game.
+pub fn valores_das_pecas(board: &mut Board) -> Vec<(crate::types::PieceType, i32, usize)> {
+    use crate::types::PieceType;
+    let base = evaluate(board);
+    let them = board.side.opp();
+    let mut out = Vec::new();
+    for pt in [
+        PieceType::Pawn,
+        PieceType::Knight,
+        PieceType::Bishop,
+        PieceType::Rook,
+        PieceType::Queen,
+    ] {
+        let mut bbv = board.pieces[them.idx()][pt.idx()];
+        let mut soma = 0i64;
+        let mut n = 0usize;
+        while bbv != 0 {
+            let sq = bbv.trailing_zeros() as u8;
+            bbv &= bbv - 1;
+            let mut copia = board.clone();
+            copia.remove_piece(pt, them, sq);
+            // The accumulator carries pending changes; a fresh evaluate on the
+            // clone folds them in. Clearing it instead would rebuild from
+            // scratch and measure something else.
+            soma += (evaluate(&mut copia) - base) as i64;
+            n += 1;
+        }
+        if n > 0 {
+            out.push((pt, (soma / n as i64) as i32, n));
+        }
+    }
+    out
 }
