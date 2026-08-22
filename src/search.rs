@@ -183,7 +183,6 @@ pub fn eval_margin_scale() -> i32 {
     // ours, already slower per node on this network, only loses
     // effective depth by widening. Off until the cause is better
     // understood.
-    let _ = crate::nnue_napv10_ffi::active();
     100
 }
 

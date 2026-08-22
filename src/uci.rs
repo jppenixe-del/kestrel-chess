@@ -1998,17 +1998,6 @@ impl Engine {
                         "option name EvalScale type spin default {} min 100 max 2000",
                         crate::nnue::escala()
                     );
-                    // Sem esta linha, `setoption name LI11EvalScale` ia para
-                    // lado nenhum -- nao havia opcao com esse nome, portanto
-                    // o UCI ignorava-a em silencio e a escala ficava sempre no
-                    // valor compilado (400), venha o que vier pela consola.
-                    // Foi assim que uma comparacao a 200 e a 400 deu o MESMO
-                    // numero de nos ao mesmo lance: a ordem nunca chegava.
-                    let _ = writeln!(
-                        out,
-                        "option name LI11EvalScale type spin default {} min 1 max 4000",
-                        crate::nnue_li11::escala()
-                    );
                     // Tecto de tempo pelo ritmo do adversario. 0 = desligado,
                     // que e' a omissao ate' um SPRT dizer o contrario.
                     let _ = writeln!(
@@ -2124,12 +2113,7 @@ impl Engine {
                         if let Ok(v) = tokens[4].parse::<i32>() {
                             crate::nnue_sf::set_eval_factor(v);
                         }
-                    } else if tokens.len() >= 5 && tokens[1] == "name" && tokens[2] == "LI11EvalScale"
-                        && tokens[3] == "value" {
-                        if let Ok(v) = tokens[4].parse::<i32>() {
-                            crate::nnue_li11::set_escala(v);
-                        }
-                    } else if tokens.len() >= 5 && tokens[1] == "name" && tokens[2] == "Hash" && tokens[3] == "value" {
+                                        } else if tokens.len() >= 5 && tokens[1] == "name" && tokens[2] == "Hash" && tokens[3] == "value" {
                         if let Ok(mb) = tokens[4].parse::<usize>() {
                             self.tt = TranspositionTable::new(mb.max(1));
                         }

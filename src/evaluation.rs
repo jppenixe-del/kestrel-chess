@@ -33,16 +33,6 @@ use crate::board::Board;
 /// it holds are only brought up to date here, at the one moment a score is
 /// actually wanted. See `nnue::Accumulator`.
 pub fn evaluate(board: &mut Board) -> i32 {
-    // napv10 (our own network, ported from a related project) takes
-    // priority over li11 when both are loaded -- the two should not be in
-    // real use at the same time, but the order has to be something. See
-    // `nnue_napv10_ffi.rs` for why this calls the vendored C++ evaluate()
-    // (vendor/napv10/) directly instead of a Rust reimplementation.
-    if crate::nnue_plenty::active() {
-        if let Some(net) = crate::nnue_plenty::rede() {
-            return crate::nnue_plenty::evaluate(net, atk(), board);
-        }
-    }
     if crate::nnue_sf256::active() {
         if let Some(net) = crate::nnue_sf256::rede() {
             return crate::nnue_sf256::evaluate(net, board);
@@ -64,20 +54,6 @@ pub fn evaluate(board: &mut Board) -> i32 {
     if crate::nnue_q900::active() {
         if let Some(net) = crate::nnue_q900::rede() {
             return crate::nnue_q900::evaluate(net, board);
-        }
-    }
-    if crate::nnue_napv10_ffi::active() {
-        return crate::nnue_napv10_ffi::evaluate(board);
-    }
-    // li11, when loaded, takes priority over everything else below -- a
-    // test network from 2026-08-12/13, its reader validated byte-for-byte
-    // against the engine (accumulator, FC0, FC1 checked), correlation still
-    // weak (0.42 without threats vs 0.91 for the 512) and never played.
-    // Gated on KESTREL_NNUE_LI11 being empty by default -- without the
-    // variable this block does nothing and the usual path keeps deciding.
-    if crate::nnue_li11::li11_ligada() {
-        if let Some(net) = crate::nnue_li11::rede() {
-            return crate::nnue_li11::evaluate(net, board);
         }
     }
     // The threats network takes precedence when one is loaded. Chosen by which
@@ -245,13 +221,6 @@ pub fn warmup() {
     let _ = crate::nnue::rede();
     let _ = crate::nnue_threats::rede();
     let _ = crate::nnue_v3::rede();
-    // The two most recent architectures (li11, napv10) had been left out of
-    // this list -- both only load themselves on the first real evaluate(),
-    // which is inside the clock of the first move. napv10 alone is 34MB of
-    // LEB128 (net + full threats): the same class of bug this warmup()
-    // already exists to prevent, just not covering these two.
-    let _ = crate::nnue_li11::rede();
-    let _ = crate::nnue_napv10_ffi::net_loaded();
 }
 
 /// The attack tables, built once.
