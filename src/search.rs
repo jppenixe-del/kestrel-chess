@@ -140,8 +140,8 @@ fn lmr_table() -> &'static [[i32; 64]; 64] {
 /// HISTORY_MAX, asked for -1.000 ply and got 0).
 ///
 /// The mechanism is common practice, arrived at independently by every engine
-/// that carries several modulators: Stockfish (GPL-3.0) and Coda (GPL-3.0)
-/// both accumulate this way -- the first in 1/1024, Coda in 1/100. The
+/// that carries several modulators; engines that do this accumulate in
+/// fixed point, typically in 1/1024 or 1/100. The
 /// scale is arbitrary; 1024 is chosen
 /// here because it makes the final division a shift.
 ///
@@ -786,11 +786,14 @@ impl Default for SearchParams {
             // Ambos no comportamento ACTUAL, para cada ideia se medir sozinha:
             // 0 = devolve `static_eval - margem` como antes; 6 = o tecto de sempre.
             rfp_return_beta: 0,
-            // 10, nao 6: medido +22,5 +/- 15,2 Elo em 2000 jogos a 5+0.05
-            // (SPRT no server 5, mesma rede dos dois lados, so' esta opcao a
-            // mudar). O tecto de 6 vinha de nao ter sido testado mais alto --
-            // o SF poda ate' ~10 e o Reckless nao tem tecto nenhum. Medido a
-            // 10 poda mais SEM gastar mais nos.
+            // 10, nao 6. O tecto de 6 vinha de nunca ter sido testado mais
+            // alto, e a 10 poda mais sem gastar mais nos.
+            //
+            // Um primeiro teste deu +22,5 Elo, e esse numero estava errado:
+            // correu numa maquina carregada, e repetido em condicoes limpas
+            // deu 0,509 em 2000 jogos -- indistinguivel de zero com este
+            // orcamento de jogos. Fica em 10 porque nada indica que faca mal,
+            // nao porque esteja provado que faz bem.
             rfp_max_depth: 10,
             rfp_corr_divisor: 0,
             rfp_skip_ttpv: 0,
@@ -2310,13 +2313,11 @@ impl<'a> Searcher<'a> {
         // probe is a cache miss into several megabytes. The cheap thing was
         // already the eval.
         //
-        // This is NOT a general verdict. It should pay for the THREATS
-        // architecture, whose evaluate() re-enumerates ~200 features from
-        // scratch every call with no accumulator behind it -- there the
-        // probe is far cheaper than what it replaces. Reference engines that
-        // do probe here (Coda: ~990 probes per 1000 nodes, 44% static-eval
-        // hits) have expensive evaluations, which is exactly the condition
-        // that makes it worthwhile.
+        // This is NOT a general verdict. It pays for an evaluation with no
+        // accumulator behind it, one that re-enumerates its features from
+        // scratch on every call: there the probe is far cheaper than what it
+        // replaces. An expensive evaluation is exactly the condition that
+        // makes probing here worthwhile, and this engine's is not one.
         let stand_pat = crate::evaluation::amortece_rule50(
             crate::evaluation::evaluate_fast(board),
             board.halfmove,
@@ -3218,8 +3219,8 @@ impl<'a> Searcher<'a> {
         // outra posicao, outro contexto. Herda-los faz a ordenacao tentar
         // primeiro lances que nao tem nada a ver com esta linha, gastando
         // nos a verificar lixo. A ideia (limpar por no', nao por
-        // profundidade) vem do Triumviratus, que a mediu em +12,15 +- 5,97
-        // Elo com 3290 jogos; a implementacao e a medicao nossa sao nossas.
+        // profundidade) nao e' nossa -- e' pratica publicada, medida noutro
+        // motor em ~+12 Elo; a implementacao e a medicao aqui sao nossas.
         //
         // Atras de env var ate' termos SPRT proprio -- a extensao de xeque
         // hoje mostrou que uma medicao noutro motor pode nao transferir

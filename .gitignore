@@ -17,7 +17,7 @@ resolvequiet.log
 datagen_*.log
 
 # Redes e leitores de OUTROS motores: uso interno de diagnostico, nunca
-# comitados. O Coda e' GPL-3.0 e a rede dele e' artefacto dele; serve para
+# comitados. Uma rede de outro projecto e' artefacto desse projecto; serve para
 # responder "a fraqueza e' a nossa busca ou a nossa rede?", nao para andar
 # neste repositorio.
 *.nnue

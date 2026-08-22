@@ -18,7 +18,7 @@ pub struct Attacks {
     /// and diff) -- used by the threats accumulator's discovered-attack
     /// check (the threat delta path), which does this once per
     /// slider found among a changed square's attackers, on every piece
-    /// move the search makes. Same idea as Coda's `ray_extension` table.
+    /// move the search makes.
     pub ray_extension: [[Bitboard; 64]; 64],
 }
 

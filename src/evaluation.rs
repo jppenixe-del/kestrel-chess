@@ -88,7 +88,7 @@ pub fn evaluate_fast(board: &mut Board) -> i32 {
 /// improving heuristic's `static_evals[ply]` -- and reused across nodes that
 /// share a position but not a halfmove count. Baking the scale in there
 /// would freeze a value computed for one node's halfmove into a cache read
-/// back by a different node's, applying the wrong shrink. Coda hit this
+/// back by a different node's, applying the wrong shrink. This is a known
 /// exact class of bug (their comment: "apply this at the point of use,
 /// never before storing to TT") and their own conversion-failure study
 /// traced won-position draws to an earlier, more aggressive version of this

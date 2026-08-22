@@ -77,7 +77,7 @@ struct TtSlot {
 /// re-run. This is that re-run, at the size actually requested, and judged
 /// on games rather than nodes to a fixed depth.
 const BUCKET: usize = 3;
-/// Quality lost per generation of staleness. Berserk uses 4, Sirius uses 2
+/// Quality lost per generation of staleness. Other engines use 2 to 4
 /// (out of a 32-generation cycle instead of this table's 256) -- picked 3
 /// here as a genuine middle value pending a real measurement, not because
 /// splitting the difference is principled on its own.
