@@ -7,12 +7,9 @@ mod endgame;
 mod magic;
 mod movegen;
 mod nnue;
-mod features;
-mod nnue_threats;
 mod nnue_sf;
 mod nnue_sf_ffi;
 mod sf_features;
-mod nnue_v3;
 mod evaluation;
 mod moves;
 mod perft;
@@ -31,31 +28,6 @@ use std::env;
 use std::io::{BufRead, Write};
 use std::time::Instant;
 use zobrist::Zobrist;
-
-/// Quantos neuronios das camadas escondidas nunca sairam de zero.
-///
-/// Sob SCReLU um neuronio que nunca passa de zero contribui exactamente zero
-/// para tudo o que vem a seguir. "Morto" e' contavel, nao e' uma opiniao --
-/// mas o numero depende de ONDE se conta: medido num percurso aleatorio a
-/// partir da posicao inicial da' menos mortos do que em posicoes de jogo a
-/// serio, porque metade das posicoes visitadas nao se parecem com xadrez.
-fn imprime_saude(vistas: usize) {
-    use std::sync::atomic::Ordering::Relaxed;
-    let v = crate::nnue_v3::VISITAS.load(Relaxed).max(1);
-    let conta = |a: &[std::sync::atomic::AtomicU64]| {
-        let vals: Vec<u64> = a.iter().map(|x| x.load(Relaxed)).collect();
-        let mortos = vals.iter().filter(|&&c| c == 0).count();
-        let raros = vals.iter().filter(|&&c| c > 0 && c * 100 < v).count();
-        (mortos, raros, vals)
-    };
-    let (m1, r1, v1) = conta(&crate::nnue_v3::ACTIVOU_H1);
-    let (m2, r2, v2) = conta(&crate::nnue_v3::ACTIVOU_H2);
-    let _ = vistas;
-    println!("{v} avaliacoes | fc1: {m1}/{} mortos ({r1} raros) | fc2: {m2}/{} mortos ({r2} raros)",
-             v1.len(), v2.len());
-    println!("  fc1 taxas%: {:?}", v1.iter().map(|c| (c * 100 / v) as u32).collect::<Vec<_>>());
-    println!("  fc2 taxas%: {:?}", v2.iter().map(|c| (c * 100 / v) as u32).collect::<Vec<_>>());
-}
 
 fn main() {
     // Buckets de PSQT: ligados por feature. Arrancam com as OITO tabelas
@@ -353,42 +325,6 @@ fn main() {
         );
         return;
     }
-    if args.len() >= 4 && args[1] == "empacotathreats" {
-        // empacotathreats <rede_threats.bin> <saida.bin>
-        //
-        // Twin of `empacota` for the threats architecture, and verified the
-        // same way: packing is only worth shipping if the network that comes
-        // back is provably the same one, so this repacks AND reloads both
-        // files and compares every tensor rather than trusting the size.
-        let crus = std::fs::read(&args[2]).expect("nao consegui ler");
-        let empacotado = nnue_threats::empacota(&crus);
-        std::fs::write(&args[3], &empacotado).expect("nao consegui escrever");
-        let a = nnue_threats::load(&crus).expect("original nao carrega");
-        let b = nnue_threats::load(&empacotado).expect("empacotado nao carrega");
-        let iguais = a.l0w == b.l0w
-            && a.l0w_threats == b.l0w_threats
-            && a.l0b == b.l0b
-            && a.l1w == b.l1w
-            && a.l1b == b.l1b;
-        println!(
-            "empacotada: {} -> {} bytes ({:.1}% do original) -> {}",
-            crus.len(),
-            empacotado.len(),
-            100.0 * empacotado.len() as f64 / crus.len() as f64,
-            args[3]
-        );
-        if iguais {
-            println!(
-                "identico: {} valores de pecas + {} de ameacas, byte a byte",
-                a.l0w.len(),
-                a.l0w_threats.len()
-            );
-        } else {
-            println!("DIFERENTE -- nao usar este ficheiro");
-            std::process::exit(1);
-        }
-        return;
-    }
     if args.len() >= 3 && args[1] == "carregatest" {
         // carregatest <rede.bin> [repeticoes]
         //
@@ -436,25 +372,6 @@ fn main() {
         }
         return;
     }
-    if args.len() >= 2 && args[1] == "verificathreats" {
-        let net = match nnue_threats::rede() {
-            Some(n) => n,
-            None => { eprintln!("precisa de KESTREL_NNUE_THREATS"); return; }
-        };
-        // Uma SEQUENCIA de posicoes de um jogo real, nao posicoes soltas: o
-        // que se testa e' se o acumulador se desvia ao longo de dezenas de
-        // actualizacoes seguidas.
-        let ficheiro = args.get(2).map(|s| s.as_str()).unwrap_or("/root/kestrel_joao/blunders_big_v2.epd");
-        let fens: Vec<String> = std::fs::read_to_string(ficheiro)
-            .expect("nao consegui ler")
-            .lines()
-            .filter_map(|l| l.split('|').next().map(|f| f.trim().to_string()))
-            .filter(|f| !f.is_empty())
-            .collect();
-        let (n, e, m) = nnue_threats::verifica(net, &fens);
-        println!("threats: {} posicoes, {} divergencias, {:.1} features actualizadas por posicao", n, e, m);
-        return;
-    }
     if args.len() >= 2 && args[1] == "verificahash" {
         // Compares the incrementally maintained Board::hash against a full
         // recompute at EVERY node of a perft, forwards AND after every undo.
@@ -498,230 +415,6 @@ fn main() {
         if mal > 0 {
             std::process::exit(1);
         }
-        return;
-    }
-    if args.len() >= 2 && args[1] == "contafeatures" {
-        // Quantas features ACTIVAS emite cada posicao, no modo das ameacas.
-        //
-        // O adaptador do treinador (`NapkChess::map_features`) corta a lista
-        // em `max_active()` = 192 pares. Se as posicoes reais passarem disso,
-        // o treinador aprende sobre uma posicao MUTILADA e o motor avalia
-        // sobre a inteira -- e nenhuma quantidade de treino aproxima as duas.
-        let atk = Attacks::new();
-        let mut n_max = 0usize;
-        let mut acima = 0usize;
-        let mut total = 0usize;
-        let mut soma = 0usize;
-        let caminho = args.get(2).map(|s| s.as_str()).unwrap_or("/root/kestrel_joao/UHO_4060_v2.epd");
-        let texto = std::fs::read_to_string(caminho).expect("sem epd");
-        let mut rng: u64 = 12345;
-        for linha in texto.lines().take(400) {
-            let fen = linha.split(';').next().unwrap_or("").trim();
-            if fen.is_empty() { continue; }
-            let mut b = Board::from_fen(fen);
-            // Alguns lances a partir da abertura, para apanhar meio-jogo a
-            // serio: e' la' que ha' mais ameacas.
-            for _ in 0..24 {
-                let legais = movegen::generate_legal(&mut b, &atk);
-                if legais.is_empty() { break; }
-                rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
-                let mv = legais[(rng as usize) % legais.len()];
-                b.make_move(&mv);
-                let pos = features::Pos { pieces: b.pieces };
-                let mut n = 0usize;
-                features::map_features_pairs_mode(&pos, 0, 2, &mut |_a, _b| { n += 1; });
-                total += 1; soma += n;
-                if n > n_max { n_max = n; }
-                if n > 192 { acima += 1; }
-            }
-        }
-        println!("posicoes: {total}");
-        println!("features activas: media {:.1}, maximo {}", soma as f64 / total as f64, n_max);
-        println!("acima do corte de 192: {} ({:.1}%)", acima, 100.0 * acima as f64 / total as f64);
-        return;
-    }
-    if args.len() >= 2 && args[1] == "churn" {
-        // Quantas features MUDAM de um lance para o seguinte, separadas por
-        // metade (peca-casa contra ameacas).
-        //
-        // E' o numero que decide se vale a pena tornar algo incremental, e
-        // as quatro tentativas anteriores mediram-no so' para o conjunto
-        // todo. Uma metade pode compensar largamente e a outra nao: as
-        // features de peca mudam uma ou duas por lance (excepto quando o
-        // nosso rei muda de bucket, e ai mudam TODAS), enquanto mexer uma
-        // peca reescreve o mapa de ataque dela e com ele muitas ameacas.
-        // Somar as duas esconde exactamente a diferenca que interessa.
-        let atk = Attacks::new();
-        let caminho = args.get(2).map(|s| s.as_str()).unwrap_or("/root/kestrel_joao/UHO_4060_v2.epd");
-        let texto = std::fs::read_to_string(caminho).expect("sem epd");
-        let mut rng: u64 = 987_654_321;
-        let (mut n_lances, mut d_pecas, mut d_ameacas) = (0usize, 0usize, 0usize);
-        let (mut tot_pecas, mut tot_ameacas) = (0usize, 0usize);
-        let mut trocas_bucket = 0usize;
-        let recolhe = |b: &mut Board| -> (std::collections::HashSet<usize>, std::collections::HashSet<usize>) {
-            let pos = features::Pos { pieces: b.pieces };
-            let (mut p, mut a) = (std::collections::HashSet::new(), std::collections::HashSet::new());
-            features::map_features_pairs_mode(&pos, 0, 2, &mut |x, _y| {
-                if x < features::PIECE_FEATURES { p.insert(x); } else { a.insert(x); }
-            });
-            (p, a)
-        };
-        for linha in texto.lines().take(200) {
-            let fen = linha.split(';').next().unwrap_or("").trim();
-            if fen.is_empty() { continue; }
-            let mut b = Board::from_fen(fen);
-            let (mut p0, mut a0) = recolhe(&mut b);
-            for _ in 0..24 {
-                let ks_antes = b.pieces[0][5].trailing_zeros() as usize;
-                let legais = movegen::generate_legal(&mut b, &atk);
-                if legais.is_empty() { break; }
-                rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
-                let mv = legais[(rng as usize) % legais.len()];
-                b.make_move(&mv);
-                let ks_depois = b.pieces[0][5].trailing_zeros() as usize;
-                if features::BUCKET_MAP[ks_antes] != features::BUCKET_MAP[ks_depois] {
-                    trocas_bucket += 1;
-                }
-                let (p1, a1) = recolhe(&mut b);
-                // Simetrica: entradas mais saidas, que e' o trabalho real de
-                // um acumulador incremental (uma coluna somada ou subtraida).
-                d_pecas += p0.symmetric_difference(&p1).count();
-                d_ameacas += a0.symmetric_difference(&a1).count();
-                tot_pecas += p1.len();
-                tot_ameacas += a1.len();
-                n_lances += 1;
-                p0 = p1; a0 = a1;
-            }
-        }
-        let n = n_lances as f64;
-        println!("lances medidos: {n_lances}");
-        println!("  PECAS   : {:5.1} activas, {:5.1} mudam por lance  ({:4.1}%)",
-                 tot_pecas as f64 / n, d_pecas as f64 / n, 100.0 * d_pecas as f64 / tot_pecas as f64);
-        println!("  AMEACAS : {:5.1} activas, {:5.1} mudam por lance  ({:4.1}%)",
-                 tot_ameacas as f64 / n, d_ameacas as f64 / n, 100.0 * d_ameacas as f64 / tot_ameacas as f64);
-        println!("  trocas de bucket do rei: {} ({:.1}% dos lances)",
-                 trocas_bucket, 100.0 * trocas_bucket as f64 / n);
-        return;
-    }
-    if args.len() >= 2 && args[1] == "saudev3" {
-        // Quantos neuronios das camadas escondidas estao mortos.
-        //
-        // O Coda documenta a morte de neuronios de fc1 por volta do SB40 sem
-        // aquecimento do LR, e o nosso treinador da v3 nao tem aquecimento
-        // nenhum -- cosseno desde o superbatch 1. Isto mede em vez de supor:
-        // sob SCReLU um neuronio que nunca passa de zero contribui zero.
-        let Some(net) = crate::nnue_v3::rede() else {
-            eprintln!("sem KESTREL_NNUE_V3");
-            return;
-        };
-        let n: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(3000);
-        crate::nnue_v3::SAUDE.store(true, std::sync::atomic::Ordering::Relaxed);
-        let atk = Attacks::new();
-        // Com um ficheiro EPD mede-se em posicoes REAIS. Sem ele o percurso
-        // aleatorio a partir da posicao inicial passa a maior parte do tempo
-        // em posicoes que nenhuma partida produz, e um neuronio que so'
-        // dispara em estruturas de meio-jogo a serio aparece morto sem o
-        // estar. Foi o erro da primeira medicao.
-        if let Some(caminho) = args.get(3) {
-            let texto = match std::fs::read_to_string(caminho) {
-                Ok(t) => t,
-                Err(e) => { eprintln!("nao consegui ler {caminho}: {e}"); return; }
-            };
-            let mut vistas = 0usize;
-            for linha in texto.lines().take(n) {
-                let fen = linha.split(';').next().unwrap_or("").trim();
-                if fen.is_empty() { continue; }
-                let mut b = Board::from_fen(fen);
-                // Alguns lances a partir de cada posicao: uma abertura sozinha
-                // e' meia duzia de estruturas, e o que interessa e' cobrir o
-                // meio-jogo que a rede vai mesmo ver.
-                for _ in 0..12 {
-                    if let Some(net3) = crate::nnue_v3::rede() {
-                        if let Some(acc) = b.acc_v3.as_ref() { let _ = acc.valor(net3, &b); vistas += 1; }
-                    }
-                    let legais = movegen::generate_legal(&mut b, &atk);
-                    if legais.is_empty() { break; }
-                    let mv = legais[vistas % legais.len()];
-                    b.make_move(&mv);
-                }
-            }
-            imprime_saude(vistas);
-            return;
-        }
-        let mut rng = 0x1234_5678_9abc_def0u64;
-        let mut board = Board::startpos();
-        let mut jogadas = 0usize;
-        while jogadas < n {
-            let mvs = movegen::generate_legal(&mut board, &atk);
-            if mvs.is_empty() {
-                board = Board::startpos();
-                continue;
-            }
-            let _ = board.acc_v3.as_ref().map(|a| a.valor(net, &board));
-            rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
-            let mv = mvs[(rng as usize) % mvs.len()];
-            board.make_move(&mv);
-            jogadas += 1;
-            if board.halfmove >= 100 || board.occ_all.count_ones() <= 4 {
-                board = Board::startpos();
-            }
-        }
-        imprime_saude(0);
-        return;
-    }
-    if args.len() >= 2 && args[1] == "verificav3" {
-        // O acumulador incremental da v3 contra a recomputacao total, a cada
-        // ply de jogos REAIS -- e depois de cada undo.
-        //
-        // Posicoes soltas nao servem: o caminho incremental so' e' alimentado
-        // por add_piece/remove_piece, chamados de dentro de make_move e
-        // unmake_move. Uma lista de FENs testaria apenas o `fresh()`.
-        if nnue_v3::rede().is_none() {
-            eprintln!("precisa de KESTREL_NNUE_V3");
-            return;
-        }
-        let net = nnue_v3::rede().unwrap();
-        let atk = Attacks::new();
-        let n_jogos: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(60);
-        let plies: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(120);
-        let mut seed: u64 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(1);
-        let mut rng = move || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed };
-        let (mut n, mut mal, mut mal_undo) = (0usize, 0usize, 0usize);
-        for _ in 0..n_jogos {
-            let mut board = Board::startpos();
-            let mut hist: Vec<(moves::Move, board::Undo)> = Vec::new();
-            for _ in 0..plies {
-                let legais = movegen::generate_legal(&mut board, &atk);
-                if legais.is_empty() { break; }
-                let mv = legais[(rng() as usize) % legais.len()];
-                let undo = board.make_move(&mv);
-                n += 1;
-                let inc = board.acc_v3.as_ref().unwrap().valor(net, &board);
-                let cheio = nnue_v3::evaluate(net, &board);
-                if inc != cheio {
-                    mal += 1;
-                    if mal <= 3 {
-                        let (ca, np) = board.acc_v3.as_ref().unwrap().debug_fase();
-                        eprintln!("DIVERGE inc={} cheio={} | acc: com_ameacas={} n_pecas={} | tabuleiro: {} pecas | {}",
-                                  inc, cheio, ca, np, board.occ_all.count_ones(), board.to_fen());
-                    }
-                }
-                hist.push((mv, undo));
-                if hist.len() % 7 == 0 {
-                    let (m2, u2) = *hist.last().unwrap();
-                    board.unmake_move(&m2, &u2);
-                    let inc = board.acc_v3.as_ref().unwrap().valor(net, &board);
-                    let cheio = nnue_v3::evaluate(net, &board);
-                    if inc != cheio {
-                        mal_undo += 1;
-                        if mal_undo <= 3 { eprintln!("DIVERGE undo inc={} cheio={} {}", inc, cheio, board.to_fen()); }
-                    }
-                    board.make_move(&m2);
-                }
-            }
-        }
-        println!("v3: {} lances, {} divergencias make, {} divergencias unmake", n, mal, mal_undo);
-        if mal > 0 || mal_undo > 0 { std::process::exit(1); }
         return;
     }
     if args.len() >= 2 && args[1] == "verificacache" {

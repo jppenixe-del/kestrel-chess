@@ -41,24 +41,6 @@ pub fn evaluate(board: &mut Board) -> i32 {
             return crate::nnue_sf::evaluate(net, atk(), board);
         }
     }
-    // The threats network takes precedence when one is loaded. Chosen by which
-    // file the caller supplied rather than by a build flag, so comparing the
-    // two architectures compares two networks and not two binaries.
-    // v3 first when one is loaded: same rule as everywhere else here, the
-    // architecture is chosen by which file was given, never by a build flag,
-    // so comparing two of them compares networks and not binaries.
-    if let Some(net) = crate::nnue_v3::rede() {
-        // Through the accumulator when there is one, as with the simple
-        // network: recomputing the ~190 features on every evaluation cost 61%
-        // of total time in the profile, against ~16% for the simple net.
-        return match board.acc_v3.as_ref() {
-            Some(acc) => acc.valor(net, board),
-            None => crate::nnue_v3::evaluate(net, board),
-        };
-    }
-    if let Some(net) = crate::nnue_threats::rede() {
-        return crate::nnue_threats::evaluate(net, board);
-    }
     let net = match crate::nnue::rede() {
         Some(n) => n,
         None => {
@@ -204,8 +186,6 @@ pub fn warmup() {
     // Cheap when a network is absent: `rede()` returns None without reading
     // anything when its variable is unset and nothing is embedded.
     let _ = crate::nnue::rede();
-    let _ = crate::nnue_threats::rede();
-    let _ = crate::nnue_v3::rede();
 }
 
 /// The attack tables, built once.

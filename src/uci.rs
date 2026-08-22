@@ -1607,12 +1607,6 @@ impl Engine {
         });
         match final_move {
             Some(mv) => {
-                if std::env::var_os("KESTREL_CONTA_MEXIDAS").is_some() {
-                    let m = crate::nnue_threats::MEXIDAS.load(std::sync::atomic::Ordering::Relaxed);
-                    let c = crate::nnue_threats::CHAMADAS.load(std::sync::atomic::Ordering::Relaxed);
-                    eprintln!("mexidas por avaliacao: {:.1} ({} em {} chamadas)",
-                              m as f64 / c.max(1) as f64, m, c);
-                }
                 let _ = writeln!(out, "bestmove {}", mv.to_uci());
             }
             None => {
@@ -2077,10 +2071,6 @@ impl Engine {
                     } else if tokens.len() >= 5 && tokens[1] == "name" && tokens[2] == "HeatmapOnly" && tokens[3] == "value" {
                         let on = tokens[4].eq_ignore_ascii_case("true") || tokens[4] == "1";
                         HEATMAP_ONLY.store(on, std::sync::atomic::Ordering::Relaxed);
-                    } else if tokens.len() >= 5 && tokens[1] == "name" && tokens[2] == "Threats"
-                        && tokens[3] == "value" {
-                        crate::nnue_threats::set_ameacas(
-                            tokens[4].eq_ignore_ascii_case("true") || tokens[4] == "1");
                     } else if tokens.len() >= 5 && tokens[1] == "name" && tokens[2] == "LazyVote"
                         && tokens[3] == "value" {
                         self.lazy_vote = tokens[4].eq_ignore_ascii_case("true") || tokens[4] == "1";

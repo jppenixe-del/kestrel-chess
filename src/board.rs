@@ -34,11 +34,6 @@ pub struct Board {
     /// silently wrong only in rare positions. `None` until a network is
     /// loaded, so the hand-written evaluation costs nothing for it.
     pub acc: Option<Box<crate::nnue::Accumulator>>,
-    /// O mesmo para a rede v3 -- ver `nnue_v3::AccV3`. Independente do `acc`:
-    /// qual das arquitecturas o `evaluate` le' decide-se pelo ficheiro que foi
-    /// carregado, nao por uma bandeira de compilacao, portanto os dois
-    /// acumuladores mantem-se vivos.
-    pub acc_v3: Option<Box<crate::nnue_v3::AccV3>>,
     pub castling: u8,
     pub ep_square: Square,
     pub halfmove: u32,
@@ -167,7 +162,6 @@ impl Board {
             occ_color: [0, 0],
             occ_all: 0,
             acc: None,
-            acc_v3: None,
             side,
             castling,
             ep_square,
@@ -184,9 +178,6 @@ impl Board {
         // through add_piece/remove_piece and updates it a piece at a time.
         if let Some(net) = crate::nnue::rede() {
             b.acc = Some(Box::new(crate::nnue::Accumulator::fresh(net, &b)));
-        }
-        if let Some(net) = crate::nnue_v3::rede() {
-            b.acc_v3 = Some(Box::new(crate::nnue_v3::AccV3::fresh(net, &b)));
         }
         b
     }
@@ -346,9 +337,6 @@ impl Board {
         if let (Some(a), Some(net)) = (self.acc.as_mut(), crate::nnue::rede()) {
             a.push_dirty(net, c, pt, s, false);
         }
-        if let (Some(a), Some(net)) = (self.acc_v3.as_mut(), crate::nnue_v3::rede()) {
-            a.remove_piece(net, pt, c, s, self.occ_all, self.pieces, self.mailbox);
-        }
         // Os acumuladores por flanco so' sao LIDOS com a feature `psqtmirror`
         // ligada (ver `material_pst_white`). Sem ela isto era trabalho morto
         // pago em cada peca colocada ou retirada, ou seja, em cada lance da
@@ -366,9 +354,6 @@ impl Board {
         let ph = pt.phase_inc();
         if let (Some(a), Some(net)) = (self.acc.as_mut(), crate::nnue::rede()) {
             a.push_dirty(net, c, pt, s, true);
-        }
-        if let (Some(a), Some(net)) = (self.acc_v3.as_mut(), crate::nnue_v3::rede()) {
-            a.add_piece(net, pt, c, s, self.occ_all, self.pieces, self.mailbox);
         }
         // Os acumuladores por flanco so' sao LIDOS com a feature `psqtmirror`
         // ligada (ver `material_pst_white`). Sem ela isto era trabalho morto
@@ -519,7 +504,7 @@ impl Board {
         // Mesma familia do bug do `busy` na ponte e do `unmake_move` sem
         // correccao de bucket: uma condicao de UM caminho a decidir por todos.
         //
-        // Saida rapida: esta correccao so' serve as redes `nnue`/`nnue_v3` (buckets
+        // Saida rapida: esta correccao so' serve as redes `nnue` (buckets
         // de rei). A super rede `nnue_sf` (a do bot, por EvalFile) e o HCE nao
         // precisam dela -- tem o seu proprio acumulador. Decidir uma vez e cachear
         // evita 4 `rede()` + a copia das pecas por NO (make+unmake), ~4,3% do bench.
@@ -537,12 +522,8 @@ impl Board {
     #[cold]
     #[inline(never)]
     fn corrige_bucket_slow(&mut self) {
-        let pecas = self.pieces;
         if let Some(net) = crate::nnue::rede().filter(|n| n.buckets > 1) {
             self.corrige_bucket_simples(net);
-        }
-        if let (Some(net), Some(acc)) = (crate::nnue_v3::rede(), self.acc_v3.as_mut()) {
-            acc.fix_bucket(net, pecas);
         }
     }
 
@@ -724,7 +705,7 @@ impl Board {
     }
 }
 
-/// So' as redes `nnue`/`nnue_v3` (buckets de rei) precisam do `corrige_bucket`.
+/// So' as redes `nnue` (buckets de rei) precisam do `corrige_bucket`.
 /// A super rede `nnue_sf` (do bot, por EvalFile) e o HCE nao -- tem o seu proprio
 /// acumulador. Decidido UMA vez (as duas redes carregam por env no arranque, via
 /// OnceLock, e nao mudam depois) e cacheado, para o `corrige_bucket` sair cedo no
@@ -734,7 +715,7 @@ fn precisa_corrigir_bucket() -> bool {
     static DECISAO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *DECISAO.get_or_init(|| {
         let nnue_buckets = crate::nnue::rede().map_or(false, |n| n.buckets > 1);
-        let v3 = crate::nnue_v3::rede().is_some();
+        let v3 = false;
         nnue_buckets || v3
     })
 }

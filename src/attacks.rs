@@ -16,7 +16,7 @@ pub struct Attacks {
     /// ray in one table lookup instead of two magic-bitboard slider calls
     /// (compute attacks from b with b's occupant present, then without,
     /// and diff) -- used by the threats accumulator's discovered-attack
-    /// check (`nnue_threats::threat_deltas`), which does this once per
+    /// check (the threat delta path), which does this once per
     /// slider found among a changed square's attackers, on every piece
     /// move the search makes. Same idea as Coda's `ray_extension` table.
     pub ray_extension: [[Bitboard; 64]; 64],

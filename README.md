@@ -13,18 +13,16 @@ Static Exchange Evaluation, a lock-free transposition table with proper
 mate-score handling, and a staged move picker built on killer moves,
 continuation history and a history heuristic.
 
-Positions are scored by a trained network in Stockfish's SFNNv16 format. The
-format is theirs, and reading it is the one part of this engine derived from
-another — which is why this project is GPLv3.
+Positions are scored by a trained network in Stockfish's **SFNNv16** format.
+The format is theirs, and reading it is the one part of this engine derived
+from another — which is why this project is GPLv3. See
+[License](#-license).
 
-**No network ships with this repository, and the project's own SFNNv16
-network is still in training.** The engine reads whatever `.nnue` file it is
-pointed at; testing at present uses Stockfish's published network. Earlier
-networks, in this project's own smaller architectures, were trained here and
-are embedded in the binary.
-
-The engine is paired with a signature opening book drawn from 1825 real games
-by one of the sharpest attacking players in chess history.
+> **This repository is the engine, and only the engine.** No network ships
+> here, and no opening book: the engine reads whatever `.nnue` file it is
+> pointed at, and without one it has no evaluation at all. The pipeline that
+> trains networks, the tooling that tunes the engine and runs the bot, and
+> the trained weights themselves are not published.
 
 The evaluation used to be hand-written — some eight thousand lines of
 piece-square tables, mobility counts and king-safety curves, tuned on the
@@ -49,15 +47,15 @@ standard-variant challenges automatically, within a self-imposed rating
 margin of its own current strength, so games stay competitive rather than
 one-sided.
 
-| | |
-|---|---|
-| **Bullet / Blitz rating** | ~2560 / ~2415 (moving as the engine improves) |
-| **Status** | Actively developed in the open — the rating tracks a real, changing engine, not a fixed one |
+Ratings are on the profile rather than in this file. A number written into a
+README is stale within the week; the profile never is.
 
 ## 🏗️ Architecture
 
-- **Move generation** — bitboard-based, validated by perft (`startpos` depth
-  6 = `119,060,324`; Kiwipete depth 4 = `4,085,603`).
+- **Move generation** — bitboard-based, validated by perft: `startpos`
+  depth 5 = `4,865,609`, depth 6 = `119,060,324`; Kiwipete depth 4 =
+  `4,085,603`. `validate.sh` checks the first of these on every run and fails
+  on a mismatch.
 - **Search** — negamax + PVS with iterative deepening and aspiration windows;
   eval-adaptive null-move pruning, late move reductions (adjusted by history,
   TT-PV, position complexity and the improving signal), reverse futility
@@ -65,64 +63,53 @@ one-sided.
   double and negative extensions), internal iterative reduction, mate-distance
   pruning, and a lock-free transposition table with ply-correct mate scoring.
 - **Static eval in search** — the pruning and reduction decisions use the
-  *full* evaluation (not a cheap material-only proxy), cached in the
+  *full* evaluation, not a cheap material-only proxy: cached in the
   transposition table and refined by a six-dimensional correction history
-  (pawn, non-pawn per side, minor, major, threats) so the eval used to prune
-  tracks what search actually finds. This was worth a large, SPRT-verified
-  strength gain.
+  (pawn, non-pawn per side, minor, major, threats), so the eval used to prune
+  tracks what the search actually finds.
 - **Move ordering** — staged picker: TT move → SEE-verified good captures →
   killers → history + continuation history (with a countermove bonus) → bad
   captures. Capture history breaks SEE ties.
-- **Evaluation** — a quantised network. The architecture is chosen by which
-  file the engine is given rather than by a build flag, so comparing two of
-  them compares networks and not binaries:
-  - *SFNNv16* — what the engine evaluates with today: `HalfKAv2_hm` +
-    `Full_Threats` + `PP_3Wide`, 86896 inputs into a 1024-wide accumulator.
-    This is Stockfish's network format, and reading it is the one part of
-    this engine derived from theirs — see [License](#-license). A network of
-    this project's own is in training; until it is finished and validated,
-    testing uses Stockfish's published one.
-  - *piece-square* (earlier): `(768 → 512)x2 → 8`, twelve king buckets, eight output
-    buckets by piece count. The accumulator is carried on the board and
-    updated one piece at a time, with a refresh cache per king bucket — king
-    moves are a quarter of all moves and a sixth of those cross a bucket
-    boundary, so without that cache bucketed inputs cost more in speed than
-    they return in strength.
-  - *threats*: `(31744 → 512)x2 → 8`, where 9216 of the inputs encode what is
-    attacking what rather than only where the pieces stand. Those weights are
-    stored as `i8` and widened on the fly: at 32.5 MB the first layer does not
-    fit in cache, so the accumulator is bound by memory bandwidth and halving
-    the bytes moved is worth 17%.
+- **Evaluation** — a quantised network in the SFNNv16 format: `86896` inputs
+  into a `1024`-wide accumulator, in three blocks that answer three different
+  questions about a position.
+  - `HalfKAv2_hm` — *where the pieces are*, indexed jointly with the side's
+    own king square, so the same material reads differently depending on
+    where the king sits. Mirrored on the king's file, which halves the table.
+  - `Full_Threats` (`59808`) — *what is attacking what*, rather than only
+    where things stand. Two positions with identical material on identical
+    squares are still different positions if the pieces bear on each other
+    differently, and this is the block that sees that.
+  - `PP_3Wide` (`4560`) — *pawn structure*, as pairs of pawns at most one
+    file apart. The restriction is the whole idea: trained on all pawn pairs,
+    the ones that carry information turn out to be the near ones. **This
+    feature is not this project's invention** — see [License](#-license).
+  - The accumulator is carried on the board and updated a move at a time
+    rather than rebuilt. What costs is not the number of weight rows touched
+    but where they come from: the threat block is the largest and the least
+    local, so it is what any speed work here has to attack. Weights are
+    stored narrow and widened on the fly.
   - Hand-written terms survive only where they are not evaluation: piece
     values, which Static Exchange Evaluation needs before any score exists to
-    judge, and game phase, which the search uses for time and reductions.
-- **Training** — an SFNNv16 network is being trained by this project's own
-  pipeline, on the Stockfish project's published 5000-node data, filtered
-  here. It is not finished, and nothing is claimed for it until it is
-  validated in play. The weights will be ours; the data is not, and is
-  credited in [NOTICES.md](NOTICES.md). Earlier networks were trained with
-  [bullet](https://github.com/jw1912/bullet) on the engine's own self-play,
-  which is what this section used to describe. Every candidate is validated
-  by SPRT in real games before adoption; a lower training loss on its own has
-  more than once meant nothing at the board. Search parameters are tuned
-  separately by SPSA.
+    judge with, and game phase, which the search uses for time and reductions.
+- **Training** — a network is being trained by this project's own pipeline on
+  the Stockfish project's published 5000-node positions. It is not finished,
+  and nothing is claimed for it until it has been validated in play; until
+  then the engine is developed and tested against Stockfish's published
+  network. The weights will be this project's, the data is not, and both are
+  credited in [NOTICES.md](NOTICES.md). Every candidate network faces SPRT in
+  real games before adoption — a lower training loss on its own has more than
+  once meant nothing at the board. Search parameters are tuned separately by
+  SPSA.
 - **Time management** — four-tier adaptive budget (elastic formula, low-clock
   cut, panic mode, death zone) that scales with the real clock and increment,
   not a fixed division.
-
-## 📈 Status
-
-This project is under active, ongoing development, in the open. Real bugs get
-found, fixed, and validated against evidence — perft, tactical sanity checks,
-and SPRT self-play testing against a fixed reference — before being kept; see
-the commit history for the specifics of each one. Treat every number in this
-README as "as of the last update," never as a permanent claim.
 
 ## 🔧 Building
 
 ```bash
 cargo build --release
-./target/release/kestrel perft 5   # move generation: should print 4865609
+./target/release/kestrel perft 5   # move generation: 4865609
 ```
 
 **The engine needs a network.** Point `KESTREL_NNUE_SF` at an SFNNv16-format
@@ -130,42 +117,53 @@ cargo build --release
 
 ```bash
 export KESTREL_NNUE_SF=/path/to/net.nnue
-./target/release/kestrel bench      # with the network: 2716488 nodes
+./target/release/kestrel bench     # with the network: 2716488 nodes
 ```
 
-Without that variable there is no evaluation at all: the engine does not fall
-back to a hand-crafted one, it scores every position as zero and searches
-blind. It will still run, and `bench` will still print a node count — a
-different, meaningless one. If you are using the node count as a regression
-check, take it with the network loaded.
+Without that variable there is no evaluation at all. The engine does not fall
+back to a hand-crafted one — it scores every position as zero and searches
+blind. It still runs, and `bench` still prints a node count while doing it: a
+different number, and a meaningless one. If you use the node count as a
+regression check, take it with the network loaded.
+
+`./validate.sh` runs the gate: perft first, then the node signature and the
+tactical suite. It skips the second pair, loudly, when no network is set,
+rather than reporting a pass it did not measure.
+
+## 📈 Status
+
+Under active development, in the open. Bugs get found, fixed and validated
+against evidence — perft, the node signature, and SPRT self-play against a
+fixed reference — before being kept. Treat every number here as "as of the
+last update", never as a permanent claim.
 
 ## 🧭 Design principle
 
-Kestrel is meant to be an *original* engine, not a clone, and the line falls in
-a specific place. Concepts are drawn from the public chess-programming
-literature — the Chess Programming Wiki, forum discussions, published papers,
-and other open engines. The **search is written from scratch for this
-codebase**, and every weight this project ships is **trained by this project**
-and validated in play, never copied from another engine — with the current
-state stated plainly: the SFNNv16 network is still training, and until it is
-done the engine is tested against Stockfish's published one. The training
-*data* is a separate question again, and is credited in
-[NOTICES.md](NOTICES.md): it is the Stockfish project's published positions,
-not Kestrel's own games.
+Kestrel is meant to be an *original* engine, not a clone, and the line falls
+in a specific place.
 
-The exception, stated plainly because it is the kind of thing that should not
-have to be discovered: the **NNUE inference side is derived from Stockfish**.
-Reading a network in the SFNNv16 format means implementing that format —
-its quantisation, its feature sets, their index mappings. That is Stockfish's
-work, it is GPLv3, and it is why this engine is GPLv3 too. See
-[License](#-license).
+**The search is written from scratch for this codebase**, and so is
+everything around it: board representation, move generation, time management.
+Concepts come from the public chess-programming literature — the Chess
+Programming Wiki, forum discussions, published papers, and other open
+engines — but reading how a technique works and writing your own is not the
+same act as taking the code, and the difference is the whole point.
 
-Reading other engines and naming them is what makes that claim checkable, so
-[NOTICES.md](NOTICES.md) lists what was studied, under which licence, and
-where the line falls between an idea and a copy. Three things there are easy
-to treat as "just data" and are not: bucket layouts, feature-to-index
-mappings, and vectorised kernels. Where this engine uses bucketed inputs, the
-layout is computed from a stated rule rather than transcribed.
+**The exception is stated plainly, because it is the kind of thing that
+should not have to be discovered.** The NNUE inference side is derived from
+Stockfish. Reading a network in the SFNNv16 format means implementing that
+format: its quantisation, its feature sets, their index mappings. That is
+Stockfish's work, it is GPLv3, and it is why this engine is GPLv3 too.
+
+**The weights are trained here; the data is not.** The network in training is
+this project's own, produced by its own pipeline, and no network from another
+engine is shipped or adapted. The positions it learns from are the Stockfish
+project's published data, and that is credited rather than quietly absorbed.
+
+[NOTICES.md](NOTICES.md) carries the full account: what is third-party, under
+which licence, and where the line falls between an idea and a copy. Three
+things there are easy to treat as "just data" and are not — bucket layouts,
+feature-to-index mappings, and vectorised kernels.
 
 ## 📄 License
 
@@ -182,16 +180,16 @@ board representation, move generation, and the whole of `search.rs`.
 
 **The network will be the project's own**, and is not yet. One is being
 trained by this project's own pipeline; until it is finished and validated in
-play, the engine is run and tested against Stockfish's published network, and
-no network at all ships in this repository. Stockfish supplies the *format*
+play, the engine is run and tested against Stockfish's published network. No
+network ships in this repository either way. Stockfish supplies the *format*
 the weights are stored and evaluated in — and, for now, a set of weights to
 test against.
 
 Because the engine incorporates Stockfish's GPL-licensed work, **the whole
 project is distributed under GPLv3**, with Stockfish's copyright notices
 preserved. Earlier public history carried an MIT notice, and that was correct
-at the time: it predates the SFNNv16 evaluation entirely. The licence changes
-here, in the same change that first publishes that code — not after it.
+at the time: it predates the SFNNv16 evaluation entirely. The licence changed
+in the same change that first published that code — not after it.
 
 **Input feature attribution.** The pawn-pair block (`PP_3Wide`, `4560` inputs,
 pairs of pawns at most one file apart) is **not an original idea of this
