@@ -797,10 +797,7 @@ impl Default for SearchParams {
             // o SF poda ate' ~10 e o Reckless nao tem tecto nenhum. Medido a
             // 10 poda mais SEM gastar mais nos.
             rfp_max_depth: 10,
-            // 4, nao 0: medido +23,2 +/- 15,2 Elo em 2000 jogos a 5+0.05
-            // (SPRT no server 5). Uma correccao de 100 cp -- grande para o
-            // nosso grao -- sobe a margem 25 cp; uma pequena nao faz nada.
-            rfp_corr_divisor: 4,
+            rfp_corr_divisor: 0,
             rfp_skip_ttpv: 0,
         }
     }
