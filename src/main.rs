@@ -41,6 +41,27 @@ fn main() {
     }
 
     let args: Vec<String> = env::args().collect();
+    if args.len() >= 4 && args[1] == "para_bullet" {
+        // para_bullet <net SF (ex.: torch serializado .nnue)> <saida_pesos.bin>
+        // Converte um net SF para os pesos do bullet, no formato do
+        // load_weights_from_file, para warm-start do treino.
+        let bytes = match std::fs::read(&args[2]) {
+            Ok(b) => b,
+            Err(e) => { eprintln!("nao consegui ler {}: {e}", args[2]); return; }
+        };
+        let net = match nnue_sf::carrega_pub(&bytes) {
+            Some(n) => n,
+            None => { eprintln!("net SF invalido"); return; }
+        };
+        let pesos = nnue_sf::para_bullet_pesos(&net);
+        let out = nnue_sf::escreve_pesos_bullet(&pesos);
+        match std::fs::write(&args[3], &out) {
+            Ok(()) => println!("escrito: {} ({} bytes, {} tensores)", args[3], out.len(), pesos.len()),
+            Err(e) => eprintln!("nao consegui escrever: {e}"),
+        }
+        return;
+    }
+
     if args.len() >= 2 && args[1] == "bench" {
         // Fixed-work benchmark, in the shape a distributed test framework
         // expects: a total node count and a rate, on a fixed position set at
@@ -485,9 +506,27 @@ fn main() {
             ("psqtb", NB), ("psqtw", NB * NIN),
         ];
         let total: usize = tam.iter().map(|(_, n)| n).sum();
-        if f32s.len() != total {
-            eprintln!("raw.bin tem {} valores, esperava {total} -- arquitectura diferente?", f32s.len());
+        // Duas formas validas, e a diferenca entre elas sao 2209 valores.
+        //
+        // O treinador deixou de factorizar a fc_1 e a fc_2, para ficar igual ao
+        // nnue-pytorch, que factoriza SO' a primeira camada -- depois de uma
+        // nao-linearidade a componente partilhada limita-se a fazer a media dos
+        // baldes e impede a saida de divergir por balde, que e' precisamente o
+        // que os finais precisam. Os checkpoints novos vem sem `fc1f`/`fc2f`:
+        //     fc1f = L3*2*L2 + L3 = 2080
+        //     fc2f = (2*L2 + 2*L3) + 1 = 129
+        // Aceitar as duas em vez de recusar a nova: sem factorizador, a
+        // componente partilhada e' zero, que e' exactamente o que somar nada
+        // significa.
+        let sem_fc12f = L3 * 2 * L2 + L3 + (2 * L2 + 2 * L3) + 1;
+        let tem_fc12f = f32s.len() == total;
+        if !tem_fc12f && f32s.len() != total - sem_fc12f {
+            eprintln!("raw.bin tem {} valores, esperava {total} (com fc1f/fc2f) ou {} (sem) -- arquitectura diferente?",
+                      f32s.len(), total - sem_fc12f);
             return;
+        }
+        if !tem_fc12f {
+            println!("checkpoint sem fc1f/fc2f (treinador alinhado com o nnue-pytorch): a usar zeros");
         }
         let mut o = 0usize;
         let mut get = |n: usize| -> &[f32] { let s = &f32s[o..o + n]; o += n; s };
@@ -512,10 +551,13 @@ fn main() {
         let fc2b = get(NB).to_vec();
         let fc0fw = get(L2 * L1).to_vec();
         let fc0fb = get(L2).to_vec();
-        let fc1fw = get(L3 * 2 * L2).to_vec();
-        let fc1fb = get(L3).to_vec();
-        let fc2fw = get(2 * L2 + 2 * L3).to_vec();
-        let fc2fb = get(1).to_vec();
+        let (fc1fw, fc1fb, fc2fw, fc2fb) = if tem_fc12f {
+            (get(L3 * 2 * L2).to_vec(), get(L3).to_vec(),
+             get(2 * L2 + 2 * L3).to_vec(), get(1).to_vec())
+        } else {
+            (vec![0.0; L3 * 2 * L2], vec![0.0; L3],
+             vec![0.0; 2 * L2 + 2 * L3], vec![0.0; 1])
+        };
         let psqtw = get(NB * NIN).to_vec();
         let _psqtb = get(NB).to_vec();
 

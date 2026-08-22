@@ -1096,6 +1096,120 @@ pub fn roundtrip_bullet(net: &RedeSf) -> RedeSf {
         &fc0fw, &fc0fb, &fc1fw, &fc1fb, &fc2fw, &fc2fb)
 }
 
+
+pub fn para_bullet_pesos(net: &RedeSf) -> Vec<(String, Vec<f32>)> {
+    const FACT: usize = 704;
+    const BASE: usize = FACT + 1;
+    const NIN: usize = BASE + INPUT_DIM;
+    let n2 = 2 * L2 + 2 * L3;
+
+    let mut l0w = vec![0f32; NIN * L1];
+    let mut l0b = vec![0f32; L1];
+    for k in 0..L1 {
+        l0b[k] = net.ft_bias[k] as f32 / CONV_QA;
+    }
+    for f in 0..PIECE_DIM {
+        for k in 0..L1 {
+            l0w[(BASE + f) * L1 + k] = net.ft_piece_w[f * L1 + k] as f32 / CONV_QA;
+        }
+    }
+    for f in 0..THREAT_DIM {
+        for k in 0..L1 {
+            l0w[(BASE + PIECE_DIM + f) * L1 + k] = net.ft_threat_w[f * L1 + k] as f32 / CONV_QA;
+        }
+    }
+    for f in 0..PAIR_DIM {
+        for k in 0..L1 {
+            l0w[(BASE + PIECE_DIM + THREAT_DIM + f) * L1 + k] = net.ft_pair_w[f * L1 + k] as f32 / CONV_QA;
+        }
+    }
+
+    let mut psqtw = vec![0f32; NIN * NB];
+    for f in 0..PIECE_DIM {
+        for b in 0..NB {
+            psqtw[(BASE + f) * NB + b] = net.ft_piece_psqt[f * NB + b] as f32 / CONV_PSQT;
+        }
+    }
+    for f in 0..THREAT_DIM {
+        for b in 0..NB {
+            psqtw[(BASE + PIECE_DIM + f) * NB + b] = net.ft_threat_psqt[f * NB + b] as f32 / CONV_PSQT;
+        }
+    }
+    for f in 0..PAIR_DIM {
+        for b in 0..NB {
+            psqtw[(BASE + PIECE_DIM + THREAT_DIM + f) * NB + b] =
+                net.ft_pair_psqt[f * NB + b] as f32 / CONV_PSQT;
+        }
+    }
+    let psqtb = vec![0f32; NB];
+
+    let mut fc0w = vec![0f32; L1 * L2 * NB];
+    let mut fc0b = vec![0f32; L2 * NB];
+    let mut fc1w = vec![0f32; (2 * L2) * L3 * NB];
+    let mut fc1b = vec![0f32; L3 * NB];
+    let mut fc2w = vec![0f32; n2 * NB];
+    let mut fc2b = vec![0f32; NB];
+    for b in 0..NB {
+        let st = &net.stacks[b];
+        for o in 0..L2 {
+            fc0b[b * L2 + o] = st.fc0b[o] as f32 / CONV_B_FC0;
+            for i in 0..L1 {
+                fc0w[i * (L2 * NB) + b * L2 + o] = st.fc0w[o * L1 + i] as f32 / CONV_W_FC0;
+            }
+        }
+        for o in 0..L3 {
+            fc1b[b * L3 + o] = st.fc1b[o] as f32 / CONV_B_FC1;
+            for i in 0..2 * L2 {
+                fc1w[i * (L3 * NB) + b * L3 + o] = st.fc1w[o * (2 * L2) + i] as f32 / CONV_W_FC1;
+            }
+        }
+        for i in 0..n2 {
+            fc2w[i * NB + b] = st.fc2w[i] as f32 / CONV_W_FC2;
+        }
+        fc2b[b] = st.fc2b as f32 / CONV_B_FC2;
+    }
+    let fc0fw = vec![0f32; L1 * L2];
+    let fc0fb = vec![0f32; L2];
+
+    // O carregamento do bullet mete os pesos a ~metade (a semente compensava
+    // isto com o pre-factor ~1,844). Multiplicamos TUDO por KESTREL_WARM_SCALE
+    // (default 2,0) para cancelar o corte -- o oficial e' o arbitro. Escala
+    // separada para o PSQT (KESTREL_WARM_PSQT) porque, sendo linear, pode pedir
+    // um valor ligeiramente diferente do resto.
+    let s_geral: f32 = std::env::var("KESTREL_WARM_SCALE").ok().and_then(|v| v.parse().ok()).unwrap_or(2.0);
+    let s_psqt: f32 = std::env::var("KESTREL_WARM_PSQT").ok().and_then(|v| v.parse().ok()).unwrap_or(s_geral);
+    let escala = |mut v: Vec<f32>, s: f32| { for x in v.iter_mut() { *x *= s; } v };
+
+    vec![
+        ("l0w".to_string(), escala(l0w, s_geral)),
+        ("l0b".to_string(), escala(l0b, s_geral)),
+        ("fc0w".to_string(), escala(fc0w, s_geral)),
+        ("fc0b".to_string(), escala(fc0b, s_geral)),
+        ("fc1w".to_string(), escala(fc1w, s_geral)),
+        ("fc1b".to_string(), escala(fc1b, s_geral)),
+        ("fc2w".to_string(), escala(fc2w, s_geral)),
+        ("fc2b".to_string(), escala(fc2b, s_geral)),
+        ("fc0fw".to_string(), fc0fw),
+        ("fc0fb".to_string(), fc0fb),
+        ("psqtw".to_string(), escala(psqtw, s_psqt)),
+        ("psqtb".to_string(), psqtb),
+    ]
+}
+
+/// Escreve os pesos nomeados no formato do bullet: `id\n` + u64 comprimento + f32[].
+pub fn escreve_pesos_bullet(pesos: &[(String, Vec<f32>)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (id, data) in pesos {
+        out.extend_from_slice(id.as_bytes());
+        out.push(b'\n');
+        out.extend_from_slice(&(data.len() as u64).to_le_bytes());
+        for &v in data {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    out
+}
+
 pub fn de_bullet(
     molde: &RedeSf,
     l0w: &[f32], l0b: &[f32],
