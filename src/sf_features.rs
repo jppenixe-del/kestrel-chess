@@ -883,7 +883,13 @@ mod medicao {
     #[ignore]
     fn conta_features_activas() {
         use std::io::BufRead;
-        let f = std::fs::File::open("/root/kestrel_joao/UHO_4060_v2.epd").unwrap();
+        // Suite de posicoes por variavel de ambiente: um caminho fixo so'
+        // existe na maquina de quem o escreveu.
+        let caminho = match std::env::var("KESTREL_EPD") {
+            Ok(v) => v,
+            Err(_) => return, // sem suite, nada a contar
+        };
+        let f = std::fs::File::open(caminho).unwrap();
         let mut pior = 0usize;
         let mut soma = 0usize;
         let mut n = 0usize;

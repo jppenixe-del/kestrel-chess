@@ -573,9 +573,9 @@ fn compute_time_budget(
 }
 
 
-/// Caminho do livro relativo ao proprio executavel (nao fixo a esta
-/// maquina) -- pedido depois de mover o motor para o servidor remoto:
-/// "/mnt/d/..." nao existe la'. Espera polgar_book.bin ao lado do binario.
+/// Book path relative to the executable itself, never absolute: an absolute
+/// path only exists on the machine it was written on, and the engine moves
+/// between machines. Expects the book file next to the binary.
 /// Quantas vezes um lance tem de aparecer no livro para ser jogado sem busca.
 /// Medido neste livro: 23% das posicoes tem o seu melhor lance com contagem 1
 /// e 43% com 2 ou menos. Abaixo deste numero o livro cala-se e a posicao vai a

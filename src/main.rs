@@ -423,7 +423,7 @@ fn main() {
             Some(n) => n,
             None => { eprintln!("precisa de KESTREL_NNUE"); return; }
         };
-        let ficheiro = args.get(2).map(|s| s.as_str()).unwrap_or("/root/kestrel_joao/blunders_big_v2.epd");
+        let ficheiro = args.get(2).map(|s| s.as_str()).unwrap_or("blunders.epd");
         let fens: Vec<String> = std::fs::read_to_string(ficheiro)
             .expect("nao consegui ler")
             .lines()
