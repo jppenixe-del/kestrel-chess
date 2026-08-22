@@ -6,14 +6,19 @@
 [![Lichess Bot](https://img.shields.io/badge/lichess-KestrelStrike-brightgreen?logo=lichess&logoColor=white)](https://lichess.org/@/KestrelStrike)
 [![Rust](https://img.shields.io/badge/language-Rust-orange?logo=rust)](https://www.rust-lang.org/)
 
-A from-scratch chess engine, written in Rust — bitboards, alpha-beta search
-with PVS, eval-adaptive null-move pruning, late move reductions, singular
-extensions, aspiration windows, quiescence search with Static Exchange
-Evaluation, a lock-free transposition table with proper mate-score handling,
-and a staged move picker built on killer moves, continuation history and a
-history heuristic. Positions are scored by a trained network, and the engine
-is paired with a signature opening book drawn from 1825 real games by one of
-the sharpest attacking players in chess history.
+A chess engine written in Rust, its search built from scratch — bitboards,
+alpha-beta search with PVS, eval-adaptive null-move pruning, late move
+reductions, singular extensions, aspiration windows, quiescence search with
+Static Exchange Evaluation, a lock-free transposition table with proper
+mate-score handling, and a staged move picker built on killer moves,
+continuation history and a history heuristic.
+
+Positions are scored by a trained network in Stockfish's SFNNv16 format. The
+format is theirs, and reading it is the one part of this engine derived from
+another — which is why this project is GPLv3. The weights are trained here.
+
+The engine is paired with a signature opening book drawn from 1825 real games
+by one of the sharpest attacking players in chess history.
 
 The evaluation used to be hand-written — some eight thousand lines of
 piece-square tables, mobility counts and king-safety curves, tuned on the
@@ -62,10 +67,15 @@ one-sided.
 - **Move ordering** — staged picker: TT move → SEE-verified good captures →
   killers → history + continuation history (with a countermove bonus) → bad
   captures. Capture history breaks SEE ties.
-- **Evaluation** — a quantised network, in two architectures the engine picks
-  between by which file it is given rather than by a build flag, so comparing
+- **Evaluation** — a quantised network. The architecture is chosen by which
+  file the engine is given rather than by a build flag, so comparing two of
   them compares networks and not binaries:
-  - *piece-square*: `(768 → 512)x2 → 8`, twelve king buckets, eight output
+  - *SFNNv16* — what the engine evaluates with today: `HalfKAv2_hm` +
+    `Full_Threats` + `PP_3Wide`, 86896 inputs into a 1024-wide accumulator.
+    This is Stockfish's network format, and reading it is the one part of
+    this engine derived from theirs — see [License](#-license). The weights
+    are trained by this project.
+  - *piece-square* (earlier): `(768 → 512)x2 → 8`, twelve king buckets, eight output
     buckets by piece count. The accumulator is carried on the board and
     updated one piece at a time, with a refresh cache per king bucket — king
     moves are a quarter of all moves and a sixth of those cross a bucket
@@ -79,11 +89,15 @@ one-sided.
   - Hand-written terms survive only where they are not evaluation: piece
     values, which Static Exchange Evaluation needs before any score exists to
     judge, and game phase, which the search uses for time and reductions.
-- **Training** — networks are trained with [bullet](https://github.com/jw1912/bullet)
-  on positions the engine generates itself, labelled by game result. Every
-  candidate is validated by SPRT in real games before adoption; a lower
-  training loss on its own has more than once meant nothing at the board.
-  Search parameters are tuned separately by SPSA.
+- **Training** — the network is trained by this project's own pipeline, on
+  the Stockfish project's published 5000-node data, filtered here. The
+  weights are ours; the data is not, and is credited in
+  [NOTICES.md](NOTICES.md). Earlier networks were trained with
+  [bullet](https://github.com/jw1912/bullet) on the engine's own self-play,
+  which is what this section used to describe. Every candidate is validated
+  by SPRT in real games before adoption; a lower training loss on its own has
+  more than once meant nothing at the board. Search parameters are tuned
+  separately by SPSA.
 - **Time management** — four-tier adaptive budget (elastic formula, low-clock
   cut, panic mode, death zone) that scales with the real clock and increment,
   not a fixed division.
@@ -100,8 +114,22 @@ README as "as of the last update," never as a permanent claim.
 
 ```bash
 cargo build --release
-./target/release/kestrel perft 5   # sanity check: should print 4865609
+./target/release/kestrel perft 5   # move generation: should print 4865609
 ```
+
+**The engine needs a network.** Point `KESTREL_NNUE_SF` at an SFNNv16-format
+`.nnue` file:
+
+```bash
+export KESTREL_NNUE_SF=/path/to/net.nnue
+./target/release/kestrel bench      # with the network: 2716488 nodes
+```
+
+Without that variable there is no evaluation at all: the engine does not fall
+back to a hand-crafted one, it scores every position as zero and searches
+blind. It will still run, and `bench` will still print a node count — a
+different, meaningless one. If you are using the node count as a regression
+check, take it with the network loaded.
 
 ## 🧭 Design principle
 
@@ -109,8 +137,11 @@ Kestrel is meant to be an *original* engine, not a clone, and the line falls in
 a specific place. Concepts are drawn from the public chess-programming
 literature — the Chess Programming Wiki, forum discussions, published papers,
 and other open engines. The **search is written from scratch for this
-codebase**, and every weight is **trained on Kestrel's own data** and validated
-in play, never copied from another engine.
+codebase**, and every weight is **trained by this project** and validated in
+play, never copied from another engine. The training *data* is a separate
+question and is credited in [NOTICES.md](NOTICES.md): the current network is
+trained on the Stockfish project's published positions, not on Kestrel's own
+games.
 
 The exception, stated plainly because it is the kind of thing that should not
 have to be discovered: the **NNUE inference side is derived from Stockfish**.
