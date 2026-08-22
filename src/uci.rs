@@ -1746,13 +1746,12 @@ impl Engine {
                         report: ti == 0,
                         thread_idx: ti,
                     };
-                    // The default stack (2MB) was enough for Rust search
-                    // alone, but napv10 (vendor/napv10/, vendored C++)
-                    // allocates large stack buffers on EVERY evaluate() call
-                    // (concat[2*1536+32], a1[1024] floats, ...) -- multiplied
-                    // by real negamax recursion depth, that overflows the
-                    // default stack. 16MB is generous headroom, cheap in
-                    // virtual memory on a 64-bit system.
+                    // The default stack (2MB) is enough for the Rust search
+                    // alone, but an evaluation that allocates its working
+                    // buffers on the stack multiplies them by the real
+                    // negamax recursion depth, and 2MB does not survive that.
+                    // 16MB is generous headroom and costs nothing but virtual
+                    // address space on a 64-bit system.
                     std::thread::Builder::new()
                         .stack_size(16 * 1024 * 1024)
                         .spawn_scoped(scope, move || {

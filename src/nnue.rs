@@ -674,11 +674,10 @@ fn empacota_leb128(valores: &[i16]) -> Vec<u8> {
 /// The first version of this called a second helper afterward just to
 /// re-decode the same stream and count its length -- for `l0w` (393216 of
 /// this network's 394753 values) that was the whole tensor parsed twice for
-/// no reason. Reading littleindian's own LEB128 reader in nnue_net.cpp
-/// (`lebOne`/`lebI16`) turned up nothing structurally faster -- same
-/// scalar, byte-at-a-time decode -- but its chunk format stores each
-/// chunk's byte length up front instead of re-deriving it, which is the
-/// actual fix: don't recompute what the first pass already knew.
+/// no reason. There is nothing structurally faster available for the decode
+/// itself -- it is scalar and byte-at-a-time either way. The fix is not to
+/// decode faster but to stop decoding twice: don't recompute what the first
+/// pass already knew.
 fn desempacota_leb128(bytes: &[u8], n: usize) -> Option<(Vec<i16>, usize)> {
     let mut out = Vec::with_capacity(n);
     let mut pos = 0;

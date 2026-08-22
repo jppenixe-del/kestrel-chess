@@ -219,11 +219,12 @@ pub fn generate_legal(board: &mut Board, atk: &Attacks) -> Vec<Move> {
 }
 
 fn gera_legal<const APENAS_CAPTURAS: bool>(board: &mut Board, atk: &Attacks) -> Vec<Move> {
-    // `pseudo` (o intermedio) e' um scratch thread-local reutilizado, para nao
-    // alocar+libertar um Vec por NO -- o malloc/free era ~4% do perfil. O `legal`
-    // continua fresco (o caller detem-no durante a recursao da busca). Sem
-    // re-entrancia: a recursao chama gera_legal DEPOIS de este devolver, e um
-    // RefCell entraria em panico se houvesse um caminho re-entrante que me escapou.
+    // `pseudo`, the intermediate, is a reused thread-local scratch buffer, so
+    // that a Vec is not allocated and freed once per NODE -- malloc/free was
+    // ~4% of the profile. `legal` stays fresh, because the caller holds it
+    // across the search recursion. There is no re-entrancy here: the recursion
+    // calls gera_legal only AFTER this one returns, and the RefCell would
+    // panic outright if some re-entrant path had been missed.
     std::thread_local! {
         static PSEUDO: std::cell::RefCell<Vec<Move>> =
             std::cell::RefCell::new(Vec::with_capacity(64));

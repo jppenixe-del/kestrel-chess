@@ -141,8 +141,8 @@ fn lmr_table() -> &'static [[i32; 64]; 64] {
 ///
 /// The mechanism is common practice, arrived at independently by every engine
 /// that carries several modulators: Stockfish (GPL-3.0) and Coda (GPL-3.0)
-/// both accumulate this way, as does our own earlier napv10 engine -- the
-/// first two in 1/1024, Coda in 1/100. The scale is arbitrary; 1024 is chosen
+/// both accumulate this way -- the first in 1/1024, Coda in 1/100. The
+/// scale is arbitrary; 1024 is chosen
 /// here because it makes the final division a shift.
 ///
 /// The constants below are NOT taken from any of them. Every term keeps the
@@ -166,23 +166,19 @@ pub const MAX_PLY: usize = 128;
 
 /// Percent multiplier for the eval-margin pruning thresholds (RFP, NMP,
 /// razoring, futility) -- 100 = unchanged. A foreign network read through
-/// our own port has a different noise/volatility profile than the one
-/// these margins were tuned against; the Nap2Siriux reference documents
-/// exactly this (`search_params.h`: separate, ~1.5x wider `_NNUE` margins,
-/// "the HCE margins fire too early" against their own bullet-WDL net).
-/// We do not have a second network to split constants against the way
-/// they do -- one pragmatic knob instead of relearning their whole
-/// parameter set, widening every eval-margin site the same way while this
-/// gets measured.
+/// our own port has a different noise/volatility profile than the one these
+/// margins were tuned against, and margins tuned for a hand-crafted
+/// evaluation fire too early against a network. The usual answer is a second
+/// set of constants for the network path; this is one pragmatic knob
+/// instead, widening every eval-margin site the same way while it gets
+/// measured.
 #[inline]
 pub fn eval_margin_scale() -> i32 {
-    // 2026-08-13: tried widening by 1.5x (the ratio dual_vision.h uses)
-    // and measured WORSE (15% vs 27.5% vs the same SF1800 baseline
-    // without this) -- their search is multi-threaded with heavy SIMD in
-    // the dense forward pass and can afford to explore more per node;
-    // ours, already slower per node on this network, only loses
-    // effective depth by widening. Off until the cause is better
-    // understood.
+    // Widening by 1.5x was tried and measured WORSE against the same
+    // baseline. Widening buys width at the cost of depth, and that trade
+    // only pays for a search fast enough per node to afford the extra
+    // exploration; ours, already slow per node on this network, just loses
+    // effective depth. Off until the cause is better understood.
     100
 }
 
@@ -3991,16 +3987,14 @@ impl<'a> Searcher<'a> {
         if depth <= 1 {
             return self.negamax(board, depth, -MATE_SCORE - 1, MATE_SCORE + 1, 0, false, false);
         }
-        // 2026-08-13: tried a napv10-gated sliding-average variant here
-        // (Nap2Siriux's aspWindowsNNUE(), centers on a running average
-        // instead of prev_score, asymmetric 52/256 vs 120/256 widening).
-        // Measured WORSE against the same SF1800 baseline than the plain
-        // version below (21.7% vs the un-gated 35% baseline), on top of an
-        // already-documented history of three independent negative signals
-        // for touching this function at all. Reverted; not worth the added
-        // surface for an unproven gain. `_root_average` kept as a parameter
-        // so the call site does not have to change again if this is
-        // revisited with better evidence.
+        // A sliding-average variant was tried here -- centre the window on a
+        // running average of the root score instead of on prev_score, and
+        // widen asymmetrically. It measured WORSE than the plain version
+        // below, on top of an already-documented history of three independent
+        // negative signals for touching this function at all. Reverted; not
+        // worth the added surface for an unproven gain. `_root_average` is
+        // kept as a parameter so the call site does not have to change again
+        // if this is revisited with better evidence.
         // Adopted whole, rather than assembled a piece at a time.
         //
         // Every part of this had a reason behind it in the engine it comes
@@ -4071,8 +4065,9 @@ impl<'a> Searcher<'a> {
         let mut best_score = 0;
         let mut last_depth = 0;
         let mut prev_score = 0;
-        // Sliding average of the root score across iterations, only read
-        // when napv10 is active -- see `search_root`'s use of it.
+        // Sliding average of the root score across iterations. Currently
+        // unread -- see `search_root`, where the variant that would have used
+        // it measured worse and was reverted.
         let mut root_average: Option<i32> = None;
         let mut stable_count: u32 = 0;
         // How often the search has changed its mind about the best move.

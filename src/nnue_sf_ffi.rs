@@ -1,12 +1,14 @@
-//! Ponte para o forward NNUE do Stockfish (GPL-3.0), quando compilada.
+//! Bridge to the reference NNUE forward pass (GPL-3.0 -- see NOTICES.md),
+//! when it is compiled in.
 //!
-//! Porquê: medido na mesma máquina, mesma posição, 1 thread -- Stockfish
-//! 138k NPS, Triumviratus 202k, a nossa versão em Rust escalar 46k. O perfil
-//! diz 73% do tempo em avaliação, 5% em busca. A diferença não está na
-//! arquitectura, está em quem executa o forward.
+//! Why it exists: measured on one machine, one position, one thread, this
+//! project's scalar Rust forward ran at roughly a third of the speed of a
+//! vectorised one. The profile puts 73% of the time in evaluation against 5%
+//! in search, so that gap is most of the engine. The difference is not in the
+//! architecture; it is in what executes the forward pass.
 //!
-//! Ligado por `KESTREL_NNUE_SF_FFI=<rede.nnue>`. Sem essa variável, ou sem a
-//! biblioteca, nada disto entra em jogo e o motor usa o caminho em Rust.
+//! Enabled by `KESTREL_NNUE_SF_FFI=<net.nnue>`. Without that variable, or
+//! without the library, none of this is reached and the Rust path is used.
 
 #[cfg(tem_sfbridge)]
 mod ligado {

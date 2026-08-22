@@ -3,10 +3,8 @@
 //! L2=32, L3=32, 8 output buckets/LayerStacks, double activation with a
 //! raw-difference skip term). Reads the actual GPL-3.0 released .nnue
 //! file directly -- format understood by reading Stockfish's own source
-//! (GPL-3.0, no copyleft issue for running/adapting), values are that
-//! network's own trained weights, used as-is on the project owner's
-//! explicit instruction, same footing as the PlentyChess and Triumviratus
-//! reference imports this session.
+//! (GPL-3.0 -- see NOTICES.md), values are that network's own trained
+//! weights, read as-is.
 //!
 //! Gated behind `KESTREL_NNUE_SF`; unset, this module does nothing.
 
@@ -65,7 +63,8 @@ const ORIENT_HALFKA: [i32; 64] = {
 const ORIENT_THREATS: [i32; 64] = {
     // Full_Threats/PP_3Wide's own OrientTBL: opposite sense from HalfKAv2_hm
     // (files a-d -> SQ_A1=0, e-h -> SQ_H1=7) -- kept as a separate table on
-    // purpose, conflating the two cost real time earlier today (PlentyChess).
+    // purpose: the two look interchangeable and are not, and conflating them
+    // produces a network that reads as merely mediocre rather than broken.
     let h = 7; let a = 0;
     [
     a,a,a,a, h,h,h,h,
@@ -268,9 +267,10 @@ fn pawn_id(square: usize, color_offset: i32, square_flip: usize) -> i32 {
     color_offset + (square ^ square_flip) as i32 - 8
 }
 
-// ---- LEB128 (Stockfish's own: standard signed LEB128, sign-extended from
-// the last byte's bit 6 -- NOT the zigzag scheme our own .li11 format uses,
-// despite sharing the "COMPRESSED_LEB128" magic string). ----
+// ---- LEB128, as this format defines it: standard signed LEB128,
+// sign-extended from the last byte's bit 6. NOT zigzag -- other formats
+// share the "COMPRESSED_LEB128" magic string and encode differently, so the
+// magic alone does not tell you how to decode. ----
 const LEB_MAGIC: &[u8] = b"COMPRESSED_LEB128";
 
 fn leb_decode_one(bytes: &[u8], pos: &mut usize, bits: u32) -> i64 {

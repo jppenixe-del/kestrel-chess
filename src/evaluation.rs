@@ -48,9 +48,9 @@ pub fn evaluate(board: &mut Board) -> i32 {
     // architecture is chosen by which file was given, never by a build flag,
     // so comparing two of them compares networks and not binaries.
     if let Some(net) = crate::nnue_v3::rede() {
-        // Pelo acumulador quando existe, como na rede simples: recomputar as
-        // ~190 features a cada avaliacao custava 61% do tempo total (perf),
-        // contra ~16% da simples.
+        // Through the accumulator when there is one, as with the simple
+        // network: recomputing the ~190 features on every evaluation cost 61%
+        // of total time in the profile, against ~16% for the simple net.
         return match board.acc_v3.as_ref() {
             Some(acc) => acc.valor(net, board),
             None => crate::nnue_v3::evaluate(net, board),
