@@ -795,7 +795,28 @@ impl Default for SearchParams {
             // orcamento de jogos. Fica em 10 porque nada indica que faca mal,
             // nao porque esteja provado que faz bem.
             rfp_max_depth: 10,
-            rfp_corr_divisor: 0,
+            // 4, nao 0. Soma |correccao|/4 a` margem do RFP: onde a historia de
+            // correccao diz que a avaliacao estatica costuma estar enganada
+            // NESTE tipo de posicao, exige-se mais folga antes de podar.
+            //
+            // Medido a 10+0.1, 1638 jogos, so' esta opcao a mudar:
+            //     +3,4 Elo +/- 11,9
+            //
+            // O intervalo inclui o zero, e isso NAO quer dizer que o ganho seja
+            // nulo -- quer dizer que 1638 jogos nao chegam para o separar de
+            // zero. Resolver +3 Elo com confianca exige ~20 mil jogos, que e' o
+            // que motores com fila de testes distribuida fazem e nos nao.
+            // Perante um positivo, a escolha e' entre adoptar e continuar, ou
+            // gastar dez vezes mais jogos para o confirmar antes de seguir. Um
+            // motor forte e' feito de dezenas destes; arrumar cada um como
+            // "nulo" por falta de significancia e' deitar fora exactamente o
+            // material de que ele e' feito.
+            //
+            // O que NAO se pode fazer -- e ja' foi feito neste repo, ver o
+            // handover -- e' adoptar VARIOS positivos medidos em paralelo
+            // contra a mesma base, como se somassem. A partir daqui esta e' a
+            // base, e o proximo candidato mede-se contra ela.
+            rfp_corr_divisor: 4,
             rfp_skip_ttpv: 0,
         }
     }
