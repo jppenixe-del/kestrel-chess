@@ -1736,12 +1736,15 @@ impl Engine {
                         capture_history: ht.capture_history,
                         dextensions: [0; crate::search::MAX_PLY],
                         cutoff_cnt: [0; crate::search::MAX_PLY],
+                        ult_margem: [-1; crate::search::MAX_PLY],
                         ameacas_reduzidos: [0; 4],
                         ameacas_bateram: [0; 4],
                         cutcnt_reduzidos: [0; 4],
                         cutcnt_bateram: [0; 4],
                         subalfa_reduzidos: [0; 4],
                         subalfa_bateram: [0; 4],
+                        margem_reduzidos: [0; 4],
+                        margem_bateram: [0; 4],
                         // only thread 0 narrates, or each depth would be
                         // announced once per Lazy-SMP thread
                         report: ti == 0,

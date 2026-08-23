@@ -521,6 +521,17 @@ pub struct SearchParams {
     pub lmr_check: i32,
     /// Extra MILLI-PLY reduction when the TT move is a capture. 0 = off.
     pub lmr_ttcapture: i32,
+    /// Weight, in MILLI-PLIES, of the previous reduced sibling's fail-low
+    /// margin. Positive margin above the pivot reduces MORE, below it
+    /// reduces LESS. 0 = off. Measured across three middlegames, bucketing
+    /// reduced moves by the previous sibling's margin against how often each
+    /// then beat alpha: 2.41/1.04/0.62/0.16, 2.07/1.20/0.60/0.16 and
+    /// 2.96/1.46/0.78/0.38 per cent -- monotone in all three, an 8x to 15x
+    /// spread, the widest of any signal measured here. The number was already
+    /// being computed and thrown away.
+    pub lmr_margem: i32,
+    /// Margin, in eval units, that counts as "neither close nor hopeless".
+    pub lmr_margem_pivo: i32,
     /// MILLI-PLIES of reduction REMOVED when the moved piece attacks ANY
     /// enemy piece from its destination square. A threshold, not a per-piece
     /// weight: measured, the entire signal sits between zero threats and one.
@@ -724,6 +735,10 @@ impl Default for SearchParams {
             lmr_cutnode: std::env::var("KESTREL_LMR_CUTNODE")
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(0),
             lmr_ttcapture: 0,
+            lmr_margem: std::env::var("KESTREL_LMR_MARGEM")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+            lmr_margem_pivo: std::env::var("KESTREL_LMR_MARGEM_PIVO")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(180),
             lmr_ameacas: std::env::var("KESTREL_LMR_AMEACAS")
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(0),
             lmr_min_moves_pv: std::env::var("KESTREL_LMR_MIN_PV")
@@ -1007,6 +1022,10 @@ impl SearchParams {
             // que e' exactamente como se invalida uma afinacao inteira sem dar
             // por isso. Entram quando um SPRT os justificar.
             lmr_ttcapture: 0,
+            lmr_margem: std::env::var("KESTREL_LMR_MARGEM")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+            lmr_margem_pivo: std::env::var("KESTREL_LMR_MARGEM_PIVO")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(180),
             lmr_ameacas: std::env::var("KESTREL_LMR_AMEACAS")
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(0),
             lmr_min_moves_pv: std::env::var("KESTREL_LMR_MIN_PV")
@@ -1446,6 +1465,8 @@ pub struct Searcher<'a> {
     pub cutcnt_bateram: [u64; 4],
     pub subalfa_reduzidos: [u64; 4],
     pub subalfa_bateram: [u64; 4],
+    pub margem_reduzidos: [u64; 4],
+    pub margem_bateram: [u64; 4],
     pub lmr_quiet_total: u64,
     pub lmr_skip_check: u64,
     pub lmr_skip_depth: u64,
@@ -1585,6 +1606,13 @@ pub struct Searcher<'a> {
     /// built by the siblings searched under it during THIS visit and
     /// does not leak in from the previous sibling's subtree.
     pub cutoff_cnt: [i32; MAX_PLY],
+    /// By how much the previous reduced sibling at this ply fell SHORT of
+    /// alpha. The reduced search already returns a number and we throw all
+    /// of it away except one bit ("did it beat alpha"), yet a move that
+    /// missed by five centipawns and one that missed by three hundred are
+    /// not the same evidence about how well this node is ordered. This is
+    /// that number, kept per ply and reset on entry.
+    pub ult_margem: [i32; MAX_PLY],
     /// Report each completed iteration on stdout as a UCI `info` line.
     /// Set on ONE searcher only (the rest of the Lazy-SMP threads stay
     /// silent, or every depth would be reported several times over).
@@ -2804,6 +2832,7 @@ impl<'a> Searcher<'a> {
         // Clearing `ply + 1` here would wipe the child's count before the
         // reduction below ever reads it; clearing `ply + 2` leaves the
         // child's slot to be filled by its own children during this visit.
+        self.ult_margem[ply] = -1;
         if ply + 2 < MAX_PLY {
             self.cutoff_cnt[ply + 2] = 0;
         }
@@ -3646,6 +3675,7 @@ impl<'a> Searcher<'a> {
                 let mut n_ameacas_visto = 0i32;
                 let mut cutcnt_visto = 0i32;
                 let mut subalfa_visto = 0i32;
+                let mut margem_vista = -1i32;
                 let capture_ok_for_lmr = lmr_captures_enabled()
                     && matches!(capture_lmr_info, Some((losing_or_equal, _)) if losing_or_equal);
                 let r = if i >= min_moves
@@ -3730,6 +3760,7 @@ impl<'a> Searcher<'a> {
                     n_ameacas_visto = n_ameacas;
                     cutcnt_visto = self.cutoff_cnt[(ply + 1).min(MAX_PLY - 1)];
                     subalfa_visto = subidas_alpha;
+                    margem_vista = self.ult_margem[ply];
                     // A THRESHOLD, not a linear weight -- and that shape came
                     // out of measuring, not out of assuming. Bucketing 677852
                     // reduced moves across three middlegames by threat count
@@ -3744,6 +3775,22 @@ impl<'a> Searcher<'a> {
                     // at all", not "how many" -- the linear term this started
                     // as would have spent its resolution on the half of the
                     // range that carries nothing.
+                    // The reduction correcting itself from its own error.
+                    // Every other term here decides the cut from information
+                    // that existed BEFORE any search happened; this one uses
+                    // the result of the reduced search we just ran on the
+                    // previous sibling. We were asking that search a yes/no
+                    // question ("did it beat alpha") and discarding the number
+                    // it actually returned -- yet a sibling that missed alpha
+                    // by five centipawns and one that missed by three hundred
+                    // say opposite things about how safe the next cut is.
+                    let margem_adj = if sp_lmr.lmr_margem != 0 && margem_vista >= 0 {
+                        let pivo = sp_lmr.lmr_margem_pivo.max(1);
+                        ((margem_vista - pivo) * sp_lmr.lmr_margem / pivo)
+                            .clamp(-2 * LMR_ESCALA, 2 * LMR_ESCALA)
+                    } else {
+                        0
+                    };
                     let ameacas_adj = if n_ameacas > 0 { -sp_lmr.lmr_ameacas } else { 0 };
                     // Corrplexity: reduce ~one ply less when
                     // |eval-staticEval| > 89 --
@@ -3849,6 +3896,7 @@ impl<'a> Searcher<'a> {
                         0
                     };
                     let mut r_milli = base
+                        + margem_adj
                         + ameacas_adj
                         + cutoffcnt_adj
                         + hist_adj
@@ -3916,6 +3964,26 @@ impl<'a> Searcher<'a> {
                     // the signal is empty and games would only have told us
                     // so more slowly.
                     let bateu = s > alpha;
+                    // Grava a margem para o irmao seguinte. So' quando falha
+                    // baixo: quando bate alpha ha' re-pesquisa e a informacao
+                    // ja' e' usada.
+                    if !bateu {
+                        self.ult_margem[ply] = (alpha - s).clamp(0, 2000);
+                    }
+                    // Balde pela margem do irmao ANTERIOR (-1 = nao houve).
+                    let bm = match margem_vista {
+                        m if m < 0 => usize::MAX,
+                        m if m < 60 => 0,
+                        m if m < 180 => 1,
+                        m if m < 450 => 2,
+                        _ => 3,
+                    };
+                    if bm != usize::MAX {
+                        self.margem_reduzidos[bm] += 1;
+                        if bateu {
+                            self.margem_bateram[bm] += 1;
+                        }
+                    }
                     for (val, tot, bat) in [
                         (n_ameacas_visto, &mut self.ameacas_reduzidos, &mut self.ameacas_bateram),
                         (cutcnt_visto, &mut self.cutcnt_reduzidos, &mut self.cutcnt_bateram),
@@ -4774,6 +4842,7 @@ impl<'a> Searcher<'a> {
                 ("ameacas ", &self.ameacas_reduzidos, &self.ameacas_bateram),
                 ("cutcnt  ", &self.cutcnt_reduzidos, &self.cutcnt_bateram),
                 ("subalfa ", &self.subalfa_reduzidos, &self.subalfa_bateram),
+                ("margem  ", &self.margem_reduzidos, &self.margem_bateram),
             ] {
                 let mut linha = format!("sinal {}: ", nome);
                 for b in 0..4 {
