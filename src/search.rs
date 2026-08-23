@@ -521,6 +521,30 @@ pub struct SearchParams {
     pub lmr_check: i32,
     /// Extra MILLI-PLY reduction when the TT move is a capture. 0 = off.
     pub lmr_ttcapture: i32,
+    /// Move index from which a quiet move is "late" enough to reduce, at a
+    /// PV node. Default 4 (the 4th move). Both reference engines start at
+    /// the 2nd; ours is a gate nobody measured, and our instrumentation
+    /// says it holds 8.9% of quiet moves at full depth.
+    pub lmr_min_moves_pv: i32,
+    /// Same, outside the PV. Default 3.
+    pub lmr_min_moves_nonpv: i32,
+    /// Extra MILLI-PLIES of reduction when the CHILD ply has already
+    /// produced more than one beta cutoff -- the node is refuting easily,
+    /// so what is left of the move list is probably noise. 0 = off, which
+    /// also disables the three terms below.
+    pub lmr_cutoffcnt: i32,
+    /// Further MILLI-PLIES on top of `lmr_cutoffcnt` when the child has
+    /// produced more than TWO cutoffs.
+    pub lmr_cutoffcnt2: i32,
+    /// Further MILLI-PLIES on top of `lmr_cutoffcnt` at an ALL node, where
+    /// every move is expected to fail low anyway.
+    pub lmr_cutoffcnt_allnode: i32,
+    /// MILLI-PLIES of reduction REMOVED from the TT move when the child ply
+    /// has NOT been failing high. Deliberately the `else` branch of the
+    /// cutoff-count test, not an independent term: the point is to
+    /// discriminate between the two kinds of node, so a node that is
+    /// refuting easily must not also hand its TT move a discount.
+    pub lmr_ttmove: i32,
     /// MILLI-PLIES of reduction REMOVED at a PV node (subtracted). 0 = off.
     pub lmr_pvnode: i32,
     /// Multiplicative scaling of the whole reduction at an ALL node:
@@ -692,6 +716,18 @@ impl Default for SearchParams {
             lmr_cutnode: std::env::var("KESTREL_LMR_CUTNODE")
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(0),
             lmr_ttcapture: 0,
+            lmr_min_moves_pv: std::env::var("KESTREL_LMR_MIN_PV")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(4),
+            lmr_min_moves_nonpv: std::env::var("KESTREL_LMR_MIN_NONPV")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(3),
+            lmr_cutoffcnt: std::env::var("KESTREL_LMR_CUTOFFCNT")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+            lmr_cutoffcnt2: std::env::var("KESTREL_LMR_CUTOFFCNT2")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+            lmr_cutoffcnt_allnode: std::env::var("KESTREL_LMR_CUTOFFCNT_ALLNODE")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+            lmr_ttmove: std::env::var("KESTREL_LMR_TTMOVE")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(0),
             lmr_pvnode: 0,
             lmr_allnode: 0,
             lmr_killer: 0,
@@ -961,6 +997,18 @@ impl SearchParams {
             // que e' exactamente como se invalida uma afinacao inteira sem dar
             // por isso. Entram quando um SPRT os justificar.
             lmr_ttcapture: 0,
+            lmr_min_moves_pv: std::env::var("KESTREL_LMR_MIN_PV")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(4),
+            lmr_min_moves_nonpv: std::env::var("KESTREL_LMR_MIN_NONPV")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(3),
+            lmr_cutoffcnt: std::env::var("KESTREL_LMR_CUTOFFCNT")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+            lmr_cutoffcnt2: std::env::var("KESTREL_LMR_CUTOFFCNT2")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+            lmr_cutoffcnt_allnode: std::env::var("KESTREL_LMR_CUTOFFCNT_ALLNODE")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+            lmr_ttmove: std::env::var("KESTREL_LMR_TTMOVE")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(0),
             lmr_pvnode: 0,
             lmr_allnode: 0,
             lmr_killer: 0,
@@ -1496,6 +1544,20 @@ pub struct Searcher<'a> {
     /// each one costs an extra full ply, and they can chain if several
     /// nodes in a row are singular by a wide margin.
     pub dextensions: [i32; MAX_PLY],
+    /// How many beta cutoffs this ply has produced (indexed by ply).
+    /// Read from the CHILD ply (`ply + 1`) when deciding a reduction: a
+    /// node whose child keeps failing high is a node whose remaining
+    /// moves are noise, so cut them harder. Our own instrumentation said
+    /// we needed exactly this signal -- we reduce 54% of quiet moves by
+    /// 3.33 plies on average and only 1.3% ever come back above alpha,
+    /// which is a uniform cut, not a discriminating one. This is the
+    /// first term that says WHERE the cut is safe rather than how deep
+    /// to make it everywhere.
+    ///
+    /// Cleared two plies ahead on entry (not one), so a node's count is
+    /// built by the siblings searched under it during THIS visit and
+    /// does not leak in from the previous sibling's subtree.
+    pub cutoff_cnt: [i32; MAX_PLY],
     /// Report each completed iteration on stdout as a UCI `info` line.
     /// Set on ONE searcher only (the rest of the Lazy-SMP threads stay
     /// silent, or every depth would be reported several times over).
@@ -2694,6 +2756,13 @@ impl<'a> Searcher<'a> {
         if ply > 0 {
             self.dextensions[ply] = self.dextensions[ply - 1];
         }
+        // Clear the cutoff counter TWO plies ahead, as the reference does.
+        // Clearing `ply + 1` here would wipe the child's count before the
+        // reduction below ever reads it; clearing `ply + 2` leaves the
+        // child's slot to be filled by its own children during this visit.
+        if ply + 2 < MAX_PLY {
+            self.cutoff_cnt[ply + 2] = 0;
+        }
         let mut tt_entry_captured: Option<crate::tt::TtEntry> = None;
         if excluded.is_none() { if let Some(e) = self.tt.probe(hash) {
             tt_entry_captured = Some(e);
@@ -3497,7 +3566,21 @@ impl<'a> Searcher<'a> {
                 // threshold, no fixed-point/scale conversion involved
                 // (unlike the NMP/corr-hist calibrations above), so
                 // applied directly without the caution those needed.
-                let min_moves = if is_pv { 4 } else { 3 };
+                // Which move index is "late" enough to reduce. Ours has been
+                // the 4th move (3rd outside PV) since the split was
+                // introduced; both reference engines we can read start at the
+                // SECOND, with opposite design philosophies and no exemptions
+                // at all. Our own counters say 8.9% of quiet moves are
+                // searched at full depth purely because they arrive too early
+                // in the list -- and those are moves 1-3, whose subtrees cost
+                // far more than the late ones LMR currently spends its effort
+                // on. The depth gate below looks bigger (36.2%) but is not a
+                // lever: at depth 2 `new_depth` is 1 and the reduced depth
+                // floors at 1, so reducing there is arithmetically a no-op.
+                let sp_gate = search_params();
+                let min_moves =
+                    if is_pv { sp_gate.lmr_min_moves_pv } else { sp_gate.lmr_min_moves_nonpv }
+                        .max(0) as usize;
                 // Which condition is granting immunity to quiet moves. The
                 // reductions we DO apply almost never need a re-search (1.5%),
                 // which is not a healthy sign -- it says we only reduce what
@@ -3645,7 +3728,32 @@ impl<'a> Searcher<'a> {
                         ),
                         _ => (hist_adj, 0),
                     };
+                    // Cutoff count of the CHILD ply: how noisy the remaining
+                    // moves at this node have proven to be. Two cutoffs
+                    // already say the node is refuting easily; three say the
+                    // rest is almost certainly noise, and an all-node makes
+                    // that stronger still. When the child has NOT been failing
+                    // high, the tt_move earns a reduction back instead --
+                    // the two are mutually exclusive in the reference, which
+                    // is what makes this a discriminating signal rather than
+                    // another flat offset.
+                    //
+                    // This is the term our instrumentation was asking for:
+                    // 54% of quiet moves reduced by 3.33 plies with a 1.3%
+                    // re-search rate is a uniform cut. Defaults to 0 so the
+                    // binary is unchanged until an SPRT says otherwise.
+                    let child_cutoffs = self.cutoff_cnt[(ply + 1).min(MAX_PLY - 1)];
+                    let cutoffcnt_adj = if child_cutoffs > 1 {
+                        sp_lmr.lmr_cutoffcnt
+                            + if child_cutoffs > 2 { sp_lmr.lmr_cutoffcnt2 } else { 0 }
+                            + if all_node { sp_lmr.lmr_cutoffcnt_allnode } else { 0 }
+                    } else if Some(mv) == tt_move {
+                        -sp_lmr.lmr_ttmove
+                    } else {
+                        0
+                    };
                     let mut r_milli = base
+                        + cutoffcnt_adj
                         + hist_adj
                         + cont_adj
                         + ttpv_adj
@@ -3864,6 +3972,13 @@ impl<'a> Searcher<'a> {
                 self.cut_nodes += 1;
                 if i == 0 {
                     self.cut_first += 1;
+                }
+                // Feed the reduction signal. A double extension means this
+                // node was searched deeper than its siblings, so its cutoff
+                // says less about how noisy the remaining moves are -- the
+                // reference excludes exactly that case, and only outside PV.
+                if extend < 2 || is_pv {
+                    self.cutoff_cnt[ply] += 1;
                 }
                 // How much a cutoff is worth to the history tables is not the
                 // same as how deep the search was. A move that beats beta by a
