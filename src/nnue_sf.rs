@@ -1436,6 +1436,36 @@ pub fn de_bullet(
     }
 }
 
+/// Quantas relacoes de ameaca se ENUMERAM para encontrar as que mudam.
+///
+/// A pergunta: o Stockfish constroi a lista de ameacas sujas DURANTE o
+/// `do_move` (ver `DirtyThreats` em types.h), enquanto nos reconstruimos a
+/// posicao anterior e re-enumeramos com o `relacoes_ameaca`. Se enumerarmos
+/// muitas para aplicar poucas, essa e' a diferenca de custo entre as duas
+/// mecanicas -- e ate' agora foi ESTIMADA, nunca medida. `KESTREL_RELS=1`.
+static REL_ENUM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REL_APLIC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REL_CHAM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[inline(always)]
+fn diag_rels() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KESTREL_RELS").is_some())
+}
+
+pub fn imprime_rels() {
+    if !diag_rels() {
+        return;
+    }
+    use std::sync::atomic::Ordering::Relaxed;
+    let (e, a, c) = (REL_ENUM.load(Relaxed), REL_APLIC.load(Relaxed), REL_CHAM.load(Relaxed).max(1));
+    eprintln!(
+        "ameacas: {:.1} relacoes enumeradas por chamada, {:.1} features aplicadas -- {:.1}x",
+        e as f64 / c as f64, a as f64 / c as f64,
+        if a > 0 { e as f64 / a as f64 } else { 0.0 }
+    );
+}
+
 // ---- Incremental accumulator ----
 //
 // Measured: the reader was spending ~90% of its time reading ~290 KB of
@@ -1797,6 +1827,10 @@ fn delta_por_lance(
     let rels = std::mem::take(&mut st.rels);
     let mut tocadas = std::mem::take(&mut st.tocadas);
     tocadas.clear();
+    if diag_rels() {
+        REL_ENUM.fetch_add(rels.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        REL_CHAM.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     if ksq_pov < 64 {
         let hm = crate::sf_features::hm_de_rei(ksq_pov);
         for r in rels.iter() {
@@ -1833,6 +1867,9 @@ fn delta_por_lance(
                 st.psqt[pov][b] += sinal * net.ft_threat_psqt[idx * NB + b] as i64;
             }
         }
+    }
+    if diag_rels() {
+        REL_APLIC.fetch_add(tocadas.len() as u64, std::sync::atomic::Ordering::Relaxed);
     }
     st.tocadas = tocadas;
     // Pawn pairs. These were not handled here AT ALL: a plain `a2-a3` changes

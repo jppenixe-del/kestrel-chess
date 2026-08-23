@@ -71,6 +71,7 @@ fn main() {
         // or that a worker built something other than what it was asked to.
         let depth: i32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(11);
         bench(depth);
+        nnue_sf::imprime_rels();
         return;
     }
     // Confronta see_ge(mv, t) com see(mv) >= t em todas as capturas de todas
