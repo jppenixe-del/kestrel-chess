@@ -785,7 +785,23 @@ impl Default for SearchParams {
             do_shallower_margin: 18,
             // Ambos no comportamento ACTUAL, para cada ideia se medir sozinha:
             // 0 = devolve `static_eval - margem` como antes; 6 = o tecto de sempre.
-            rfp_return_beta: 0,
+            // 300, nao 0. Ao cortar por RFP, devolver 29% de `beta` misturado
+            // com 71% de `static_eval - margem`, em vez do segundo sozinho.
+            //
+            // Porque: `static_eval - margem` assume que a estimativa estatica
+            // esta' certa; `beta` e' o unico valor que o corte PROVA. Misturar
+            // devolve a` arvore menos ficcao sem mudar QUANDO se corta -- a
+            // condicao do corte e' a mesma, so' muda o numero que sobe.
+            //
+            // Medido a 10+0.1, so' esta opcao a mudar, contra a base com
+            // `rfp_corr_divisor 4` ja' adoptado:
+            //     +5,3 Elo +/- 8,5 em 3004 jogos, LOS 89%
+            //
+            // Testado a seguir ao `rfp_skip_ttpv 1`, que foi REJEITADO na mesma
+            // base: parecia +1,9 aos 2200 jogos e caiu para -3,7 aos 2798, com
+            // 81% de probabilidade de ser pior. Adoptar aos 2200 tinha metido
+            // uma regressao -- e' por isso que nao se le' um SPRT cedo.
+            rfp_return_beta: 300,
             // 10, nao 6. O tecto de 6 vinha de nunca ter sido testado mais
             // alto, e a 10 poda mais sem gastar mais nos.
             //
