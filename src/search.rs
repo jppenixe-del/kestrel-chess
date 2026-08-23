@@ -727,9 +727,9 @@ impl Default for SearchParams {
             lmr_ameacas: std::env::var("KESTREL_LMR_AMEACAS")
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(0),
             lmr_min_moves_pv: std::env::var("KESTREL_LMR_MIN_PV")
-                .ok().and_then(|v| v.parse().ok()).unwrap_or(4),
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(1),
             lmr_min_moves_nonpv: std::env::var("KESTREL_LMR_MIN_NONPV")
-                .ok().and_then(|v| v.parse().ok()).unwrap_or(3),
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(1),
             lmr_cutoffcnt: std::env::var("KESTREL_LMR_CUTOFFCNT")
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(0),
             lmr_cutoffcnt2: std::env::var("KESTREL_LMR_CUTOFFCNT2")
@@ -1010,9 +1010,9 @@ impl SearchParams {
             lmr_ameacas: std::env::var("KESTREL_LMR_AMEACAS")
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(0),
             lmr_min_moves_pv: std::env::var("KESTREL_LMR_MIN_PV")
-                .ok().and_then(|v| v.parse().ok()).unwrap_or(4),
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(1),
             lmr_min_moves_nonpv: std::env::var("KESTREL_LMR_MIN_NONPV")
-                .ok().and_then(|v| v.parse().ok()).unwrap_or(3),
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(1),
             lmr_cutoffcnt: std::env::var("KESTREL_LMR_CUTOFFCNT")
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(0),
             lmr_cutoffcnt2: std::env::var("KESTREL_LMR_CUTOFFCNT2")
@@ -1438,6 +1438,14 @@ pub struct Searcher<'a> {
     /// idea is wrong and no number of games would have made it right.
     pub ameacas_reduzidos: [u64; 4],
     pub ameacas_bateram: [u64; 4],
+    /// The same test applied to the child-cutoff count and to the number of
+    /// alpha raises at this node. Three candidate reduction signals, one
+    /// measurement, so the comparison is between what they predict and not
+    /// between where they came from.
+    pub cutcnt_reduzidos: [u64; 4],
+    pub cutcnt_bateram: [u64; 4],
+    pub subalfa_reduzidos: [u64; 4],
+    pub subalfa_bateram: [u64; 4],
     pub lmr_quiet_total: u64,
     pub lmr_skip_check: u64,
     pub lmr_skip_depth: u64,
@@ -3636,6 +3644,8 @@ impl<'a> Searcher<'a> {
                     }
                 }
                 let mut n_ameacas_visto = 0i32;
+                let mut cutcnt_visto = 0i32;
+                let mut subalfa_visto = 0i32;
                 let capture_ok_for_lmr = lmr_captures_enabled()
                     && matches!(capture_lmr_info, Some((losing_or_equal, _)) if losing_or_equal);
                 let r = if i >= min_moves
@@ -3718,6 +3728,8 @@ impl<'a> Searcher<'a> {
                         None => 0,
                     };
                     n_ameacas_visto = n_ameacas;
+                    cutcnt_visto = self.cutoff_cnt[(ply + 1).min(MAX_PLY - 1)];
+                    subalfa_visto = subidas_alpha;
                     // A THRESHOLD, not a linear weight -- and that shape came
                     // out of measuring, not out of assuming. Bucketing 677852
                     // reduced moves across three middlegames by threat count
@@ -3903,10 +3915,17 @@ impl<'a> Searcher<'a> {
                     // idea itself, not of a tuned value: a flat table means
                     // the signal is empty and games would only have told us
                     // so more slowly.
-                    let b = n_ameacas_visto.clamp(0, 3) as usize;
-                    self.ameacas_reduzidos[b] += 1;
-                    if s > alpha {
-                        self.ameacas_bateram[b] += 1;
+                    let bateu = s > alpha;
+                    for (val, tot, bat) in [
+                        (n_ameacas_visto, &mut self.ameacas_reduzidos, &mut self.ameacas_bateram),
+                        (cutcnt_visto, &mut self.cutcnt_reduzidos, &mut self.cutcnt_bateram),
+                        (subalfa_visto, &mut self.subalfa_reduzidos, &mut self.subalfa_bateram),
+                    ] {
+                        let b = val.clamp(0, 3) as usize;
+                        tot[b] += 1;
+                        if bateu {
+                            bat[b] += 1;
+                        }
                     }
                 }
                 if r > 0 && s > alpha && !self.stop {
@@ -4745,15 +4764,26 @@ impl<'a> Searcher<'a> {
             // so' chegam a' reducao lances que ja eram maus. Os contadores
             // separam-nas, e existiam sem nunca terem sido impressos, o que
             // e' o mesmo que nao existirem.
-            let mut linha = String::from("ameacas: ");
-            for b in 0..4 {
-                let n = self.ameacas_reduzidos[b];
-                let bate = self.ameacas_bateram[b];
-                let pct = if n > 0 { 100.0 * bate as f64 / n as f64 } else { 0.0 };
-                let rotulo = if b == 3 { "3+".to_string() } else { b.to_string() };
-                linha.push_str(&format!("{}={} bate={:.2}%  ", rotulo, n, pct));
+            // Three candidate reduction signals, one identical test: bucket
+            // every reduced move by the signal's value, then report how often
+            // each bucket went on to beat alpha. A signal whose rate climbs
+            // with its value predicts something; a flat row is an empty idea,
+            // and finding that out costs one bench run instead of a night of
+            // games. Provenance does not appear in the table on purpose.
+            for (nome, tot, bat) in [
+                ("ameacas ", &self.ameacas_reduzidos, &self.ameacas_bateram),
+                ("cutcnt  ", &self.cutcnt_reduzidos, &self.cutcnt_bateram),
+                ("subalfa ", &self.subalfa_reduzidos, &self.subalfa_bateram),
+            ] {
+                let mut linha = format!("sinal {}: ", nome);
+                for b in 0..4 {
+                    let n = tot[b];
+                    let pct = if n > 0 { 100.0 * bat[b] as f64 / n as f64 } else { 0.0 };
+                    let rotulo = if b == 3 { "3+".to_string() } else { b.to_string() };
+                    linha.push_str(&format!("{}={} bate={:.2}%  ", rotulo, n, pct));
+                }
+                eprintln!("{}", linha);
             }
-            eprintln!("{}", linha);
             let qt = self.lmr_quiet_total.max(1);
             eprintln!(
                 "lmr-porque: quiets={} | xeque={} ({:.1}%) profundidade={} ({:.1}%)                  extensao={} ({:.1}%) cedo-demais={} ({:.1}%) | reduzidos={} ({:.1}%)",

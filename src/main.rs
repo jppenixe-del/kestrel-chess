@@ -978,6 +978,10 @@ fn play_one_selfplay_game(
             cutoff_cnt: [0; MAX_PLY],
             ameacas_reduzidos: [0; 4],
             ameacas_bateram: [0; 4],
+            cutcnt_reduzidos: [0; 4],
+            cutcnt_bateram: [0; 4],
+            subalfa_reduzidos: [0; 4],
+            subalfa_bateram: [0; 4],
             report: false, // offline tools: no UCI narration
         };
         let (best, score, _depth, _nodes) = searcher.iterative_deepening(&mut board);
@@ -1250,6 +1254,10 @@ fn play_one_selfplay_game_tc(
             cutoff_cnt: [0; MAX_PLY],
             ameacas_reduzidos: [0; 4],
             ameacas_bateram: [0; 4],
+            cutcnt_reduzidos: [0; 4],
+            cutcnt_bateram: [0; 4],
+            subalfa_reduzidos: [0; 4],
+            subalfa_bateram: [0; 4],
             report: false, // offline tools: no UCI narration
         };
         let (best, score, _depth, _nodes) = searcher.iterative_deepening(&mut board);
@@ -1725,6 +1733,10 @@ fn bench(depth: i32) {
             cutoff_cnt: [0; search::MAX_PLY],
             ameacas_reduzidos: [0; 4],
             ameacas_bateram: [0; 4],
+            cutcnt_reduzidos: [0; 4],
+            cutcnt_bateram: [0; 4],
+            subalfa_reduzidos: [0; 4],
+            subalfa_bateram: [0; 4],
             report: false, // offline tools: no UCI narration
         };
         let (_, _, _, nodes) = searcher.iterative_deepening(&mut board);
@@ -1854,6 +1866,6 @@ fn novo_searcher_raso<'a>(
         root_best: None, root_scores: Vec::new(), nmp_min_ply: 0,
         excluded_move: None, excluded_root_moves: vec![], style_book: None,
         root_move_nodes: Vec::new(), capture_history: [[[0; 6]; 6]; 2],
-        dextensions: [0; MAX_PLY], cutoff_cnt: [0; MAX_PLY], ameacas_reduzidos: [0; 4], ameacas_bateram: [0; 4], report: false,
+        dextensions: [0; MAX_PLY], cutoff_cnt: [0; MAX_PLY], ameacas_reduzidos: [0; 4], ameacas_bateram: [0; 4], cutcnt_reduzidos: [0; 4], cutcnt_bateram: [0; 4], subalfa_reduzidos: [0; 4], subalfa_bateram: [0; 4], report: false,
     }
 }
