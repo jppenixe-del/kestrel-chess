@@ -521,6 +521,14 @@ pub struct SearchParams {
     pub lmr_check: i32,
     /// Extra MILLI-PLY reduction when the TT move is a capture. 0 = off.
     pub lmr_ttcapture: i32,
+    /// MILLI-PLIES of reduction REMOVED when the moved piece attacks ANY
+    /// enemy piece from its destination square. A threshold, not a per-piece
+    /// weight: measured, the entire signal sits between zero threats and one.
+    /// 0 = off. Ours by construction:
+    /// the network spends 59808 of 86896 inputs on exactly this (attacker,
+    /// victim) relation, so a move that creates threats is not quiet in the
+    /// terms the evaluation is written in.
+    pub lmr_ameacas: i32,
     /// Move index from which a quiet move is "late" enough to reduce, at a
     /// PV node. Default 4 (the 4th move). Both reference engines start at
     /// the 2nd; ours is a gate nobody measured, and our instrumentation
@@ -716,6 +724,8 @@ impl Default for SearchParams {
             lmr_cutnode: std::env::var("KESTREL_LMR_CUTNODE")
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(0),
             lmr_ttcapture: 0,
+            lmr_ameacas: std::env::var("KESTREL_LMR_AMEACAS")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(0),
             lmr_min_moves_pv: std::env::var("KESTREL_LMR_MIN_PV")
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(4),
             lmr_min_moves_nonpv: std::env::var("KESTREL_LMR_MIN_NONPV")
@@ -997,6 +1007,8 @@ impl SearchParams {
             // que e' exactamente como se invalida uma afinacao inteira sem dar
             // por isso. Entram quando um SPRT os justificar.
             lmr_ttcapture: 0,
+            lmr_ameacas: std::env::var("KESTREL_LMR_AMEACAS")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(0),
             lmr_min_moves_pv: std::env::var("KESTREL_LMR_MIN_PV")
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(4),
             lmr_min_moves_nonpv: std::env::var("KESTREL_LMR_MIN_NONPV")
@@ -1419,6 +1431,13 @@ pub struct Searcher<'a> {
     pub cut_razor: u64,
     pub cut_futility: u64,
     pub nodes_shallow: u64,
+    /// Does the threat signal carry information? Reduced moves bucketed by
+    /// how many enemy pieces the moved piece attacks from its destination
+    /// (0, 1, 2, 3+), and how many of each bucket then beat alpha. If the
+    /// share rises with the count, the signal is real; if it is flat, the
+    /// idea is wrong and no number of games would have made it right.
+    pub ameacas_reduzidos: [u64; 4],
+    pub ameacas_bateram: [u64; 4],
     pub lmr_quiet_total: u64,
     pub lmr_skip_check: u64,
     pub lmr_skip_depth: u64,
@@ -1861,6 +1880,23 @@ fn all_attacks(board: &Board, atk: &Attacks, color: Color) -> Bitboard {
     let king_sq = board.pieces[us][PieceType::King.idx()].trailing_zeros() as usize;
     att |= atk.king[king_sq];
     att
+}
+
+/// Attacks of ONE piece of `pt` standing on `sq`, for `color`. The
+/// single-piece counterpart to `all_attacks`: one table read (or one
+/// magic lookup for a slider) instead of a sweep over the whole board,
+/// which is what makes it usable inside the per-move loop.
+#[inline]
+fn ataques_de(atk: &Attacks, pt: PieceType, color: Color, sq: crate::types::Square, occ: Bitboard) -> Bitboard {
+    let s = sq as usize;
+    match pt {
+        PieceType::Pawn => atk.pawn[color.idx()][s],
+        PieceType::Knight => atk.knight[s],
+        PieceType::Bishop => bishop_attacks(sq as u8, occ),
+        PieceType::Rook => rook_attacks(sq as u8, occ),
+        PieceType::Queen => bishop_attacks(sq as u8, occ) | rook_attacks(sq as u8, occ),
+        PieceType::King => atk.king[s],
+    }
 }
 
 /// Threats correction hash: which of OUR pieces are currently attacked
@@ -3599,6 +3635,7 @@ impl<'a> Searcher<'a> {
                         self.lmr_skip_early += 1;
                     }
                 }
+                let mut n_ameacas_visto = 0i32;
                 let capture_ok_for_lmr = lmr_captures_enabled()
                     && matches!(capture_lmr_info, Some((losing_or_equal, _)) if losing_or_equal);
                 let r = if i >= min_moves
@@ -3649,6 +3686,53 @@ impl<'a> Searcher<'a> {
                         }
                         None => 0,
                     };
+                    // How many enemy pieces the moved piece now attacks from
+                    // its destination square -- reduce LESS the more of them
+                    // there are.
+                    //
+                    // This is the one reduction signal here that is ours by
+                    // construction rather than borrowed. Our network spends
+                    // 59808 of its 86896 inputs on threats: (attacker,
+                    // victim) pairs. A quiet move that lands a piece attacking
+                    // enemy material is not quiet in the terms the evaluation
+                    // itself is written in -- it rewrites a large part of the
+                    // input vector -- yet the reduction currently treats it
+                    // exactly like a move that changes nothing. No engine
+                    // without threat inputs has a reason to compute this;
+                    // for us it is the same relation the eval already speaks.
+                    //
+                    // Cheap on purpose: ONE attack lookup for the moved piece
+                    // plus an AND and a popcount, and only for moves that are
+                    // already going to be reduced. `all_attacks` (used by the
+                    // threats correction history) recomputes the whole picture
+                    // and is explicitly documented as too expensive for the
+                    // per-move loop; this asks a much smaller question.
+                    //
+                    // Post-make_move, so `board.side` is the OPPONENT of the
+                    // mover -- which makes `occ_color[board.side]` exactly the
+                    // set of pieces the moved piece can now be threatening.
+                    let n_ameacas = match board.piece_at(mv.to) {
+                        Some((pt, _)) => (ataques_de(&self.atk, pt, board.side.opp(), mv.to, board.occ_all)
+                            & board.occ_color[board.side.idx()])
+                            .count_ones() as i32,
+                        None => 0,
+                    };
+                    n_ameacas_visto = n_ameacas;
+                    // A THRESHOLD, not a linear weight -- and that shape came
+                    // out of measuring, not out of assuming. Bucketing 677852
+                    // reduced moves across three middlegames by threat count
+                    // and recording how often each bucket then beat alpha:
+                    //
+                    //   0 threats : 368588 moves, 0.84% beat alpha
+                    //   >=1       : 309264 moves, 1.17% beat alpha   (z ~ 14)
+                    //
+                    // The whole jump is between zero and one; from one to
+                    // three-plus the rate is flat and noisy. So the question
+                    // the search should ask is "does this move create a threat
+                    // at all", not "how many" -- the linear term this started
+                    // as would have spent its resolution on the half of the
+                    // range that carries nothing.
+                    let ameacas_adj = if n_ameacas > 0 { -sp_lmr.lmr_ameacas } else { 0 };
                     // Corrplexity: reduce ~one ply less when
                     // |eval-staticEval| > 89 --
                     // i.e. when the correction-history signal
@@ -3753,6 +3837,7 @@ impl<'a> Searcher<'a> {
                         0
                     };
                     let mut r_milli = base
+                        + ameacas_adj
                         + cutoffcnt_adj
                         + hist_adj
                         + cont_adj
@@ -3813,6 +3898,16 @@ impl<'a> Searcher<'a> {
                 if r > 0 {
                     self.lmr_tried += 1;
                     self.lmr_sum += r as u64;
+                    // Bucket this reduction by the threat count, and record
+                    // whether it then beat alpha. This is the test of the
+                    // idea itself, not of a tuned value: a flat table means
+                    // the signal is empty and games would only have told us
+                    // so more slowly.
+                    let b = n_ameacas_visto.clamp(0, 3) as usize;
+                    self.ameacas_reduzidos[b] += 1;
+                    if s > alpha {
+                        self.ameacas_bateram[b] += 1;
+                    }
                 }
                 if r > 0 && s > alpha && !self.stop {
                     // A reduced search that beats alpha has to be redone at
@@ -4650,6 +4745,15 @@ impl<'a> Searcher<'a> {
             // so' chegam a' reducao lances que ja eram maus. Os contadores
             // separam-nas, e existiam sem nunca terem sido impressos, o que
             // e' o mesmo que nao existirem.
+            let mut linha = String::from("ameacas: ");
+            for b in 0..4 {
+                let n = self.ameacas_reduzidos[b];
+                let bate = self.ameacas_bateram[b];
+                let pct = if n > 0 { 100.0 * bate as f64 / n as f64 } else { 0.0 };
+                let rotulo = if b == 3 { "3+".to_string() } else { b.to_string() };
+                linha.push_str(&format!("{}={} bate={:.2}%  ", rotulo, n, pct));
+            }
+            eprintln!("{}", linha);
             let qt = self.lmr_quiet_total.max(1);
             eprintln!(
                 "lmr-porque: quiets={} | xeque={} ({:.1}%) profundidade={} ({:.1}%)                  extensao={} ({:.1}%) cedo-demais={} ({:.1}%) | reduzidos={} ({:.1}%)",
