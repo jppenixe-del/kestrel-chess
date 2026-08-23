@@ -1500,6 +1500,20 @@ fn linha_peso(net: &RedeSf, u: usize, i: usize) -> i16 {
 /// em L1 entre as chamadas; o que custa e' percorrer as linhas de peso, e
 /// nenhuma arrumacao das passagens evita esse trafego. Nao repetir sem uma
 /// razao nova.
+/// Acumular o PSQT num array LOCAL e escrever em memoria uma so' vez no fim,
+/// em vez de somar em `st.psqt[pov][b]` por cada uma das oito casas de cada
+/// feature, foi escrito e MEDIDO: fica ~1% MAIS LENTO (mediana 20,30s contra
+/// 20,12s, minimo 19,43 contra 19,06, dez corridas alternadas de cada). O
+/// perfil parecia dar-lhe razao -- `addq %rax,(%rbx)` a 7,0% e o `subq` a 2,2%
+/// dentro de `delta_por_lance` -- e depois da alteracao essa funcao desce de
+/// 17,7% para 15,7%. Mas percentagem de perfil e' RELATIVA: uma fatia menor de
+/// um todo mais lento nao e' um ganho. So' o tempo absoluto decide.
+///
+/// Duas armadilhas de medicao que este caso mostrou, e valem para o proximo:
+/// medir os dois binarios em blocos separados deu +18% falsos (a maquina
+/// deriva; e' preciso ALTERNAR), e o NPS do bench varia ~20% entre corridas do
+/// mesmo binario, portanto nao serve -- usar tempo total, muitas corridas,
+/// comparar medianas E minimos. Nao repetir sem uma razao nova.
 /// Pedir as linhas a memoria antes de as usar (`_mm_prefetch` no inicio de cada
 /// uma, todas de uma vez antes de aplicar qualquer) foi escrito e MEDIDO:
 /// 121459 contra 121107 nps em quatro rondas, empate. As ~24 linhas estao
