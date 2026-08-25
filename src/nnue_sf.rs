@@ -621,7 +621,7 @@ fn bandeira(nome: &'static str) -> bool {
 }
 
 pub fn evaluate(net: &RedeSf, atk: &Attacks, board: &mut Board) -> i32 {
-    conta_eval();
+    count_eval();
     // `KESTREL_TROCA_POV=1` swaps the two perspectives in the forward pass.
     // A diagnostic, not an option, and it has already answered its question:
     // NO. Our trained nets score a queen up for White as WORSE than the same
@@ -1454,6 +1454,10 @@ pub fn de_bullet(
 static REL_ENUM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static REL_APLIC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static REL_CHAM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REL_TOTAL_AP: [std::sync::atomic::AtomicU64; 6] = [
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
 /// Quantas vezes o acumulador e' MATERIALIZADO contra quantas vezes a rede e'
 /// mesmo avaliada. Sao perguntas diferentes: o `garante_camada` corre em todo o
@@ -1461,19 +1465,45 @@ static REL_CHAM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 /// filhos tenham pai, e paga as ~30 linhas de pesos na mesma. O Stockfish nao:
 /// marca o estado sujo e so' materializa a cadeia quando alguem avalia. Medido
 /// com uprobe, ele avalia 0,247 vezes por no'. `KESTREL_RELS=1`.
-static ACC_MAT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static ACC_PAI: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static EVAL_CHAM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ACC_MATERIALISED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ACC_FROM_PARENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static EVAL_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static ACC_REFRESH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static PAI_HIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static PAI_MISS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Lances de rei que forcam refresh, repartidos por [so' as pecas mudam,
+/// as ameacas tambem mudam]. O primeiro grupo e' o que a actualizacao hibrida
+/// do Stockfish (db98633b) recupera.
+static REI_CLASSE: [std::sync::atomic::AtomicU64; 2] = [
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+static PARENT_HIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PARENT_MISS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DIRTY_OK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DIRTY_BAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static WALK_OK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static WALK_PLIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Porque e' que o recuo desistiu: 0=tentativas, 1=sem antepassado calculado,
+/// 2=a cadeia nao liga ao tabuleiro, 3=lance de rei pelo meio, 4=delta falhou.
+static WALK_EXIT: [std::sync::atomic::AtomicU64; 5] = [
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+#[inline(always)]
+fn walk_exit(i: usize) {
+    WALK_EXIT[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline(always)]
+fn verify_dirty() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KESTREL_VERIFICA_SUJAS").is_some())
+}
 
 /// Contar uma avaliacao completa da rede (passagem densa), para separar
 /// "actualizei o acumulador" de "avaliei mesmo".
 #[inline(always)]
-pub fn conta_eval() {
+pub fn count_eval() {
     if diag_rels() {
-        EVAL_CHAM.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        EVAL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -1498,7 +1528,7 @@ pub fn imprime_rels() {
     // vem de cada actualizacao ser cara ou de haver muitas -- que sao dois
     // problemas diferentes com solucoes diferentes.
     eprintln!("brutos: {c} chamadas de delta, {e} relacoes, {a} features aplicadas");
-    let (m, p, ev) = (ACC_MAT.load(Relaxed), ACC_PAI.load(Relaxed), EVAL_CHAM.load(Relaxed));
+    let (m, p, ev) = (ACC_MATERIALISED.load(Relaxed), ACC_FROM_PARENT.load(Relaxed), EVAL_CALLS.load(Relaxed));
     eprintln!(
         "acumulador: {m} materializacoes, {p} vindas do pai; rede avaliada {ev} vezes \
          -- {:.2} materializacoes por avaliacao",
@@ -1508,7 +1538,26 @@ pub fn imprime_rels() {
     eprintln!(
         "refresh completo: {r} vezes",
     );
-    let (ph, pm) = (PAI_HIT.load(Relaxed), PAI_MISS.load(Relaxed));
+    let (ro, rp) = (WALK_OK.load(Relaxed), WALK_PLIES.load(Relaxed));
+    eprintln!(
+        "recuo pela cadeia: {ro} vezes, {:.1} plies em media; tentativas {}, \
+         sem-antepassado {}, cadeia-nao-liga {}, rei {}, delta-falhou {}",
+        if ro > 0 { rp as f64 / ro as f64 } else { 0.0 },
+        WALK_EXIT[0].load(Relaxed), WALK_EXIT[1].load(Relaxed),
+        WALK_EXIT[2].load(Relaxed), WALK_EXIT[3].load(Relaxed),
+        WALK_EXIT[4].load(Relaxed)
+    );
+    if verify_dirty() {
+        let (sb, sm) = (DIRTY_OK.load(Relaxed), DIRTY_BAD.load(Relaxed));
+        eprintln!("sujas do make_move: {sb} certas, {sm} ERRADAS");
+    }
+    let (so_peca, tambem_ameaca) = (REI_CLASSE[0].load(Relaxed), REI_CLASSE[1].load(Relaxed));
+    eprintln!(
+        "lances de rei que invalidam: {so_peca} so' as PECAS, {tambem_ameaca} tambem as ameacas \
+         -- {:.0}% recuperaveis por actualizacao hibrida",
+        so_peca as f64 / (so_peca + tambem_ameaca).max(1) as f64 * 100.0
+    );
+    let (ph, pm) = (PARENT_HIT.load(Relaxed), PARENT_MISS.load(Relaxed));
     eprintln!(
         "pilha por ply: {ph} acertos, {pm} falhas -- {:.1}% de acerto; \
          dos que falham, {:.1}% acabam em refresh completo",
@@ -1749,6 +1798,156 @@ struct Camada {
     valido: bool,
 }
 
+/// What one move touched, recorded by `make_move` at the moment it knows --
+/// rather than recovered afterwards by diffing the stored bitboards against the
+/// board, which is what `eventos_de_casa` does.
+///
+/// Five entries cover everything: a quiet move is 2 (leaves `from`, arrives at
+/// `to`), a capture or en passant 3, a castle 4 (king and rook). Every one of
+/// those goes through `remove_piece`/`add_piece` in `make_move`, so the list is
+/// exact by construction rather than inferred.
+///
+/// This is the `DirtyPiece` Stockfish hands to `do_move` and the
+/// `AccumulatorStack::push` Triumviratus calls. Without it the accumulator
+/// chain can only step back ONE ply; with it, as many as it needs.
+#[derive(Clone, Copy)]
+pub struct DirtyPieces {
+    pub n: u8,
+    /// (casa, tipo de peca, cor, entra?)
+    pub ev: [(u8, u8, u8, bool); 5],
+}
+
+impl Default for DirtyPieces {
+    fn default() -> Self {
+        DirtyPieces { n: 0, ev: [(0, 0, 0, false); 5] }
+    }
+}
+
+impl DirtyPieces {
+    #[inline(always)]
+    pub fn push_change(&mut self, sq: u8, pt: u8, cor: u8, entra: bool) {
+        if (self.n as usize) < self.ev.len() {
+            self.ev[self.n as usize] = (sq, pt, cor, entra);
+            self.n += 1;
+        }
+    }
+    #[inline(always)]
+    pub fn events(&self) -> impl Iterator<Item = (usize, usize, usize, bool)> + '_ {
+        self.ev[..self.n as usize]
+            .iter()
+            .map(|&(sq, pt, c, a)| (sq as usize, pt as usize, c as usize, a))
+    }
+}
+
+thread_local! {
+    /// The current line's move chain, indexed by `board.prof_acc`. Needs no
+    /// clearing in `unmake_move`: the next `make_move` at that depth overwrites
+    /// it, and nothing ever reads a depth above the current one.
+    static CHAIN: std::cell::RefCell<Vec<DirtyPieces>> =
+        std::cell::RefCell::new(vec![DirtyPieces::default(); MAX_CAMADAS]);
+}
+
+/// The threat relations each ply's move changed, produced by `make_move` while
+/// the board is actually being walked through the move.
+///
+/// Flat storage on purpose: one `Vec` holding every ply's relations end to end,
+/// plus a start offset per ply. A `Vec<Vec<_>>` would cost a pointer chase per
+/// access for no gain -- the same lesson the flattened weight tables taught
+/// (+9% NPS there).
+///
+/// `make_move` at depth d truncates back to `start[d]` and appends; nothing
+/// reads a depth above the current one, so no clearing is ever needed.
+pub struct ThreatChain {
+    rel: Vec<crate::sf_features::RelAmeaca>,
+    start: Vec<u32>,
+}
+
+impl ThreatChain {
+    fn new() -> Self {
+        ThreatChain { rel: Vec::with_capacity(4096), start: vec![0; MAX_CAMADAS + 1] }
+    }
+    #[inline]
+    fn begin(&mut self, d: usize) {
+        let from = self.start[d] as usize;
+        self.rel.truncate(from);
+    }
+    #[inline]
+    fn end(&mut self, d: usize) {
+        self.start[d + 1] = self.rel.len() as u32;
+    }
+    #[inline]
+    fn slice(&self, d: usize) -> &[crate::sf_features::RelAmeaca] {
+        &self.rel[self.start[d] as usize..self.start[d + 1] as usize]
+    }
+}
+
+thread_local! {
+    static THREAT_CHAIN: std::cell::RefCell<ThreatChain> =
+        std::cell::RefCell::new(ThreatChain::new());
+}
+
+/// Runs the threat enumeration for one piece appearing or disappearing, on the
+/// board as it stands right now. This is the whole point: `make_move` already
+/// walks the position through the move one piece at a time, which is exactly
+/// the sequence `delta_por_lance` reconstructs afterwards from two snapshots.
+///
+/// `sem_raios` is `noRaysContaining` in the reference, and belongs to the piece
+/// that MOVES and only to it -- passing it on a capture's removal suppresses
+/// half of a discovery and leaves a threat standing that exists in neither real
+/// position.
+pub fn threats_for_change(
+    pieces: &[[u64; 6]; 2], d: usize, add: bool, color: usize, piece: usize, sq: usize,
+    sem_raios: u64,
+) {
+    if d >= MAX_CAMADAS {
+        return;
+    }
+    let pos = crate::sf_features::PosBB { pieces: *pieces };
+    THREAT_CHAIN.with(|c| {
+        let mut c = c.borrow_mut();
+        let rel = &mut c.rel;
+        crate::sf_features::relacoes_ameaca(&pos, add, color, piece, sq, sem_raios, MAGIC, rel);
+    });
+}
+
+/// Opens/closes one ply's slice in the chain.
+pub fn threats_begin(d: usize) {
+    if d < MAX_CAMADAS {
+        THREAT_CHAIN.with(|c| c.borrow_mut().begin(d));
+    }
+}
+pub fn threats_end(d: usize) {
+    if d < MAX_CAMADAS {
+        THREAT_CHAIN.with(|c| c.borrow_mut().end(d));
+    }
+}
+
+/// Reads one ply's relations back, for the consumer and for the verification.
+pub fn threats_at<R>(d: usize, f: impl FnOnce(&[crate::sf_features::RelAmeaca]) -> R) -> Option<R> {
+    if d >= MAX_CAMADAS {
+        return None;
+    }
+    THREAT_CHAIN.with(|c| Some(f(c.borrow().slice(d))))
+}
+
+/// Called by `make_move`. Deliberately cheap: one 24-byte write into a
+/// thread-local, once per node.
+#[inline]
+pub fn record_dirty(d: usize, s: &DirtyPieces) {
+    if d >= MAX_CAMADAS {
+        return;
+    }
+    CHAIN.with(|c| c.borrow_mut()[d] = *s);
+}
+
+/// Reads back what was recorded for a given depth.
+pub fn dirty_at(d: usize) -> Option<DirtyPieces> {
+    if d >= MAX_CAMADAS {
+        return None;
+    }
+    CHAIN.with(|c| Some(c.borrow()[d]))
+}
+
 /// Fundo maximo coberto pela pilha. Acima disto o motor volta ao comportamento
 /// de um so' estado, que e' sempre correcto, so' mais lento.
 const MAX_CAMADAS: usize = 256;
@@ -1807,11 +2006,15 @@ thread_local! {
 /// occupancy demands: the piece leaving is evaluated on the OLD board, the
 /// piece arriving on the NEW one. Returns false when the change is not a
 /// simple move, and the caller rebuilds instead.
+/// Recebe a posicao em BITBOARDS, nao o `Board`. A funcao so' precisava disso --
+/// usava o `board` numa unica linha, para o converter -- e a diferenca importa:
+/// com `PosBB` a entrada pode ser uma posicao INTERMEDIA reconstruida da cadeia
+/// de `DirtyPieces`, que e' o que permite ao acumulador recuar mais de um ply.
 fn delta_por_lance(
-    net: &RedeSf, board: &Board, pov: usize, st: &mut EstadoAcc,
+    net: &RedeSf, agora: &crate::sf_features::PosBB, pov: usize, st: &mut EstadoAcc,
     ev: &[(usize, usize, usize, bool)],
 ) -> bool {
-    let agora = board_para_posbb(board);
+    let agora = *agora;
     let mut antes = agora;
     // desfazer os eventos para reconstruir o tabuleiro anterior
     for &(sq, t, c, add) in ev {
@@ -2030,12 +2233,12 @@ pub fn garante_camada(atk: &Attacks, board: &mut Board) {
         let mut st = c.borrow_mut();
         if carrega_do_pai(&mut st, board) {
             if diag_rels() {
-                ACC_PAI.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                ACC_FROM_PARENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             return;
         }
         if diag_rels() {
-            ACC_MAT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            ACC_MATERIALISED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         acc_incremental(net, atk, board, 0, &mut st);
         acc_incremental(net, atk, board, 1, &mut st);
@@ -2110,14 +2313,14 @@ unsafe fn produto_u8_i8_avx2(x: &[u8], w: &[i8]) -> i32 {
 fn carrega_do_pai(st: &mut EstadoAcc, board: &Board) -> bool {
     let d = board.prof_acc;
     if d >= MAX_CAMADAS {
-        if diag_rels() { PAI_MISS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+        if diag_rels() { PARENT_MISS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
         return false;
     }
     if diag_rels() {
         if st.pilha[d].valido && st.pilha[d].bb == board.pieces {
-            PAI_HIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            PARENT_HIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         } else {
-            PAI_MISS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            PARENT_MISS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
     if st.pilha[d].valido && st.pilha[d].bb == board.pieces {
@@ -2130,6 +2333,28 @@ fn carrega_do_pai(st: &mut EstadoAcc, board: &Board) -> bool {
         st.feats[0].clear();
         st.feats[1].clear();
         return true;
+    }
+    // Prova do registo do `make_move`: aplicar as `DirtyPieces` deste ply aos
+    // bitboards do PAI tem de dar exactamente o tabuleiro actual. Enquanto
+    // ninguem depende delas, isto e' so' um teste; quando o acumulador passar a
+    // recuar pela cadeia, e' a diferenca entre correcto e silenciosamente
+    // errado. `KESTREL_VERIFICA_SUJAS=1`.
+    if verify_dirty() && d > 0 && st.pilha[d - 1].valido {
+        if let Some(sj) = dirty_at(d) {
+            let mut bb = st.pilha[d - 1].bb;
+            for (sq, t, c, entra) in sj.events() {
+                if entra {
+                    bb[c][t] |= 1u64 << sq;
+                } else {
+                    bb[c][t] &= !(1u64 << sq);
+                }
+            }
+            if bb != board.pieces {
+                DIRTY_BAD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                DIRTY_OK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
     }
     if d > 0 && st.pilha[d - 1].valido {
         for pov in 0..2 {
@@ -2178,11 +2403,13 @@ fn acc_incremental(
     let verifica = *VERIFICA.get_or_init(|| std::env::var_os("KESTREL_VERIFICA_DELTA").is_some());
     if verifica && st.valido && !sem_delta {
         if let Some(ev) = eventos_de_casa(&st.bb, &board.pieces) {
-            if !rei_invalida_indices(&ev, pov, st, board) {
+            let antes_bb = crate::sf_features::PosBB { pieces: st.bb };
+            let agora_bb = board_para_posbb(board);
+            if !rei_invalida_indices(&ev, pov, &antes_bb, &agora_bb) {
                 let acc_antes = st.acc[pov].clone();
                 let psqt_antes = st.psqt[pov];
                 let bb_antes = st.bb;
-                if delta_por_lance(net, board, pov, st, &ev) {
+                if delta_por_lance(net, &board_para_posbb(board), pov, st, &ev) {
                     let acc_delta = st.acc[pov].clone();
                     let psqt_delta = st.psqt[pov];
                     st.acc[pov] = acc_antes;
@@ -2249,7 +2476,11 @@ fn acc_incremental(
     }
     if st.valido && !sem_delta {
         if let Some(ev) = eventos_de_casa(&st.bb, &board.pieces) {
-            if !rei_invalida_indices(&ev, pov, st, board) && delta_por_lance(net, board, pov, st, &ev) {
+            let antes_bb = crate::sf_features::PosBB { pieces: st.bb };
+            let agora_bb = board_para_posbb(board);
+            if !rei_invalida_indices(&ev, pov, &antes_bb, &agora_bb)
+                && delta_por_lance(net, &agora_bb, pov, st, &ev)
+            {
                 // as listas ficam desactualizadas de proposito: enquanto o
                 // caminho rapido pegar, nao sao precisas (o psqt agora e'
                 // acumulado). Marca-se para o caminho lento as reconstruir.
@@ -2259,9 +2490,17 @@ fn acc_incremental(
         }
     }
 
+    // O delta de UM lance nao serviu. Antes de re-enumerar a posicao inteira,
+    // tentar a cadeia: recuar ate' ao antepassado calculado mais proximo e
+    // aplicar os deltas para a frente -- o que os dois motores de referencia
+    // fazem e nos nao faziamos.
+    if !sem_delta && walk_back_chain(net, board, pov, st) {
+        return;
+    }
+
     // Chegar aqui e' o caminho caro: o delta de um lance nao serviu e a posicao
     // vai ser re-enumerada de raiz. Contar quantas vezes acontece separa "cada
-    // actualizacao e' cara" de "ha' actualizacoes a mais" -- ver ACC_MAT.
+    // actualizacao e' cara" de "ha' actualizacoes a mais" -- ver ACC_MATERIALISED.
     if diag_rels() {
         ACC_REFRESH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
@@ -2566,23 +2805,171 @@ fn eventos_de_casa(
 /// in a pawn endgame -- of which ~83% kept the same orientation. Nearly half of
 /// all evaluations in an endgame were rebuilding three feature tables from
 /// scratch to arrive at the numbers they already had.
+/// Recebe as DUAS posicoes em bitboards em vez de ir buscar a antiga a
+/// `st.bb`. Num recuo de varios plies cada passo tem o seu proprio "antes", e
+/// `st.bb` so' conhece o ultimo estado avaliado.
+/// How many plies are worth walking back before giving up and re-enumerating.
+/// Walking N plies costs N deltas; a refresh costs the whole position (~26
+/// threat rows, plus pieces and pairs, plus the enumeration). Tunable for
+/// measurement: `KESTREL_RECUO=N`.
+fn max_walk_back() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("KESTREL_RECUO").ok().and_then(|v| v.parse().ok()).unwrap_or(4)
+    })
+}
+
+/// Walks the `DirtyPieces` chain back to the nearest ancestor that already has
+/// a computed accumulator, then applies each ply's delta forward.
+///
+/// This is Triumviratus's `backward_update_incremental` and Stockfish's
+/// `update_accumulator_incremental`. Without it the accumulator can only step
+/// back ONE ply: `eventos_de_casa` compares `st.bb` (the last position
+/// evaluated, often a sibling's child rather than this node's parent) against
+/// the current board and gives up when the difference does not fit in one move.
+/// That was the route to 7.9% of all refreshes.
+///
+/// MEDIDO (2026-08-25), e a premissa estava ERRADA. Vale 34370 recuos e corta
+/// os refreshes de 224639 para 190269 (-15%), mas isso sao **0,75%** das
+/// instrucoes (23691 -> 23514 por no', bench identico a 1970705). Duas razoes,
+/// ambas dos contadores: `sem-antepassado 0` e recuo medio de **1,0 plies** --
+/// o pai esta praticamente sempre calculado, por isso nao havia cadeia partida
+/// para recuperar; e 181833 das 224537 falhas do delta sao lances de REI, que
+/// sao inerentes ao HalfKA (mudam o indice de todas as features) e que o
+/// Stockfish tambem resolve com a cache de refresh, nao com a pilha.
+///
+/// Fica porque esta' correcto e custa pouco, e porque e' o alicerce necessario
+/// se algum dia avaliarmos menos vezes -- mas nao e' o buraco dos 2,7x.
+///
+/// ARMADILHA: o `delta_por_lance` so' aceita a forma que o `eventos_de_casa`
+/// deixa passar (UMA adicao, no maximo tres eventos). As `DirtyPieces` sao mais
+/// gerais: um roque traz quatro eventos e duas adicoes. Passa-lo por ali da' um
+/// acumulador diferente do refresh -- silenciosamente. Foi a assinatura de nos
+/// que o apanhou (2022050 em vez de 1970705); por isso a guarda abaixo.
+///
+/// Devolve `false` sem estragar nada se a cadeia nao ligar. Se falhar A MEIO,
+/// `st.acc[pov]` fica inconsistente -- mas o chamador cai no refresh, que
+/// reescreve o acumulador por inteiro, portanto e' recuperavel por construcao.
+fn walk_back_chain(
+    net: &RedeSf, board: &Board, pov: usize, st: &mut EstadoAcc,
+) -> bool {
+    let d = board.prof_acc;
+    let recuo = max_walk_back();
+    if d == 0 || d >= MAX_CAMADAS || recuo == 0 {
+        return false;
+    }
+    walk_exit(0);
+    // Antepassado calculado mais proximo, no maximo `recuo` plies atras.
+    let baixo = d.saturating_sub(recuo);
+    let k = match (baixo..d).rev().find(|&j| st.pilha[j].valido) {
+        Some(k) => k,
+        None => { walk_exit(1); return false; }
+    };
+    let n = d - k;
+
+    // Reconstruir as posicoes intermedias e PROVAR que a cadeia liga mesmo ao
+    // tabuleiro actual. Sem esta prova estariamos a confiar que `pilha[k]` e'
+    // do nosso antepassado e nao de outro ramo que passou pela mesma
+    // profundidade -- e um acumulador errado nao da sinal nenhum.
+    let mut pos = [crate::sf_features::PosBB::default(); 17];
+    if n >= pos.len() {
+        return false;
+    }
+    pos[0] = crate::sf_features::PosBB { pieces: st.pilha[k].bb };
+    for i in 0..n {
+        let sj = match dirty_at(k + 1 + i) {
+            Some(s) => s,
+            None => return false,
+        };
+        pos[i + 1] = pos[i];
+        for (sq, t, c, entra) in sj.events() {
+            if entra {
+                pos[i + 1].pieces[c][t] |= 1u64 << sq;
+            } else {
+                pos[i + 1].pieces[c][t] &= !(1u64 << sq);
+            }
+        }
+    }
+    if pos[n].pieces != board.pieces {
+        walk_exit(2);
+        return false;
+    }
+
+    // Passagem seca: se algum ply mexer o rei de forma a invalidar os indices,
+    // nao vale a pena comecar -- o refresh trata disso. Verificar ANTES de
+    // tocar no acumulador poupa o estrago a meio.
+    let mut evs: Vec<Vec<(usize, usize, usize, bool)>> = Vec::with_capacity(n);
+    for i in 0..n {
+        let sj = match dirty_at(k + 1 + i) {
+            Some(s) => s,
+            None => return false,
+        };
+        let ev: Vec<_> = sj.events().collect();
+        if ev.is_empty() {
+            // Lance nulo: nao mexe peca, logo nao mexe feature nenhuma.
+            evs.push(ev);
+            continue;
+        }
+        if rei_invalida_indices(&ev, pov, &pos[i], &pos[i + 1]) {
+            walk_exit(3);
+            return false;
+        }
+        // O `delta_por_lance` foi escrito para a forma que o `eventos_de_casa`
+        // deixa passar: UMA adicao e no maximo tres eventos. Um roque tem
+        // quatro eventos e duas adicoes -- passa-lo por ali da' um acumulador
+        // diferente do refresh, e foi o que a assinatura de nos apanhou.
+        if ev.iter().filter(|e| e.3).count() != 1 || ev.len() > 3 {
+            walk_exit(4);
+            return false;
+        }
+        evs.push(ev);
+    }
+
+    // Carregar o antepassado (so' esta perspectiva) e andar para a frente.
+    st.acc[pov].copy_from_slice(&st.pilha[k].acc[pov]);
+    st.psqt[pov] = st.pilha[k].psqt[pov];
+    for i in 0..n {
+        if evs[i].is_empty() {
+            continue;
+        }
+        if !delta_por_lance(net, &pos[i + 1], pov, st, &evs[i]) {
+            walk_exit(4);
+            return false;
+        }
+    }
+    st.feats[pov].clear();
+    WALK_OK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    WALK_PLIES.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+    true
+}
+
 fn rei_invalida_indices(
-    ev: &[(usize, usize, usize, bool)], pov: usize, st: &EstadoAcc, board: &Board,
+    ev: &[(usize, usize, usize, bool)], pov: usize,
+    antes: &crate::sf_features::PosBB, agora: &crate::sf_features::PosBB,
 ) -> bool {
     if !ev.iter().any(|&(_, t, c, _)| t == 5 && c == pov) {
         return false;
     }
     if std::env::var_os("KESTREL_REI_ANTIGO").is_some() { return true; }
-    let novo = board.king_sq(if pov == 0 { Color::White } else { Color::Black }) as usize;
-    let velho = st.bb[pov][5].trailing_zeros() as usize;
+    let novo = agora.king_sq(pov);
+    let velho = antes.pieces[pov][5].trailing_zeros() as usize;
     if velho >= 64 || novo >= 64 {
         return true;
     }
     let flip = if pov == 1 { 56 } else { 0 };
-    ORIENT_HALFKA[velho] != ORIENT_HALFKA[novo]
-        || ORIENT_THREATS[velho] != ORIENT_THREATS[novo]
+    // As tres condicoes nao sao a mesma coisa. O espelho e o bucket do HalfKA
+    // mexem so' nas features de PECA; so' `ORIENT_THREATS` mexe nas de ameaca e
+    // nas de par. Quando muda o bucket e nao a orientacao das ameacas, o bloco
+    // de ameacas do acumulador continua valido e estamos a deita-lo fora.
+    let peca_muda = ORIENT_HALFKA[velho] != ORIENT_HALFKA[novo]
         || crate::sf_features::KING_BUCKETS_BASE[velho ^ flip]
-            != crate::sf_features::KING_BUCKETS_BASE[novo ^ flip]
+            != crate::sf_features::KING_BUCKETS_BASE[novo ^ flip];
+    let ameaca_muda = ORIENT_THREATS[velho] != ORIENT_THREATS[novo];
+    if diag_rels() && (peca_muda || ameaca_muda) {
+        REI_CLASSE[if ameaca_muda { 1 } else { 0 }]
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    peca_muda || ameaca_muda
 }
 
 #[cfg(test)]

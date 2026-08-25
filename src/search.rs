@@ -304,7 +304,7 @@ pub mod see {
             n_gains += 1;
             attacker_val = lva_pt.value();
             occ &= !bb(lva_sq);
-            // Tira o atacante usado e junta o que ele tapava.
+            // Tira o atacante usado e push_change o que ele tapava.
             attackers |= (bishop_attacks(to, occ) & diag) | (rook_attacks(to, occ) & orth);
             attackers &= occ;
             side = side.opp();
