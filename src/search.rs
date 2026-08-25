@@ -5008,6 +5008,17 @@ impl<'a> Searcher<'a> {
                 self.lmr_tried, 100.0 * self.lmr_tried as f64 / q
             );
         }
+        // Lazy SMP: quem manda e' a thread que reporta. As ajudantes correm o
+        // mesmo `for depth in 1..=max_depth` mas duplicam trabalho com outra
+        // ordenacao, por isso chegam a' profundidade pedida MUITO mais tarde --
+        // e o `join` no chamador espera por todas. Sem este sinal, um
+        // `go depth N` com `Threads > 1` completava a busca principal e depois
+        // ficava preso sem devolver `bestmove`, porque nada dizia as outras
+        // para desistirem. Um limite de tempo escondia o defeito; sem ele fica
+        // a descoberto.
+        if self.report {
+            self.stop_flag.store(true, Ordering::Relaxed);
+        }
         (best_move, best_score, last_depth, self.nodes)
     }
 }

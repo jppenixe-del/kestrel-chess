@@ -1220,20 +1220,32 @@ pub fn relacoes_ameaca(
         incoming |= (pawn_attacks_from(0, s) & peoes[1]) | (pawn_attacks_from(1, s) & peoes[0]);
     }
 
-    while ameacados != 0 {
-        let alvo = ameacados.trailing_zeros() as usize;
-        ameacados &= ameacados - 1;
-        if let Some((tp, tc)) = pos.piece_at(alvo) {
+    // Por TIPO, nao por casa. O `piece_at` varre ate' 12 bitboards com ramos
+    // imprevisiveis para descobrir o que esta' numa casa; percorrendo um
+    // bitboard de cada tipo o tipo e' conhecido de graca e so' a cor precisa de
+    // um teste. O conjunto visitado e' o mesmo -- a ORDEM e' que muda, e a
+    // ordem nao importa porque estas relacoes sao somadas, nao aplicadas em
+    // sequencia (a assinatura do bench e' quem o prova).
+    for tp in 0..6 {
+        let brancas = pos.pieces[0][tp];
+        let mut b = ameacados & (brancas | pos.pieces[1][tp]);
+        while b != 0 {
+            let alvo = b.trailing_zeros() as usize;
+            b &= b - 1;
+            let tc = usize::from(brancas & (1u64 << alvo) == 0);
             empurra(add, piece, color, s, tp, tc, alvo);
         }
     }
 
     processa_sliders(sliders, true, &mut empurra);
 
-    while incoming != 0 {
-        let src = incoming.trailing_zeros() as usize;
-        incoming &= incoming - 1;
-        if let Some((sp, sc)) = pos.piece_at(src) {
+    for sp in 0..6 {
+        let brancas = pos.pieces[0][sp];
+        let mut b = incoming & (brancas | pos.pieces[1][sp]);
+        while b != 0 {
+            let src = b.trailing_zeros() as usize;
+            b &= b - 1;
+            let sc = usize::from(brancas & (1u64 << src) == 0);
             empurra(add, sp, sc, src, piece, color, s);
         }
     }
