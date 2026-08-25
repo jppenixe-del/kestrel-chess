@@ -1454,6 +1454,10 @@ pub fn de_bullet(
 static REL_ENUM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static REL_APLIC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static REL_CHAM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REL_TOTAL_AP: [std::sync::atomic::AtomicU64; 6] = [
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
 /// Quantas vezes o acumulador e' MATERIALIZADO contra quantas vezes a rede e'
 /// mesmo avaliada. Sao perguntas diferentes: o `garante_camada` corre em todo o
@@ -1830,6 +1834,89 @@ thread_local! {
     /// it, and nothing ever reads a depth above the current one.
     static CHAIN: std::cell::RefCell<Vec<DirtyPieces>> =
         std::cell::RefCell::new(vec![DirtyPieces::default(); MAX_CAMADAS]);
+}
+
+/// The threat relations each ply's move changed, produced by `make_move` while
+/// the board is actually being walked through the move.
+///
+/// Flat storage on purpose: one `Vec` holding every ply's relations end to end,
+/// plus a start offset per ply. A `Vec<Vec<_>>` would cost a pointer chase per
+/// access for no gain -- the same lesson the flattened weight tables taught
+/// (+9% NPS there).
+///
+/// `make_move` at depth d truncates back to `start[d]` and appends; nothing
+/// reads a depth above the current one, so no clearing is ever needed.
+pub struct ThreatChain {
+    rel: Vec<crate::sf_features::RelAmeaca>,
+    start: Vec<u32>,
+}
+
+impl ThreatChain {
+    fn new() -> Self {
+        ThreatChain { rel: Vec::with_capacity(4096), start: vec![0; MAX_CAMADAS + 1] }
+    }
+    #[inline]
+    fn begin(&mut self, d: usize) {
+        let from = self.start[d] as usize;
+        self.rel.truncate(from);
+    }
+    #[inline]
+    fn end(&mut self, d: usize) {
+        self.start[d + 1] = self.rel.len() as u32;
+    }
+    #[inline]
+    fn slice(&self, d: usize) -> &[crate::sf_features::RelAmeaca] {
+        &self.rel[self.start[d] as usize..self.start[d + 1] as usize]
+    }
+}
+
+thread_local! {
+    static THREAT_CHAIN: std::cell::RefCell<ThreatChain> =
+        std::cell::RefCell::new(ThreatChain::new());
+}
+
+/// Runs the threat enumeration for one piece appearing or disappearing, on the
+/// board as it stands right now. This is the whole point: `make_move` already
+/// walks the position through the move one piece at a time, which is exactly
+/// the sequence `delta_por_lance` reconstructs afterwards from two snapshots.
+///
+/// `sem_raios` is `noRaysContaining` in the reference, and belongs to the piece
+/// that MOVES and only to it -- passing it on a capture's removal suppresses
+/// half of a discovery and leaves a threat standing that exists in neither real
+/// position.
+pub fn threats_for_change(
+    pieces: &[[u64; 6]; 2], d: usize, add: bool, color: usize, piece: usize, sq: usize,
+    sem_raios: u64,
+) {
+    if d >= MAX_CAMADAS {
+        return;
+    }
+    let pos = crate::sf_features::PosBB { pieces: *pieces };
+    THREAT_CHAIN.with(|c| {
+        let mut c = c.borrow_mut();
+        let rel = &mut c.rel;
+        crate::sf_features::relacoes_ameaca(&pos, add, color, piece, sq, sem_raios, MAGIC, rel);
+    });
+}
+
+/// Opens/closes one ply's slice in the chain.
+pub fn threats_begin(d: usize) {
+    if d < MAX_CAMADAS {
+        THREAT_CHAIN.with(|c| c.borrow_mut().begin(d));
+    }
+}
+pub fn threats_end(d: usize) {
+    if d < MAX_CAMADAS {
+        THREAT_CHAIN.with(|c| c.borrow_mut().end(d));
+    }
+}
+
+/// Reads one ply's relations back, for the consumer and for the verification.
+pub fn threats_at<R>(d: usize, f: impl FnOnce(&[crate::sf_features::RelAmeaca]) -> R) -> Option<R> {
+    if d >= MAX_CAMADAS {
+        return None;
+    }
+    THREAT_CHAIN.with(|c| Some(f(c.borrow().slice(d))))
 }
 
 /// Called by `make_move`. Deliberately cheap: one 24-byte write into a

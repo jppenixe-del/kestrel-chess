@@ -392,15 +392,50 @@ impl Board {
         // this is what lets the accumulator walk back more than a single ply.
         let mut sujas = crate::nnue_sf::DirtyPieces::default();
 
+        // And the threat relations, enumerated on the board AS IT IS WALKED
+        // through the move. `delta_por_lance` reconstructs exactly this
+        // sequence afterwards from two snapshots; doing it here costs one pass
+        // instead of a rebuild. Removals are enumerated with the piece still
+        // present, additions once it has landed -- the order is what makes the
+        // result correct, not an implementation detail.
+        //
+        // Castling is left out: its rook moves AFTER the king lands here, but
+        // `delta_por_lance` does every removal before every addition, so the
+        // two orders disagree. It already takes the refresh path, so nothing is
+        // lost by skipping it.
+        let ply_acc = self.prof_acc;
+        // A producao das ameacas dentro do lance esta' escrita mas ainda NAO tem
+        // consumidor -- com ela ligada enumeramos duas vezes, o que custa mais
+        // do que tudo o que ja' se poupou. Fica desligada por uma constante para
+        // o compilador a apagar por inteiro, ate' o `delta_por_lance` passar a
+        // ler daqui em vez de reconstruir as posicoes.
+        const PRODUZ_AMEACAS: bool = false;
+        let roque = !PRODUZ_AMEACAS || matches!(mv.flag, MoveFlag::CastleKing | MoveFlag::CastleQueen);
+        let mut casas = bb(mv.from) | bb(mv.to);
+        if mv.flag == MoveFlag::EnPassant {
+            casas |= bb(if us == Color::White { mv.to - 8 } else { mv.to + 8 });
+        }
+        crate::nnue_sf::threats_begin(ply_acc);
+
         // remove captured piece (normal or en passant)
         match mv.flag {
             MoveFlag::EnPassant => {
                 let cap_sq = if us == Color::White { mv.to - 8 } else { mv.to + 8 };
+                if !roque {
+                    crate::nnue_sf::threats_for_change(
+                        &self.pieces, ply_acc, false, them.idx(),
+                        PieceType::Pawn.idx(), cap_sq as usize, !0u64);
+                }
                 self.remove_piece(PieceType::Pawn, them, cap_sq);
                 sujas.push_change(cap_sq, PieceType::Pawn as u8, them as u8, false);
             }
             _ => {
                 if let Some((cpt, cc)) = captured {
+                    if !roque {
+                        crate::nnue_sf::threats_for_change(
+                            &self.pieces, ply_acc, false, cc.idx(),
+                            cpt.idx(), mv.to as usize, !0u64);
+                    }
                     self.remove_piece(cpt, cc, mv.to);
                     sujas.push_change(mv.to, cpt as u8, cc as u8, false);
                 }
@@ -408,11 +443,21 @@ impl Board {
         }
 
         // move the piece
+        if !roque {
+            crate::nnue_sf::threats_for_change(
+                &self.pieces, ply_acc, false, us.idx(),
+                moving_pt.idx(), mv.from as usize, casas);
+        }
         self.remove_piece(moving_pt, us, mv.from);
         sujas.push_change(mv.from, moving_pt as u8, us as u8, false);
         let final_pt = mv.promotion.unwrap_or(moving_pt);
         self.add_piece(final_pt, us, mv.to);
         sujas.push_change(mv.to, final_pt as u8, us as u8, true);
+        if !roque {
+            crate::nnue_sf::threats_for_change(
+                &self.pieces, ply_acc, true, us.idx(),
+                final_pt.idx(), mv.to as usize, casas);
+        }
 
         // castling: move the rook too
         match mv.flag {
@@ -432,7 +477,8 @@ impl Board {
             }
             _ => {}
         }
-        crate::nnue_sf::record_dirty(self.prof_acc, &sujas);
+        crate::nnue_sf::threats_end(ply_acc);
+        crate::nnue_sf::record_dirty(ply_acc, &sujas);
 
         // en passant square update
         self.ep_square = if mv.flag == MoveFlag::DoublePush {

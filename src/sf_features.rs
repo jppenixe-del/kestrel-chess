@@ -1178,14 +1178,8 @@ pub fn relacoes_ameaca(
         // king moving forces a full rebuild anyway -- which is why a search
         // with no king moves matched the rebuild exactly, and one with a single
         // `Ke1-f1` diverged from that move onward.
-        let mut alvos = king_attacks(s) & occ_sem_reis;
-        while alvos != 0 {
-            let alvo = alvos.trailing_zeros() as usize;
-            alvos &= alvos - 1;
-            if let Some((tp, tc)) = pos.piece_at(alvo) {
-                empurra(add, piece, color, s, tp, tc, alvo);
-            }
-        }
+        // EXPERIENCIA: o rei nao emite ameacas directas neste conjunto de
+        // features -- medido, 1048846 de 1048846 (100%) caem fora do espaco.
         return;
     }
 
@@ -1199,15 +1193,25 @@ pub fn relacoes_ameaca(
     let peoes = [pos.pieces[0][0], pos.pieces[1][0]];
 
     let mut ameacados = ataques_de(piece, color, s, occ, d) & occ_sem_reis;
-    let mut incoming = (knight_attacks(s) & cavalos) | (king_attacks(s) & reis);
+    // O termo `king_attacks(s) & reis` sai daqui pela mesma razao que o bloco
+    // do rei acima: (rei -> peca) nao existe neste conjunto de features. Medido,
+    // 610441 de 610441 (100%) caiam fora do espaco -- geradas, indexadas e
+    // deitadas fora.
+    let mut incoming = knight_attacks(s) & cavalos;
 
+    // A pawn threatens ONLY knights and rooks: `PIECE_INTERACTION_MAP[0]` is
+    // `[-1, 0, -1, 1, -1, -1]`. Pawn->pawn relations and the push relations were
+    // dropped when the feature set went from 60720 to 59808 inputs, but the code
+    // that generated them stayed, so every one of those tuples was built,
+    // indexed, and then discarded by the `idx < THREAT_DIM` test downstream.
+    //
+    // Stockfish avoids the same waste with `threatTargets = pt == PAWN ?
+    // pieces(KNIGHT, ROOK) : ...` and by gating the pawn half of
+    // `incomingThreats` on `pt == KNIGHT || pt == ROOK`.
+    let torres = pos.pieces[0][3] | pos.pieces[1][3];
     if piece == 0 {
-        // pawns also threaten (and are threatened by) pushes
-        let empurroes = (1u64 << s) << 8 | (1u64 << s) >> 8;
-        ameacados |= (pawn_attacks_from(color, s) | empurroes) & (peoes[0] | peoes[1]);
-        incoming |= ((pawn_attacks_from(0, s) | empurroes) & peoes[1])
-            | ((pawn_attacks_from(1, s) | empurroes) & peoes[0]);
-    } else {
+        ameacados |= pawn_attacks_from(color, s) & (cavalos | torres);
+    } else if piece == 1 || piece == 3 {
         incoming |= (pawn_attacks_from(0, s) & peoes[1]) | (pawn_attacks_from(1, s) & peoes[0]);
     }
 
