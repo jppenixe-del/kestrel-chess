@@ -1464,6 +1464,9 @@ static REL_CHAM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 static ACC_MAT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static ACC_PAI: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static EVAL_CHAM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ACC_REFRESH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PAI_HIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PAI_MISS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Contar uma avaliacao completa da rede (passagem densa), para separar
 /// "actualizei o acumulador" de "avaliei mesmo".
@@ -1500,6 +1503,17 @@ pub fn imprime_rels() {
         "acumulador: {m} materializacoes, {p} vindas do pai; rede avaliada {ev} vezes \
          -- {:.2} materializacoes por avaliacao",
         if ev > 0 { m as f64 / ev as f64 } else { 0.0 }
+    );
+    let r = ACC_REFRESH.load(Relaxed);
+    eprintln!(
+        "refresh completo: {r} vezes",
+    );
+    let (ph, pm) = (PAI_HIT.load(Relaxed), PAI_MISS.load(Relaxed));
+    eprintln!(
+        "pilha por ply: {ph} acertos, {pm} falhas -- {:.1}% de acerto; \
+         dos que falham, {:.1}% acabam em refresh completo",
+        ph as f64 / (ph + pm).max(1) as f64 * 100.0,
+        r as f64 / ((pm + m) * 2).max(1) as f64 * 100.0
     );
 }
 
@@ -2096,7 +2110,15 @@ unsafe fn produto_u8_i8_avx2(x: &[u8], w: &[i8]) -> i32 {
 fn carrega_do_pai(st: &mut EstadoAcc, board: &Board) -> bool {
     let d = board.prof_acc;
     if d >= MAX_CAMADAS {
+        if diag_rels() { PAI_MISS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
         return false;
+    }
+    if diag_rels() {
+        if st.pilha[d].valido && st.pilha[d].bb == board.pieces {
+            PAI_HIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            PAI_MISS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
     if st.pilha[d].valido && st.pilha[d].bb == board.pieces {
         for pov in 0..2 {
@@ -2237,6 +2259,12 @@ fn acc_incremental(
         }
     }
 
+    // Chegar aqui e' o caminho caro: o delta de um lance nao serviu e a posicao
+    // vai ser re-enumerada de raiz. Contar quantas vezes acontece separa "cada
+    // actualizacao e' cara" de "ha' actualizacoes a mais" -- ver ACC_MAT.
+    if diag_rels() {
+        ACC_REFRESH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     let mut pecas = std::mem::take(&mut st.pecas);
     let mut novas = std::mem::take(&mut st.novas);
     let mut t = std::mem::take(&mut st.scratch_t);
