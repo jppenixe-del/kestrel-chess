@@ -529,6 +529,23 @@ pub struct SearchParams {
     /// 2.96/1.46/0.78/0.38 per cent -- monotone in all three, an 8x to 15x
     /// spread, the widest of any signal measured here. The number was already
     /// being computed and thrown away.
+    ///
+    /// MEASURED AND REJECTED (2026-08-25): -8.8 +/- 13.6 Elo over 1566 games
+    /// at 10+0.1, LOS 10.3%, with weight 512. An earlier run on a different
+    /// base agreed (-12.5 +/- 22.9 at 511 games). Stays at 0.
+    ///
+    /// The lesson is bigger than the term. The bucket test measures that a
+    /// signal PREDICTS whether a reduced move will beat alpha; it does not
+    /// measure that using it to modulate the reduction GAINS Elo. Those are
+    /// different claims and I treated them as one. This signal had the widest
+    /// spread of the four measured -- the information is real -- and the games
+    /// still say no: it is probably already captured by the other terms, or
+    /// modulating the reduction is not how to spend it.
+    ///
+    /// What the bucket test IS good for: killing empty ideas cheaply before
+    /// they cost a night of games (it killed the linear shape of lmr_ameacas
+    /// and showed subidas_alpha to be inconsistent). What it cannot do is
+    /// promote one.
     pub lmr_margem: i32,
     /// Margin, in eval units, that counts as "neither close nor hopeless".
     pub lmr_margem_pivo: i32,
