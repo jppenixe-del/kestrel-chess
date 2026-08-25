@@ -758,10 +758,13 @@ pub fn evaluate(net: &RedeSf, atk: &Attacks, board: &mut Board) -> i32 {
         }
         for (pov, base) in [(stm, 0usize), (nstm, half)] {
             let (a, b) = st.acc[pov].split_at(half);
-            for (j, (&lo, &hi)) in a.iter().zip(b.iter()).enumerate() {
+            // Fatia de saida em vez de `x[base + j]`: uma verificacao de
+            // limites no `split`, e nenhuma dentro do ciclo.
+            let saida = &mut x[base..base + half];
+            for (d, (&lo, &hi)) in saida.iter_mut().zip(a.iter().zip(b.iter())) {
                 let s0 = lo.clamp(0, TETO) as u16;
                 let s1 = hi.clamp(0, TETO) as u16;
-                x[base + j] = (s0.wrapping_mul(s1) >> 9) as u8;
+                *d = (s0.wrapping_mul(s1) >> 9) as u8;
             }
         }
         st.x = x;
@@ -825,12 +828,16 @@ pub fn evaluate(net: &RedeSf, atk: &Attacks, board: &mut Board) -> i32 {
 
     let mut fc1_out = [0i32; L3];
     for o in 0..L3 {
-        let mut s: i64 = 0;
+        // `i32` e nao `i64`: os valores cabem, e com 64 bits o LLVM so'
+        // consegue metade dos elementos por registo. E iterador em vez de
+        // `row[i]`, que verificava limites a cada um dos 64 acessos.
         let row = &stack.fc1w[o * (2 * L2)..(o + 1) * (2 * L2)];
-        for i in 0..2 * L2 {
-            s += concat1[i] as i64 * row[i] as i64;
-        }
-        fc1_out[o] = (s as i32) + stack.fc1b[o];
+        let s: i32 = concat1
+            .iter()
+            .zip(row.iter())
+            .map(|(&a, &b)| a as i32 * b as i32)
+            .sum();
+        fc1_out[o] = s + stack.fc1b[o];
     }
 
     // ac_sqr_1 / ac_1 use plain WeightScaleBits.
@@ -1464,6 +1471,10 @@ pub fn imprime_rels() {
         e as f64 / c as f64, a as f64 / c as f64,
         if a > 0 { e as f64 / a as f64 } else { 0.0 }
     );
+    // Os totais em bruto, e nao so' as medias: sem eles nao se sabe se o custo
+    // vem de cada actualizacao ser cara ou de haver muitas -- que sao dois
+    // problemas diferentes com solucoes diferentes.
+    eprintln!("brutos: {c} chamadas de delta, {e} relacoes, {a} features aplicadas");
 }
 
 // ---- Incremental accumulator ----
@@ -1551,28 +1562,53 @@ fn linha_peso(net: &RedeSf, u: usize, i: usize) -> i16 {
 /// ja' as tinha em voo ao mesmo tempo por execucao fora de ordem -- as faltas
 /// nao estavam a acontecer em serie, como eu supus. Nao repetir sem uma razao
 /// nova.
+/// O nucleo, com o comprimento no TIPO e o sinal em const generic.
+///
+/// Porque isto e' diferente de `&mut [i16]` com um `bool`, e porque foi a
+/// linha mais quente do programa inteiro (7,83%):
+///
+/// - `&mut [i16; L1]` diz ao compilador que sao exactamente 1024. Com fatias
+///   o `zip` tinha de comparar os dois comprimentos em execucao e parar no
+///   menor -- e um ciclo cujo fim o compilador nao conhece nao se desenrola
+///   como deve.
+/// - `const SOMAR: bool` faz o Rust compilar DUAS funcoes, cada uma sem ramo
+///   nenhum. Com um `bool` normal era um salto por chamada dentro do ciclo
+///   mais quente que temos.
+///
+/// Nao e' micro-optimizacao: e' deixar de escrever C em Rust. O gerador de
+/// codigo sabe fazer isto sozinho, desde que lhe digamos o que sabemos.
+#[inline(always)]
+fn soma_linha_i16<const SOMAR: bool>(acc: &mut [i16; L1], row: &[i16; L1]) {
+    for (a, &w) in acc.iter_mut().zip(row.iter()) {
+        *a = if SOMAR { a.wrapping_add(w) } else { a.wrapping_sub(w) };
+    }
+}
+
+#[inline(always)]
+fn soma_linha_i8<const SOMAR: bool>(acc: &mut [i16; L1], row: &[i8; L1]) {
+    for (a, &w) in acc.iter_mut().zip(row.iter()) {
+        let w = w as i16;
+        *a = if SOMAR { a.wrapping_add(w) } else { a.wrapping_sub(w) };
+    }
+}
+
 fn aplica_linha(net: &RedeSf, acc: &mut [i16], u: usize, somar: bool) {
+    // Uma verificacao de comprimento a' entrada, e dai' para dentro o
+    // compilador ja' sabe tudo.
+    let acc: &mut [i16; L1] = acc.try_into().expect("acumulador com comprimento errado");
     if u < U_THREAT {
-        let row = &net.ft_piece_w[u * L1..(u + 1) * L1];
-        if somar {
-            for (a, &w) in acc.iter_mut().zip(row) { *a = a.wrapping_add(w); }
-        } else {
-            for (a, &w) in acc.iter_mut().zip(row) { *a = a.wrapping_sub(w); }
-        }
+        let row: &[i16; L1] =
+            net.ft_piece_w[u * L1..(u + 1) * L1].try_into().unwrap();
+        if somar { soma_linha_i16::<true>(acc, row) } else { soma_linha_i16::<false>(acc, row) }
     } else {
-        let (f, row) = if u < U_PAIR {
+        let row: &[i8; L1] = if u < U_PAIR {
             let f = u - U_THREAT;
-            (f, &net.ft_threat_w[f * L1..(f + 1) * L1])
+            net.ft_threat_w[f * L1..(f + 1) * L1].try_into().unwrap()
         } else {
             let f = u - U_PAIR;
-            (f, &net.ft_pair_w[f * L1..(f + 1) * L1])
+            net.ft_pair_w[f * L1..(f + 1) * L1].try_into().unwrap()
         };
-        let _ = f;
-        if somar {
-            for (a, &w) in acc.iter_mut().zip(row) { *a = a.wrapping_add(w as i16); }
-        } else {
-            for (a, &w) in acc.iter_mut().zip(row) { *a = a.wrapping_sub(w as i16); }
-        }
+        if somar { soma_linha_i8::<true>(acc, row) } else { soma_linha_i8::<false>(acc, row) }
     }
 }
 

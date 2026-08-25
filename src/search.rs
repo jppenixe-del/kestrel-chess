@@ -5110,17 +5110,21 @@ impl MovePicker {
                     // "captura de peca grande com peca pequena", e ainda
                     // rejeita capturas que aparentam ganhar mas perdem no
                     // full exchange (Bxf7 defendido).
-                    for i in 0..self.noisy.len() {
-                        let m = self.noisy[i].0;
+                    // `iter_mut` em vez de indexar: cada `self.noisy[i]`
+                    // era um acesso com verificacao de limites, e havia
+                    // tres ou quatro por iteracao. Com a referencia mutavel
+                    // ha' zero -- e o codigo diz melhor o que faz.
+                    for e in self.noisy.iter_mut() {
+                        let m = e.0;
                         if Some(m) == self.tt_move {
-                            self.noisy[i].1 = i32::MIN; // marca para saltar depois
+                            e.1 = i32::MIN; // marca para saltar depois
                             continue;
                         }
-                        self.noisy[i].1 = see::see(searcher.atk, board, &m);
+                        e.1 = see::see(searcher.atk, board, &m);
                         // Capture history: tie-break only (see field doc
                         // on Searcher::capture_history) -- non-capture
                         // promotions have no "captured piece", left at 0.
-                        self.noisy[i].2 = if m.is_capture() {
+                        e.2 = if m.is_capture() {
                             let moving_pt = board.piece_at(m.from).map(|(pt, _)| pt);
                             let captured_pt = if m.flag == MoveFlag::EnPassant {
                                 Some(PieceType::Pawn)
@@ -5194,15 +5198,15 @@ impl MovePicker {
                         .and_then(|(pt, to)| searcher.countermoves[pt.idx()][to as usize]);
                     let prev1 = if ply >= 1 { searcher.ply_last_move.get(ply).and_then(|x| *x) } else { None };
                     let prev2 = if ply >= 2 { searcher.ply_last_move.get(ply - 1).and_then(|x| *x) } else { None };
-                    for i in 0..self.quiet.len() {
-                        let m = self.quiet[i].0;
+                    for e in self.quiet.iter_mut() {
+                        let m = e.0;
                         if m.from == m.to {
                             // marcador "ja usado" (killer, ver mark_quiet_used)
-                            self.quiet[i].1 = i32::MIN;
+                            e.1 = i32::MIN;
                             continue;
                         }
                         if Some(m) == self.tt_move {
-                            self.quiet[i].1 = i32::MIN;
+                            e.1 = i32::MIN;
                             continue;
                         }
                         let h = searcher.history_scores[side][m.from as usize][m.to as usize];
@@ -5221,7 +5225,7 @@ impl MovePicker {
                                 ch += searcher.cont_hist[cont_hist_idx(p2_pt, p2_to, curr_pt, m.to)];
                             }
                         }
-                        self.quiet[i].1 = h + cm_bonus + book + ch;
+                        e.1 = h + cm_bonus + book + ch;
                     }
                     self.stage = PickerStage::Quiet;
                 }
@@ -5283,12 +5287,20 @@ impl MovePicker {
             // the tie-break (many other pruning decisions assume that
             // boundary is pure SEE, see search_params()-driven captures
             // futility/SEE pruning).
-            let mut best_i = self.noisy_idx;
-            for i in (self.noisy_idx + 1)..self.noisy.len() {
-                let (_, s, h) = self.noisy[i];
-                let (_, bs, bh) = self.noisy[best_i];
+            // Duas mudancas, sem tocar na semantica (o `>` estrito mantem o
+            // PRIMEIRO dos empatados, como antes):
+            //  - itera sobre a fatia em vez de indexar, o que tira a
+            //    verificacao de limites de dentro do ciclo;
+            //  - guarda o melhor em variaveis. Antes relia `self.noisy[best_i]`
+            //    a CADA iteracao, so' para comparar.
+            let base = self.noisy_idx;
+            let mut best_i = base;
+            let (mut bs, mut bh) = (self.noisy[base].1, self.noisy[base].2);
+            for (k, &(_, s, h)) in self.noisy[base + 1..].iter().enumerate() {
                 if s > bs || (s == bs && h > bh) {
-                    best_i = i;
+                    best_i = base + 1 + k;
+                    bs = s;
+                    bh = h;
                 }
             }
             self.noisy.swap(self.noisy_idx, best_i);
@@ -5318,12 +5330,13 @@ impl MovePicker {
 
     fn pick_best_quiet(&mut self) -> Option<Move> {
         while self.quiet_idx < self.quiet.len() {
-            let mut best_i = self.quiet_idx;
-            let mut best_score = self.quiet[best_i].1;
-            for i in (self.quiet_idx + 1)..self.quiet.len() {
-                if self.quiet[i].1 > best_score {
-                    best_score = self.quiet[i].1;
-                    best_i = i;
+            let base = self.quiet_idx;
+            let mut best_i = base;
+            let mut best_score = self.quiet[base].1;
+            for (k, e) in self.quiet[base + 1..].iter().enumerate() {
+                if e.1 > best_score {
+                    best_score = e.1;
+                    best_i = base + 1 + k;
                 }
             }
             self.quiet.swap(self.quiet_idx, best_i);

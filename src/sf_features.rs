@@ -363,6 +363,11 @@ fn is_pair_excluded(excluded: bool, semi_excluded: bool, attacking_sq: i32, atta
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Invólucro sobre `get_threat_feature_t`. Tinha cinco variaveis locais
+/// calculadas e NUNCA usadas (a chamada passa os parametros originais) e nao
+/// estava marcado como `inline` -- so' o salto valia 6,9% do
+/// `delta_por_lance`. Agora e' o que sempre foi: um reencaminhamento.
+#[inline(always)]
 pub fn get_threat_feature(
     pov: usize,
     attacking_piece: usize,
@@ -373,11 +378,6 @@ pub fn get_threat_feature(
     attacked_square: i32,
     mirrored: bool,
 ) -> i32 {
-    let square_flip = (if mirrored { 7 } else { 0 }) ^ (if pov == 1 { 56 } else { 0 });
-    let a_sq = attacking_square ^ square_flip;
-    let d_sq = attacked_square ^ square_flip;
-    let a_c = attacking_color ^ pov;
-    let d_c = attacked_color ^ pov;
     get_threat_feature_t(threat_tables(), pov, attacking_piece, attacking_color,
         attacked_piece, attacked_color, attacking_square, attacked_square, mirrored)
 }
