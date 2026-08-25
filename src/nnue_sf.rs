@@ -621,6 +621,7 @@ fn bandeira(nome: &'static str) -> bool {
 }
 
 pub fn evaluate(net: &RedeSf, atk: &Attacks, board: &mut Board) -> i32 {
+    conta_eval();
     // `KESTREL_TROCA_POV=1` swaps the two perspectives in the forward pass.
     // A diagnostic, not an option, and it has already answered its question:
     // NO. Our trained nets score a queen up for White as WORSE than the same
@@ -1454,6 +1455,25 @@ static REL_ENUM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 static REL_APLIC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static REL_CHAM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Quantas vezes o acumulador e' MATERIALIZADO contra quantas vezes a rede e'
+/// mesmo avaliada. Sao perguntas diferentes: o `garante_camada` corre em todo o
+/// no' -- inclusive em xeque e com a avaliacao ja' na TT -- so' para que os
+/// filhos tenham pai, e paga as ~30 linhas de pesos na mesma. O Stockfish nao:
+/// marca o estado sujo e so' materializa a cadeia quando alguem avalia. Medido
+/// com uprobe, ele avalia 0,247 vezes por no'. `KESTREL_RELS=1`.
+static ACC_MAT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ACC_PAI: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static EVAL_CHAM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Contar uma avaliacao completa da rede (passagem densa), para separar
+/// "actualizei o acumulador" de "avaliei mesmo".
+#[inline(always)]
+pub fn conta_eval() {
+    if diag_rels() {
+        EVAL_CHAM.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 #[inline(always)]
 fn diag_rels() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1475,6 +1495,12 @@ pub fn imprime_rels() {
     // vem de cada actualizacao ser cara ou de haver muitas -- que sao dois
     // problemas diferentes com solucoes diferentes.
     eprintln!("brutos: {c} chamadas de delta, {e} relacoes, {a} features aplicadas");
+    let (m, p, ev) = (ACC_MAT.load(Relaxed), ACC_PAI.load(Relaxed), EVAL_CHAM.load(Relaxed));
+    eprintln!(
+        "acumulador: {m} materializacoes, {p} vindas do pai; rede avaliada {ev} vezes \
+         -- {:.2} materializacoes por avaliacao",
+        if ev > 0 { m as f64 / ev as f64 } else { 0.0 }
+    );
 }
 
 // ---- Incremental accumulator ----
@@ -1989,7 +2015,13 @@ pub fn garante_camada(atk: &Attacks, board: &mut Board) {
     ESTADO.with(|c| {
         let mut st = c.borrow_mut();
         if carrega_do_pai(&mut st, board) {
+            if diag_rels() {
+                ACC_PAI.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             return;
+        }
+        if diag_rels() {
+            ACC_MAT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         acc_incremental(net, atk, board, 0, &mut st);
         acc_incremental(net, atk, board, 1, &mut st);

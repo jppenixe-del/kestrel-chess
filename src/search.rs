@@ -2489,23 +2489,36 @@ impl<'a> Searcher<'a> {
     }
 
     fn quiescence(&mut self, board: &mut Board, alpha: i32, beta: i32, ply: usize) -> i32 {
-        // MEASURED AND REJECTED (2026-08-06), and worth knowing before
-        // trying it: reusing a stored static eval here instead of
-        // recomputing costs ~3.2% NPS rather than saving anything
-        // (1123k -> 1087k, five interleaved runs, node count identical).
+        // Reusing a stored static eval here was MEASURED AND REJECTED on
+        // 2026-08-06 -- ~3.2% NPS worse, 1123k -> 1087k -- and the note left
+        // behind named the exact condition for revisiting it: "an expensive
+        // evaluation is exactly the condition that makes probing here
+        // worthwhile, and this engine's is not one". Back then the eval was an
+        // already-current accumulator plus one 2x512 output pass, so a probe
+        // (a cache miss into several megabytes) cost more than it saved.
         //
-        // 54% of all evaluations do come from this line, so the premise was
-        // right -- but with the lazy accumulator in place, evaluating the
-        // piece-square network here is reading an accumulator that is
-        // usually already current plus one 2x512 output pass, while a table
-        // probe is a cache miss into several megabytes. The cheap thing was
-        // already the eval.
+        // That condition changed with the SFNNv16 net. An evaluation now
+        // applies ~30 weight rows of 1024 and runs the dense pass: ~21000
+        // instructions, against ~300 cycles for the missed probe. And 54% of
+        // all evaluations come from this one line, which is why we evaluate
+        // 0.72 times per node where Stockfish evaluates 0.247 (measured with
+        // a uprobe on its Worker::evaluate, same net, same machine).
         //
-        // This is NOT a general verdict. It pays for an evaluation with no
-        // accumulator behind it, one that re-enumerates its features from
-        // scratch on every call: there the probe is far cheaper than what it
-        // replaces. An expensive evaluation is exactly the condition that
-        // makes probing here worthwhile, and this engine's is not one.
+        // RE-MEASURED 2026-08-25 with the new net, and it STILL loses -- but
+        // the note above had the wrong reason, so here is the right one. The
+        // probe was added back and the evaluation counter went from 1420101 to
+        // 1417581: a hit rate of 0.18%. Not "the probe costs more than it
+        // saves" -- the probe simply never hits, because qsearch neither
+        // probes nor stores (the only `tt.store` in this file is in negamax),
+        // so no qsearch position is ever in the table to be found.
+        //
+        // What that means for the real fix: reusing a stored eval here is
+        // worthless until qsearch also STORES, which is how Stockfish gets its
+        // hits. And even then the saving is only the dense forward pass --
+        // `garante_camada` would still have to run on the reuse path to keep
+        // the children's parent accumulator alive, and that is where most of
+        // the cost is. The prize needs the lazy dirty-chain accumulator, not a
+        // probe. See the note in `nnue_sf::garante_camada`.
         let stand_pat = crate::evaluation::amortece_rule50(
             crate::evaluation::evaluate_fast(board),
             board.halfmove,
