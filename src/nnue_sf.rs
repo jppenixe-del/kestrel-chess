@@ -1472,6 +1472,7 @@ static ACC_REFRESH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// Lances de rei que forcam refresh, repartidos por [so' as pecas mudam,
 /// as ameacas tambem mudam]. O primeiro grupo e' o que a actualizacao hibrida
 /// do Stockfish (db98633b) recupera.
+static HIBRIDO_OK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static REI_CLASSE: [std::sync::atomic::AtomicU64; 2] = [
     std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 static PARENT_HIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1551,6 +1552,7 @@ pub fn imprime_rels() {
         let (sb, sm) = (DIRTY_OK.load(Relaxed), DIRTY_BAD.load(Relaxed));
         eprintln!("sujas do make_move: {sb} certas, {sm} ERRADAS");
     }
+    eprintln!("hibrido de rei aplicado: {} vezes", HIBRIDO_OK.load(Relaxed));
     let (so_peca, tambem_ameaca) = (REI_CLASSE[0].load(Relaxed), REI_CLASSE[1].load(Relaxed));
     eprintln!(
         "lances de rei que invalidam: {so_peca} so' as PECAS, {tambem_ameaca} tambem as ameacas \
@@ -1765,6 +1767,8 @@ struct EstadoAcc {
     conta: Vec<i8>,
     tocadas: Vec<u32>,
     x: Vec<u8>,
+    /// Dois blocos HalfKA de trabalho para a actualizacao hibrida.
+    hka: [Vec<i16>; 2],
     psqt: [[i64; NB]; 2],
     /// Cache de refresh por casa de rei ("finny tables"): para cada
     /// (casa do rei, perspectiva) guarda o acumulador SO' com features de
@@ -1964,6 +1968,7 @@ impl EstadoAcc {
     fn novo() -> Self {
         EstadoAcc {
             valido: false,
+            hka: [Vec::with_capacity(L1), Vec::with_capacity(L1)],
             acc: [vec![0i16; L1], vec![0i16; L1]],
             feats: [Vec::with_capacity(192), Vec::with_capacity(192)],
             novas: Vec::with_capacity(192),
@@ -2012,7 +2017,7 @@ thread_local! {
 /// de `DirtyPieces`, que e' o que permite ao acumulador recuar mais de um ply.
 fn delta_por_lance(
     net: &RedeSf, agora: &crate::sf_features::PosBB, pov: usize, st: &mut EstadoAcc,
-    ev: &[(usize, usize, usize, bool)],
+    ev: &[(usize, usize, usize, bool)], saltar_pecas: bool,
 ) -> bool {
     let agora = *agora;
     let mut antes = agora;
@@ -2198,6 +2203,12 @@ fn delta_por_lance(
 
     // features de peca: indice calculado directamente (o rei desta
     // perspectiva nao mexeu -- o chamador ja' o garantiu)
+    // Na actualizacao hibrida o bloco de pecas ja' foi trocado por inteiro
+    // (casa de rei nova contra antiga), por isso aplicar aqui os deltas de peca
+    // sobre a casa nova somaria o mesmo trabalho duas vezes.
+    if saltar_pecas {
+        return true;
+    }
     let ksq = agora.king_sq(pov);
     for &(sq, t, c, add) in ev {
         let u = crate::sf_features::indice_peca(ksq, pov, sq, t, c);
@@ -2409,7 +2420,7 @@ fn acc_incremental(
                 let acc_antes = st.acc[pov].clone();
                 let psqt_antes = st.psqt[pov];
                 let bb_antes = st.bb;
-                if delta_por_lance(net, &board_para_posbb(board), pov, st, &ev) {
+                if delta_por_lance(net, &board_para_posbb(board), pov, st, &ev, false) {
                     let acc_delta = st.acc[pov].clone();
                     let psqt_delta = st.psqt[pov];
                     st.acc[pov] = acc_antes;
@@ -2478,8 +2489,18 @@ fn acc_incremental(
         if let Some(ev) = eventos_de_casa(&st.bb, &board.pieces) {
             let antes_bb = crate::sf_features::PosBB { pieces: st.bb };
             let agora_bb = board_para_posbb(board);
+            // Lance de rei que so' mexe nas features de PECA: o bloco de
+            // ameacas do acumulador continua valido e recupera-se trocando so'
+            // o bloco HalfKA, em vez de re-enumerar a posicao inteira.
+            if hibrido_ligado()
+                && rei_classifica(&ev, pov, &antes_bb, &agora_bb) == ReiMuda::SoPecas
+                && hibrido_rei(net, &antes_bb, &agora_bb, pov, st, &ev)
+            {
+                st.feats[pov].clear();
+                return;
+            }
             if !rei_invalida_indices(&ev, pov, &antes_bb, &agora_bb)
-                && delta_por_lance(net, &agora_bb, pov, st, &ev)
+                && delta_por_lance(net, &agora_bb, pov, st, &ev, false)
             {
                 // as listas ficam desactualizadas de proposito: enquanto o
                 // caminho rapido pegar, nao sao precisas (o psqt agora e'
@@ -2932,7 +2953,7 @@ fn walk_back_chain(
         if evs[i].is_empty() {
             continue;
         }
-        if !delta_por_lance(net, &pos[i + 1], pov, st, &evs[i]) {
+        if !delta_por_lance(net, &pos[i + 1], pov, st, &evs[i], false) {
             walk_exit(4);
             return false;
         }
@@ -2941,6 +2962,128 @@ fn walk_back_chain(
     WALK_OK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     WALK_PLIES.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
     true
+}
+
+/// O que um lance de rei invalida. As tres condicoes do
+/// `rei_invalida_indices` nao sao a mesma coisa: o espelho do HalfKA e o bucket
+/// mexem so' nas features de PECA, e so' o `ORIENT_THREATS` mexe nas de ameaca
+/// e par. Medido: 308781 lances de rei mexem so' nas pecas contra 46551 que
+/// mexem em ambas -- 87% do que hoje forca um refresh e' recuperavel.
+#[derive(PartialEq, Clone, Copy)]
+enum ReiMuda {
+    Nada,
+    SoPecas,
+    Tudo,
+}
+
+/// Constroi o acumulador SO' DE PECAS para uma casa de rei e uma posicao, a
+/// partir da cache de refresh (as "finny tables"). E' o mesmo procedimento que
+/// o caminho lento ja' faz para a posicao actual; aqui e' extraido para poder
+/// correr tambem sobre a posicao ANTERIOR e a casa de rei ANTIGA, que e' o que
+/// a actualizacao hibrida precisa.
+///
+/// Nao toca na cache: le' a entrada e aplica o diff de pecas por cima de uma
+/// copia. Escrever de volta so' se faz no caminho lento, que e' quem tem o
+/// direito de a actualizar.
+fn halfka_do_cache(
+    net: &RedeSf, st: &EstadoAcc, pov: usize, ksq: usize,
+    pieces: &[[u64; 6]; 2], saida: &mut Vec<i16>, psqt: &mut [i64; NB],
+) -> bool {
+    if ksq >= 64 {
+        return false;
+    }
+    let e = &st.cache[ksq * 2 + pov];
+    if !e.valido || e.acc.len() != L1 {
+        return false;
+    }
+    saida.clear();
+    saida.extend_from_slice(&e.acc);
+    *psqt = e.psqt;
+    for c in 0..2 {
+        for t in 0..6 {
+            let saiu = e.bb[c][t] & !pieces[c][t];
+            let entrou = pieces[c][t] & !e.bb[c][t];
+            for (mut bb, add) in [(saiu, false), (entrou, true)] {
+                while bb != 0 {
+                    let sq = bb.trailing_zeros() as usize;
+                    bb &= bb - 1;
+                    let u = crate::sf_features::indice_peca(ksq, pov, sq, t, c);
+                    aplica_linha(net, saida, u, add);
+                    let sinal = if add { 1i64 } else { -1 };
+                    for b in 0..NB {
+                        psqt[b] += sinal * net.ft_piece_psqt[u * NB + b] as i64;
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Actualizacao hibrida para um lance de rei que so' invalida as features de
+/// PECA. Porto de Stockfish db98633b (o Triumviratus mede +2,13%).
+///
+///     acc_novo = acc_anterior - HalfKA_anterior + HalfKA_novo + delta(ameacas)
+///
+/// Nenhum dos dois blocos HalfKA esta' guardado: vem ambos da cache de refresh,
+/// o anterior contra a casa de rei antiga e a posicao anterior. As ameacas e os
+/// pares NAO sao tocados alem do seu proprio delta, porque os indices deles
+/// dependem do `ORIENT_THREATS`, que por hipotese nao mudou.
+fn hibrido_rei(
+    net: &RedeSf, antes: &crate::sf_features::PosBB, agora: &crate::sf_features::PosBB,
+    pov: usize, st: &mut EstadoAcc, ev: &[(usize, usize, usize, bool)],
+) -> bool {
+    let ksq_velho = antes.king_sq(pov);
+    let ksq_novo = agora.king_sq(pov);
+    let mut a = std::mem::take(&mut st.hka[0]);
+    let mut b = std::mem::take(&mut st.hka[1]);
+    let (mut pa, mut pb) = ([0i64; NB], [0i64; NB]);
+    let ok = halfka_do_cache(net, st, pov, ksq_velho, &antes.pieces, &mut a, &mut pa)
+        && halfka_do_cache(net, st, pov, ksq_novo, &agora.pieces, &mut b, &mut pb);
+    if !ok {
+        st.hka = [a, b];
+        return false;
+    }
+    let acc = &mut st.acc[pov];
+    for ((v, &x), &y) in acc.iter_mut().zip(a.iter()).zip(b.iter()) {
+        *v = v.wrapping_sub(x).wrapping_add(y);
+    }
+    for k in 0..NB {
+        st.psqt[pov][k] += pb[k] - pa[k];
+    }
+    st.hka = [a, b];
+    if !delta_por_lance(net, agora, pov, st, ev, true) {
+        return false;
+    }
+    HIBRIDO_OK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    true
+}
+
+fn rei_classifica(
+    ev: &[(usize, usize, usize, bool)], pov: usize,
+    antes: &crate::sf_features::PosBB, agora: &crate::sf_features::PosBB,
+) -> ReiMuda {
+    if !ev.iter().any(|&(_, t, c, _)| t == 5 && c == pov) {
+        return ReiMuda::Nada;
+    }
+    let novo = agora.king_sq(pov);
+    let velho = antes.pieces[pov][5].trailing_zeros() as usize;
+    if velho >= 64 || novo >= 64 {
+        return ReiMuda::Tudo;
+    }
+    if ORIENT_THREATS[velho] != ORIENT_THREATS[novo] {
+        return ReiMuda::Tudo;
+    }
+    let flip = if pov == 1 { 56 } else { 0 };
+    let peca_muda = ORIENT_HALFKA[velho] != ORIENT_HALFKA[novo]
+        || crate::sf_features::KING_BUCKETS_BASE[velho ^ flip]
+            != crate::sf_features::KING_BUCKETS_BASE[novo ^ flip];
+    if peca_muda { ReiMuda::SoPecas } else { ReiMuda::Nada }
+}
+
+fn hibrido_ligado() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KESTREL_HIBRIDO").is_some())
 }
 
 fn rei_invalida_indices(
