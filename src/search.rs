@@ -2023,8 +2023,24 @@ impl<'a> Searcher<'a> {
             b.make_move(&first);
             pv.push(first);
         }
-        let mut seen = std::collections::HashSet::new();
+        // Semear com o historico REAL do jogo, nao so' com a propria linha. A
+        // PV parava numa segunda ocorrencia dentro dela mesma, o que nao e' uma
+        // repeticao tripla: se a posicao ja' apareceu duas vezes na partida, a
+        // primeira ocorrencia na PV ja' e' a terceira. Era isso que fazia o
+        // arbitro avisar "PV continues after threefold repetition" enquanto o
+        // jogo era correctamente adjudicado como empate.
+        let mut seen: std::collections::HashSet<u64> = self
+            .history
+            .iter()
+            .rev()
+            .take(board.halfmove as usize + 1)
+            .copied()
+            .collect();
         for _ in 0..max_len {
+            // E a regra dos 50 lances, que a PV ignorava por completo.
+            if b.halfmove >= 100 {
+                break;
+            }
             let hash = b.hash;
             if !seen.insert(hash) {
                 break;

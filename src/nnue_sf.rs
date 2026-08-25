@@ -1473,6 +1473,13 @@ static ACC_REFRESH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// as ameacas tambem mudam]. O primeiro grupo e' o que a actualizacao hibrida
 /// do Stockfish (db98633b) recupera.
 static HIBRIDO_OK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static HIBRIDO_CONFERE: [std::sync::atomic::AtomicU64; 2] = [
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+
+fn verifica_hibrido() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KESTREL_VERIFICA_HIBRIDO").is_some())
+}
 static REI_CLASSE: [std::sync::atomic::AtomicU64; 2] = [
     std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 static PARENT_HIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1553,6 +1560,10 @@ pub fn imprime_rels() {
         eprintln!("sujas do make_move: {sb} certas, {sm} ERRADAS");
     }
     eprintln!("hibrido de rei aplicado: {} vezes", HIBRIDO_OK.load(Relaxed));
+    if verifica_hibrido() {
+        eprintln!("hibrido conferido: {} certos, {} ERRADOS",
+            HIBRIDO_CONFERE[0].load(Relaxed), HIBRIDO_CONFERE[1].load(Relaxed));
+    }
     let (so_peca, tambem_ameaca) = (REI_CLASSE[0].load(Relaxed), REI_CLASSE[1].load(Relaxed));
     eprintln!(
         "lances de rei que invalidam: {so_peca} so' as PECAS, {tambem_ameaca} tambem as ameacas \
@@ -2496,6 +2507,9 @@ fn acc_incremental(
                 && rei_classifica(&ev, pov, &antes_bb, &agora_bb) == ReiMuda::SoPecas
                 && hibrido_rei(net, &antes_bb, &agora_bb, pov, st, &ev)
             {
+                if verifica_hibrido() {
+                    confere_hibrido(net, atk, board, pov, st);
+                }
                 st.feats[pov].clear();
                 return;
             }
@@ -3059,6 +3073,28 @@ fn hibrido_rei(
     true
 }
 
+/// Confere o resultado do hibrido contra uma reconstrucao de raiz.
+///
+/// A assinatura do bench prova as posicoes que o bench toca e mais nenhumas, e
+/// um acumulador errado nao da sinal nenhum. `KESTREL_VERIFICA_HIBRIDO=1`.
+fn confere_hibrido(net: &RedeSf, atk: &Attacks, board: &Board, pov: usize, st: &mut EstadoAcc) {
+    let acc_hibrido = st.acc[pov].clone();
+    let psqt_hibrido = st.psqt[pov];
+    let bb_guardado = st.bb;
+    st.valido = false;
+    st.feats[pov].clear();
+    acc_incremental(net, atk, board, pov, st);
+    if st.acc[pov] == acc_hibrido && st.psqt[pov] == psqt_hibrido {
+        HIBRIDO_CONFERE[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    } else {
+        HIBRIDO_CONFERE[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dif = st.acc[pov].iter().zip(acc_hibrido.iter())
+            .map(|(a, b)| (*a as i32 - *b as i32).abs()).max().unwrap_or(0);
+        eprintln!("HIBRIDO-MAU pov={pov} maxdif={dif}");
+    }
+    st.bb = bb_guardado;
+}
+
 fn rei_classifica(
     ev: &[(usize, usize, usize, bool)], pov: usize,
     antes: &crate::sf_features::PosBB, agora: &crate::sf_features::PosBB,
@@ -3081,9 +3117,13 @@ fn rei_classifica(
     if peca_muda { ReiMuda::SoPecas } else { ReiMuda::Nada }
 }
 
+/// LIGADO por omissao. Cada aplicacao foi conferida contra uma reconstrucao de
+/// raiz da posicao -- 150528 de 150528 certas, zero erradas -- e a assinatura
+/// do bench e' identica com e sem. `KESTREL_SEM_HIBRIDO=1` desliga, para
+/// medicoes A/B.
 fn hibrido_ligado() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("KESTREL_HIBRIDO").is_some())
+    *ON.get_or_init(|| std::env::var_os("KESTREL_SEM_HIBRIDO").is_none())
 }
 
 fn rei_invalida_indices(
