@@ -1469,6 +1469,11 @@ static ACC_MATERIALISED: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 static ACC_FROM_PARENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static EVAL_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static ACC_REFRESH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Lances de rei que forcam refresh, repartidos por [so' as pecas mudam,
+/// as ameacas tambem mudam]. O primeiro grupo e' o que a actualizacao hibrida
+/// do Stockfish (db98633b) recupera.
+static REI_CLASSE: [std::sync::atomic::AtomicU64; 2] = [
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 static PARENT_HIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static PARENT_MISS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DIRTY_OK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1546,6 +1551,12 @@ pub fn imprime_rels() {
         let (sb, sm) = (DIRTY_OK.load(Relaxed), DIRTY_BAD.load(Relaxed));
         eprintln!("sujas do make_move: {sb} certas, {sm} ERRADAS");
     }
+    let (so_peca, tambem_ameaca) = (REI_CLASSE[0].load(Relaxed), REI_CLASSE[1].load(Relaxed));
+    eprintln!(
+        "lances de rei que invalidam: {so_peca} so' as PECAS, {tambem_ameaca} tambem as ameacas \
+         -- {:.0}% recuperaveis por actualizacao hibrida",
+        so_peca as f64 / (so_peca + tambem_ameaca).max(1) as f64 * 100.0
+    );
     let (ph, pm) = (PARENT_HIT.load(Relaxed), PARENT_MISS.load(Relaxed));
     eprintln!(
         "pilha por ply: {ph} acertos, {pm} falhas -- {:.1}% de acerto; \
@@ -2946,10 +2957,19 @@ fn rei_invalida_indices(
         return true;
     }
     let flip = if pov == 1 { 56 } else { 0 };
-    ORIENT_HALFKA[velho] != ORIENT_HALFKA[novo]
-        || ORIENT_THREATS[velho] != ORIENT_THREATS[novo]
+    // As tres condicoes nao sao a mesma coisa. O espelho e o bucket do HalfKA
+    // mexem so' nas features de PECA; so' `ORIENT_THREATS` mexe nas de ameaca e
+    // nas de par. Quando muda o bucket e nao a orientacao das ameacas, o bloco
+    // de ameacas do acumulador continua valido e estamos a deita-lo fora.
+    let peca_muda = ORIENT_HALFKA[velho] != ORIENT_HALFKA[novo]
         || crate::sf_features::KING_BUCKETS_BASE[velho ^ flip]
-            != crate::sf_features::KING_BUCKETS_BASE[novo ^ flip]
+            != crate::sf_features::KING_BUCKETS_BASE[novo ^ flip];
+    let ameaca_muda = ORIENT_THREATS[velho] != ORIENT_THREATS[novo];
+    if diag_rels() && (peca_muda || ameaca_muda) {
+        REI_CLASSE[if ameaca_muda { 1 } else { 0 }]
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    peca_muda || ameaca_muda
 }
 
 #[cfg(test)]
