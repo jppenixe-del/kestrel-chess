@@ -1469,6 +1469,19 @@ static PAI_HIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 static PAI_MISS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static SUJAS_BOM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static SUJAS_MAU: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RECUO_OK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RECUO_PLIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Porque e' que o recuo desistiu: 0=tentativas, 1=sem antepassado calculado,
+/// 2=a cadeia nao liga ao tabuleiro, 3=lance de rei pelo meio, 4=delta falhou.
+static RECUO_SAIDA: [std::sync::atomic::AtomicU64; 5] = [
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+#[inline(always)]
+fn saida_recuo(i: usize) {
+    RECUO_SAIDA[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
 
 #[inline(always)]
 fn verifica_sujas() -> bool {
@@ -1515,6 +1528,15 @@ pub fn imprime_rels() {
     let r = ACC_REFRESH.load(Relaxed);
     eprintln!(
         "refresh completo: {r} vezes",
+    );
+    let (ro, rp) = (RECUO_OK.load(Relaxed), RECUO_PLIES.load(Relaxed));
+    eprintln!(
+        "recuo pela cadeia: {ro} vezes, {:.1} plies em media; tentativas {}, \
+         sem-antepassado {}, cadeia-nao-liga {}, rei {}, delta-falhou {}",
+        if ro > 0 { rp as f64 / ro as f64 } else { 0.0 },
+        RECUO_SAIDA[0].load(Relaxed), RECUO_SAIDA[1].load(Relaxed),
+        RECUO_SAIDA[2].load(Relaxed), RECUO_SAIDA[3].load(Relaxed),
+        RECUO_SAIDA[4].load(Relaxed)
     );
     if verifica_sujas() {
         let (sb, sm) = (SUJAS_BOM.load(Relaxed), SUJAS_MAU.load(Relaxed));
@@ -1887,11 +1909,15 @@ thread_local! {
 /// occupancy demands: the piece leaving is evaluated on the OLD board, the
 /// piece arriving on the NEW one. Returns false when the change is not a
 /// simple move, and the caller rebuilds instead.
+/// Recebe a posicao em BITBOARDS, nao o `Board`. A funcao so' precisava disso --
+/// usava o `board` numa unica linha, para o converter -- e a diferenca importa:
+/// com `PosBB` a entrada pode ser uma posicao INTERMEDIA reconstruida da cadeia
+/// de `Sujas`, que e' o que permite ao acumulador recuar mais de um ply.
 fn delta_por_lance(
-    net: &RedeSf, board: &Board, pov: usize, st: &mut EstadoAcc,
+    net: &RedeSf, agora: &crate::sf_features::PosBB, pov: usize, st: &mut EstadoAcc,
     ev: &[(usize, usize, usize, bool)],
 ) -> bool {
-    let agora = board_para_posbb(board);
+    let agora = *agora;
     let mut antes = agora;
     // desfazer os eventos para reconstruir o tabuleiro anterior
     for &(sq, t, c, add) in ev {
@@ -2280,11 +2306,13 @@ fn acc_incremental(
     let verifica = *VERIFICA.get_or_init(|| std::env::var_os("KESTREL_VERIFICA_DELTA").is_some());
     if verifica && st.valido && !sem_delta {
         if let Some(ev) = eventos_de_casa(&st.bb, &board.pieces) {
-            if !rei_invalida_indices(&ev, pov, st, board) {
+            let antes_bb = crate::sf_features::PosBB { pieces: st.bb };
+            let agora_bb = board_para_posbb(board);
+            if !rei_invalida_indices(&ev, pov, &antes_bb, &agora_bb) {
                 let acc_antes = st.acc[pov].clone();
                 let psqt_antes = st.psqt[pov];
                 let bb_antes = st.bb;
-                if delta_por_lance(net, board, pov, st, &ev) {
+                if delta_por_lance(net, &board_para_posbb(board), pov, st, &ev) {
                     let acc_delta = st.acc[pov].clone();
                     let psqt_delta = st.psqt[pov];
                     st.acc[pov] = acc_antes;
@@ -2351,7 +2379,11 @@ fn acc_incremental(
     }
     if st.valido && !sem_delta {
         if let Some(ev) = eventos_de_casa(&st.bb, &board.pieces) {
-            if !rei_invalida_indices(&ev, pov, st, board) && delta_por_lance(net, board, pov, st, &ev) {
+            let antes_bb = crate::sf_features::PosBB { pieces: st.bb };
+            let agora_bb = board_para_posbb(board);
+            if !rei_invalida_indices(&ev, pov, &antes_bb, &agora_bb)
+                && delta_por_lance(net, &agora_bb, pov, st, &ev)
+            {
                 // as listas ficam desactualizadas de proposito: enquanto o
                 // caminho rapido pegar, nao sao precisas (o psqt agora e'
                 // acumulado). Marca-se para o caminho lento as reconstruir.
@@ -2359,6 +2391,14 @@ fn acc_incremental(
                 return;
             }
         }
+    }
+
+    // O delta de UM lance nao serviu. Antes de re-enumerar a posicao inteira,
+    // tentar a cadeia: recuar ate' ao antepassado calculado mais proximo e
+    // aplicar os deltas para a frente -- o que os dois motores de referencia
+    // fazem e nos nao faziamos.
+    if !sem_delta && recua_pela_cadeia(net, board, pov, st) {
+        return;
     }
 
     // Chegar aqui e' o caminho caro: o delta de um lance nao serviu e a posicao
@@ -2668,15 +2708,153 @@ fn eventos_de_casa(
 /// in a pawn endgame -- of which ~83% kept the same orientation. Nearly half of
 /// all evaluations in an endgame were rebuilding three feature tables from
 /// scratch to arrive at the numbers they already had.
+/// Recebe as DUAS posicoes em bitboards em vez de ir buscar a antiga a
+/// `st.bb`. Num recuo de varios plies cada passo tem o seu proprio "antes", e
+/// `st.bb` so' conhece o ultimo estado avaliado.
+/// Quantos plies vale a pena recuar antes de desistir e re-enumerar. Recuar N
+/// plies custa N deltas; um refresh custa a posicao inteira (~26 linhas so' de
+/// ameacas, mais as pecas e os pares, mais a enumeracao). Ajustavel para medir:
+/// `KESTREL_RECUO=N`.
+fn max_recuo() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("KESTREL_RECUO").ok().and_then(|v| v.parse().ok()).unwrap_or(4)
+    })
+}
+
+/// Recua pela cadeia de `Sujas` ate' ao antepassado mais proximo que ja' tenha
+/// acumulador calculado, e aplica os deltas de cada ply para a frente.
+///
+/// E' o `backward_update_incremental` do Triumviratus e o
+/// `update_accumulator_incremental` do Stockfish. Sem isto o acumulador so'
+/// sabe recuar UM ply -- o `eventos_de_casa` compara `st.bb` (a ultima posicao
+/// avaliada, muitas vezes o filho de um irmao) com a actual e desiste se a
+/// diferenca nao couber num lance. Era esse o caminho para 7,9% dos refreshes.
+///
+/// MEDIDO (2026-08-25), e a premissa estava ERRADA. Vale 34370 recuos e corta
+/// os refreshes de 224639 para 190269 (-15%), mas isso sao **0,75%** das
+/// instrucoes (23691 -> 23514 por no', bench identico a 1970705). Duas razoes,
+/// ambas dos contadores: `sem-antepassado 0` e recuo medio de **1,0 plies** --
+/// o pai esta praticamente sempre calculado, por isso nao havia cadeia partida
+/// para recuperar; e 181833 das 224537 falhas do delta sao lances de REI, que
+/// sao inerentes ao HalfKA (mudam o indice de todas as features) e que o
+/// Stockfish tambem resolve com a cache de refresh, nao com a pilha.
+///
+/// Fica porque esta' correcto e custa pouco, e porque e' o alicerce necessario
+/// se algum dia avaliarmos menos vezes -- mas nao e' o buraco dos 2,7x.
+///
+/// ARMADILHA: o `delta_por_lance` so' aceita a forma que o `eventos_de_casa`
+/// deixa passar (UMA adicao, no maximo tres eventos). As `Sujas` sao mais
+/// gerais: um roque traz quatro eventos e duas adicoes. Passa-lo por ali da' um
+/// acumulador diferente do refresh -- silenciosamente. Foi a assinatura de nos
+/// que o apanhou (2022050 em vez de 1970705); por isso a guarda abaixo.
+///
+/// Devolve `false` sem estragar nada se a cadeia nao ligar. Se falhar A MEIO,
+/// `st.acc[pov]` fica inconsistente -- mas o chamador cai no refresh, que
+/// reescreve o acumulador por inteiro, portanto e' recuperavel por construcao.
+fn recua_pela_cadeia(
+    net: &RedeSf, board: &Board, pov: usize, st: &mut EstadoAcc,
+) -> bool {
+    let d = board.prof_acc;
+    let recuo = max_recuo();
+    if d == 0 || d >= MAX_CAMADAS || recuo == 0 {
+        return false;
+    }
+    saida_recuo(0);
+    // Antepassado calculado mais proximo, no maximo `recuo` plies atras.
+    let baixo = d.saturating_sub(recuo);
+    let k = match (baixo..d).rev().find(|&j| st.pilha[j].valido) {
+        Some(k) => k,
+        None => { saida_recuo(1); return false; }
+    };
+    let n = d - k;
+
+    // Reconstruir as posicoes intermedias e PROVAR que a cadeia liga mesmo ao
+    // tabuleiro actual. Sem esta prova estariamos a confiar que `pilha[k]` e'
+    // do nosso antepassado e nao de outro ramo que passou pela mesma
+    // profundidade -- e um acumulador errado nao da sinal nenhum.
+    let mut pos = [crate::sf_features::PosBB::default(); 17];
+    if n >= pos.len() {
+        return false;
+    }
+    pos[0] = crate::sf_features::PosBB { pieces: st.pilha[k].bb };
+    for i in 0..n {
+        let sj = match sujas_em(k + 1 + i) {
+            Some(s) => s,
+            None => return false,
+        };
+        pos[i + 1] = pos[i];
+        for (sq, t, c, entra) in sj.como_eventos() {
+            if entra {
+                pos[i + 1].pieces[c][t] |= 1u64 << sq;
+            } else {
+                pos[i + 1].pieces[c][t] &= !(1u64 << sq);
+            }
+        }
+    }
+    if pos[n].pieces != board.pieces {
+        saida_recuo(2);
+        return false;
+    }
+
+    // Passagem seca: se algum ply mexer o rei de forma a invalidar os indices,
+    // nao vale a pena comecar -- o refresh trata disso. Verificar ANTES de
+    // tocar no acumulador poupa o estrago a meio.
+    let mut evs: Vec<Vec<(usize, usize, usize, bool)>> = Vec::with_capacity(n);
+    for i in 0..n {
+        let sj = match sujas_em(k + 1 + i) {
+            Some(s) => s,
+            None => return false,
+        };
+        let ev: Vec<_> = sj.como_eventos().collect();
+        if ev.is_empty() {
+            // Lance nulo: nao mexe peca, logo nao mexe feature nenhuma.
+            evs.push(ev);
+            continue;
+        }
+        if rei_invalida_indices(&ev, pov, &pos[i], &pos[i + 1]) {
+            saida_recuo(3);
+            return false;
+        }
+        // O `delta_por_lance` foi escrito para a forma que o `eventos_de_casa`
+        // deixa passar: UMA adicao e no maximo tres eventos. Um roque tem
+        // quatro eventos e duas adicoes -- passa-lo por ali da' um acumulador
+        // diferente do refresh, e foi o que a assinatura de nos apanhou.
+        if ev.iter().filter(|e| e.3).count() != 1 || ev.len() > 3 {
+            saida_recuo(4);
+            return false;
+        }
+        evs.push(ev);
+    }
+
+    // Carregar o antepassado (so' esta perspectiva) e andar para a frente.
+    st.acc[pov].copy_from_slice(&st.pilha[k].acc[pov]);
+    st.psqt[pov] = st.pilha[k].psqt[pov];
+    for i in 0..n {
+        if evs[i].is_empty() {
+            continue;
+        }
+        if !delta_por_lance(net, &pos[i + 1], pov, st, &evs[i]) {
+            saida_recuo(4);
+            return false;
+        }
+    }
+    st.feats[pov].clear();
+    RECUO_OK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    RECUO_PLIES.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+    true
+}
+
 fn rei_invalida_indices(
-    ev: &[(usize, usize, usize, bool)], pov: usize, st: &EstadoAcc, board: &Board,
+    ev: &[(usize, usize, usize, bool)], pov: usize,
+    antes: &crate::sf_features::PosBB, agora: &crate::sf_features::PosBB,
 ) -> bool {
     if !ev.iter().any(|&(_, t, c, _)| t == 5 && c == pov) {
         return false;
     }
     if std::env::var_os("KESTREL_REI_ANTIGO").is_some() { return true; }
-    let novo = board.king_sq(if pov == 0 { Color::White } else { Color::Black }) as usize;
-    let velho = st.bb[pov][5].trailing_zeros() as usize;
+    let novo = agora.king_sq(pov);
+    let velho = antes.pieces[pov][5].trailing_zeros() as usize;
     if velho >= 64 || novo >= 64 {
         return true;
     }
