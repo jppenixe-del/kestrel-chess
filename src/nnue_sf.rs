@@ -1778,8 +1778,6 @@ struct EstadoAcc {
     conta: Vec<i8>,
     tocadas: Vec<u32>,
     x: Vec<u8>,
-    /// Dois blocos HalfKA de trabalho para a actualizacao hibrida.
-    hka: [Vec<i16>; 2],
     psqt: [[i64; NB]; 2],
     /// Cache de refresh por casa de rei ("finny tables"): para cada
     /// (casa do rei, perspectiva) guarda o acumulador SO' com features de
@@ -1979,7 +1977,6 @@ impl EstadoAcc {
     fn novo() -> Self {
         EstadoAcc {
             valido: false,
-            hka: [Vec::with_capacity(L1), Vec::with_capacity(L1)],
             acc: [vec![0i16; L1], vec![0i16; L1]],
             feats: [Vec::with_capacity(192), Vec::with_capacity(192)],
             novas: Vec::with_capacity(192),
@@ -3049,23 +3046,62 @@ fn hibrido_rei(
 ) -> bool {
     let ksq_velho = antes.king_sq(pov);
     let ksq_novo = agora.king_sq(pov);
-    let mut a = std::mem::take(&mut st.hka[0]);
-    let mut b = std::mem::take(&mut st.hka[1]);
-    let (mut pa, mut pb) = ([0i64; NB], [0i64; NB]);
-    let ok = halfka_do_cache(net, st, pov, ksq_velho, &antes.pieces, &mut a, &mut pa)
-        && halfka_do_cache(net, st, pov, ksq_novo, &agora.pieces, &mut b, &mut pb);
-    if !ok {
-        st.hka = [a, b];
+    if ksq_velho >= 64 || ksq_novo >= 64 {
         return false;
     }
-    let acc = &mut st.acc[pov];
-    for ((v, &x), &y) in acc.iter_mut().zip(a.iter()).zip(b.iter()) {
-        *v = v.wrapping_sub(x).wrapping_add(y);
+    let (iv, ino) = (ksq_velho * 2 + pov, ksq_novo * 2 + pov);
+    if !st.cache[iv].valido
+        || !st.cache[ino].valido
+        || st.cache[iv].acc.len() != L1
+        || st.cache[ino].acc.len() != L1
+    {
+        return false;
     }
-    for k in 0..NB {
-        st.psqt[pov][k] += pb[k] - pa[k];
+
+    // Uma passagem fundida, sem materializar nada. A forma ingenua --
+    // construir os dois blocos em buffers e so' depois somar -- custava duas
+    // copias de 2 KiB e tres passagens onde basta uma.
+    {
+        let (velho, novo) = (&st.cache[iv], &st.cache[ino]);
+        let acc = &mut st.acc[pov];
+        for ((v, &x), &y) in acc.iter_mut().zip(velho.acc.iter()).zip(novo.acc.iter()) {
+            *v = v.wrapping_sub(x).wrapping_add(y);
+        }
+        for b in 0..NB {
+            st.psqt[pov][b] += novo.psqt[b] - velho.psqt[b];
+        }
     }
-    st.hka = [a, b];
+
+    // E agora os dois diffs de peca, aplicados DIRECTAMENTE ao acumulador: o da
+    // casa antiga com o sinal invertido (esta' a ser retirado), o da nova como
+    // esta'. `bb` da entrada da cache contra a posicao a que ela corresponde.
+    for (idx, ksq, pos, inverte) in
+        [(iv, ksq_velho, antes, true), (ino, ksq_novo, agora, false)]
+    {
+        for c in 0..2 {
+            for t in 0..6 {
+                let base = st.cache[idx].bb[c][t];
+                let saiu = base & !pos.pieces[c][t];
+                let entrou = pos.pieces[c][t] & !base;
+                for (mut bb, mut add) in [(saiu, false), (entrou, true)] {
+                    if inverte {
+                        add = !add;
+                    }
+                    while bb != 0 {
+                        let sq = bb.trailing_zeros() as usize;
+                        bb &= bb - 1;
+                        let u = crate::sf_features::indice_peca(ksq, pov, sq, t, c);
+                        aplica_linha(net, &mut st.acc[pov], u, add);
+                        let sinal = if add { 1i64 } else { -1 };
+                        for b in 0..NB {
+                            st.psqt[pov][b] += sinal * net.ft_piece_psqt[u * NB + b] as i64;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     if !delta_por_lance(net, agora, pov, st, ev, true) {
         return false;
     }
