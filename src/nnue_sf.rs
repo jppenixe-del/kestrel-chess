@@ -1467,6 +1467,14 @@ static EVAL_CHAM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::n
 static ACC_REFRESH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static PAI_HIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static PAI_MISS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SUJAS_BOM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SUJAS_MAU: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[inline(always)]
+fn verifica_sujas() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KESTREL_VERIFICA_SUJAS").is_some())
+}
 
 /// Contar uma avaliacao completa da rede (passagem densa), para separar
 /// "actualizei o acumulador" de "avaliei mesmo".
@@ -1508,6 +1516,10 @@ pub fn imprime_rels() {
     eprintln!(
         "refresh completo: {r} vezes",
     );
+    if verifica_sujas() {
+        let (sb, sm) = (SUJAS_BOM.load(Relaxed), SUJAS_MAU.load(Relaxed));
+        eprintln!("sujas do make_move: {sb} certas, {sm} ERRADAS");
+    }
     let (ph, pm) = (PAI_HIT.load(Relaxed), PAI_MISS.load(Relaxed));
     eprintln!(
         "pilha por ply: {ph} acertos, {pm} falhas -- {:.1}% de acerto; \
@@ -1747,6 +1759,74 @@ struct Camada {
     psqt: [[i64; NB]; 2],
     bb: [[u64; 6]; 2],
     valido: bool,
+}
+
+/// O que UM lance mexeu, registado pelo `make_move` no momento em que sabe --
+/// em vez de redescoberto depois comparando bitboards guardados com os do
+/// tabuleiro, que e' o que o `eventos_de_casa` faz hoje.
+///
+/// Cinco entradas chegam para tudo: um lance normal sao 2 (sai de `from`, entra
+/// em `to`), uma captura 3, um en passant 3, um roque 4 (rei e torre). O
+/// `make_move` passa por `remove_piece`/`add_piece` para cada uma destas, por
+/// isso a lista e' exacta por construcao e nao uma inferencia.
+///
+/// Isto e' o `Dirties`/`DirtyThreats` que o Stockfish passa ao `do_move` e o
+/// `AccumulatorStack::push` do Triumviratus. Sem ele a cadeia do acumulador so'
+/// consegue recuar UM ply; com ele consegue recuar os que forem precisos.
+#[derive(Clone, Copy)]
+pub struct Sujas {
+    pub n: u8,
+    /// (casa, tipo de peca, cor, entra?)
+    pub ev: [(u8, u8, u8, bool); 5],
+}
+
+impl Default for Sujas {
+    fn default() -> Self {
+        Sujas { n: 0, ev: [(0, 0, 0, false); 5] }
+    }
+}
+
+impl Sujas {
+    #[inline(always)]
+    pub fn junta(&mut self, sq: u8, pt: u8, cor: u8, entra: bool) {
+        if (self.n as usize) < self.ev.len() {
+            self.ev[self.n as usize] = (sq, pt, cor, entra);
+            self.n += 1;
+        }
+    }
+    #[inline(always)]
+    pub fn como_eventos(&self) -> impl Iterator<Item = (usize, usize, usize, bool)> + '_ {
+        self.ev[..self.n as usize]
+            .iter()
+            .map(|&(sq, pt, c, a)| (sq as usize, pt as usize, c as usize, a))
+    }
+}
+
+thread_local! {
+    /// A cadeia de lances da linha actual, indexada por `board.prof_acc`. Nao
+    /// precisa de limpeza no `unmake_move`: o proximo `make_move' a essa
+    /// profundidade escreve por cima, e nada le' uma profundidade acima da
+    /// actual.
+    static CADEIA: std::cell::RefCell<Vec<Sujas>> =
+        std::cell::RefCell::new(vec![Sujas::default(); MAX_CAMADAS]);
+}
+
+/// Chamado pelo `make_move`. Barato de proposito: uma escrita de 24 bytes num
+/// thread-local, uma vez por no'.
+#[inline]
+pub fn regista_sujas(d: usize, s: &Sujas) {
+    if d >= MAX_CAMADAS {
+        return;
+    }
+    CADEIA.with(|c| c.borrow_mut()[d] = *s);
+}
+
+/// Le' o que ficou registado para uma profundidade.
+pub fn sujas_em(d: usize) -> Option<Sujas> {
+    if d >= MAX_CAMADAS {
+        return None;
+    }
+    CADEIA.with(|c| Some(c.borrow()[d]))
 }
 
 /// Fundo maximo coberto pela pilha. Acima disto o motor volta ao comportamento
@@ -2130,6 +2210,28 @@ fn carrega_do_pai(st: &mut EstadoAcc, board: &Board) -> bool {
         st.feats[0].clear();
         st.feats[1].clear();
         return true;
+    }
+    // Prova do registo do `make_move`: aplicar as `Sujas` deste ply aos
+    // bitboards do PAI tem de dar exactamente o tabuleiro actual. Enquanto
+    // ninguem depende delas, isto e' so' um teste; quando o acumulador passar a
+    // recuar pela cadeia, e' a diferenca entre correcto e silenciosamente
+    // errado. `KESTREL_VERIFICA_SUJAS=1`.
+    if verifica_sujas() && d > 0 && st.pilha[d - 1].valido {
+        if let Some(sj) = sujas_em(d) {
+            let mut bb = st.pilha[d - 1].bb;
+            for (sq, t, c, entra) in sj.como_eventos() {
+                if entra {
+                    bb[c][t] |= 1u64 << sq;
+                } else {
+                    bb[c][t] &= !(1u64 << sq);
+                }
+            }
+            if bb != board.pieces {
+                SUJAS_MAU.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                SUJAS_BOM.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
     }
     if d > 0 && st.pilha[d - 1].valido {
         for pov in 0..2 {
