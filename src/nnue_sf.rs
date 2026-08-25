@@ -1860,6 +1860,25 @@ fn delta_por_lance(
     // `sort_unstable_by_key` over ~100 structs of 32 bytes, once per
     // perspective per evaluation -- was the bulk of `delta_por_lance`'s own
     // 17.5% in the profile. The reference does no sorting here either.
+    //
+    // MEASURED AND REJECTED (2026-08-25). The counter array is 59808 bytes and
+    // takes ~31 scattered touches per call, so it looks like it should thrash
+    // the 32 KB L1. Replacing it with the obvious small-data alternative --
+    // collect the (feature, sign) pairs, `sort_unstable_by_key`, `chunk_by` --
+    // gives an identical bench (1970705 nodes) and measures SLOWER by ~2%:
+    // total time over ten alternating runs each, median 13.74s against 13.45s,
+    // minimum 13.32 against 12.74, mean 13.75 against 13.47. (The first attempt
+    // read bench NPS instead and reported -4%; NPS swings ~20% between runs of
+    // the same binary, exactly as the note above this one warns. Same verdict,
+    // but the honest magnitude is half of what the noisy metric claimed.)
+    //
+    // Two reasons, both worth remembering before trying this again. The array
+    // is not cold: sibling nodes touch the same threats, so it stays L1/L2 warm
+    // and the "58 KB" is a footprint, not a working set. And nine branchy
+    // comparisons in a generic sort cost more in mispredictions than the loads
+    // they save -- the diagnostic says 9.5 relations per call, which is far too
+    // few to amortise anything. Size of the structure is not the same question
+    // as cost of touching it; only the measurement separates them.
     let rels = std::mem::take(&mut st.rels);
     let mut tocadas = std::mem::take(&mut st.tocadas);
     tocadas.clear();
