@@ -3683,7 +3683,7 @@ impl<'a> Searcher<'a> {
                     && extend == 0
                     && (!mv.is_capture() || capture_ok_for_lmr)
                     && mv.promotion.is_none()
-                    && !gives_check
+                    && (!gives_check || lmr_reduz_xeque())
                     && !peao_avancado(board, &mv)
                 {
                     let sp_lmr = search_params();
@@ -5325,6 +5325,45 @@ impl MovePicker {
 /// Repoe a extensao incondicional de xeque (`KESTREL_EXT_XEQUE=1`), desligada
 /// por omissao. Lido uma vez: consultas ao ambiente no caminho quente custam
 /// caro -- medido, um `env::var_os` por avaliacao valia ~25% do tempo.
+/// Reduzir tambem os lances que DAO XEQUE. `KESTREL_LMR_XEQUE=1` liga.
+///
+/// PORQUE: e' a terceira isencao de xeque que este motor tem, e as duas
+/// primeiras, retiradas, pagaram. A extensao de xeque incondicional saiu em
+/// 2026-08-16 (o comentario dela regista +8,0 +- 8,1 Elo medidos num projecto
+/// proximo, e a nossa propria medicao com a rede do Stockfish confirmou o
+/// sinal: profundidade 21 sem ela contra 19 com ela). Um motor da mesma
+/// familia documenta as duas irmas a valerem **+7,98** (extensao) e **+9,71**
+/// (xeques quietos na qsearch), e marca esta -- a comporta da LMR -- como a
+/// que se deve testar PRIMEIRO das que restam, por ser a de menor risco: toca
+/// so' nos lances filhos e nao no regime do no'.
+///
+/// O Stockfish nao tem nenhuma das duas comportas: a LMR dele e' condicionada
+/// so' por `depth >= 2 && moveCount > 1`.
+///
+/// MEDIDO E REJEITADO (2026-08-25). Nao vai a jogos, e a razao e' o proprio
+/// numero. Mesma posicao, mesma maquina, lados alternados:
+///
+///     d13     97 393  ->    154 749    +58,9%
+///     d17    468 560  ->    337 800    -27,9%
+///     d20    991 632  ->  2 048 501   +106,6%
+///
+/// A arvore DUPLICA a profundidade 20. E o que isto ensina vale mais do que o
+/// resultado: uma medicao a UMA profundidade dava "+59%, mau" (d13), "-28%,
+/// optimo" (d17) ou "+107%, pessimo" (d20) -- tres conclusoes opostas conforme
+/// a profundidade que se calhasse a escolher.
+///
+/// Porque nao funciona aqui, ao contrario do que a evidencia externa sugeria:
+/// os xeques sao forcados e quase sempre bons. Reduzidos, a busca rasa falha,
+/// bate alpha, e a re-pesquisa que se segue custa mais do que a poupanca. No
+/// nosso motor esta isencao esta' a pagar-se.
+///
+/// A bandeira fica para quem quiser voltar a medir com outra base -- mas com
+/// TRES profundidades, que foi o que apanhou isto.
+pub fn lmr_reduz_xeque() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("KESTREL_LMR_XEQUE").map(|v| v != "0").unwrap_or(false))
+}
+
 pub fn ext_xeque() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var_os("KESTREL_EXT_XEQUE").is_some())
