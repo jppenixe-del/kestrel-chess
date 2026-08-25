@@ -1192,7 +1192,14 @@ pub fn relacoes_ameaca(
     // thing and drops the last reason this enumeration needed a perspective.
     let peoes = [pos.pieces[0][0], pos.pieces[1][0]];
 
-    let mut ameacados = ataques_de(piece, color, s, occ, d) & occ_sem_reis;
+    // A MASCARA, nao um OR. Um peao so' ameaca cavalo e torre
+    // (`PIECE_INTERACTION_MAP[0]` = `[-1, 0, -1, 1, -1, -1]`), mas
+    // `ataques_de` devolve tudo o que ele ataca -- peoes, bispos e damas
+    // incluidos, todos mortos. Sao 1912581 de 2653570 relacoes de peao (72%)
+    // geradas e indexadas para nada.
+    let torres = pos.pieces[0][3] | pos.pieces[1][3];
+    let alvos_validos = if piece == 0 { cavalos | torres } else { !0u64 };
+    let mut ameacados = ataques_de(piece, color, s, occ, d) & occ_sem_reis & alvos_validos;
     // O termo `king_attacks(s) & reis` sai daqui pela mesma razao que o bloco
     // do rei acima: (rei -> peca) nao existe neste conjunto de features. Medido,
     // 610441 de 610441 (100%) caiam fora do espaco -- geradas, indexadas e
@@ -1208,9 +1215,7 @@ pub fn relacoes_ameaca(
     // Stockfish avoids the same waste with `threatTargets = pt == PAWN ?
     // pieces(KNIGHT, ROOK) : ...` and by gating the pawn half of
     // `incomingThreats` on `pt == KNIGHT || pt == ROOK`.
-    let torres = pos.pieces[0][3] | pos.pieces[1][3];
     if piece == 0 {
-        ameacados |= pawn_attacks_from(color, s) & (cavalos | torres);
     } else if piece == 1 || piece == 3 {
         incoming |= (pawn_attacks_from(0, s) & peoes[1]) | (pawn_attacks_from(1, s) & peoes[0]);
     }
