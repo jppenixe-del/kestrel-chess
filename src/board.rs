@@ -388,31 +388,31 @@ impl Board {
         };
 
         // Record what this move touches, at the one moment it is known rather
-        // than rediscovered later by diffing bitboards. See `nnue_sf::Sujas`:
+        // than rediscovered later by diffing bitboards. See `nnue_sf::DirtyPieces`:
         // this is what lets the accumulator walk back more than a single ply.
-        let mut sujas = crate::nnue_sf::Sujas::default();
+        let mut sujas = crate::nnue_sf::DirtyPieces::default();
 
         // remove captured piece (normal or en passant)
         match mv.flag {
             MoveFlag::EnPassant => {
                 let cap_sq = if us == Color::White { mv.to - 8 } else { mv.to + 8 };
                 self.remove_piece(PieceType::Pawn, them, cap_sq);
-                sujas.junta(cap_sq, PieceType::Pawn as u8, them as u8, false);
+                sujas.push_change(cap_sq, PieceType::Pawn as u8, them as u8, false);
             }
             _ => {
                 if let Some((cpt, cc)) = captured {
                     self.remove_piece(cpt, cc, mv.to);
-                    sujas.junta(mv.to, cpt as u8, cc as u8, false);
+                    sujas.push_change(mv.to, cpt as u8, cc as u8, false);
                 }
             }
         }
 
         // move the piece
         self.remove_piece(moving_pt, us, mv.from);
-        sujas.junta(mv.from, moving_pt as u8, us as u8, false);
+        sujas.push_change(mv.from, moving_pt as u8, us as u8, false);
         let final_pt = mv.promotion.unwrap_or(moving_pt);
         self.add_piece(final_pt, us, mv.to);
-        sujas.junta(mv.to, final_pt as u8, us as u8, true);
+        sujas.push_change(mv.to, final_pt as u8, us as u8, true);
 
         // castling: move the rook too
         match mv.flag {
@@ -420,19 +420,19 @@ impl Board {
                 let (rf, rt) = if us == Color::White { (7u8, 5u8) } else { (63u8, 61u8) };
                 self.remove_piece(PieceType::Rook, us, rf);
                 self.add_piece(PieceType::Rook, us, rt);
-                sujas.junta(rf, PieceType::Rook as u8, us as u8, false);
-                sujas.junta(rt, PieceType::Rook as u8, us as u8, true);
+                sujas.push_change(rf, PieceType::Rook as u8, us as u8, false);
+                sujas.push_change(rt, PieceType::Rook as u8, us as u8, true);
             }
             MoveFlag::CastleQueen => {
                 let (rf, rt) = if us == Color::White { (0u8, 3u8) } else { (56u8, 59u8) };
                 self.remove_piece(PieceType::Rook, us, rf);
                 self.add_piece(PieceType::Rook, us, rt);
-                sujas.junta(rf, PieceType::Rook as u8, us as u8, false);
-                sujas.junta(rt, PieceType::Rook as u8, us as u8, true);
+                sujas.push_change(rf, PieceType::Rook as u8, us as u8, false);
+                sujas.push_change(rt, PieceType::Rook as u8, us as u8, true);
             }
             _ => {}
         }
-        crate::nnue_sf::regista_sujas(self.prof_acc, &sujas);
+        crate::nnue_sf::record_dirty(self.prof_acc, &sujas);
 
         // en passant square update
         self.ep_square = if mv.flag == MoveFlag::DoublePush {
@@ -597,7 +597,7 @@ impl Board {
         // lance anterior a esta profundidade, e a cadeia do acumulador aplica
         // um lance que nao aconteceu. Foi o que a verificacao apanhou: 16986
         // entradas erradas em 1,5 milhoes, todas aqui.
-        crate::nnue_sf::regista_sujas(self.prof_acc, &crate::nnue_sf::Sujas::default());
+        crate::nnue_sf::record_dirty(self.prof_acc, &crate::nnue_sf::DirtyPieces::default());
         let undo = NullUndo { ep_square: self.ep_square, hash: self.hash };
         self.side = self.side.opp();
         self.ep_square = NO_SQUARE;
