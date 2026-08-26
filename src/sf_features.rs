@@ -1212,9 +1212,6 @@ pub fn relacoes_ameaca(
     // that generated them stayed, so every one of those tuples was built,
     // indexed, and then discarded by the `idx < THREAT_DIM` test downstream.
     //
-    // Stockfish avoids the same waste with `threatTargets = pt == PAWN ?
-    // pieces(KNIGHT, ROOK) : ...` and by gating the pawn half of
-    // `incomingThreats` on `pt == KNIGHT || pt == ROOK`.
     if piece == 0 {
     } else if piece == 1 || piece == 3 {
         incoming |= (pawn_attacks_from(0, s) & peoes[1]) | (pawn_attacks_from(1, s) & peoes[0]);

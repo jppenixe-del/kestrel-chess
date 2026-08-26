@@ -816,8 +816,7 @@ pub fn evaluate(net: &RedeSf, atk: &Attacks, board: &mut Board) -> i32 {
     //
     // 60% of `x` is zero after the clipped ReLU -- measured with
     // KESTREL_SATURA -- so more than half of these 32768 multiply-accumulates
-    // are against nothing, and the reference implementation carries a whole
-    // sparse-input path for exactly this. It does not pay here, and the
+    // are against nothing. Skipping them does not pay here, and the
     // arithmetic says why before any code is written:
     //
     //   dense:  32 outputs x 1024 inputs = 32768 products, 32 per vpmaddubsw

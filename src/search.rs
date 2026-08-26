@@ -449,9 +449,9 @@ impl DepthMargin {
 #[derive(Clone, Copy)]
 pub struct SearchParams {
     /// RFP margin, quadratic in depth: `step*d*d/2 - step*d/2 + base*d`.
-    /// 2026-08-03: adopted from a reference engine's own RFP wholesale --
-    /// not just the numbers, the SHAPE. That reference does not split on
-    /// `improving` and has none of the three modulators below; one curve,
+    /// 2026-08-03: this SHAPE was adopted wholesale, not just the numbers.
+    /// The shape it came from does not split on `improving` and has none of
+    /// the three modulators below; one curve,
     /// unconditional. `rfp_base`/`rfp_step` are close to identical to its
     /// own constants (65 and 5). The three modulators and the old linear
     /// `rfp_improving`/`rfp_not_improving` pair stay in the struct --
@@ -495,7 +495,7 @@ pub struct SearchParams {
     ///
     /// Our base curve grows as `ln(depth)*ln(move)` and never flattens, so the
     /// deeper into a move list we go the harder we cut -- by the 20th move we
-    /// reduce ~0.6 ply more than a reference engine does at the same point,
+    /// reduce ~0.6 ply more than the curve this was compared against,
     /// which is where a late tactic stops being seen at all. A linear term is
     /// what bends that tail back.
     ///
@@ -561,7 +561,7 @@ pub struct SearchParams {
     /// terms the evaluation is written in.
     pub lmr_ameacas: i32,
     /// Move index from which a quiet move is "late" enough to reduce, at a
-    /// PV node. Default 4 (the 4th move). Both reference engines start at
+    /// PV node. Default 4 (the 4th move). Stronger searches start at
     /// the 2nd; ours is a gate nobody measured, and our instrumentation
     /// says it holds 8.9% of quiet moves at full depth.
     pub lmr_min_moves_pv: i32,
@@ -722,7 +722,7 @@ impl Default for SearchParams {
         // discarded for lack of a positive delta ("os testes sao so'
         // para verificar, e' sempre para implementar").
         SearchParams {
-            // Close to identical to a reference engine's own constants (65
+            // Close to identical to a published set of constants (65
             // and 5) -- see the field doc comment for why the shape, not
             // just the numbers, was adopted.
             rfp_base: 75,
@@ -785,7 +785,7 @@ impl Default for SearchParams {
             // losing exchange resolves a tension a quiet never does, sized
             // in our own existing unit rather than invented from scratch.
             //
-            // A diagnostic run tried a reference engine's own tuned
+            // A diagnostic run tried a published set of tuned
             // capture-reduction offset instead (unit-converted, 1372/19750
             // -- never a raw copy since the two formulas aren't even the
             // same shape) purely to answer "does the result move at all".
@@ -3118,8 +3118,7 @@ impl<'a> Searcher<'a> {
             && ply > 0
             && depth <= search_params().rfp_max_depth
             // MEASURED AND REJECTED (2026-08-26): restricting this to nodes
-            // where the table has no move, or the move it has is a capture --
-            // the gate the reference search puts on the same cut.
+            // where the table has no move, or the move it has is a capture.
             //
             // The reasoning looked sound. Our version fires 26 times per 100
             // nodes and runs BEFORE the null move, which is tried at only 0.9%
@@ -3732,7 +3731,7 @@ impl<'a> Searcher<'a> {
                 // applied directly without the caution those needed.
                 // Which move index is "late" enough to reduce. Ours has been
                 // the 4th move (3rd outside PV) since the split was
-                // introduced; both reference engines we can read start at the
+                // introduced; stronger searches start at the
                 // SECOND, with opposite design philosophies and no exemptions
                 // at all. Our own counters say 8.9% of quiet moves are
                 // searched at full depth purely because they arrive too early

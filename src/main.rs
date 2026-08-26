@@ -149,9 +149,8 @@ fn main() {
         lookup_book(&args[2], &args[3..].join(" "));
         return;
     }
-    // SPSA config for an external tuning harness (OpenBench's format), the
-    // same thing a reference engine's own search-params file does -- it
-    // does not run its own SPSA either, it exports "name, int, default,
+    // SPSA config for an external tuning harness (OpenBench's format). We do
+    // not run our own SPSA: this exports "name, int, default,
     // min, max, step, C_end" and lets OpenBench (or WeatherFactory) play
     // the games and do the math. `PARAM_NAMES`/`SearchParams::to_vec` are
     // already the same kind of registry that reference's `SEARCH_PARAM`
