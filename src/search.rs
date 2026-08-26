@@ -650,6 +650,8 @@ pub struct SearchParams {
     /// Quiescence delta pruning margin (both the negamax entry point and
     /// the tuning-dataset quiescence_leaf path use the same value).
     pub delta_margin: i32,
+    /// Ganho da historia de continuacao, em percentagem. Ver `cont_hist_score`.
+    pub cont_hist_ganho: i32,
     pub qs_lmp_limit: i32,
     pub tt_extended_cutoff_margin: i32,
     /// History pruning threshold multiplier: a quiet move is skipped
@@ -870,6 +872,7 @@ impl Default for SearchParams {
             cap_futility_improving: DepthMargin { base: 1, slope: 186 },
             cap_futility_not_improving: DepthMargin { base: 2, slope: 97 },
             delta_margin: 275,
+            cont_hist_ganho: 150,
             qs_lmp_limit: 8,
             tt_extended_cutoff_margin: 162,
             history_prune_mult: 2472,
@@ -1027,6 +1030,7 @@ impl SearchParams {
             cap_futility_improving: DepthMargin { base: v[10], slope: v[11] },
             cap_futility_not_improving: DepthMargin { base: v[12], slope: v[13] },
             delta_margin: v[14],
+            cont_hist_ganho: 150,
             qs_lmp_limit: v[15],
             tt_extended_cutoff_margin: v[16],
             history_prune_mult: v[17],
@@ -1795,7 +1799,17 @@ const DOUBLE_EXT_MAX: i32 = 6;
 /// Tamanho da tabela cont_hist -- 6 tipos de peca * 64 casas destino
 /// para o prev-move, vezes o mesmo para o curr-move. Ver campo
 /// `cont_hist` do Searcher.
-pub const CONT_HIST_SIZE: usize = 6 * 64 * 6 * 64;
+/// Quantos desfasamentos a historia de continuacao guarda EM SEPARADO.
+///
+/// Eram tres a ser escritos -- o lance anterior, o nosso de ha' dois plies e o
+/// de ha' quatro -- todos na MESMA celula, e so' os dois primeiros eram lidos.
+/// Ou seja o desfasamento de quatro plies existia so' para poluir os outros:
+/// escrevia por cima do sinal que a ordenacao usava e nunca era consultado.
+///
+/// Com uma tabela por desfasamento cada um responde a` sua propria pergunta.
+const LER_LAG4: bool = true;
+pub const CONT_HIST_LAGS: usize = 3;
+pub const CONT_HIST_SIZE: usize = CONT_HIST_LAGS * 6 * 64 * 6 * 64;
 const CONT_HIST_MAX: i32 = 16000;
 
 /// History update with gravity: the closer an entry already sits to the
@@ -1843,10 +1857,10 @@ fn history_malus(depth: i32) -> i32 {
 }
 
 #[inline(always)]
-fn cont_hist_idx(prev_pt: PieceType, prev_to: crate::types::Square, curr_pt: PieceType, curr_to: crate::types::Square) -> usize {
+fn cont_hist_idx(lag: usize, prev_pt: PieceType, prev_to: crate::types::Square, curr_pt: PieceType, curr_to: crate::types::Square) -> usize {
     let prev = prev_pt.idx() * 64 + prev_to as usize;
     let curr = curr_pt.idx() * 64 + curr_to as usize;
-    prev * (6 * 64) + curr
+    lag * (6 * 64 * 6 * 64) + prev * (6 * 64) + curr
 }
 
 /// Correction history table size (per color) and clamp. 16384 slots is
@@ -2358,8 +2372,8 @@ impl<'a> Searcher<'a> {
     /// -bonus para os quiets tentados antes que nao cortaram.
     /// `curr_pt` e a peca que fez `curr_mv` (piece_at(mv.from) no board
     /// ANTES do make_move). Ver campo cont_hist no Searcher.
-    fn update_cont_hist(&mut self, prev_pt: PieceType, prev_to: crate::types::Square, curr_pt: PieceType, curr_to: crate::types::Square, delta: i32) {
-        let idx = cont_hist_idx(prev_pt, prev_to, curr_pt, curr_to);
+    fn update_cont_hist(&mut self, lag: usize, prev_pt: PieceType, prev_to: crate::types::Square, curr_pt: PieceType, curr_to: crate::types::Square, delta: i32) {
+        let idx = cont_hist_idx(lag, prev_pt, prev_to, curr_pt, curr_to);
         let v = &mut self.cont_hist[idx];
         *v = apply_gravity(*v, delta, CONT_HIST_MAX);
     }
@@ -2382,12 +2396,12 @@ impl<'a> Searcher<'a> {
         let mut ch = 0i32;
         if ply >= 1 {
             if let Some((p_pt, p_to)) = self.ply_last_move.get(ply).and_then(|x| *x) {
-                ch += self.cont_hist[cont_hist_idx(p_pt, p_to, curr_pt, to)];
+                ch += self.cont_hist[cont_hist_idx(0, p_pt, p_to, curr_pt, to)];
             }
         }
         if ply >= 2 {
             if let Some((p_pt, p_to)) = self.ply_last_move.get(ply - 1).and_then(|x| *x) {
-                ch += self.cont_hist[cont_hist_idx(p_pt, p_to, curr_pt, to)];
+                ch += self.cont_hist[cont_hist_idx(1, p_pt, p_to, curr_pt, to)];
             }
         }
         // Four plies back as well, not just one and two. One and two capture
@@ -2395,12 +2409,23 @@ impl<'a> Searcher<'a> {
         // before that. Four reaches past it, to the move that set up the
         // structure the current one is working within, and a plan that takes
         // several moves to pay off is invisible at the shorter lags.
-        if ply >= 4 {
+        if LER_LAG4 && ply >= 4 {
             if let Some((p_pt, p_to)) = self.ply_last_move.get(ply - 3).and_then(|x| *x) {
-                ch += self.cont_hist[cont_hist_idx(p_pt, p_to, curr_pt, to)];
+                ch += self.cont_hist[cont_hist_idx(2, p_pt, p_to, curr_pt, to)];
             }
         }
-        ch
+        // Compensacao de magnitude, nao afinacao.
+        //
+        // Este valor nao serve so' para ordenar: as comportas de poda por
+        // historia e as reducoes comparam-no contra limiares fixos. Antes de
+        // as tabelas serem separadas, os tres desfasamentos escreviam na MESMA
+        // celula e a leitura somava duas delas -- ou seja lia seis unidades de
+        // actualizacao. Separadas, soma tres celulas de uma unidade cada.
+        //
+        // Sem isto, separar as tabelas -- que MELHORA a ordenacao, de 65,5%
+        // para 68,6% de cortes no primeiro lance -- fazia a arvore crescer
+        // 35%, porque metade do sinal que as comportas esperavam desapareceu.
+        ch * search_params().cont_hist_ganho / 100
     }
 
     #[inline]
@@ -4368,24 +4393,24 @@ impl<'a> Searcher<'a> {
                         // or the accessor sums a table nothing ever fills.
                         let prev4 = if ply >= 4 { self.ply_last_move.get(ply - 3).and_then(|x| *x) } else { None };
                         if let Some((p4_pt, p4_to)) = prev4 {
-                            self.update_cont_hist(p4_pt, p4_to, curr_pt, mv.to, bonus);
+                            self.update_cont_hist(2, p4_pt, p4_to, curr_pt, mv.to, bonus);
                         }
                         if let Some((p1_pt, p1_to)) = prev1 {
-                            self.update_cont_hist(p1_pt, p1_to, curr_pt, mv.to, bonus);
+                            self.update_cont_hist(0, p1_pt, p1_to, curr_pt, mv.to, bonus);
                         }
                         if let Some((p2_pt, p2_to)) = prev2 {
-                            self.update_cont_hist(p2_pt, p2_to, curr_pt, mv.to, bonus);
+                            self.update_cont_hist(1, p2_pt, p2_to, curr_pt, mv.to, bonus);
                         }
                         for qm in &quiets_tried[..n] {
                             if let Some((q_pt, _)) = board.piece_at(qm.from) {
                                 if let Some((p4_pt, p4_to)) = prev4 {
-                                    self.update_cont_hist(p4_pt, p4_to, q_pt, qm.to, -malus);
+                                    self.update_cont_hist(2, p4_pt, p4_to, q_pt, qm.to, -malus);
                                 }
                                 if let Some((p1_pt, p1_to)) = prev1 {
-                                    self.update_cont_hist(p1_pt, p1_to, q_pt, qm.to, -malus);
+                                    self.update_cont_hist(0, p1_pt, p1_to, q_pt, qm.to, -malus);
                                 }
                                 if let Some((p2_pt, p2_to)) = prev2 {
-                                    self.update_cont_hist(p2_pt, p2_to, q_pt, qm.to, -malus);
+                                    self.update_cont_hist(1, p2_pt, p2_to, q_pt, qm.to, -malus);
                                 }
                             }
                         }
@@ -5368,6 +5393,7 @@ impl MovePicker {
                         .and_then(|(pt, to)| searcher.countermoves[pt.idx()][to as usize]);
                     let prev1 = if ply >= 1 { searcher.ply_last_move.get(ply).and_then(|x| *x) } else { None };
                     let prev2 = if ply >= 2 { searcher.ply_last_move.get(ply - 1).and_then(|x| *x) } else { None };
+                    let prev4 = if ply >= 4 { searcher.ply_last_move.get(ply - 3).and_then(|x| *x) } else { None };
                     for e in self.quiet.iter_mut() {
                         let m = e.0;
                         if m.from == m.to {
@@ -5389,10 +5415,15 @@ impl MovePicker {
                         let mut ch = 0i32;
                         if let Some((curr_pt, _)) = board.piece_at(m.from) {
                             if let Some((p1_pt, p1_to)) = prev1 {
-                                ch += searcher.cont_hist[cont_hist_idx(p1_pt, p1_to, curr_pt, m.to)];
+                                ch += searcher.cont_hist[cont_hist_idx(0, p1_pt, p1_to, curr_pt, m.to)];
                             }
                             if let Some((p2_pt, p2_to)) = prev2 {
-                                ch += searcher.cont_hist[cont_hist_idx(p2_pt, p2_to, curr_pt, m.to)];
+                                ch += searcher.cont_hist[cont_hist_idx(1, p2_pt, p2_to, curr_pt, m.to)];
+                            }
+                            if LER_LAG4 {
+                                if let Some((p4_pt, p4_to)) = prev4 {
+                                    ch += searcher.cont_hist[cont_hist_idx(2, p4_pt, p4_to, curr_pt, m.to)];
+                                }
                             }
                         }
                         // MEDIDO E REJEITADO (2026-08-27): um termo de
