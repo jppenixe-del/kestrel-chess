@@ -1350,7 +1350,10 @@ impl Engine {
             // a move that took 1.04s tells you nothing about whether the
             // engine considered spending more and declined, or was never
             // allowed to. This line is what the heatmap reads.
-            println!(
+            // Ver a nota em `search.rs`: `println!` entra em panico com o cano
+            // fechado, e o arbitro fecha-o no fim de cada jogo.
+            let _ = writeln!(
+                std::io::stdout(),
                 "info string tm soft {} hard {} horizon {} pieces {} myclock {} oppclock {} pace {:?}",
                 soft,
                 hard_cap,

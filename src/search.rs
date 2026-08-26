@@ -4687,12 +4687,20 @@ impl<'a> Searcher<'a> {
                     // whether to offer a draw on centipawns is reading a ruler
                     // whose marks move. This is what it should read instead.
                     let (w, d, l) = crate::evaluation::win_draw_loss(rs);
-                    println!(
+                    // `writeln!` e nao `println!`: o segundo entra em PANICO se
+                    // o cano fechar, e o arbitro fecha-o assim que o jogo acaba
+                    // -- com uma thread de busca ainda a escrever a sua linha
+                    // `info`. Um motor que entra em panico no fim de um jogo
+                    // pode perder o seguinte. Aqui um cano fechado nao e' erro
+                    // nenhum: nao ha' ninguem para ler.
+                    use std::io::Write;
+                    let mut saida = std::io::stdout().lock();
+                    let _ = writeln!(
+                        saida,
                         "info depth {} multipv 1 score {} wdl {} {} {} nodes {} nps {} time {} pv {}",
                         depth, score_str, w, d, l, self.nodes, nps, ms, pv_str.join(" ")
                     );
-                    use std::io::Write;
-                    let _ = std::io::stdout().flush();
+                    let _ = saida.flush();
                 }
             }
             if self.stop {
