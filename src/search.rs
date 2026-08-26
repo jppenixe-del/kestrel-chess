@@ -4687,12 +4687,12 @@ impl<'a> Searcher<'a> {
                     // whether to offer a draw on centipawns is reading a ruler
                     // whose marks move. This is what it should read instead.
                     let (w, d, l) = crate::evaluation::win_draw_loss(rs);
-                    // `writeln!` e nao `println!`: o segundo entra em PANICO se
-                    // o cano fechar, e o arbitro fecha-o assim que o jogo acaba
-                    // -- com uma thread de busca ainda a escrever a sua linha
-                    // `info`. Um motor que entra em panico no fim de um jogo
-                    // pode perder o seguinte. Aqui um cano fechado nao e' erro
-                    // nenhum: nao ha' ninguem para ler.
+                    // writeln!, not println!: the latter panics on a write
+                    // error, and a broken pipe is one. The arbiter closes our
+                    // pipe the moment a game ends, while a search thread can
+                    // still be printing this line -- and an engine that panics
+                    // at the end of a game can lose the next one. A closed pipe
+                    // is not an error here: there is nobody left to read.
                     use std::io::Write;
                     let mut saida = std::io::stdout().lock();
                     let _ = writeln!(

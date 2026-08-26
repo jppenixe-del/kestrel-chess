@@ -1469,9 +1469,8 @@ static ACC_MATERIALISED: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 static ACC_FROM_PARENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static EVAL_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static ACC_REFRESH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// Lances de rei que forcam refresh, repartidos por [so' as pecas mudam,
-/// as ameacas tambem mudam]. O primeiro grupo e' o que a actualizacao hibrida
-/// do Stockfish (db98633b) recupera.
+/// King moves that force a refresh, split into [only the pieces change, the
+/// threats change too]. The first group is what the hybrid update recovers.
 static HIBRIDO_OK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static HIBRIDO_CONFERE: [std::sync::atomic::AtomicU64; 2] = [
     std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
@@ -1820,9 +1819,8 @@ struct Camada {
 /// those goes through `remove_piece`/`add_piece` in `make_move`, so the list is
 /// exact by construction rather than inferred.
 ///
-/// This is the `DirtyPiece` Stockfish hands to `do_move` and the
-/// `AccumulatorStack::push` Triumviratus calls. Without it the accumulator
-/// chain can only step back ONE ply; with it, as many as it needs.
+/// Without it the accumulator chain can only step back ONE ply; with it, as
+/// many as it needs.
 #[derive(Clone, Copy)]
 pub struct DirtyPieces {
     pub n: u8,
@@ -2854,9 +2852,8 @@ fn max_walk_back() -> usize {
 /// Walks the `DirtyPieces` chain back to the nearest ancestor that already has
 /// a computed accumulator, then applies each ply's delta forward.
 ///
-/// This is Triumviratus's `backward_update_incremental` and Stockfish's
-/// `update_accumulator_incremental`. Without it the accumulator can only step
-/// back ONE ply: `eventos_de_casa` compares `st.bb` (the last position
+/// Without it the accumulator can only step back ONE ply:
+/// `eventos_de_casa` compares `st.bb` (the last position
 /// evaluated, often a sibling's child rather than this node's parent) against
 /// the current board and gives up when the difference does not fit in one move.
 /// That was the route to 7.9% of all refreshes.
@@ -3031,12 +3028,11 @@ fn halfka_do_cache(
     true
 }
 
-/// Actualizacao hibrida para um lance de rei que so' invalida as features de
-/// PECA. Porto de Stockfish db98633b (o Triumviratus mede +2,13%).
+/// Hybrid update for a king move that invalidates only the PIECE features.
 ///
-///     acc_novo = acc_anterior - HalfKA_anterior + HalfKA_novo + delta(ameacas)
+///     new_acc = prev_acc - HalfKA_prev + HalfKA_new + delta(threats/pairs)
 ///
-/// Nenhum dos dois blocos HalfKA esta' guardado: vem ambos da cache de refresh,
+/// Neither HalfKA block is stored: both come from the refresh cache,
 /// o anterior contra a casa de rei antiga e a posicao anterior. As ameacas e os
 /// pares NAO sao tocados alem do seu proprio delta, porque os indices deles
 /// dependem do `ORIENT_THREATS`, que por hipotese nao mudou.
