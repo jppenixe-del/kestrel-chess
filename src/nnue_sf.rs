@@ -2498,7 +2498,20 @@ fn acc_incremental(
             // Lance de rei que so' mexe nas features de PECA: o bloco de
             // ameacas do acumulador continua valido e recupera-se trocando so'
             // o bloco HalfKA, em vez de re-enumerar a posicao inteira.
+            // Piece-count gate. With few pieces a refresh is cheap -- there
+            // are few active features to enumerate -- while the hybrid always
+            // costs two full passes over 1024 accumulator entries, whatever
+            // the position holds. Below the threshold the swap does not pay.
+            //
+            // Swept, three runs each, instructions per node (they vary by ~2
+            // within a setting, so these gaps are real):
+            //   no gate 22909 | 8 -> 22795 | 12 -> 22825 | 15 -> 22881
+            //   20 -> 22980 | 24 -> 23012 | 28 -> 23106
+            // 8 it is, worth 0.50%. Above 15 it degrades monotonically, which
+            // is the gate switching the hybrid off in positions where it still
+            // pays. KESTREL_HIBRIDO_MIN tunes it; 0 disables the gate.
             if hibrido_ligado()
+                && agora_bb.occ().count_ones() >= hibrido_min()
                 && rei_classifica(&ev, pov, &antes_bb, &agora_bb) == ReiMuda::SoPecas
                 && hibrido_rei(net, &antes_bb, &agora_bb, pov, st, &ev)
             {
@@ -3153,6 +3166,13 @@ fn rei_classifica(
 /// raiz da posicao -- 150528 de 150528 certas, zero erradas -- e a assinatura
 /// do bench e' identica com e sem. `KESTREL_SEM_HIBRIDO=1` desliga, para
 /// medicoes A/B.
+fn hibrido_min() -> u32 {
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("KESTREL_HIBRIDO_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(8)
+    })
+}
+
 fn hibrido_ligado() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("KESTREL_SEM_HIBRIDO").is_none())
