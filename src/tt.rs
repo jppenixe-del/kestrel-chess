@@ -7,6 +7,19 @@ pub enum Bound {
     Exact,
     Lower,
     Upper,
+    /// No bound at all: the entry carries only a cached static evaluation.
+    ///
+    /// The search computes a static eval and then has fourteen ways to leave
+    /// the node before it ever reaches the store at the bottom -- razoring,
+    /// null move, probcut and the rest. Every one of those threw away an
+    /// evaluation that now costs ~21000 instructions, and the next visit paid
+    /// for it again. Worse, the loss was invisible: it shows up as a MISSING
+    /// entry, not as an entry without an eval, so it counted as a first visit.
+    ///
+    /// Writing the eval the moment it is computed makes the work survive the
+    /// early exits. Such an entry must never produce a cutoff -- it has no
+    /// score to stand behind.
+    NoBound,
 }
 
 /// Sentinel for "no cached static eval in this entry" -- e.g. entries
@@ -54,6 +67,19 @@ pub struct TtEntry {
 /// entries for stale ones. A whole byte costs a little more memory per
 /// slot and buys a cycle of 256, which does not wrap inside any game this
 /// engine will play.
+impl TtEntry {
+    /// Is there a score behind this entry?
+    ///
+    /// `Bound::NoBound` entries carry only a cached static eval; their `score`
+    /// field is meaningless. Anything that reads `score` outside the bound
+    /// match has to ask this first -- two places did not, and a score of 0
+    /// read as a real bound cost 33% more nodes.
+    #[inline]
+    pub fn has_bound(&self) -> bool {
+        !matches!(self.bound, Bound::NoBound)
+    }
+}
+
 struct TtSlot {
     key_xor_data: AtomicU64,
     data: AtomicU64,
@@ -170,6 +196,7 @@ fn encode_data(depth: i32, score: i32, bound: Bound, best: Option<Move>, pv: boo
         Bound::Exact => 0,
         Bound::Lower => 1,
         Bound::Upper => 2,
+        Bound::NoBound => 3,
     };
     let pv_bit: u64 = if pv { 1 } else { 0 };
     let eval16 = (static_eval as u16) as u64;
@@ -183,7 +210,8 @@ fn decode_data(data: u64) -> (i32, i32, Bound, Option<Move>, bool, i16) {
     let bound = match (data >> 42) & 0x3 {
         0 => Bound::Exact,
         1 => Bound::Lower,
-        _ => Bound::Upper,
+        2 => Bound::Upper,
+        _ => Bound::NoBound,
     };
     let pv = (data >> 44) & 1 == 1;
     let static_eval = ((data >> 45) & 0xFFFF) as u16 as i16;

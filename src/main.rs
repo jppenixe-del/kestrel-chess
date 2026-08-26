@@ -1669,7 +1669,7 @@ const BENCH_FENS: [&str; 51] = [
 fn bench(depth: i32) {
     let atk = Attacks::new();
     let zob = zobrist::Zobrist::new();
-    let tt = tt::TranspositionTable::new(16);
+    let tt = tt::TranspositionTable::new(std::env::var("KESTREL_BENCH_HASH").ok().and_then(|v| v.parse().ok()).unwrap_or(16));
     evaluation::warmup();
     search::warmup();
     let start = std::time::Instant::now();
@@ -1788,7 +1788,7 @@ fn bullet_data(in_path: &str, out_path: &str, depth: i32, threads: usize) {
                 let zob = &zob;
                 let feito = &feito;
                 scope.spawn(move || {
-                    let tt = tt::TranspositionTable::new(16);
+                    let tt = tt::TranspositionTable::new(std::env::var("KESTREL_BENCH_HASH").ok().and_then(|v| v.parse().ok()).unwrap_or(16));
                     let mut out = String::new();
                     for linha in parte {
                         let mut it = linha.split('\t');
