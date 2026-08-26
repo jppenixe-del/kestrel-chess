@@ -1831,10 +1831,9 @@ impl Engine {
                     // plays -- it simply does not get to outvote one that
                     // searched something through to an end.
                     let trusted = if pv_len[i] > 2 { 1i64 } else { 0i64 };
-                    // SEM o factor de profundidade. O Stockfish actual pesa
-                    // por `score - minScore + 14` e mais nada; o `* depth`
-                    // vinha de uma versao antiga, a par do esquema de saltos
-                    // que o acompanhava. Com as threads todas a percorrer as
+                    // SEM o factor de profundidade: pesa-se por
+                    // `score - minScore + 14` e mais nada. O `* depth` vinha
+                    // do tempo do esquema de saltos que o acompanhava. Com as threads todas a percorrer as
                     // mesmas profundidades (ver search.rs), multiplicar pela
                     // profundidade so' amplifica ruido de quem chegou la'
                     // primeiro.
@@ -1984,7 +1983,7 @@ impl Engine {
                     // Escala da rede, em centesimos. Uma rede que avalia material
                     // ao dobro faz TODAS as margens de poda dispararem ao dobro
                     // da velocidade, porque elas sao centipeoes fixos. Medido:
-                    // uma dama vale 2578 na rede do Stockfish contra 1161 na
+                    // uma dama vale 2578 na rede oficial contra 1161 na
                     // nossa antiga, para a qual as margens foram afinadas -- dai'
                     // 222. Por opcao em vez de por compilacao, para o bot poder
                     // trocar de rede sem recompilar.

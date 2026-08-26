@@ -277,7 +277,7 @@ fn main() {
         // ~350 centipeoes que NAO descia com o treino (358 aos dez
         // superbatches, 385 aos vinte, 388 aos cinquenta) -- que e'
         // precisamente a assinatura de um erro de leitura e nao de uma rede
-        // por treinar. Descartar o bloco: +6 onde o Stockfish diz +32.
+        // por treinar. Descartar o bloco: +6 onde a referencia diz +32.
         // Somar o bloco: +388.
         let cru = std::fs::read(&args[2]).expect("nao consegui ler");
         let vals: Vec<i16> = cru.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect();

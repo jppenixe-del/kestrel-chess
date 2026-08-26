@@ -38,8 +38,9 @@ static LMR_TABLE: OnceLock<[[i32; 64]; 64]> = OnceLock::new();
 /// casas" -- ve peca e casa, e se o peao esta livre depende dos peoes do
 /// adversario em tres colunas, que uma camada so' infere mal.
 ///
-/// Medido nas nossas proprias posicoes, contra o Stockfish em 6000 posicoes
-/// etiquetadas, o erro medio da avaliacao por distancia a promocao:
+/// Medido nas nossas proprias posicoes, contra avaliacoes de referencia em
+/// 6000 posicoes etiquetadas, o erro medio da avaliacao por distancia a
+/// promocao:
 ///
 ///     sem passados   94 cp        a 2 filas   128 cp
 ///     a 3 filas     118 cp        a 1 fila    158 cp
@@ -2520,8 +2521,7 @@ impl<'a> Searcher<'a> {
         // applies ~30 weight rows of 1024 and runs the dense pass: ~21000
         // instructions, against ~300 cycles for the missed probe. And 54% of
         // all evaluations come from this one line, which is why we evaluate
-        // 0.72 times per node where Stockfish evaluates 0.247 (measured with
-        // a uprobe on its Worker::evaluate, same net, same machine).
+        // 0.72 times per node.
         //
         // RE-MEASURED 2026-08-25 with the new net, and it STILL loses -- but
         // the note above had the wrong reason, so here is the right one. The
@@ -2532,8 +2532,8 @@ impl<'a> Searcher<'a> {
         // so no qsearch position is ever in the table to be found.
         //
         // What that means for the real fix: reusing a stored eval here is
-        // worthless until qsearch also STORES, which is how Stockfish gets its
-        // hits. And even then the saving is only the dense forward pass --
+        // worthless until qsearch also STORES, since otherwise there is nothing
+        // in the table for it to find. And even then the saving is only the dense forward pass --
         // `garante_camada` would still have to run on the reuse path to keep
         // the children's parent accumulator alive, and that is where most of
         // the cost is. The prize needs the lazy dirty-chain accumulator, not a
@@ -3697,7 +3697,7 @@ impl<'a> Searcher<'a> {
             // que qualquer dos extremos.
             //
             // Removida por omissao desde 2026-08-16. O nosso teste com a rede
-            // do Stockfish confirmou o mesmo sinal: 8 s na posicao inicial dao
+            // oficial confirmou o mesmo sinal: 8 s na posicao inicial dao
             // profundidade 21 sem extensao contra 19 com ela. `KESTREL_EXT_XEQUE=1`
             // repoe o comportamento antigo para efeitos de comparacao.
             let extend = if in_check && ext_xeque() {
@@ -4449,8 +4449,8 @@ impl<'a> Searcher<'a> {
         let sp = search_params();
         // A janela e' o que separa as threads umas das outras agora. Cada uma
         // parte de uma largura propria, portanto falha alto/baixo em pontos
-        // diferentes e explora ordens diferentes -- mesma ideia do
-        // `5 + threadIdx % 8` do Stockfish, escrita nas nossas unidades.
+        // diferentes e explora ordens diferentes -- a largura varia com o indice
+        // da thread, escrita nas nossas unidades.
         let mut delta: i32 = sp.asp_init_delta
             + (self.thread_idx as i32 % 8)
             + prev_score * prev_score / 16384;
@@ -4548,11 +4548,10 @@ impl<'a> Searcher<'a> {
         // chega a cada uma com a TT noutro estado e explora outra ordem. A
         // thread 0 nunca salta nada: e ela que decide o lance.
         // SEM SALTOS. As threads passam a divergir pela LARGURA DA JANELA DE
-        // ASPIRACAO (ver `asp_init_delta` em search_root), que e' como o
-        // Stockfish actual o faz -- `delta = 5 + threadIdx % 8 + ...`.
+        // ASPIRACAO (ver `asp_init_delta` em search_root).
         //
-        // Os saltos de profundidade vinham de uma versao antiga do Stockfish
-        // que entretanto os abandonou, e o efeito medido aqui foi patologico:
+        // Os saltos de profundidade sao uma tecnica antiga, e o efeito medido
+        // aqui foi patologico:
         // na MESMA posicao e com o MESMO tempo, um fio escolhia sempre o mesmo
         // lance e seis fios espalhavam-se por cinco lances diferentes, sem
         // nunca escolher o do fio unico --
@@ -5453,15 +5452,12 @@ impl MovePicker {
 /// PORQUE: e' a terceira isencao de xeque que este motor tem, e as duas
 /// primeiras, retiradas, pagaram. A extensao de xeque incondicional saiu em
 /// 2026-08-16 (o comentario dela regista +8,0 +- 8,1 Elo medidos num projecto
-/// proximo, e a nossa propria medicao com a rede do Stockfish confirmou o
+/// proximo, e a nossa propria medicao com a rede oficial confirmou o
 /// sinal: profundidade 21 sem ela contra 19 com ela). Um motor da mesma
 /// familia documenta as duas irmas a valerem **+7,98** (extensao) e **+9,71**
 /// (xeques quietos na qsearch), e marca esta -- a comporta da LMR -- como a
 /// que se deve testar PRIMEIRO das que restam, por ser a de menor risco: toca
 /// so' nos lances filhos e nao no regime do no'.
-///
-/// O Stockfish nao tem nenhuma das duas comportas: a LMR dele e' condicionada
-/// so' por `depth >= 2 && moveCount > 1`.
 ///
 /// MEDIDO E REJEITADO (2026-08-25). Nao vai a jogos, e a razao e' o proprio
 /// numero. Mesma posicao, mesma maquina, lados alternados:

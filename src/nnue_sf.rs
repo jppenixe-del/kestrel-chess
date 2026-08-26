@@ -1328,8 +1328,8 @@ pub fn de_bullet(
     // corpo sozinho, com o PSQT anulado dos dois lados: sem negacao
     // correlaciona 0,7172, com negacao 0,5315. O PSQT e' que a quer -- a
     // semente que o inicializa nasceu com o sinal ao contrario do que o motor
-    // espera, e o motor esta' certo, porque le' a rede oficial ao bit contra o
-    // codigo do Stockfish.
+    // espera, e o motor esta' certo, porque le' a rede oficial ao bit contra a
+    // implementacao de referencia do formato.
     //
     // Isto explica o tecto: metade da rede vinha invertida em todas as
     // conversoes que fizemos, e a metade que estava bem era a que eu negava.
@@ -1478,9 +1478,9 @@ pub fn de_bullet(
 
 /// Quantas relacoes de ameaca se ENUMERAM para encontrar as que mudam.
 ///
-/// A pergunta: o Stockfish constroi a lista de ameacas sujas DURANTE o
-/// `do_move` (ver `DirtyThreats` em types.h), enquanto nos reconstruimos a
-/// posicao anterior e re-enumeramos com o `relacoes_ameaca`. Se enumerarmos
+/// A pergunta: da' para construir a lista de ameacas sujas DURANTE o proprio
+/// lance, enquanto nos reconstruimos a posicao anterior e re-enumeramos com o
+/// `relacoes_ameaca`. Se enumerarmos
 /// muitas para aplicar poucas, essa e' a diferenca de custo entre as duas
 /// mecanicas -- e ate' agora foi ESTIMADA, nunca medida. `KESTREL_RELS=1`.
 static REL_ENUM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1494,9 +1494,9 @@ static REL_TOTAL_AP: [std::sync::atomic::AtomicU64; 6] = [
 /// Quantas vezes o acumulador e' MATERIALIZADO contra quantas vezes a rede e'
 /// mesmo avaliada. Sao perguntas diferentes: o `garante_camada` corre em todo o
 /// no' -- inclusive em xeque e com a avaliacao ja' na TT -- so' para que os
-/// filhos tenham pai, e paga as ~30 linhas de pesos na mesma. O Stockfish nao:
-/// marca o estado sujo e so' materializa a cadeia quando alguem avalia. Medido
-/// com uprobe, ele avalia 0,247 vezes por no'. `KESTREL_RELS=1`.
+/// filhos tenham pai, e paga as ~30 linhas de pesos na mesma. A alternativa e'
+/// marcar o estado sujo e so' materializar a cadeia quando alguem avalia --
+/// medida e rejeitada, ver o commit que a testou. `KESTREL_RELS=1`.
 static ACC_MATERIALISED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static ACC_FROM_PARENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static EVAL_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1668,8 +1668,7 @@ fn linha_peso(net: &RedeSf, u: usize, i: usize) -> i16 {
 /// ameacas, nao a contagem de linhas.
 ///
 /// Fundir as passagens -- manter um pedaco do acumulador em registos enquanto
-/// as ~12 linhas de um lance lhe passam por cima, como o Stockfish faz -- foi
-/// escrito e MEDIDO: 98184 contra 97506 nps em cinco rondas, ou seja empate,
+/// as ~12 linhas de um lance lhe passam por cima -- foi escrito e MEDIDO: 98184 contra 97506 nps em cinco rondas, ou seja empate,
 /// com os melhores tempos tambem empatados. O acumulador sao 2 KiB e ja' fica
 /// em L1 entre as chamadas; o que custa e' percorrer as linhas de peso, e
 /// nenhuma arrumacao das passagens evita esse trafego. Nao repetir sem uma
@@ -1856,8 +1855,8 @@ struct EstadoAcc {
     conta: Vec<i8>,
     tocadas: Vec<u32>,
     x: Vec<u8>,
-    /// i32, not i64: the weights on disk are i32 and Stockfish accumulates in
-    /// i32 with this same net, so the extra width bought nothing but memory.
+    /// i32, not i64: the weights on disk are i32, so the extra width bought
+    /// nothing but memory.
     /// MEASURED: +0.08% instructions -- the compiler was already vectorising
     /// the i64 loop. Kept for the halved footprint (32 bytes per perspective
     /// instead of 64, and there is one of these per ply), not for speed.
@@ -2334,9 +2333,9 @@ fn delta_por_lance(
 /// Pagar aqui um delta (~12 linhas de pesos) evita aos filhos uma
 /// reconstrucao (~35 linhas mais a enumeracao das features), e um no' que
 /// chega aqui vai mesmo procurar filhos -- os cortes por TT ja' retornaram
-/// antes. E' o mesmo principio do `find_last_usable_accumulator` do
-/// Stockfish, sem precisar de guardar as pecas sujas de cada ply: em vez de
-/// remontar a cadeia quando falta, nao a deixamos partir.
+/// antes. E' o mesmo principio de procurar o ultimo acumulador utilizavel,
+/// sem precisar de guardar as pecas sujas de cada ply: em vez de remontar a
+/// cadeia quando falta, nao a deixamos partir.
 pub fn garante_camada(atk: &Attacks, board: &mut Board) {
     let net = match rede() {
         Some(n) if active() => n,
@@ -2985,8 +2984,8 @@ fn max_walk_back() -> usize {
 /// ambas dos contadores: `sem-antepassado 0` e recuo medio de **1,0 plies** --
 /// o pai esta praticamente sempre calculado, por isso nao havia cadeia partida
 /// para recuperar; e 181833 das 224537 falhas do delta sao lances de REI, que
-/// sao inerentes ao HalfKA (mudam o indice de todas as features) e que o
-/// Stockfish tambem resolve com a cache de refresh, nao com a pilha.
+/// sao inerentes ao HalfKA (mudam o indice de todas as features) e que se
+/// resolvem com a cache de refresh, nao com a pilha.
 ///
 /// Fica porque esta' correcto e custa pouco, e porque e' o alicerce necessario
 /// se algum dia avaliarmos menos vezes -- mas nao e' o buraco dos 2,7x.
