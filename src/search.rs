@@ -3117,6 +3117,19 @@ impl<'a> Searcher<'a> {
             && !in_check
             && ply > 0
             && depth <= search_params().rfp_max_depth
+            // MEASURED AND REJECTED (2026-08-26): restricting this to nodes
+            // where the table has no move, or the move it has is a capture --
+            // the gate the reference search puts on the same cut.
+            //
+            // The reasoning looked sound. Our version fires 26 times per 100
+            // nodes and runs BEFORE the null move, which is tried at only 0.9%
+            // of nodes because this cut has already taken them. Restricting it
+            // should have handed those nodes back.
+            //
+            // Nodes went from 1970705 to ~2742000, +39%, and quiescence nodes
+            // from 587k to 915k. The cut firing often is compensating for
+            // something else, and taking cases away floods the quiescence
+            // instead of feeding the null move. Not repeated.
             && (search_params().rfp_skip_ttpv == 0
                 || !tt_entry_captured.map(|e| e.pv).unwrap_or(false))
             && beta.abs() < MATE_SCORE - MAX_PLY as i32

@@ -1674,6 +1674,8 @@ fn bench(depth: i32) {
     search::warmup();
     let start = std::time::Instant::now();
     let mut total: u64 = 0;
+    let (mut c_rfp, mut c_razor, mut c_fut, mut c_nmp, mut c_q) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    let (mut n_tried, mut n_raw, mut n_vt, mut n_vf, mut n_low) = (0u64, 0u64, 0u64, 0u64, 0u64);
     for fen in BENCH_FENS.iter() {
         let mut board = Board::from_fen(fen);
         tt.clear();
@@ -1750,9 +1752,31 @@ fn bench(depth: i32) {
         };
         let (_, _, _, nodes) = searcher.iterative_deepening(&mut board);
         total += nodes;
+        c_rfp += searcher.cut_rfp;
+        c_razor += searcher.cut_razor;
+        c_fut += searcher.cut_futility;
+        c_nmp += searcher.nmp_cut_taken;
+        n_tried += searcher.nmp_tried;
+        n_raw += searcher.nmp_cutoff_raw;
+        n_vt += searcher.nmp_verify_tried;
+        n_vf += searcher.nmp_verify_failed;
+        n_low += searcher.nmp_failed_low;
+        c_q += searcher.qnodes;
     }
     let ms = start.elapsed().as_millis().max(1) as u64;
     println!("{} nodes {} nps", total, total * 1000 / ms);
+    if std::env::var_os("KESTREL_CORTES").is_some() {
+        let p = |n: u64| 100.0 * n as f64 / total as f64;
+        eprintln!(
+            "cortes por 100 nos: rfp {:.2} razor {:.2} futility {:.2} nmp {:.2} | quiescencia {:.1}%",
+            p(c_rfp), p(c_razor), p(c_fut), p(c_nmp), p(c_q)
+        );
+        eprintln!("brutos: rfp {c_rfp} razor {c_razor} futility {c_fut} nmp {c_nmp} qnodes {c_q}");
+        eprintln!(
+            "null move: {n_tried} tentados -> {n_raw} deram corte -> {n_vt} verificados \
+             ({n_vf} falharam) -> {c_nmp} usados; {n_low} falharam baixo"
+        );
+    }
 }
 
 /// Diagnostic: is the king accumulator linear in the king weights?
