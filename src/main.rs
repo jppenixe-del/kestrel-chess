@@ -926,6 +926,9 @@ fn play_one_selfplay_game(
             cut_first: 0,
             cut_idx: [0; 17],
             cut_noisy: 0,
+            cut_etapa: [0; 7],
+            tt_nos: 0,
+            tt_com_lance: 0,
             nmp_tried: 0,
             nmp_tried_pv: 0,
             nmp_failed_pv: 0,
@@ -1202,6 +1205,9 @@ fn play_one_selfplay_game_tc(
             cut_first: 0,
             cut_idx: [0; 17],
             cut_noisy: 0,
+            cut_etapa: [0; 7],
+            tt_nos: 0,
+            tt_com_lance: 0,
             nmp_tried: 0,
             nmp_tried_pv: 0,
             nmp_failed_pv: 0,
@@ -1680,6 +1686,8 @@ fn bench(depth: i32) {
     let (mut c_rfp, mut c_razor, mut c_fut, mut c_nmp, mut c_q) = (0u64, 0u64, 0u64, 0u64, 0u64);
     let (mut c_cut, mut c_1st, mut c_noisy) = (0u64, 0u64, 0u64);
     let mut c_idx = [0u64; 17];
+    let mut c_et = [0u64; 7];
+    let (mut t_nos, mut t_lance) = (0u64, 0u64);
     let (mut n_tried, mut n_raw, mut n_vt, mut n_vf, mut n_low) = (0u64, 0u64, 0u64, 0u64, 0u64);
     for fen in BENCH_FENS.iter() {
         let mut board = Board::from_fen(fen);
@@ -1695,6 +1703,9 @@ fn bench(depth: i32) {
             cut_first: 0,
             cut_idx: [0; 17],
             cut_noisy: 0,
+            cut_etapa: [0; 7],
+            tt_nos: 0,
+            tt_com_lance: 0,
             nmp_tried: 0,
             nmp_tried_pv: 0,
             nmp_failed_pv: 0,
@@ -1772,6 +1783,9 @@ fn bench(depth: i32) {
         c_cut += searcher.cut_nodes;
         c_1st += searcher.cut_first;
         c_noisy += searcher.cut_noisy;
+        for k in 0..7 { c_et[k] += searcher.cut_etapa[k]; }
+        t_nos += searcher.tt_nos;
+        t_lance += searcher.tt_com_lance;
         for k in 0..17 { c_idx[k] += searcher.cut_idx[k]; }
     }
     let ms = start.elapsed().as_millis().max(1) as u64;
@@ -1807,6 +1821,18 @@ fn bench(depth: i32) {
                 acum.join(" "),
                 100.0 * c_idx[16] as f64 / c_cut as f64
             );
+            let nomes = ["-", "tabela", "boa captura", "killer1", "killer2", "quieto", "ma captura"];
+            let et: Vec<String> = (0..7)
+                .filter(|k| c_et[*k] > 0)
+                .map(|k| format!("{}:{:.1}%", nomes[k], 100.0 * c_et[k] as f64 / c_cut as f64))
+                .collect();
+            eprintln!("etapa que produziu o corte: {}", et.join("  "));
+            if t_nos > 0 {
+                eprintln!(
+                    "tabela: {t_lance} de {t_nos} nos interiores trouxeram lance -- {:.1}%",
+                    100.0 * t_lance as f64 / t_nos as f64
+                );
+            }
         }
     }
 }
@@ -1909,7 +1935,9 @@ fn novo_searcher_raso<'a>(
         root_side: crate::types::Color::White,
         stop_flag: &crate::search::NO_STOP,
         asp_re: 0, asp_nos: 0,
-        cut_nodes: 0, cut_first: 0, cut_idx: [0; 17], cut_noisy: 0, nmp_tried: 0, nmp_tried_pv: 0,
+        cut_nodes: 0, cut_first: 0, cut_idx: [0; 17], cut_noisy: 0, cut_etapa: [0; 7],
+            tt_nos: 0,
+            tt_com_lance: 0, nmp_tried: 0, nmp_tried_pv: 0,
         nmp_failed_pv: 0, nmp_cutoff_raw: 0, nmp_cut_taken: 0,
         nmp_verify_tried: 0, nmp_verify_ok: 0, nmp_verify_failed: 0,
         nmp_failed_low: 0, qnodes: 0, cut_rfp: 0, cut_razor: 0,

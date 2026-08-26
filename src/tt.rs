@@ -109,6 +109,8 @@ const BUCKET: usize = 3;
 /// splitting the difference is principled on its own.
 const STALE_PENALTY: i32 = 3;
 
+const EVAL_ONLY_DEPTH: i32 = -8;
+
 pub struct TranspositionTable {
     slots: Vec<[TtSlot; BUCKET]>,
     mask: usize,
@@ -336,6 +338,61 @@ impl TranspositionTable {
     /// later -- the same tolerance every bucketed lock-free TT accepts,
     /// and each slot's own write is still atomic and torn-read-safe.
     #[inline]
+    /// Guarda uma entrada que so' traz a avaliacao estatica, sem lance nem
+    /// limite -- e que NUNCA despeja a entrada de outra posicao.
+    ///
+    /// A `store` normal escolhe a pior ranhura do balde e escreve la'. Para
+    /// uma entrada de profundidade -8 isso e' um mau negocio: troca-se uma
+    /// entrada com lance e profundidade real de OUTRA posicao por uma
+    /// avaliacao. E acontece a cada avaliacao nova, que sao centenas de
+    /// milhares por busca.
+    ///
+    /// MEDIDO antes disto existir: a tabela so' trazia lance em 22,3% dos nos
+    /// interiores, e o lance dela -- quando existia -- produzia 18,5% de todos
+    /// os cortes. Ou seja o lance era bom e faltava; nao era mau e sobrava.
+    ///
+    /// Aqui so' se escreve numa ranhura que ja' e' desta chave, ou numa que
+    /// nao vale a pena guardar (vazia, ou ja' so'-avaliacao, ou de uma geracao
+    /// antiga). Se as tres do balde estiverem ocupadas com trabalho real,
+    /// deita-se fora a avaliacao em vez do lance -- recalcula-la custa uma
+    /// passagem pela rede, recalcular a ordenacao custa uma subarvore.
+    pub fn store_eval_only(&self, key: u64, static_eval: i16) {
+        let idx = (key as usize) & self.mask;
+        let bucket = &self.slots[idx];
+        let gen = self.current_gen.load(Ordering::Relaxed);
+        let mut alvo: Option<usize> = None;
+        for (i, slot) in bucket.iter().enumerate() {
+            let data = slot.data.load(Ordering::Relaxed);
+            let key_xor = slot.key_xor_data.load(Ordering::Relaxed);
+            if key_xor ^ data == key {
+                alvo = Some(i);
+                break;
+            }
+            if alvo.is_some() {
+                continue;
+            }
+            let depth = ((data >> 34) & 0xFF) as u8 as i8 as i32;
+            let stale = gen.wrapping_sub(slot.gen.load(Ordering::Relaxed)) as i32;
+            if data == 0 || depth <= EVAL_ONLY_DEPTH || stale >= STALE_PENALTY {
+                alvo = Some(i);
+            }
+        }
+        let Some(i) = alvo else { return };
+        let slot = &bucket[i];
+        // Preserva o que a ranhura ja' tivesse desta mesma chave: se ela e'
+        // desta posicao, o lance dela continua a valer.
+        let anterior = {
+            let data = slot.data.load(Ordering::Relaxed);
+            let key_xor = slot.key_xor_data.load(Ordering::Relaxed);
+            if key_xor ^ data == key { Some(data) } else { None }
+        };
+        let best = anterior.and_then(|d| decode_move(d & 0x3FFFF));
+        let data = encode_data(EVAL_ONLY_DEPTH, 0, Bound::NoBound, best, false, static_eval);
+        slot.data.store(data, Ordering::Relaxed);
+        slot.key_xor_data.store(key ^ data, Ordering::Relaxed);
+        slot.gen.store(gen, Ordering::Relaxed);
+    }
+
     pub fn store(&self, key: u64, depth: i32, score: i32, bound: Bound, best: Option<Move>, pv: bool, static_eval: i16) {
         let data = encode_data(depth, score, bound, best, pv, static_eval);
         let idx = (key as usize) & self.mask;

@@ -3,6 +3,33 @@ use crate::bitboard::{bb, Bitboard};
 
 /// Depth stamped on entries that carry only a cached static evaluation.
 const EVAL_ONLY_DEPTH: i32 = -8;
+
+// MEDIDO E REJEITADO (2026-08-27): fazer a quiescencia gravar na tabela.
+//
+// A nossa quiescencia nao escreve nada, e sao ~30% dos nos visitados a nao
+// deixar rasto: quando a busca principal transpoe para uma dessas posicoes,
+// chega sem lance para ordenar. Parecia o buraco obvio, e o alvo era grande --
+// medido contra uma busca de referencia no mesmo trabalho, ela tem lance da
+// tabela em 45,3% dos nos interiores e tira 88,9% dos cortes do primeiro
+// lance; nos temos 22,3% e 65,5%.
+//
+// Escrito em tres variantes, todas piores:
+//
+//     limites inferior e superior, despejo livre   2044165 nos  (+7,1%)
+//     o mesmo, sem despejar trabalho real          2027381      (+6,2%)
+//     so' os limites inferiores                    2164139     (+13,4%)
+//
+// E os contadores dizem porque: com a quiescencia a gravar, os cortes vindos
+// da tabela sobem 1,4 pontos e os vindos das BOAS CAPTURAS caem 1,5. A entrada
+// de quiescencia traz como lance a melhor captura de uma busca que so' viu
+// capturas, e o selector poe o lance da tabela em primeiro sem perguntar --
+// portanto esse lance vai empurrar exactamente o que a nossa ordenacao de
+// capturas ja' la' punha. Troca um por um e paga o custo de o guardar.
+//
+// A licao: o que nos falta nao e' VOLUME de lances na tabela, e' QUALIDADE.
+// Encher a tabela com sugestoes medianas mede pior do que nao a encher.
+// Retentar exige primeiro o selector deixar de confiar cegamente no lance da
+// tabela -- pesa-lo contra a ordenacao propria em vez de o antepor.
 use crate::board::Board;
 use crate::book::{encode_move, Book};
 use crate::evaluation::evaluate;
@@ -1453,6 +1480,14 @@ pub struct Searcher<'a> {
     /// problema: ordenar capturas e ordenar quietos sao dois sinais
     /// diferentes e podem estar maus de forma independente.
     pub cut_noisy: u64,
+    /// Cortes por etapa do selector: 0 nenhuma, 1 lance da tabela,
+    /// 2 boa captura, 3 killer 1, 4 killer 2, 5 quieto, 6 ma captura.
+    pub cut_etapa: [u64; 7],
+    /// Nos interiores visitados, e em quantos deles a tabela deu um lance.
+    /// A tabela produz so' 18,5% dos cortes; a primeira pergunta e' se e'
+    /// porque o lance dela e' mau ou porque ela nao o tem.
+    pub tt_nos: u64,
+    pub tt_com_lance: u64,
     pub cut_first: u64,
     /// Nodes spent in quiescence. It obeys neither the depth limit nor
     /// LMR nor LMP, so it is the one part of the tree that can grow without
@@ -3080,9 +3115,8 @@ impl<'a> Searcher<'a> {
                 // write erases it, and the next visit then reads `None` for
                 // move ordering -- which cost 33% more nodes when this was
                 // overlooked, dwarfing anything the cached eval saves.
-                self.tt.store(
-                    hash, EVAL_ONLY_DEPTH, 0, crate::tt::Bound::NoBound,
-                    tt_entry_captured.and_then(|e| e.best), false,
+                self.tt.store_eval_only(
+                    hash,
                     v.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
                 );
             }
@@ -3523,6 +3557,10 @@ impl<'a> Searcher<'a> {
             self.killers[ply + 1] = [None, None];
         }
 
+        self.tt_nos += 1;
+        if tt_move.is_some() {
+            self.tt_com_lance += 1;
+        }
         let mut picker = MovePicker::new(moves, tt_move, killers);
 
         let mut best_score = -MATE_SCORE - 1;
@@ -4269,6 +4307,7 @@ impl<'a> Searcher<'a> {
                 // where it visits 2.48, and that gap is where it lives.
                 self.cut_nodes += 1;
                 self.cut_idx[i.min(16)] += 1;
+                self.cut_etapa[(picker.ultima_etapa as usize).min(6)] += 1;
                 if mv.is_capture() || mv.promotion.is_some() {
                     self.cut_noisy += 1;
                 }
@@ -5132,6 +5171,11 @@ enum PickerStage {
 
 pub struct MovePicker {
     stage: PickerStage,
+    /// Que etapa emitiu o ultimo lance devolvido. Serve so' para
+    /// diagnostico: saber se o corte veio do lance da tabela, de uma boa
+    /// captura, de um killer ou de um quieto diz onde intervir, e o
+    /// histograma do indice sozinho nao distingue isso.
+    pub ultima_etapa: u8,
     tt_move: Option<Move>,
     killer1: Option<Move>,
     killer2: Option<Move>,
@@ -5170,6 +5214,7 @@ impl MovePicker {
         }
         MovePicker {
             stage: PickerStage::TtMove,
+            ultima_etapa: 0,
             tt_move,
             killer1: killers[0],
             killer2: killers[1],
@@ -5221,6 +5266,7 @@ impl MovePicker {
                         // de lances legais (a TT pode conter lixo por
                         // colisao de hash). Procura em noisy+quiet.
                         if self.contains_move(tm) {
+                            self.ultima_etapa = 1;
                             return Some(tm);
                         }
                     }
@@ -5268,6 +5314,7 @@ impl MovePicker {
                 }
                 PickerStage::GoodNoisy => {
                     if let Some(m) = self.pick_best_noisy(true) {
+                        self.ultima_etapa = 2;
                         return Some(m);
                     }
                     // Terminou os good noisy; a partir daqui o
@@ -5281,6 +5328,7 @@ impl MovePicker {
                     if let Some(k) = self.killer1 {
                         if Some(k) != self.tt_move && self.quiet_contains(k) {
                             self.mark_quiet_used(k);
+                            self.ultima_etapa = 3;
                             return Some(k);
                         }
                     }
@@ -5293,6 +5341,7 @@ impl MovePicker {
                             && self.quiet_contains(k)
                         {
                             self.mark_quiet_used(k);
+                            self.ultima_etapa = 4;
                             return Some(k);
                         }
                     }
@@ -5374,12 +5423,14 @@ impl MovePicker {
                 }
                 PickerStage::Quiet => {
                     if let Some(m) = self.pick_best_quiet() {
+                        self.ultima_etapa = 5;
                         return Some(m);
                     }
                     self.stage = PickerStage::BadNoisy;
                 }
                 PickerStage::BadNoisy => {
                     if let Some(m) = self.pick_best_noisy(false) {
+                        self.ultima_etapa = 6;
                         return Some(m);
                     }
                     self.stage = PickerStage::Done;
