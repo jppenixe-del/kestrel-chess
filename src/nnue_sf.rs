@@ -1711,6 +1711,47 @@ fn soma_linha_i8<const SOMAR: bool>(acc: &mut [i16; L1], row: &[i8; L1]) {
     }
 }
 
+/// Pede uma linha de pesos a' memoria antes de ela ser precisa.
+///
+/// A tabela das ameacas tem 59808 linhas de 1024 pesos: 61 MB, que nao cabem
+/// em cache nenhuma. Cada linha aplicada e' uma falha ate' a' DRAM, e o motor
+/// aplica ~15 por actualizacao. Mas os indices sao TODOS conhecidos no passo
+/// anterior, quando as relacoes sao convertidas em features -- ha' portanto
+/// uma volta inteira de folga entre saber a morada e precisar do conteudo.
+///
+/// Um pedido por linha de cache: a linha de pesos sao 16 delas, e o prefetcher
+/// da maquina nao as apanha sozinho porque de uma feature para a seguinte o
+/// salto nao e' sequencial.
+
+/// Salto entre pedidos, em bytes.
+///
+/// MEDIDO: 64 e 128 dao o mesmo (-2,6% e -3,0% de ciclos, dentro do ruido um
+/// do outro), 128 com metade das instrucoes -- o prefetcher de linha adjacente
+/// cobre a segunda. 256 ja' salta de mais e PIORA 1%: a linha tem 1 KB e com
+/// esse passo ficam quatro pedidos para dezasseis linhas de cache, tarde de
+/// mais para o resto.
+const PASSO: usize = 128;
+
+#[inline(always)]
+fn adianta<T>(p: &[T], off: usize, n: usize) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if off + n > p.len() {
+            return;
+        }
+        unsafe {
+            use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+            let base = p.as_ptr().add(off) as *const i8;
+            let bytes = n * std::mem::size_of::<T>();
+            let mut o = 0;
+            while o < bytes {
+                _mm_prefetch(base.add(o), _MM_HINT_T0);
+                o += PASSO;
+            }
+        }
+    }
+}
+
 fn aplica_linha(net: &RedeSf, acc: &mut [i16], u: usize, somar: bool) {
     // Uma verificacao de comprimento a' entrada, e dai' para dentro o
     // compilador ja' sabe tudo.
@@ -2088,6 +2129,16 @@ fn delta_por_lance(
     // the king square of THIS perspective, taken from the final board and held
     // fixed while the move is walked (see `eventos_ameaca`)
     let ksq_pov = agora.king_sq(pov);
+    // As features de peca so' dependem da casa do rei e dos eventos, ambos ja'
+    // sabidos: da' para pedir as linhas agora e ter a enumeracao inteira das
+    // ameacas como folga, que e' o passo mais caro da funcao.
+    if !saltar_pecas && ksq_pov < 64 {
+        for &(sq, t, c, _) in ev {
+            let u = crate::sf_features::indice_peca(ksq_pov, pov, sq, t, c);
+            adianta(&net.ft_piece_w, u * L1, L1);
+            adianta(&net.ft_piece_psqt, u * NB, NB);
+        }
+    }
     let mut cor_que_entra = 2usize;
     for &(_, _, c, add) in ev {
         if add {
@@ -2169,6 +2220,8 @@ fn delta_por_lance(
             let idx = crate::sf_features::indice_relacao(r, pov, hm);
             if idx < THREAT_DIM {
                 if st.conta[idx] == 0 {
+                    adianta(&net.ft_threat_w, idx * L1, L1);
+                    adianta(&net.ft_threat_psqt, idx * NB, NB);
                     tocadas.push(idx as u32);
                 }
                 st.conta[idx] += if r.adicionar { 1 } else { -1 };
