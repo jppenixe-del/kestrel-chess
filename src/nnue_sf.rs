@@ -812,6 +812,26 @@ pub fn evaluate(net: &RedeSf, atk: &Attacks, board: &mut Board) -> i32 {
     // paralelo foi MEDIDO e ficou 40% PIOR (8,6s vs 6,1s por 300k nos) --
     // quatro linhas de pesos ao mesmo tempo enchem a cache mais do que a
     // reutilizacao de `x` poupa. Nao repetir sem medir.
+    // MEASURED AND REJECTED (2026-08-26): skipping the zero inputs.
+    //
+    // 60% of `x` is zero after the clipped ReLU -- measured with
+    // KESTREL_SATURA -- so more than half of these 32768 multiply-accumulates
+    // are against nothing, and the reference implementation carries a whole
+    // sparse-input path for exactly this. It does not pay here, and the
+    // arithmetic says why before any code is written:
+    //
+    //   dense:  32 outputs x 1024 inputs = 32768 products, 32 per vpmaddubsw
+    //           -> ~1024 multiply instructions
+    //   sparse: 32 x 410 = 13120 products -> ~410 multiplies, BUT without VNNI
+    //           each needs a vpmaddwd and an add on top -> ~1230
+    //
+    // The sparse form only wins where one instruction does multiply AND
+    // accumulate (`vpdpbusd`), and this machine is AVX2 only -- no VNNI, no
+    // AVX-512. A scalar version was written to check the idea: bit-identical
+    // bench, 20% slower.
+    //
+    // Retry only on hardware with VNNI, and transpose the weights to
+    // input-major first (a column is L2 = 32 bytes, exactly one AVX2 register).
     let mut fc0_out = [0i32; L2];
     for o in 0..L2 {
         let row = &stack.fc0w[o * L1..(o + 1) * L1];
