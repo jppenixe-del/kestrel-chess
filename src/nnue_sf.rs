@@ -890,7 +890,7 @@ pub fn evaluate(net: &RedeSf, atk: &Attacks, board: &mut Board) -> i32 {
     let denominator: i64 = HIDDEN_ONE_VAL * (1i64 << WEIGHT_SCALE_BITS) * 2;
     let positional = fwd_out * multiplier / denominator;
 
-    let bruto = ((psqt / OUTPUT_SCALE) + (positional / OUTPUT_SCALE)) as i32;
+    let bruto = ((psqt as i64 / OUTPUT_SCALE) + (positional / OUTPUT_SCALE)) as i32;
 
     // O motor tem UMA escala de avaliacao, e nao e' a desta rede.
     //
@@ -1797,7 +1797,12 @@ struct EstadoAcc {
     conta: Vec<i8>,
     tocadas: Vec<u32>,
     x: Vec<u8>,
-    psqt: [[i64; NB]; 2],
+    /// i32, not i64: the weights on disk are i32 and Stockfish accumulates in
+    /// i32 with this same net, so the extra width bought nothing but memory.
+    /// MEASURED: +0.08% instructions -- the compiler was already vectorising
+    /// the i64 loop. Kept for the halved footprint (32 bytes per perspective
+    /// instead of 64, and there is one of these per ply), not for speed.
+    psqt: [[i32; NB]; 2],
     /// Cache de refresh por casa de rei ("finny tables"): para cada
     /// (casa do rei, perspectiva) guarda o acumulador SO' com features de
     /// peca e os bitboards que o geraram. Reconstruir passa a ser aplicar a
@@ -1825,7 +1830,7 @@ struct EstadoAcc {
 #[derive(Clone)]
 struct Camada {
     acc: [Vec<i16>; 2],
-    psqt: [[i64; NB]; 2],
+    psqt: [[i32; NB]; 2],
     bb: [[u64; 6]; 2],
     valido: bool,
 }
@@ -1986,7 +1991,7 @@ const MAX_CAMADAS: usize = 256;
 #[derive(Clone)]
 struct EntradaCache {
     acc: Vec<i16>,
-    psqt: [i64; NB],
+    psqt: [i32; NB],
     bb: [[u64; 6]; 2],
     valido: bool,
 }
@@ -2009,7 +2014,7 @@ impl EstadoAcc {
             conta: vec![0i8; THREAT_DIM],
             tocadas: Vec::with_capacity(256),
             x: vec![0u8; L1],
-            psqt: [[0i64; NB]; 2],
+            psqt: [[0i32; NB]; 2],
             cache: vec![
                 EntradaCache { acc: Vec::new(), psqt: [0; NB], bb: [[0; 6]; 2], valido: false };
                 64 * 2
@@ -2017,7 +2022,7 @@ impl EstadoAcc {
             pilha: vec![
                 Camada {
                     acc: [vec![0i16; L1], vec![0i16; L1]],
-                    psqt: [[0i64; NB]; 2],
+                    psqt: [[0i32; NB]; 2],
                     bb: [[0u64; 6]; 2],
                     valido: false,
                 };
@@ -2191,9 +2196,9 @@ fn delta_por_lance(
         if soma != 0 {
             let somar = soma > 0;
             aplica_linha(net, &mut st.acc[pov], U_THREAT + idx, somar);
-            let sinal = if somar { 1i64 } else { -1 };
+            let sinal = if somar { 1i32 } else { -1 };
             for b in 0..NB {
-                st.psqt[pov][b] += sinal * net.ft_threat_psqt[idx * NB + b] as i64;
+                st.psqt[pov][b] += sinal * net.ft_threat_psqt[idx * NB + b];
             }
         }
     }
@@ -2217,9 +2222,9 @@ fn delta_por_lance(
             for &f in lista.iter() {
                 let u = U_PAIR + (f - PAIR_BASE);
                 aplica_linha(net, &mut st.acc[pov], u, somar);
-                let sinal = if somar { 1i64 } else { -1 };
+                let sinal = if somar { 1i32 } else { -1 };
                 for b in 0..NB {
-                    st.psqt[pov][b] += sinal * net.ft_pair_psqt[(f - PAIR_BASE) * NB + b] as i64;
+                    st.psqt[pov][b] += sinal * net.ft_pair_psqt[(f - PAIR_BASE) * NB + b];
                 }
             }
         }
@@ -2239,9 +2244,9 @@ fn delta_por_lance(
     for &(sq, t, c, add) in ev {
         let u = crate::sf_features::indice_peca(ksq, pov, sq, t, c);
         aplica_linha(net, &mut st.acc[pov], u, add);
-        let sinal = if add { 1i64 } else { -1 };
+        let sinal = if add { 1i32 } else { -1 };
         for b in 0..NB {
-            st.psqt[pov][b] += sinal * net.ft_piece_psqt[u * NB + b] as i64;
+            st.psqt[pov][b] += sinal * net.ft_piece_psqt[u * NB + b];
         }
     }
     true
@@ -2609,9 +2614,9 @@ fn acc_incremental(
                                 bb &= bb - 1;
                                 let u = crate::sf_features::indice_peca(ksq, pov, sq, t, c);
                                 aplica_linha(net, &mut base_acc, u, add);
-                                let sinal = if add { 1i64 } else { -1 };
+                                let sinal = if add { 1i32 } else { -1 };
                                 for b in 0..NB {
-                                    base_psqt[b] += sinal * net.ft_piece_psqt[u * NB + b] as i64;
+                                    base_psqt[b] += sinal * net.ft_piece_psqt[u * NB + b];
                                 }
                             }
                         }
@@ -2619,11 +2624,11 @@ fn acc_incremental(
                 }
             } else {
                 base_acc = net.ft_bias.clone();
-                base_psqt = [0i64; NB];
+                base_psqt = [0i32; NB];
                 for &(f, _) in pecas.iter() {
                     aplica_linha(net, &mut base_acc, f, true);
                     for b in 0..NB {
-                        base_psqt[b] += net.ft_piece_psqt[f * NB + b] as i64;
+                        base_psqt[b] += net.ft_piece_psqt[f * NB + b];
                     }
                 }
             }
@@ -2695,16 +2700,16 @@ fn acc_incremental(
 
     st.feats[pov].clear();
     st.feats[pov].extend_from_slice(&novas);
-    st.psqt[pov] = [0i64; NB];
+    st.psqt[pov] = [0i32; NB];
     for &u in novas.iter() {
         let u = u as usize;
         for b in 0..NB {
             st.psqt[pov][b] += if u < U_THREAT {
-                net.ft_piece_psqt[u * NB + b] as i64
+                net.ft_piece_psqt[u * NB + b]
             } else if u < U_PAIR {
-                net.ft_threat_psqt[(u - U_THREAT) * NB + b] as i64
+                net.ft_threat_psqt[(u - U_THREAT) * NB + b]
             } else {
-                net.ft_pair_psqt[(u - U_PAIR) * NB + b] as i64
+                net.ft_pair_psqt[(u - U_PAIR) * NB + b]
             };
         }
     }
@@ -3040,7 +3045,7 @@ enum ReiMuda {
 /// direito de a actualizar.
 fn halfka_do_cache(
     net: &RedeSf, st: &EstadoAcc, pov: usize, ksq: usize,
-    pieces: &[[u64; 6]; 2], saida: &mut Vec<i16>, psqt: &mut [i64; NB],
+    pieces: &[[u64; 6]; 2], saida: &mut Vec<i16>, psqt: &mut [i32; NB],
 ) -> bool {
     if ksq >= 64 {
         return false;
@@ -3062,9 +3067,9 @@ fn halfka_do_cache(
                     bb &= bb - 1;
                     let u = crate::sf_features::indice_peca(ksq, pov, sq, t, c);
                     aplica_linha(net, saida, u, add);
-                    let sinal = if add { 1i64 } else { -1 };
+                    let sinal = if add { 1i32 } else { -1 };
                     for b in 0..NB {
-                        psqt[b] += sinal * net.ft_piece_psqt[u * NB + b] as i64;
+                        psqt[b] += sinal * net.ft_piece_psqt[u * NB + b];
                     }
                 }
             }
@@ -3133,9 +3138,9 @@ fn hibrido_rei(
                         bb &= bb - 1;
                         let u = crate::sf_features::indice_peca(ksq, pov, sq, t, c);
                         aplica_linha(net, &mut st.acc[pov], u, add);
-                        let sinal = if add { 1i64 } else { -1 };
+                        let sinal = if add { 1i32 } else { -1 };
                         for b in 0..NB {
-                            st.psqt[pov][b] += sinal * net.ft_piece_psqt[u * NB + b] as i64;
+                            st.psqt[pov][b] += sinal * net.ft_piece_psqt[u * NB + b];
                         }
                     }
                 }
