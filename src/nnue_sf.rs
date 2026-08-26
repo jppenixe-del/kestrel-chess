@@ -825,12 +825,26 @@ pub fn evaluate(net: &RedeSf, atk: &Attacks, board: &mut Board) -> i32 {
     //           each needs a vpmaddwd and an add on top -> ~1230
     //
     // The sparse form only wins where one instruction does multiply AND
-    // accumulate (`vpdpbusd`), and this machine is AVX2 only -- no VNNI, no
-    // AVX-512. A scalar version was written to check the idea: bit-identical
-    // bench, 20% slower.
+    // accumulate (`vpdpbusd`), and no machine this engine runs on has it.
     //
-    // Retry only on hardware with VNNI, and transpose the weights to
-    // input-major first (a column is L2 = 32 bytes, exactly one AVX2 register).
+    // CORRECTION (2026-08-26, later the same day). The "20% slower" first
+    // written here came from a wall-clock run taken while four cores were busy
+    // with a match, so the number was worthless -- and the verdict was written
+    // as if it were a property of the idea when it is a property of the
+    // hardware. Both halves are wrong to leave standing.
+    //
+    // What actually decides it here is the arithmetic, which contention cannot
+    // touch. Without VNNI a sparse column needs the weights widened before they
+    // can be multiplied: 4 vpmovsxbd + 4 vpmulld + 4 vpaddd per non-zero input,
+    // times ~410 of them, is ~4900 instructions against ~2000 for the dense
+    // form. Accumulating narrower does not rescue it -- a product reaches 16129
+    // and two of them overflow an i16.
+    //
+    // And the reason it is not worth revisiting is the fleet, not this box: all
+    // three machines are AMD EPYC with AVX2 and nothing above it -- no VNNI, no
+    // AVX-512 -- so there is nowhere to deploy a win. Retry when that changes,
+    // and transpose the weights to input-major first (a column is L2 = 32
+    // bytes, exactly one AVX2 register).
     let mut fc0_out = [0i32; L2];
     for o in 0..L2 {
         let row = &stack.fc0w[o * L1..(o + 1) * L1];
