@@ -2720,6 +2720,18 @@ fn acc_incremental(
 /// So the shape is checked, not just the count: exactly one piece is put down,
 /// and it belongs to the side that just played. Anything else falls back to the
 /// full rebuild, which is always right.
+/// MEASURED AND REJECTED (2026-08-26): returning the list inline instead of in
+/// a `Vec`, to kill the allocation this makes on every call.
+///
+/// `malloc`+`free` were 1.4% of the whole engine and this is the caller, so it
+/// looked free. It measured **2.6% SLOWER**. The tuple below is
+/// `(usize, usize, usize, bool)` = **32 bytes** once padded, so seven of them
+/// inline are 224 bytes copied on every return -- more than glibc's fast path
+/// costs for a repeated same-size allocation.
+///
+/// Worth retrying only with the fields packed to `u8`, which makes the entry 4
+/// bytes; and even then the whole prize is 1%, since that is all allocation
+/// costs in total.
 fn eventos_de_casa(
     antes: &[[u64; 6]; 2], agora: &[[u64; 6]; 2],
 ) -> Option<Vec<(usize, usize, usize, bool)>> {
