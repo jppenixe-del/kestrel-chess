@@ -1674,6 +1674,7 @@ fn bench(depth: i32) {
     let start = std::time::Instant::now();
     let mut total: u64 = 0;
     let (mut c_rfp, mut c_razor, mut c_fut, mut c_nmp, mut c_q) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    let (mut c_cut, mut c_1st) = (0u64, 0u64);
     let (mut n_tried, mut n_raw, mut n_vt, mut n_vf, mut n_low) = (0u64, 0u64, 0u64, 0u64, 0u64);
     for fen in BENCH_FENS.iter() {
         let mut board = Board::from_fen(fen);
@@ -1761,6 +1762,8 @@ fn bench(depth: i32) {
         n_vf += searcher.nmp_verify_failed;
         n_low += searcher.nmp_failed_low;
         c_q += searcher.qnodes;
+        c_cut += searcher.cut_nodes;
+        c_1st += searcher.cut_first;
     }
     let ms = start.elapsed().as_millis().max(1) as u64;
     println!("{} nodes {} nps", total, total * 1000 / ms);
@@ -1775,6 +1778,17 @@ fn bench(depth: i32) {
             "null move: {n_tried} tentados -> {n_raw} deram corte -> {n_vt} verificados \
              ({n_vf} falharam) -> {c_nmp} usados; {n_low} falharam baixo"
         );
+        // A percentagem de cortes produzidos pelo PRIMEIRO lance tentado e' o
+        // numero que decide a largura da arvore: um corte que so' chega ao
+        // quinto lance ja' pagou quatro subarvores que ninguem queria. Uma
+        // busca com boa ordenacao anda nos 90%; abaixo disso o problema nao e'
+        // a poda, e' a ordem por que os lances sao tentados.
+        if c_cut > 0 {
+            eprintln!(
+                "ordenacao: {c_1st} de {c_cut} cortes vieram do 1o lance -- {:.1}%",
+                100.0 * c_1st as f64 / c_cut as f64
+            );
+        }
     }
 }
 

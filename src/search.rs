@@ -5317,6 +5317,28 @@ impl MovePicker {
                                 ch += searcher.cont_hist[cont_hist_idx(p2_pt, p2_to, curr_pt, m.to)];
                             }
                         }
+                        // MEDIDO E REJEITADO (2026-08-27): um termo de
+                        // ameaca aqui -- somar `valor_da_peca * k` a quem sai
+                        // de uma casa atacada por peca mais barata, subtrair a
+                        // quem entra numa. Escrito e varrido:
+                        //
+                        //     k=0  1908483 nos      k=8   2461747  (+29%)
+                        //     k=2  5254635 (+175%)  k=18  2376529  (+24%)
+                        //     k=4  3548007  (+86%)
+                        //
+                        // Pior a TODOS os pesos, e os pequenos catastroficos.
+                        // O k=0 reproduz a base ao no', portanto o efeito e'
+                        // real e nao um erro de instrumentacao.
+                        //
+                        // A licao nao e' "o sinal nao presta" -- e' que ele nao
+                        // e' separavel. Onde funciona, vive num conjunto com
+                        // cinco historicos de continuacao, historia de peoes e
+                        // bonus de xeque, e o que ordena e' o conjunto. Sozinho
+                        // promove todas as retiradas de dama ao topo da lista e
+                        // atropela a historia que o motor aprendeu.
+                        //
+                        // Retentar so' DEPOIS de os outros sinais existirem, e
+                        // medindo o conjunto, nunca a peca.
                         e.1 = h + cm_bonus + book + ch;
                     }
                     self.stage = PickerStage::Quiet;
