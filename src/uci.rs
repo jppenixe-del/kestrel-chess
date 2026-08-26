@@ -1692,6 +1692,8 @@ impl Engine {
                 asp_nos: 0,
                 cut_nodes: 0,
                         cut_first: 0,
+                    cut_idx: [0; 17],
+                    cut_noisy: 0,
                         nmp_tried: 0,
                         nmp_tried_pv: 0,
                         nmp_failed_pv: 0,

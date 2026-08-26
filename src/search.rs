@@ -1444,6 +1444,15 @@ pub struct Searcher<'a> {
     pub asp_re: u64,
     pub asp_nos: u64,
     pub cut_nodes: u64,
+    /// Onde estava, na lista ordenada, o lance que acabou por cortar.
+    /// Indice 0..=15, e tudo a partir de 16 no ultimo balde. Diz a diferenca
+    /// entre "a ordenacao esta quase certa" (cortes no 1-2) e "ha um sinal
+    /// estruturalmente em falta" (cortes espalhados pela lista).
+    pub cut_idx: [u64; 17],
+    /// Dos cortes, quantos vieram de um lance de captura/promocao. Separa o
+    /// problema: ordenar capturas e ordenar quietos sao dois sinais
+    /// diferentes e podem estar maus de forma independente.
+    pub cut_noisy: u64,
     pub cut_first: u64,
     /// Nodes spent in quiescence. It obeys neither the depth limit nor
     /// LMR nor LMP, so it is the one part of the tree that can grow without
@@ -2288,6 +2297,22 @@ impl<'a> Searcher<'a> {
     /// by (moving piece, captured piece) instead of (from, to), since
     /// what matters for "does this TYPE of capture tend to work out" is
     /// which pieces are involved, not the exact squares.
+    ///
+    /// MEDIDO E REJEITADO (2026-08-27): acrescentar a casa de destino
+    /// (`[lado][peca][casa][capturada]`, 4608 entradas em vez de 72). Parecia
+    /// a correccao obvia -- sem a casa, `Bxf7` e `Bxb7` partilham a mesma
+    /// entrada. Resultado: 1908483 -> 5243959 nos, quase o triplo, e os nos de
+    /// quiescencia de 563540 para 1940488.
+    ///
+    /// A razao nao e' a ordenacao: e' que esta tabela NAO serve so' para
+    /// ordenar. Alimenta comportas de poda -- a reducao de capturas e a poda
+    /// por historia dentro da quiescencia -- que comparam o valor contra
+    /// limiares fixos. Diluir a tabela 64 vezes deixa quase tudo perto de zero,
+    /// essas comportas deixam de disparar, e a quiescencia inunda.
+    ///
+    /// Retentar exige recalibrar TODOS os limiares que a leem, na mesma
+    /// mudanca. Alargar a tabela sozinho nao e' uma mudanca de ordenacao, e'
+    /// uma mudanca de poda disfarcada.
     fn update_capture_history(&mut self, side: usize, moving: PieceType, captured: PieceType, delta: i32) {
         let v = &mut self.capture_history[side][moving.idx()][captured.idx()];
         *v = apply_gravity(*v, delta, HISTORY_MAX);
@@ -4243,6 +4268,10 @@ impl<'a> Searcher<'a> {
                 // a reference at the same depth we visit 2.76 nodes per node
                 // where it visits 2.48, and that gap is where it lives.
                 self.cut_nodes += 1;
+                self.cut_idx[i.min(16)] += 1;
+                if mv.is_capture() || mv.promotion.is_some() {
+                    self.cut_noisy += 1;
+                }
                 if i == 0 {
                     self.cut_first += 1;
                 }
