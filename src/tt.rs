@@ -255,6 +255,28 @@ impl TranspositionTable {
     }
 
     #[inline]
+    /// Pede o balde a' memoria antes de ele ser sondado.
+    ///
+    /// A tabela e' maior do que qualquer cache -- e' esse o objectivo -- por
+    /// isso praticamente toda a sondagem e' uma ida a' DRAM, e no perfil essas
+    /// esperas apareciam com 7,8% do tempo, escondidas nas leituras atomicas
+    /// do balde. Mas o indice e' sabido assim que o lance esta' feito, muito
+    /// antes de o filho sondar: pedir ali deixa a latencia ser coberta pelo
+    /// trabalho que fica no meio.
+    ///
+    /// Duas linhas de cache: o balde sao tres entradas de 24 bytes.
+    #[inline]
+    pub fn prefetch(&self, key: u64) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+            let idx = (key as usize) & self.mask;
+            let p = self.slots.as_ptr().add(idx) as *const i8;
+            _mm_prefetch(p, _MM_HINT_T0);
+            _mm_prefetch(p.add(64), _MM_HINT_T0);
+        }
+    }
+
     pub fn probe(&self, key: u64) -> Option<TtEntry> {
         let idx = (key as usize) & self.mask;
         let bucket = &self.slots[idx];

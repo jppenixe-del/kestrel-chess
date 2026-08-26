@@ -3678,6 +3678,7 @@ impl<'a> Searcher<'a> {
 
             let root_nodes_before = if ply == 0 { self.nodes } else { 0 };
             let undo = board.make_move(&mv);
+            self.tt.prefetch(board.hash);
             if ply + 1 < MAX_PLY {
                 if let Some((moved_pt, _)) = board.piece_at(mv.to) {
                     self.ply_last_move[ply + 1] = Some((moved_pt, mv.to));
