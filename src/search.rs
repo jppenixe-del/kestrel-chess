@@ -1,5 +1,8 @@
 use crate::attacks::{bishop_attacks, rook_attacks, Attacks};
 use crate::bitboard::{bb, Bitboard};
+
+/// Depth stamped on entries that carry only a cached static evaluation.
+const EVAL_ONLY_DEPTH: i32 = -8;
 use crate::board::Board;
 use crate::book::{encode_move, Book};
 use crate::evaluation::evaluate;
@@ -2900,6 +2903,9 @@ impl<'a> Searcher<'a> {
             let multipv_guard = ply == 0 && !self.excluded_root_moves.is_empty();
             if e.depth >= depth && !multipv_guard {
                 match e.bound {
+                    // Carries a cached static eval and nothing else -- there is
+                    // no score behind it to cut on.
+                    Bound::NoBound => {}
                     Bound::Exact => {
                         // 2026-07-20 (BUG REAL corrigido -- achado por
                         // instrumentacao directa num jogo real onde o
@@ -2960,6 +2966,7 @@ impl<'a> Searcher<'a> {
                 && ply > 0
                 && e.depth == depth - 1
                 && e.bound == Bound::Upper
+                && e.has_bound()
                 && tt_score + search_params().tt_extended_cutoff_margin <= alpha
             {
                 // Extended TT cutoff: a same-position entry exactly ONE
@@ -3029,7 +3036,32 @@ impl<'a> Searcher<'a> {
             crate::nnue_sf::garante_camada(self.atk, board);
             e.static_eval as i32
         } else {
-            crate::evaluation::evaluate(board)
+            // Fresh evaluation: write it to the table AT ONCE, before the node
+            // has any chance to leave early.
+            //
+            // There are fourteen returns between here and the store at the
+            // bottom of this function -- razoring, null move, probcut and the
+            // rest -- and every one of them used to discard an evaluation that
+            // costs ~21000 instructions. The loss was invisible in the
+            // counters: a discarded eval leaves NO entry, so the next visit
+            // looked like a first visit rather than a repeat.
+            //
+            // The entry carries no bound, so it can never cause a cutoff; it
+            // exists only so the next visit finds the number instead of
+            // computing it again.
+            let v = crate::evaluation::evaluate(board);
+            if excluded.is_none() {
+                // Keep whatever best move the slot already holds. A moveless
+                // write erases it, and the next visit then reads `None` for
+                // move ordering -- which cost 33% more nodes when this was
+                // overlooked, dwarfing anything the cached eval saves.
+                self.tt.store(
+                    hash, EVAL_ONLY_DEPTH, 0, crate::tt::Bound::NoBound,
+                    tt_entry_captured.and_then(|e| e.best), false,
+                    v.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                );
+            }
+            v
         };
         // Halfmove-scaled before correction (see `evaluation::amortece_rule50`
         // for why this has to happen here and not inside `evaluate()`
@@ -3373,7 +3405,7 @@ impl<'a> Searcher<'a> {
         let mut se_candidate: Option<Move> = None;
         let mut se_extension: i32 = 0;
         if excluded.is_none() && ply > 0 && depth >= 8 {
-            if let (Some(tm), Some(te)) = (tt_move, tt_entry_captured) {
+            if let (Some(tm), Some(te)) = (tt_move, tt_entry_captured.filter(|e| e.has_bound())) {
                 let tt_score = score_from_tt(te.score, ply as i32);
                 if te.depth >= depth - 3
                     && te.bound != Bound::Upper
