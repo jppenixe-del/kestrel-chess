@@ -1744,6 +1744,12 @@ fn soma_linha_i8<const SOMAR: bool>(acc: &mut [i16; L1], row: &[i8; L1]) {
 /// cobre a segunda. 256 ja' salta de mais e PIORA 1%: a linha tem 1 KB e com
 /// esse passo ficam quatro pedidos para dezasseis linhas de cache, tarde de
 /// mais para o resto.
+///
+/// E' pedido so' o primeiro QUARTO de cada linha, nao a linha toda: dentro da
+/// linha a leitura e' sequencial, portanto o prefetcher da maquina apanha o
+/// resto sozinho assim que os primeiros 256 bytes chegam. Pedir os 1024 custa
+/// quatro vezes as instrucoes para o mesmo efeito -- medido, um quarto e' 1,8%
+/// MELHOR do que a linha inteira, e metade fica igual a` inteira.
 const PASSO: usize = 128;
 
 #[inline(always)]
@@ -2149,7 +2155,7 @@ fn delta_por_lance(
     if !saltar_pecas && ksq_pov < 64 {
         for &(sq, t, c, _) in ev {
             let u = crate::sf_features::indice_peca(ksq_pov, pov, sq, t, c);
-            adianta(&net.ft_piece_w, u * L1, L1);
+            adianta(&net.ft_piece_w, u * L1, L1 / 4);
             adianta(&net.ft_piece_psqt, u * NB, NB);
         }
     }
@@ -2234,7 +2240,7 @@ fn delta_por_lance(
             let idx = crate::sf_features::indice_relacao(r, pov, hm);
             if idx < THREAT_DIM {
                 if st.conta[idx] == 0 {
-                    adianta(&net.ft_threat_w, idx * L1, L1);
+                    adianta(&net.ft_threat_w, idx * L1, L1 / 4);
                     adianta(&net.ft_threat_psqt, idx * NB, NB);
                     tocadas.push(idx as u32);
                 }
