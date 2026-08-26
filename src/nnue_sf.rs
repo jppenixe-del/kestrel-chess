@@ -841,10 +841,14 @@ pub fn evaluate(net: &RedeSf, atk: &Attacks, board: &mut Board) -> i32 {
     // ac_sqr_0 / ac_0 use WeightScaleBits+1 (SF: SqrClippedReLU<..,
     // WeightScaleBits+1> ac_sqr_0; ClippedReLU<.., WeightScaleBits+1> ac_0;).
     let wsb0 = WEIGHT_SCALE_BITS as u32 + 1;
-    let mut concat1 = [0i32; 2 * L2];
+    // u8, not i32. Both activations clamp to 0..127, so the wide type carried
+    // no information -- and it cost four times the instructions in the layer
+    // below: an i32 accumulator fits eight per AVX2 register where u8 x i8
+    // fits thirty-two. This is the same `produto_u8_i8` path fc0 already uses.
+    let mut concat1 = [0u8; 2 * L2];
     for o in 0..L2 {
-        concat1[o] = clipped_sq(fc0_out[o], wsb0);
-        concat1[L2 + o] = clipped_lin(fc0_out[o], wsb0);
+        concat1[o] = clipped_sq(fc0_out[o], wsb0) as u8;
+        concat1[L2 + o] = clipped_lin(fc0_out[o], wsb0) as u8;
     }
 
     let mut fc1_out = [0i32; L3];
@@ -853,28 +857,23 @@ pub fn evaluate(net: &RedeSf, atk: &Attacks, board: &mut Board) -> i32 {
         // consegue metade dos elementos por registo. E iterador em vez de
         // `row[i]`, que verificava limites a cada um dos 64 acessos.
         let row = &stack.fc1w[o * (2 * L2)..(o + 1) * (2 * L2)];
-        let s: i32 = concat1
-            .iter()
-            .zip(row.iter())
-            .map(|(&a, &b)| a as i32 * b as i32)
-            .sum();
+        let s: i32 = produto_u8_i8(&concat1, row);
         fc1_out[o] = s + stack.fc1b[o];
     }
 
     // ac_sqr_1 / ac_1 use plain WeightScaleBits.
     let wsb1 = WEIGHT_SCALE_BITS as u32;
-    let mut concat2 = [0i32; 2 * L2 + 2 * L3];
+    // Same again: 0..127 values in an i32 array. 128 entries, a multiple of
+    // 32, so the whole output layer becomes one SIMD dot product instead of a
+    // scalar loop with an i64 accumulator.
+    let mut concat2 = [0u8; 2 * L2 + 2 * L3];
     concat2[..2 * L2].copy_from_slice(&concat1);
     for o in 0..L3 {
-        concat2[2 * L2 + o] = clipped_sq(fc1_out[o], wsb1);
-        concat2[2 * L2 + L3 + o] = clipped_lin(fc1_out[o], wsb1);
+        concat2[2 * L2 + o] = clipped_sq(fc1_out[o], wsb1) as u8;
+        concat2[2 * L2 + L3 + o] = clipped_lin(fc1_out[o], wsb1) as u8;
     }
 
-    let mut s: i64 = 0;
-    for i in 0..2 * L2 + 2 * L3 {
-        s += concat2[i] as i64 * stack.fc2w[i] as i64;
-    }
-    let fc2_out = (s as i32) + stack.fc2b;
+    let fc2_out = produto_u8_i8(&concat2, &stack.fc2w[..2 * L2 + 2 * L3]) + stack.fc2b;
 
     let skip_0 = fc0_out[L2 - 2] - fc0_out[L2 - 1];
     let fwd_out = (fc2_out + skip_0) as i64;
