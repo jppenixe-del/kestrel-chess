@@ -1017,6 +1017,8 @@ impl SearchParams {
             self.rfp_max_depth,
             self.rfp_corr_divisor,
             self.rfp_skip_ttpv,
+            // No FIM, para nao deslocar os indices ja' usados por opcoes UCI.
+            self.cont_hist_ganho,
         ]
     }
     pub fn from_vec(v: &[i32]) -> Self {
@@ -1030,7 +1032,6 @@ impl SearchParams {
             cap_futility_improving: DepthMargin { base: v[10], slope: v[11] },
             cap_futility_not_improving: DepthMargin { base: v[12], slope: v[13] },
             delta_margin: v[14],
-            cont_hist_ganho: 150,
             qs_lmp_limit: v[15],
             tt_extended_cutoff_margin: v[16],
             history_prune_mult: v[17],
@@ -1103,6 +1104,7 @@ impl SearchParams {
             rfp_max_depth: v[56],
             rfp_corr_divisor: v[57],
             rfp_skip_ttpv: v[58],
+            cont_hist_ganho: v[59],
         }
     }
 }
@@ -1115,7 +1117,7 @@ impl SearchParams {
 /// Generated from `to_vec`, never hand-written. A list that drifts out of
 /// order does not fail: it quietly sets the wrong parameter, and the sweep
 /// reports whatever that other parameter happens to do.
-pub const PARAM_NAMES: [&str; 59] = [
+pub const PARAM_NAMES: [&str; 60] = [
     "rfp_improving_base",
     "rfp_improving_slope",
     "rfp_not_improving_base",
@@ -1175,6 +1177,7 @@ pub const PARAM_NAMES: [&str; 59] = [
     "rfp_max_depth",
     "rfp_corr_divisor",
     "rfp_skip_ttpv",
+    "cont_hist_ganho",
 ];
 
 /// Overrides applied on top of the defaults, set over UCI before the first
