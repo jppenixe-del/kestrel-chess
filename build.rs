@@ -46,6 +46,16 @@ fn main() {
     println!("cargo:rustc-env=KESTREL_ESCALA_COMPILADA={escala}");
 
 
+    // Caminho da rede SFNNv16, cravado na compilacao. E' por aqui que a rede
+    // do OpenBench chega ao motor: ele passa `EVALFILE=` ao make e nao define
+    // ambiente nenhum ao correr o binario.
+    println!("cargo:rerun-if-env-changed=KESTREL_NNUE_SF_BUILD");
+    if let Ok(p) = std::env::var("KESTREL_NNUE_SF_BUILD") {
+        if !p.is_empty() {
+            println!("cargo:rustc-env=KESTREL_NNUE_SF_COMPILADO={p}");
+        }
+    }
+
     embute("KESTREL_V1_EMBUTIDA", "rede_v1_embutida.bin", "v1_embutida");
     embute("KESTREL_THREATS_EMBUTIDA", "rede_threats_embutida.bin", "threats_embutida");
     println!("cargo:rerun-if-env-changed=KESTREL_V3_EMBUTIDA");

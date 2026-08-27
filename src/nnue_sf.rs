@@ -959,7 +959,21 @@ static REDE: OnceLock<Option<RedeSf>> = OnceLock::new();
 
 pub fn rede() -> Option<&'static RedeSf> {
     REDE.get_or_init(|| {
-        let path = std::env::var("KESTREL_NNUE_SF").ok()?;
+        // Caminho por ambiente, com o que foi cravado na compilacao como
+        // recurso.
+        //
+        // O OpenBench passa a rede ao `make` como `EVALFILE=<caminho>` e nao
+        // define variavel de ambiente nenhuma no motor. Sem esta segunda via, o
+        // binario que ele compila corre SEM rede: cai na avaliacao nula e mede
+        // heuristicas de busca contra ruido -- foi o que aconteceu, com o bench
+        // a dar 4354449 nos em vez de 1954973.
+        //
+        // Crava-se o CAMINHO e nao os 95 MB: o cliente guarda a rede em
+        // `Networks/<sha>` e o caminho absoluto mantem-se valido nessa maquina.
+        let path = std::env::var("KESTREL_NNUE_SF")
+            .ok()
+            .or_else(|| option_env!("KESTREL_NNUE_SF_COMPILADO").map(str::to_string))
+            .filter(|p| !p.is_empty())?;
         let bytes = std::fs::read(&path).ok()?;
         carrega(&bytes)
     })
