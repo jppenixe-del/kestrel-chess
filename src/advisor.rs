@@ -1,3 +1,14 @@
+// A rede externa vive atras da feature `bot`, e NAO esta' no build por omissao.
+//
+// O bot que corre na nossa maquina pode consultar o tablebase da Lichess e o
+// conselheiro; um motor entregue a uma lista de rating nao pode consultar nada
+// -- e' ajuda externa, e "opcao desligada por omissao" nao serve como garantia
+// porque o operador nao tem como a verificar. Fechado por feature, o binario
+// entregue nao contem o URL nem o socket, e um `strings` no ficheiro prova-o.
+//
+//     motor entregue:  cargo build --release
+//     bot da casa:     cargo build --release --features bot
+
 //! Optional LLM tie-breaker for near-equal candidate moves. Entirely
 //! opt-in and fail-safe: if `KESTREL_ADVISOR_HOST` isn't set, or the
 //! connection/response fails for ANY reason, every function here returns
@@ -23,6 +34,12 @@ impl Advisor {
     /// `KESTREL_ADVISOR_HOST` (e.g. "127.0.0.1:11434") enables the
     /// advisor; `KESTREL_ADVISOR_MODEL` optionally overrides the model
     /// name (defaults to the one used throughout this project's testing).
+    #[cfg(not(feature = "bot"))]
+    pub fn from_env() -> Option<Self> {
+        None
+    }
+
+    #[cfg(feature = "bot")]
     pub fn from_env() -> Option<Self> {
         let host = std::env::var("KESTREL_ADVISOR_HOST").ok()?;
         let model = std::env::var("KESTREL_ADVISOR_MODEL").unwrap_or_else(|_| "qwen2.5-coder:7b".to_string());
@@ -33,6 +50,12 @@ impl Advisor {
     /// label on success, `None` on any failure (network, timeout,
     /// malformed response, or a response that names none of the
     /// candidates) -- the caller should always have its own fallback.
+    #[cfg(not(feature = "bot"))]
+    pub fn ask(&self, _fen: &str, _candidates: &[(char, String, i32)]) -> Option<char> {
+        None
+    }
+
+    #[cfg(feature = "bot")]
     pub fn ask(&self, fen: &str, candidates: &[(char, String, i32)]) -> Option<char> {
         let opts: String = candidates.iter().map(|(lab, mv, _)| format!("{}) {}\n", lab, mv)).collect();
         let prompt = format!(
@@ -91,6 +114,7 @@ impl Advisor {
     }
 }
 
+#[cfg(feature = "bot")]
 fn json_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 8);
     for c in s.chars() {
@@ -110,6 +134,7 @@ fn json_escape(s: &str) -> String {
 /// Pulls the string value of one top-level JSON field out of raw JSON
 /// text. Deliberately not a general parser -- Ollama's response shape is
 /// fixed and this is the only field this project ever needs from it.
+#[cfg(feature = "bot")]
 fn extract_json_string_field(json: &str, field: &str) -> Option<String> {
     let needle = format!("\"{}\":\"", field);
     let start = json.find(&needle)? + needle.len();

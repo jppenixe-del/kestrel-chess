@@ -652,6 +652,25 @@ pub struct SearchParams {
     pub delta_margin: i32,
     /// Ganho da historia de continuacao, em percentagem. Ver `cont_hist_score`.
     pub cont_hist_ganho: i32,
+
+    /// Gestao de tempo, exposta ao afinador.
+    ///
+    /// Estavam todas em `const` no `uci.rs`, fora do alcance do SPSA -- sessenta
+    /// parametros de busca afinados por jogos, e a alocacao do relogio a nao ser
+    /// nenhum deles. Medido: com o divisor a 55 o motor termina uma partida de
+    /// 40 lances com 28% do relogio por gastar, e num encontro real a 60+0
+    /// gastou 162s onde o adversario gastou 193s, quatro plies mais raso.
+    ///
+    /// O comentario que acompanhava o 55 diz que a FORMA da alocacao foi testada
+    /// "matched on the total" -- ou seja o total nunca foi testado contra nada.
+    /// E' o que estes campos passam a permitir.
+    pub tempo_divisor: i32,
+    pub tempo_fase_abertura: i32,
+    pub tempo_fase_meio_cedo: i32,
+    pub tempo_fase_meio: i32,
+    pub tempo_fase_meio_tarde: i32,
+    pub tempo_fase_simplificado: i32,
+    pub tempo_hard_cap_pct: i32,
     pub qs_lmp_limit: i32,
     pub tt_extended_cutoff_margin: i32,
     /// History pruning threshold multiplier: a quiet move is skipped
@@ -755,15 +774,42 @@ impl Default for SearchParams {
             // Close to identical to a published set of constants (65
             // and 5) -- see the field doc comment for why the shape, not
             // just the numbers, was adopted.
-            rfp_base: 75,
-            rfp_step: 4,
+            // SETE PARAMETROS EM PONTO FIXO, e nao em unidades inteiras.
+            //
+            // Sao os valores que o SPSA da tune 6 encontrou em 7264 jogos, e
+            // chegam fraccionarios: `rfp_step` = 3.3441, `rfp_base` = 67.789.
+            // Arredondar custa caro -- `rfp_step` 3.344 -> 3 e' 10% do valor, e
+            // medido dava 1.664M nos contra 1.627M, ou seja metade do ganho da
+            // tune deitado fora. Por isso ficam multiplicados e a divisao vai
+            // para o ponto de uso.
+            //
+            // A escala NAO e' a mesma para todos, e a razao e' transbordo:
+            // `cont_hist_score` ja' devolve `ch * cont_hist_ganho / 100`, ate'
+            // 16000*140.5 = 22478 -- e' esse o valor que entra no LMR, nao os
+            // 16000 da tabela. `22478 * LMR_ESCALA * 100` = 2.30e9 passa o i32
+            // e da' outra assinatura de bench (1583456 em vez de 1626588). Os
+            // dois divisores do LMR ficam por isso em 1/25 (pior caso 5.75e8);
+            // o erro da escala e' 3.5e-8 relativo, contra um passo de SPSA de
+            // 1e-2. Verificado com `-C overflow-checks=on`: nao transborda.
+            //
+            // ATENCAO ao OpenBench: a banda anunciada no `uci` sai de
+            // `SearchParams::default().to_vec()`, portanto uma tune NOVA apanha
+            // a escala certa sozinha. Uma tune JA' A CORRER (a 6) tem a escala
+            // antiga gravada e mandaria `rfp_base 68`, que aqui vale 0.68.
+            // Nao por este binario nos workers enquanto a tune 6 nao acabar.
+            //
+            //   x100: rfp_base rfp_step rfp_hist_divisor cont_hist_ganho
+            //         history_prune_mult
+            //   x25:  lmr_hist_divisor lmr_capture_hist_divisor
+            rfp_base: 6779,
+            rfp_step: 334,
             // Reasoned from this engine's own history scale (see the note
             // at the RFP block), not copied. Starting points, not tuned
             // values -- exposed by name so they can be swept without a
             // rebuild.
             rfp_opp_easy_capture: 15,
             rfp_opp_worsening: 12,
-            rfp_hist_divisor: 150,
+            rfp_hist_divisor: 15292,
             hist_beta_margin: 46,
             hist_pruning_max_depth: 4,
             triple_ext_margin: 155,
@@ -776,7 +822,7 @@ impl Default for SearchParams {
             hist_malus_linear: 277,
             hist_malus_offset: -44,
             hist_malus_max: 992,
-            lmr_hist_divisor: 36000,
+            lmr_hist_divisor: 900574,
             lmr_move_linear: 0,
             // Ligavel por ambiente para o SPRT poder medir os dois lados sem
             // dois binarios. O de referencia usa 3687 milesimos aqui e chama-lhe
@@ -830,7 +876,7 @@ impl Default for SearchParams {
             // 16000-max table) is the correct starting point for this one
             // too -- not a guess, our own already-tuned constant for the
             // mathematically equivalent case.
-            lmr_capture_hist_divisor: 8846,
+            lmr_capture_hist_divisor: 219036,
             // 2026-08-03: tried lowering these to a reference's raw base
             // slope (26/85) and measured a real loss (-102 Elo, LOS 0.6%).
             // Reading the reference's own formula afterward explained why:
@@ -872,10 +918,17 @@ impl Default for SearchParams {
             cap_futility_improving: DepthMargin { base: 1, slope: 186 },
             cap_futility_not_improving: DepthMargin { base: 2, slope: 97 },
             delta_margin: 275,
-            cont_hist_ganho: 150,
+            cont_hist_ganho: 14049,
+            tempo_divisor: 55,
+            tempo_fase_abertura: 30,
+            tempo_fase_meio_cedo: 70,
+            tempo_fase_meio: 110,
+            tempo_fase_meio_tarde: 100,
+            tempo_fase_simplificado: 60,
+            tempo_hard_cap_pct: 25,
             qs_lmp_limit: 8,
             tt_extended_cutoff_margin: 162,
-            history_prune_mult: 2472,
+            history_prune_mult: 251374,
             // Same adoption rationale as above -- eval-adaptive NMP is a
             // strictly more informed mechanism than the old flat
             // depth>6?3:2 reduction, and there was no Kestrel-tuned
@@ -1019,6 +1072,14 @@ impl SearchParams {
             self.rfp_skip_ttpv,
             // No FIM, para nao deslocar os indices ja' usados por opcoes UCI.
             self.cont_hist_ganho,
+            // Gestao de tempo, tambem no fim pela mesma razao.
+            self.tempo_divisor,
+            self.tempo_fase_abertura,
+            self.tempo_fase_meio_cedo,
+            self.tempo_fase_meio,
+            self.tempo_fase_meio_tarde,
+            self.tempo_fase_simplificado,
+            self.tempo_hard_cap_pct,
         ]
     }
     pub fn from_vec(v: &[i32]) -> Self {
@@ -1105,6 +1166,13 @@ impl SearchParams {
             rfp_corr_divisor: v[57],
             rfp_skip_ttpv: v[58],
             cont_hist_ganho: v[59],
+            tempo_divisor: v[60],
+            tempo_fase_abertura: v[61],
+            tempo_fase_meio_cedo: v[62],
+            tempo_fase_meio: v[63],
+            tempo_fase_meio_tarde: v[64],
+            tempo_fase_simplificado: v[65],
+            tempo_hard_cap_pct: v[66],
         }
     }
 }
@@ -1117,7 +1185,7 @@ impl SearchParams {
 /// Generated from `to_vec`, never hand-written. A list that drifts out of
 /// order does not fail: it quietly sets the wrong parameter, and the sweep
 /// reports whatever that other parameter happens to do.
-pub const PARAM_NAMES: [&str; 60] = [
+pub const PARAM_NAMES: [&str; 67] = [
     "rfp_improving_base",
     "rfp_improving_slope",
     "rfp_not_improving_base",
@@ -1178,6 +1246,13 @@ pub const PARAM_NAMES: [&str; 60] = [
     "rfp_corr_divisor",
     "rfp_skip_ttpv",
     "cont_hist_ganho",
+    "tempo_divisor",
+    "tempo_fase_abertura",
+    "tempo_fase_meio_cedo",
+    "tempo_fase_meio",
+    "tempo_fase_meio_tarde",
+    "tempo_fase_simplificado",
+    "tempo_hard_cap_pct",
 ];
 
 /// Overrides applied on top of the defaults, set over UCI before the first
@@ -2428,7 +2503,7 @@ impl<'a> Searcher<'a> {
         // Sem isto, separar as tabelas -- que MELHORA a ordenacao, de 65,5%
         // para 68,6% de cortes no primeiro lance -- fazia a arvore crescer
         // 35%, porque metade do sinal que as comportas esperavam desapareceu.
-        ch * search_params().cont_hist_ganho / 100
+        ch * search_params().cont_hist_ganho / 10_000
     }
 
     #[inline]
@@ -3221,7 +3296,8 @@ impl<'a> Searcher<'a> {
             && beta.abs() < MATE_SCORE - MAX_PLY as i32
         {
             let sp = search_params();
-            let mut margin = sp.rfp_step * depth * depth / 2 - sp.rfp_step * depth / 2 + sp.rfp_base * depth;
+            let mut margin =
+                (sp.rfp_step * depth * depth / 2 - sp.rfp_step * depth / 2 + sp.rfp_base * depth) / 100;
 
             // The opponent has a piece of ours attacked by a cheaper piece.
             // Material is about to change hands and the static evaluation
@@ -3241,7 +3317,7 @@ impl<'a> Searcher<'a> {
             // The move that led here had a good history score.
             if let Some((pt, to)) = self.ply_last_move[ply] {
                 let prev_hist = self.cont_hist_score(pt, to, ply);
-                margin += prev_hist / sp.rfp_hist_divisor.max(1);
+                margin += prev_hist * 100 / sp.rfp_hist_divisor.max(1);
             }
 
             // Quanto menos fiavel for a eval estatica aqui, maior a barra para
@@ -3703,7 +3779,7 @@ impl<'a> Searcher<'a> {
                     None => 0,
                 };
                 let h = self.history_scores[board.side.idx()][mv.from as usize][mv.to as usize] + ch;
-                if h < -search_params().history_prune_mult * depth {
+                if h * 100 < -search_params().history_prune_mult * depth {
                     i += 1;
                     continue;
                 }
@@ -3903,7 +3979,8 @@ impl<'a> Searcher<'a> {
                     let cont_adj = match board.piece_at(mv.to) {
                         Some((pt, _)) => {
                             let ch = self.cont_hist_score(pt, mv.to, ply);
-                            (-(ch * LMR_ESCALA / search_params().lmr_hist_divisor.max(1)))
+                            (-(ch * LMR_ESCALA * 25
+                                / search_params().lmr_hist_divisor.max(1)))
                                 .clamp(-LMR_ESCALA, LMR_ESCALA)
                         }
                         None => 0,
@@ -4048,7 +4125,8 @@ impl<'a> Searcher<'a> {
                         Some((_, ch)) if capture_ok_for_lmr => (
                             0,
                             sp_lmr.lmr_capture_base
-                                - (ch * LMR_ESCALA / sp_lmr.lmr_capture_hist_divisor.max(1))
+                                - (ch * LMR_ESCALA * 25
+                                    / sp_lmr.lmr_capture_hist_divisor.max(1))
                                     .clamp(-LMR_ESCALA, LMR_ESCALA),
                         ),
                         _ => (hist_adj, 0),

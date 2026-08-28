@@ -827,6 +827,25 @@ pub fn evaluate(net: &RedeSf, atk: &Attacks, board: &mut Board) -> i32 {
     // The sparse form only wins where one instruction does multiply AND
     // accumulate (`vpdpbusd`), and no machine this engine runs on has it.
     //
+    // RETESTED 2026-08-28, and the retest failed too. The argument for going
+    // back was that this note counts MULTIPLIES while the engine is short of
+    // LOADS -- the input is 67% zeros (`KESTREL_SATURA=1`), so a sparse pass
+    // over input-major weights should read ~330 columns instead of 1024, 10.5
+    // KB against 32. Written properly -- weights transposed at load time, the
+    // non-zero indices extracted with `vpcmpeqb` + `movemask` rather than a
+    // scalar scan -- it measured **1.9% fewer loads and 11.4% MORE cycles**
+    // (18.70 vs 19.05 billion loads, 19.49 vs 17.50 billion cycles, mean of 8).
+    //
+    // The loads barely moved because fc0's weights are a small share of the
+    // engine's total traffic and the mask scan adds its own. The cycles moved
+    // because without VNNI each non-zero input costs a widen, a multiply and
+    // four widened adds, and three hundred of those beat 1024 fused
+    // multiply-accumulates.
+    //
+    // A first attempt that scanned the input scalar-wise (`if x[i] == 0 {
+    // continue }`) was 28% worse still, and read MORE than the dense form: it
+    // traded 1024 vector weight loads for 1024 scalar input loads.
+    //
     // CORRECTION (2026-08-26, later the same day). The "20% slower" first
     // written here came from a wall-clock run taken while four cores were busy
     // with a match, so the number was worthless -- and the verdict was written
@@ -846,6 +865,11 @@ pub fn evaluate(net: &RedeSf, atk: &Attacks, board: &mut Board) -> i32 {
     // and transpose the weights to input-major first (a column is L2 = 32
     // bytes, exactly one AVX2 register).
     let mut fc0_out = [0i32; L2];
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    unsafe {
+        fc0_grupo_avx2(&x[..L1], &stack.fc0w, &stack.fc0b, &mut fc0_out, L1);
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
     for o in 0..L2 {
         let row = &stack.fc0w[o * L1..(o + 1) * L1];
         fc0_out[o] = produto_u8_i8(&x[..L1], row) + stack.fc0b[o];
@@ -957,6 +981,69 @@ pub fn eval_factor() -> i32 {
 
 static REDE: OnceLock<Option<RedeSf>> = OnceLock::new();
 
+/// Caminho posto pela opcao UCI `EvalFile`.
+///
+/// Existe porque as outras duas vias -- variavel de ambiente e caminho cravado
+/// na compilacao -- servem o OpenBench e a linha de comandos, e nenhuma delas
+/// e' alcancavel a partir de uma interface grafica. Uma lista de rating instala
+/// o binario e a rede numa pasta e espera poder apontar-lhe o caminho por
+/// `setoption`; sem isto o motor arranca SEM rede e joga na mesma, que e' o
+/// pior dos desfechos -- ninguem ve' um erro, ve' so' um motor mau.
+static CAMINHO_UCI: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// `setoption name EvalFile value <caminho>`.
+///
+/// Devolve `false` se a rede ja' tiver sido carregada, porque a partir dai o
+/// caminho nao muda nada e um chamador que pense o contrario fica a jogar com
+/// outra rede sem saber. O UCI manda as opcoes antes da primeira busca, que e'
+/// exactamente quando isto funciona.
+pub fn define_evalfile(caminho: &str) -> bool {
+    if REDE.get().is_some() {
+        return false;
+    }
+    *CAMINHO_UCI.lock().unwrap() = Some(caminho.to_string());
+    true
+}
+
+/// Onde procurar a rede quando ninguem a indicou.
+///
+/// Ao lado do executavel primeiro, na pasta corrente depois. E' a convencao que
+/// as interfaces graficas assumem: instala-se o motor e a rede juntos e nao se
+/// configura nada. Sem isto, o caminho por omissao anunciado no `uci` era uma
+/// string vazia e o utilizador tinha de adivinhar.
+fn procura_ao_lado() -> Option<String> {
+    const NOMES: [&str; 2] = ["kestrel.nnue", "nn-kestrel.nnue"];
+    let mut pastas: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(d) = exe.parent() {
+            pastas.push(d.to_path_buf());
+        }
+    }
+    pastas.push(std::path::PathBuf::from("."));
+    for d in pastas {
+        for nome in NOMES {
+            let p = d.join(nome);
+            if p.is_file() {
+                return Some(p.to_string_lossy().into_owned());
+            }
+        }
+    }
+    None
+}
+
+/// O caminho que `rede()` vai usar, para o `uci` o anunciar como omissao.
+pub fn caminho_evalfile() -> String {
+    if let Some(p) = CAMINHO_UCI.lock().unwrap().clone() {
+        return p;
+    }
+    std::env::var("KESTREL_NNUE_SF")
+        .ok()
+        .or_else(|| option_env!("KESTREL_NNUE_SF_COMPILADO").map(str::to_string))
+        .filter(|p| !p.is_empty())
+        .or_else(procura_ao_lado)
+        .unwrap_or_else(|| "<nenhuma>".to_string())
+}
+
 pub fn rede() -> Option<&'static RedeSf> {
     REDE.get_or_init(|| {
         // Caminho por ambiente, com o que foi cravado na compilacao como
@@ -970,10 +1057,17 @@ pub fn rede() -> Option<&'static RedeSf> {
         //
         // Crava-se o CAMINHO e nao os 95 MB: o cliente guarda a rede em
         // `Networks/<sha>` e o caminho absoluto mantem-se valido nessa maquina.
-        let path = std::env::var("KESTREL_NNUE_SF")
-            .ok()
+        // A opcao UCI primeiro: e' a unica via que uma interface grafica tem,
+        // e quem a usa esta' a ser explicito. Descoberta ao lado do executavel
+        // em ultimo, para o caso em que ninguem configurou nada.
+        let path = CAMINHO_UCI
+            .lock()
+            .unwrap()
+            .clone()
+            .or_else(|| std::env::var("KESTREL_NNUE_SF").ok())
             .or_else(|| option_env!("KESTREL_NNUE_SF_COMPILADO").map(str::to_string))
-            .filter(|p| !p.is_empty())?;
+            .filter(|p| !p.is_empty())
+            .or_else(procura_ao_lado)?;
         let bytes = std::fs::read(&path).ok()?;
         carrega(&bytes)
     })
@@ -1738,6 +1832,162 @@ fn soma_linha_i8<const SOMAR: bool>(acc: &mut [i16; L1], row: &[i8; L1]) {
     }
 }
 
+/// Applies every changed feature in ONE pass over the accumulator, with the
+/// block held in registers.
+///
+/// WHY, with the number that motivated it: for the same bench and the SAME
+/// network, Stockfish issues 11.5 billion L1 loads and we issue 23.7. Our L1
+/// MISS RATE is the better of the two (10.4% against 16.1%) -- the data is in
+/// cache, we simply ask for it twice as often. The extra asks are here: one
+/// full 1024-element read-modify-write of the accumulator per changed feature,
+/// about ten per move, where one pass would do.
+///
+/// REGS = 8 of the 16 YMM registers, leaving the rest for the row loads and
+/// addressing. 8 registers x 16 lanes = 128 i16 per tile, 8 tiles for L1.
+/// Sixteen would hold a bigger slice but spills, which is what the compiler
+/// did when this was written as safe slices -- and that version measured 9.4%
+/// SLOWER, which is what sent me to look at the load counts in the first place.
+///
+/// Raw pointers and explicit intrinsics, not slices: the safe version paid a
+/// bounds check per tile PER FEATURE, four times more of them than the code it
+/// replaced, and left the vectorisation to the compiler.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[target_feature(enable = "avx2")]
+unsafe fn aplica_lote_avx2(net: &RedeSf, acc: *mut i16, feats: &[(u32, bool)]) {
+    use std::arch::x86_64::*;
+    const LANES: usize = 16;
+    const REGS: usize = 8;
+    const TILE: usize = LANES * REGS;
+
+    let mut base = 0usize;
+    while base < L1 {
+        let mut r = [_mm256_setzero_si256(); REGS];
+        for k in 0..REGS {
+            r[k] = _mm256_loadu_si256(acc.add(base + k * LANES) as *const __m256i);
+        }
+
+        // MEDIDO E REJEITADO (2026-08-28): icar o `if somar` e o `u <
+        // U_THREAT` para fora do ciclo dos registos, duplicando-o. O `perf
+        // annotate` mostrava `test %bpl,%bpl` a 3,1% e `cmp` a 3,0% no meio das
+        // operacoes vectoriais, o que parecia dinheiro no chao -- mas medido
+        // deu 0,5% menos leituras e 1,8% MAIS ciclos. O compilador ja' os
+        // resolvia por predicacao, e duplicar o ciclo so' aumentou o codigo.
+        for &(u, somar) in feats {
+            let u = u as usize;
+            if u < U_THREAT {
+                let row = net.ft_piece_w.as_ptr().add(u * L1 + base);
+                for k in 0..REGS {
+                    let w = _mm256_loadu_si256(row.add(k * LANES) as *const __m256i);
+                    r[k] = if somar { _mm256_add_epi16(r[k], w) } else { _mm256_sub_epi16(r[k], w) };
+                }
+            } else {
+                let (tab, f) = if u < U_PAIR {
+                    (net.ft_threat_w.as_ptr(), u - U_THREAT)
+                } else {
+                    (net.ft_pair_w.as_ptr(), u - U_PAIR)
+                };
+                let row = tab.add(f * L1 + base);
+                for k in 0..REGS {
+                    // 16 pesos i8 -> 16 i16, que e' o que o acumulador guarda.
+                    let b = _mm_loadu_si128(row.add(k * LANES) as *const __m128i);
+                    let w = _mm256_cvtepi8_epi16(b);
+                    r[k] = if somar { _mm256_add_epi16(r[k], w) } else { _mm256_sub_epi16(r[k], w) };
+                }
+            }
+        }
+
+        for k in 0..REGS {
+            _mm256_storeu_si256(acc.add(base + k * LANES) as *mut __m256i, r[k]);
+        }
+        base += TILE;
+    }
+}
+
+/// LIGADO por omissao. `KESTREL_LOTE=0` volta ao caminho linha-a-linha, que
+/// so' existe agora para comparacao -- medido a -5,3% de ciclos e -14,4% de
+/// leituras L1 contra ele, com contagem de nos identica.
+/// Instrumentacao temporaria: quantas features muda um lance, mesmo.
+///
+/// A conta de guardanapo dizia 8 -- peca que sai, peca que entra, captura --
+/// e o perfil dizia 3170 leituras por no' nesta funcao, cinco vezes mais do que
+/// 8 features x 64 leituras por linha dariam. Uma das duas estava errada, e sem
+/// medir nao se sabe qual. Ligar com KESTREL_CONTA_FEATS=1.
+pub static CONTA_CHAMADAS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static CONTA_FEATS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static CONTA_I8: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static HISTO: [std::sync::atomic::AtomicU64; 12] = [const { std::sync::atomic::AtomicU64::new(0) }; 12];
+
+fn conta_activa() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("KESTREL_CONTA_FEATS").as_deref() == Ok("1"))
+}
+
+pub fn relatorio_feats() -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let c = CONTA_CHAMADAS.load(Relaxed).max(1);
+    let f = CONTA_FEATS.load(Relaxed);
+    let i8n = CONTA_I8.load(Relaxed);
+    let mut s = format!(
+        "feats: {} chamadas, {} features, media {:.2}/chamada ({:.0}% i8)\n  histograma: ",
+        c, f, f as f64 / c as f64, i8n as f64 / f.max(1) as f64 * 100.0
+    );
+    for (i, h) in HISTO.iter().enumerate() {
+        let v = h.load(Relaxed);
+        if v > 0 {
+            let et = if i == 11 { ">=44".to_string() } else { format!("{}-{}", i * 4, i * 4 + 3) };
+            s += &format!("{}:{:.1}%  ", et, v as f64 / c as f64 * 100.0);
+        }
+    }
+    s
+}
+
+fn lote_activo() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("KESTREL_LOTE").as_deref() != Ok("0"))
+}
+
+#[inline]
+fn aplica_lote(net: &RedeSf, acc: &mut [i16], feats: &[(u32, bool)]) {
+    if feats.is_empty() {
+        return;
+    }
+    if conta_activa() {
+        use std::sync::atomic::Ordering::Relaxed;
+        CONTA_CHAMADAS.fetch_add(1, Relaxed);
+        CONTA_FEATS.fetch_add(feats.len() as u64, Relaxed);
+        CONTA_I8.fetch_add(feats.iter().filter(|(u, _)| *u as usize >= U_THREAT).count() as u64, Relaxed);
+        HISTO[(feats.len() / 4).min(11)].fetch_add(1, Relaxed);
+    }
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    unsafe {
+        aplica_lote_avx2(net, acc.as_mut_ptr(), feats);
+        return;
+    }
+    #[allow(unreachable_code)]
+    for &(u, somar) in feats {
+        aplica_linha(net, acc, u as usize, somar);
+    }
+}
+
+/// MEASURED AND REJECTED (2026-08-28): applying every changed feature in one
+/// pass over the accumulator, instead of one pass per feature.
+///
+/// The shape here is `for feature { for chunk }` -- a full 1024-element read
+/// and write of the accumulator per changed feature, ~10 of them per move.
+/// Inverting it to `for chunk { for feature }`, with a 256-element block held
+/// in registers across all features, cuts the load/add/store count from 480 to
+/// 352 per block. It measured **9.4% SLOWER** (426k -> 383k nps, idle machine,
+/// identical node count).
+///
+/// The arithmetic was right and the conclusion wrong, because the accumulator
+/// was never the cost: 2 KB of it live in L1. The cost is the weight rows --
+/// the threat table is 61 MB and every row is a trip to DRAM. Read one row at
+/// a time they are a single sequential stream the prefetcher follows; read
+/// interleaved across features they are ten streams of 512-byte pieces, and it
+/// stops following. Fewer instructions, worse locality, net loss.
+///
+/// Worth revisiting only if the weight tables ever fit in cache.
+
 /// Pede uma linha de pesos a' memoria antes de ela ser precisa.
 ///
 /// A tabela das ameacas tem 59808 linhas de 1024 pesos: 61 MB, que nao cabem
@@ -1763,6 +2013,16 @@ fn soma_linha_i8<const SOMAR: bool>(acc: &mut [i16; L1], row: &[i8; L1]) {
 /// resto sozinho assim que os primeiros 256 bytes chegam. Pedir os 1024 custa
 /// quatro vezes as instrucoes para o mesmo efeito -- medido, um quarto e' 1,8%
 /// MELHOR do que a linha inteira, e metade fica igual a` inteira.
+/// 2026-08-28: passou a pedir-se a LINHA INTEIRA, nao um quarto dela.
+///
+/// O quarto foi afinado quando cada linha era aplicada de uma assentada -- o
+/// pedido do inicio chegava para o prefetcher do hardware apanhar o resto. Com
+/// o lote (ver `aplica_lote_avx2`) a linha passou a ser lida em oito pedacos,
+/// intercalados com as das outras features: entre o primeiro pedaco e o
+/// segundo passam nove linhas de outras, o prefetcher perde o rasto, e o
+/// quarto inicial deixa de cobrir o que se segue.
+///
+/// Medido em dez pares alternados: -2,2% de ciclos na media e -7,5% no minimo.
 const PASSO: usize = 128;
 
 #[inline(always)]
@@ -1840,6 +2100,27 @@ fn feats_unificadas(
     }
     out[ini..].sort_unstable();
 }
+
+/// MEASURED AND REJECTED (2026-08-28): aligning the accumulator to a cache
+/// line.
+///
+/// `acc: [Vec<i16>; 2]` promises two-byte alignment and the allocator gives
+/// four, so every 256-bit load into it is unaligned and some straddle a
+/// 64-byte line. Wrapping it in `#[repr(align(64))] struct(...)` boxed, with
+/// `Deref` to `[i16]` so the call sites do not change, fixes that -- and
+/// measured **1 to 4% MORE cycles**, three pairs, never better (19.81 vs 19.63
+/// and 19.95 vs 19.25 billion). Instruction count rose 0.7% and IPC fell from
+/// 2.000 to 1.914.
+///
+/// The reason to expect a gain was real; the reason it did not appear is that
+/// modern cores split an unaligned load into the two lines for free when both
+/// are already resident, and ours are: the accumulator is 2 KB and lives in L1
+/// throughout. What the wrapper added instead was a layer of `Deref` the
+/// optimiser did not see through as cleanly.
+///
+/// Measured in CYCLES, not wall clock: the machine was serving the training
+/// feed, and three wall-clock runs of each gave 409k against 412k nps with 5%
+/// spread -- indistinguishable, and it would have been read as a small win.
 
 struct EstadoAcc {
     valido: bool,
@@ -2122,6 +2403,11 @@ fn delta_por_lance(
     net: &RedeSf, agora: &crate::sf_features::PosBB, pov: usize, st: &mut EstadoAcc,
     ev: &[(usize, usize, usize, bool)], saltar_pecas: bool,
 ) -> bool {
+    // Tudo o que este lance muda -- ameacas, pares e pecas -- junto, para UMA
+    // passagem pelo acumulador no fim. Ver `aplica_lote_avx2`.
+    let em_lote = lote_activo();
+    let mut lote: Vec<(u32, bool)> = Vec::with_capacity(32);
+
     let agora = *agora;
     let mut antes = agora;
     // desfazer os eventos para reconstruir o tabuleiro anterior
@@ -2168,7 +2454,7 @@ fn delta_por_lance(
     if !saltar_pecas && ksq_pov < 64 {
         for &(sq, t, c, _) in ev {
             let u = crate::sf_features::indice_peca(ksq_pov, pov, sq, t, c);
-            adianta(&net.ft_piece_w, u * L1, L1 / 4);
+            adianta(&net.ft_piece_w, u * L1, L1);
             adianta(&net.ft_piece_psqt, u * NB, NB);
         }
     }
@@ -2253,7 +2539,7 @@ fn delta_por_lance(
             let idx = crate::sf_features::indice_relacao(r, pov, hm);
             if idx < THREAT_DIM {
                 if st.conta[idx] == 0 {
-                    adianta(&net.ft_threat_w, idx * L1, L1 / 4);
+                    adianta(&net.ft_threat_w, idx * L1, L1);
                     adianta(&net.ft_threat_psqt, idx * NB, NB);
                     tocadas.push(idx as u32);
                 }
@@ -2279,7 +2565,8 @@ fn delta_por_lance(
         st.conta[idx] = 0;
         if soma != 0 {
             let somar = soma > 0;
-            aplica_linha(net, &mut st.acc[pov], U_THREAT + idx, somar);
+            if em_lote { lote.push(((U_THREAT + idx) as u32, somar)); }
+            else { aplica_linha(net, &mut st.acc[pov], U_THREAT + idx, somar); }
             let sinal = if somar { 1i32 } else { -1 };
             for b in 0..NB {
                 st.psqt[pov][b] += sinal * net.ft_threat_psqt[idx * NB + b];
@@ -2305,7 +2592,8 @@ fn delta_por_lance(
         for (lista, somar) in [(&sai, false), (&entra, true)] {
             for &f in lista.iter() {
                 let u = U_PAIR + (f - PAIR_BASE);
-                aplica_linha(net, &mut st.acc[pov], u, somar);
+                if em_lote { lote.push((u as u32, somar)); }
+                else { aplica_linha(net, &mut st.acc[pov], u, somar); }
                 let sinal = if somar { 1i32 } else { -1 };
                 for b in 0..NB {
                     st.psqt[pov][b] += sinal * net.ft_pair_psqt[(f - PAIR_BASE) * NB + b];
@@ -2322,17 +2610,20 @@ fn delta_por_lance(
     // (casa de rei nova contra antiga), por isso aplicar aqui os deltas de peca
     // sobre a casa nova somaria o mesmo trabalho duas vezes.
     if saltar_pecas {
+        if em_lote { aplica_lote(net, &mut st.acc[pov], &lote); }
         return true;
     }
     let ksq = agora.king_sq(pov);
     for &(sq, t, c, add) in ev {
         let u = crate::sf_features::indice_peca(ksq, pov, sq, t, c);
-        aplica_linha(net, &mut st.acc[pov], u, add);
+        if em_lote { lote.push((u as u32, add)); }
+        else { aplica_linha(net, &mut st.acc[pov], u, add); }
         let sinal = if add { 1i32 } else { -1 };
         for b in 0..NB {
             st.psqt[pov][b] += sinal * net.ft_piece_psqt[u * NB + b];
         }
     }
+    if em_lote { aplica_lote(net, &mut st.acc[pov], &lote); }
     true
 }
 
@@ -2411,6 +2702,54 @@ fn produto_u8_i8(x: &[u8], w: &[i8]) -> i32 {
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[target_feature(enable = "avx2")]
+/// fc0 for a group of outputs at once, with the input tile held in registers.
+///
+/// WHY: the loop this replaces walked the whole 1024-byte input once PER
+/// OUTPUT -- 32 outputs, so the input was read 32 times, 32 KB of loads where
+/// 1 KB would do. `evaluate` accounts for 19.4% of the engine's L1 loads and
+/// this is most of it.
+///
+/// GRUPO = 8 outputs: eight i32 accumulators plus the input tile plus the
+/// weight vector fit the 16 YMM registers. Sixteen would halve the input reads
+/// again and spill, which is the mistake the first attempt at the accumulator
+/// made.
+///
+/// Same total arithmetic, a quarter of the input traffic: the input is read
+/// L2/GRUPO = 4 times instead of 32.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[target_feature(enable = "avx2")]
+unsafe fn fc0_grupo_avx2(x: &[u8], w: &[i8], bias: &[i32], out: &mut [i32], l1: usize) {
+    use std::arch::x86_64::*;
+    const GRUPO: usize = 8;
+    let uns = _mm256_set1_epi16(1);
+    let n = l1 / 32;
+
+    let mut o = 0usize;
+    while o < out.len() {
+        let g = GRUPO.min(out.len() - o);
+        let mut soma = [_mm256_setzero_si256(); GRUPO];
+        for i in 0..n {
+            // A entrada e' lida UMA vez por bloco e usada pelas `g` saidas.
+            let a = _mm256_loadu_si256(x.as_ptr().add(i * 32) as *const __m256i);
+            for j in 0..g {
+                let b = _mm256_loadu_si256(
+                    w.as_ptr().add((o + j) * l1 + i * 32) as *const __m256i);
+                let p = _mm256_maddubs_epi16(a, b);
+                soma[j] = _mm256_add_epi32(soma[j], _mm256_madd_epi16(p, uns));
+            }
+        }
+        for j in 0..g {
+            let lo = _mm256_castsi256_si128(soma[j]);
+            let hi = _mm256_extracti128_si256(soma[j], 1);
+            let mut r = _mm_add_epi32(lo, hi);
+            r = _mm_add_epi32(r, _mm_shuffle_epi32(r, 0b01_00_11_10));
+            r = _mm_add_epi32(r, _mm_shuffle_epi32(r, 0b00_01_00_01));
+            out[o + j] = _mm_cvtsi128_si32(r) + bias[o + j];
+        }
+        o += g;
+    }
+}
+
 unsafe fn produto_u8_i8_avx2(x: &[u8], w: &[i8]) -> i32 {
     use std::arch::x86_64::*;
     let uns = _mm256_set1_epi16(1);
@@ -2743,6 +3082,12 @@ fn acc_incremental(
         // Sorted merge: what is in `novas` and not in `feats` gets added,
         // what is in `feats` and not in `novas` gets subtracted. Duplicates
         // are handled by advancing both sides together.
+        // MEDIDO E REJEITADO (2026-08-28): juntar esta diferenca num lote e
+        // aplica-la de uma vez, como se faz no caminho do lance. Aqui o N e' o
+        // mais alto do motor, e mesmo assim deu 0,3% menos leituras e 1,9%
+        // MAIS ciclos -- este caminho corre 45 414 vezes em 2,9 milhoes de
+        // chamadas de delta (1,5%), e a alocacao do lote custa mais do que
+        // poupa. O ganho do lote esta' no caminho comum, nao neste.
         let velhas = &st.feats[pov];
         let (mut i, mut j) = (0usize, 0usize);
         let mut mudou = 0usize;

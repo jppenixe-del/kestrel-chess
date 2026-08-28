@@ -1681,6 +1681,17 @@ fn bench(depth: i32) {
     let tt = tt::TranspositionTable::new(std::env::var("KESTREL_BENCH_HASH").ok().and_then(|v| v.parse().ok()).unwrap_or(16));
     evaluation::warmup();
     search::warmup();
+    // Carregar a rede ANTES de arrancar o cronometro.
+    //
+    // Ela carrega preguicosamente, na primeira avaliacao -- que acontece dentro
+    // do ciclo. Media: 1.02 G ciclos de 16.39, ou seja **6.2% do bench eram
+    // descodificar 95 MB de LEB**, contados como se fossem busca. Todos os
+    // numeros de nps deste motor sairam 6% abaixo do que a busca faz mesmo, e a
+    // comparacao com outro motor saia pior ainda: o bench do Stockfish gasta 29%
+    // do tempo a carregar a mesma rede do disco, portanto os dois numeros
+    // estavam contaminados em proporcoes diferentes e o racio entre eles nao
+    // media coisa nenhuma.
+    let _ = crate::nnue_sf::rede();
     let start = std::time::Instant::now();
     let mut total: u64 = 0;
     let (mut c_rfp, mut c_razor, mut c_fut, mut c_nmp, mut c_q) = (0u64, 0u64, 0u64, 0u64, 0u64);
@@ -1790,6 +1801,9 @@ fn bench(depth: i32) {
     }
     let ms = start.elapsed().as_millis().max(1) as u64;
     println!("{} nodes {} nps", total, total * 1000 / ms);
+    if std::env::var("KESTREL_CONTA_FEATS").as_deref() == Ok("1") {
+        println!("{}", crate::nnue_sf::relatorio_feats());
+    }
     if std::env::var_os("KESTREL_CORTES").is_some() {
         let p = |n: u64| 100.0 * n as f64 / total as f64;
         eprintln!(

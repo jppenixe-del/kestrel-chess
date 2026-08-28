@@ -297,21 +297,24 @@ fn compute_time_budget(
     // it played the last twenty moves at roughly zero. A constant fraction
     // decays with the clock instead of accelerating against it, and it does
     // not need to know how long the game will be -- which is not knowable.
-    let moves_left = movestogo.unwrap_or(TIME_SLICE_DIVISOR);
+    let sp_t = crate::search::search_params();
+    // `.max(1)`: a banda anunciada ao afinador chega a zero, e zero aqui e'
+    // divisao por zero -- um panico que so' aparecia a meio de um jogo.
+    let moves_left = movestogo.unwrap_or(sp_t.tempo_divisor as i64).max(1);
     let mut base = safe_time / moves_left + my_inc * 3 / 4;
 
     // Fase do jogo. A fatia constante do relogio e' geometricamente pesada no
     // inicio, que e' precisamente onde pensar rende menos. Ver as constantes.
     let fase = if game_ply < 12 {
-        FASE_ABERTURA_PCT
+        sp_t.tempo_fase_abertura as i64
     } else if game_ply < 24 {
-        FASE_MEIO_CEDO_PCT
+        sp_t.tempo_fase_meio_cedo as i64
     } else if game_ply < 45 {
-        FASE_MEIO_PCT
+        sp_t.tempo_fase_meio as i64
     } else if game_ply < 65 {
-        FASE_MEIO_TARDE_PCT
+        sp_t.tempo_fase_meio_tarde as i64
     } else if pieces_left <= 10 {
-        FASE_SIMPLIFICADO_PCT
+        sp_t.tempo_fase_simplificado as i64
     } else {
         100
     };
@@ -406,7 +409,7 @@ fn compute_time_budget(
     // 1+1 num convite a gastar o relogio todo num lance.
     let fatia = (safe_time / moves_left).max(1);
     let folga_inc = (100 + (my_inc * 100 / fatia)).clamp(100, 200);
-    let mut hard_cap = (safe_time * HARD_CAP_PERCENT / 100)
+    let mut hard_cap = (safe_time * sp_t.tempo_hard_cap_pct as i64 / 100)
         .min((safe_time / horizon) * emergency_mult / 10)
         .min(soft * HARD_CAP_BUDGET_MULT / 10)
         .max(soft);
@@ -1983,6 +1986,7 @@ impl Engine {
                     let _ = writeln!(out, "option name Hash type spin default 64 min 1 max 4096");
                     let _ = writeln!(out, "option name Threads type spin default 1 min 1 max 64");
                     let _ = writeln!(out, "option name Move Overhead type spin default {} min 0 max 5000", MOVE_OVERHEAD_DEFAULT_MS);
+                    #[cfg(feature = "bot")]
                     let _ = writeln!(out, "option name OnlineTablebase type check default false");
                     let _ = writeln!(out, "option name Contempt type spin default 20 min -200 max 200");
                     // Escala da rede, em centesimos. Uma rede que avalia material
@@ -2002,6 +2006,14 @@ impl Engine {
                     let _ = writeln!(
                         out,
                         "option name LmrCaptures type check default false"
+                    );
+                    // A rede, pelo nome que toda a gente usa. Sem isto so' se
+                    // carrega por variavel de ambiente, que nenhuma interface
+                    // grafica sabe pôr.
+                    let _ = writeln!(
+                        out,
+                        "option name EvalFile type string default {}",
+                        crate::nnue_sf::caminho_evalfile()
                     );
                     let _ = writeln!(
                         out,
@@ -2057,6 +2069,17 @@ impl Engine {
                             // dava-lhe 0..10 -- uma faixa onde nada do que o
                             // afinador puser muda seja o que for.
                             "rfp_return_beta" => 1024,
+                            // Tempo: a banda proporcional daria 0..110 ao
+                            // divisor, e um divisor perto de zero gasta o
+                            // relogio inteiro num lance -- perde-se por tempo
+                            // antes de o afinador aprender que foi mau.
+                            "tempo_divisor" => 35,
+                            "tempo_fase_abertura" => 25,
+                            "tempo_fase_meio_cedo" => 40,
+                            "tempo_fase_meio" => 50,
+                            "tempo_fase_meio_tarde" => 50,
+                            "tempo_fase_simplificado" => 40,
+                            "tempo_hard_cap_pct" => 15,
                             _ => (d.abs()).max(10),
                         };
                         // A default below zero exists (`hist_malus_offset`),
@@ -2137,6 +2160,22 @@ impl Engine {
                         && tokens[3] == "value" {
                         let on = tokens[4].eq_ignore_ascii_case("true") || tokens[4] == "1";
                         crate::search::set_lmr_captures(on);
+                    } else if tokens.len() >= 5 && tokens[1] == "name" && tokens[2] == "EvalFile"
+                        && tokens[3] == "value" {
+                        // Junta-se tudo o que vem depois de `value`: um caminho
+                        // com espacos e' vulgar em Windows ("Program Files") e
+                        // ler so' `tokens[4]` truncava-o silenciosamente -- a
+                        // rede nao carregava e o motor jogava sem ela.
+                        let caminho = tokens[4..].join(" ");
+                        if crate::nnue_sf::define_evalfile(&caminho) {
+                            let _ = writeln!(out, "info string EvalFile = {}", caminho);
+                        } else {
+                            let _ = writeln!(
+                                out,
+                                "info string EvalFile ignorado: a rede ja' esta' carregada"
+                            );
+                        }
+                        let _ = out.flush();
                     } else if tokens.len() >= 5 && tokens[1] == "name" && tokens[2] == "OnlineTablebase"
                         && tokens[3] == "value" {
                         let on = tokens[4].eq_ignore_ascii_case("true") || tokens[4] == "1";

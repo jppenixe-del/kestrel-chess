@@ -15,6 +15,10 @@ license = "GPL-3.0-or-later"
 default = ["fitted"]
 fitted = []
 
+# Acesso a rede: tablebase online e conselheiro. Fora do build por omissao --
+# ver a nota no topo de `src/tablebase.rs`.
+bot = []
+
 # The king-safety zone widened to the rank in front of the king's neighbours.
 # Needs its weights refitted with it to mean anything -- it changes what the
 # feature extractor sees. See the note at king_zone in eval.rs.
