@@ -2063,7 +2063,22 @@ impl Engine {
                             "lmr_move_linear" => 120,
                             "lmr_cutnode" => 3072,
                             "lmr_capture_base" => 3072,
-                            "lmr_capture_hist_divisor" => 15000,
+                            // Os sete que a tune 6 afinou entraram em ponto
+                            // fixo (x100, ou x25 nos dois divisores do LMR), e a
+                            // banda tem de acompanhar. Sem isto,
+                            // `lmr_capture_hist_divisor` anunciava 204036..234036
+                            // -- os mesmos 15000 de quando o valor era 8846, que
+                            // sobre 219036 e' uma banda de 7% e deixava o
+                            // parametro intocavel. Os limites aqui sao os da
+                            // tune 6 multiplicados pela mesma escala, para o
+                            // afinador poder repetir o percurso que ela fez.
+                            "lmr_capture_hist_divisor" => 300_000,
+                            "lmr_hist_divisor" => 900_000,
+                            "rfp_base" => 8_300,
+                            "rfp_step" => 1_100,
+                            "rfp_hist_divisor" => 15_000,
+                            "cont_hist_ganho" => 16_000,
+                            "history_prune_mult" => 200_000,
                             // Mesma armadilha: `rfp_return_beta` e' uma fraccao
                             // em 1024-avos com default 0, e a banda proporcional
                             // dava-lhe 0..10 -- uma faixa onde nada do que o
