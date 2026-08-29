@@ -801,15 +801,15 @@ impl Default for SearchParams {
             //   x100: rfp_base rfp_step rfp_hist_divisor cont_hist_ganho
             //         history_prune_mult
             //   x25:  lmr_hist_divisor lmr_capture_hist_divisor
-            rfp_base: 6779,
-            rfp_step: 334,
+            rfp_base: 5480,
+            rfp_step: 261,
             // Reasoned from this engine's own history scale (see the note
             // at the RFP block), not copied. Starting points, not tuned
             // values -- exposed by name so they can be swept without a
             // rebuild.
             rfp_opp_easy_capture: 15,
             rfp_opp_worsening: 12,
-            rfp_hist_divisor: 15292,
+            rfp_hist_divisor: 15925,
             hist_beta_margin: 46,
             hist_pruning_max_depth: 4,
             triple_ext_margin: 155,
@@ -822,7 +822,7 @@ impl Default for SearchParams {
             hist_malus_linear: 277,
             hist_malus_offset: -44,
             hist_malus_max: 992,
-            lmr_hist_divisor: 900574,
+            lmr_hist_divisor: 905458,
             lmr_move_linear: 0,
             // Ligavel por ambiente para o SPRT poder medir os dois lados sem
             // dois binarios. O de referencia usa 3687 milesimos aqui e chama-lhe
@@ -876,7 +876,7 @@ impl Default for SearchParams {
             // 16000-max table) is the correct starting point for this one
             // too -- not a guess, our own already-tuned constant for the
             // mathematically equivalent case.
-            lmr_capture_hist_divisor: 219036,
+            lmr_capture_hist_divisor: 216367,
             // 2026-08-03: tried lowering these to a reference's raw base
             // slope (26/85) and measured a real loss (-102 Elo, LOS 0.6%).
             // Reading the reference's own formula afterward explained why:
@@ -918,17 +918,17 @@ impl Default for SearchParams {
             cap_futility_improving: DepthMargin { base: 1, slope: 186 },
             cap_futility_not_improving: DepthMargin { base: 2, slope: 97 },
             delta_margin: 275,
-            cont_hist_ganho: 14049,
-            tempo_divisor: 55,
-            tempo_fase_abertura: 30,
-            tempo_fase_meio_cedo: 70,
-            tempo_fase_meio: 110,
-            tempo_fase_meio_tarde: 100,
-            tempo_fase_simplificado: 60,
-            tempo_hard_cap_pct: 25,
+            cont_hist_ganho: 13769,
+            tempo_divisor: 5376,
+            tempo_fase_abertura: 3102,
+            tempo_fase_meio_cedo: 7052,
+            tempo_fase_meio: 11181,
+            tempo_fase_meio_tarde: 10119,
+            tempo_fase_simplificado: 6000,
+            tempo_hard_cap_pct: 2511,
             qs_lmp_limit: 8,
             tt_extended_cutoff_margin: 162,
-            history_prune_mult: 251374,
+            history_prune_mult: 256152,
             // Same adoption rationale as above -- eval-adaptive NMP is a
             // strictly more informed mechanism than the old flat
             // depth>6?3:2 reduction, and there was no Kestrel-tuned
