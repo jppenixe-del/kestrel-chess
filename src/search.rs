@@ -919,7 +919,7 @@ impl Default for SearchParams {
             cap_futility_not_improving: DepthMargin { base: 2, slope: 97 },
             delta_margin: 275,
             cont_hist_ganho: 14049,
-            tempo_divisor: 55,
+            tempo_divisor: 46,
             tempo_fase_abertura: 30,
             tempo_fase_meio_cedo: 70,
             tempo_fase_meio: 110,

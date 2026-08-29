@@ -510,7 +510,17 @@ fn main() {
                             if peca == 0 && (sq < 8 || sq >= 56) { continue; }
                             let idx = crate::sf_features::indice_peca(ksq, pov, sq, peca, cor);
                             if idx >= FEAT { continue; }
-                            let sinal = if cor == pov { 1.0 } else { -1.0 };
+                            // SINAL: `KESTREL_PSQT_SINAL=-1` inverte.
+                            //
+                            // A convencao obvia -- as nossas pecas positivas --
+                            // produziu uma rede que avalia AO CONTRARIO: brancas
+                            // a menos uma dama a +1385. O motor faz
+                            // `(psqt_s - psqt_n) / 2` e o treinador o mesmo, por
+                            // isso a formula nao explica a inversao; so' medindo
+                            // se sabe qual das duas e' a certa.
+                            let inv: f32 = std::env::var("KESTREL_PSQT_SINAL")
+                                .ok().and_then(|v| v.parse().ok()).unwrap_or(1.0);
+                            let sinal = inv * if cor == pov { 1.0 } else { -1.0 };
                             let v = sinal * CP[peca] / NNUE2SCORE;
                             for b in 0..NB {
                                 w[b * NIN + FACT + idx] = v;
