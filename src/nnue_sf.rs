@@ -979,6 +979,48 @@ pub fn eval_factor() -> i32 {
     d
 }
 
+/// Pedir paginas de 2 MB para as tabelas de pesos.
+///
+/// A tabela de ameacas tem THREAT_DIM * L1 = 61 MB e le'-se por linhas
+/// dispersas: uma linha de pesos por feature que muda, ~7.5 por lance. Em
+/// paginas de 4 KB sao quinze mil paginas contra um TLB de umas duas mil
+/// entradas, e medido isso da' **26.0 milhoes de faltas de dTLB** num bench,
+/// contra 10.9 milhoes com paginas enormes -- e 28.83 G ciclos contra 24.73 G,
+/// ou seja **14.2% do tempo de busca gasto a percorrer tabelas de paginas**.
+///
+/// Sao precisas as duas chamadas. `MADV_HUGEPAGE` marca a regiao mas so' actua
+/// em faltas futuras ou quando o `khugepaged` passar, e aqui a memoria ja' esta'
+/// escrita -- foi para la' que se leu o ficheiro. `MADV_COLLAPSE` (Linux 6.1+)
+/// junta as paginas ja' existentes na altura, que e' o que este caso precisa.
+///
+/// Falhar nao e' erro: em kernel antigo, sem THP, ou sem memoria contigua, o
+/// motor corre na mesma -- mais devagar, que e' onde estava antes.
+#[cfg(target_os = "linux")]
+fn pede_paginas_enormes<T>(v: &[T]) {
+    const MADV_HUGEPAGE: i32 = 14;
+    const MADV_COLLAPSE: i32 = 25;
+    const PAGINA: usize = 4096;
+    extern "C" {
+        fn madvise(addr: *mut core::ffi::c_void, len: usize, advice: i32) -> i32;
+    }
+    let ini = v.as_ptr() as usize;
+    let fim = ini + core::mem::size_of_val(v);
+    // `madvise` exige o inicio alinhado a' pagina. Encolhe-se para DENTRO da
+    // fatia nas duas pontas: crescer para fora tocaria memoria de outrem.
+    let a = (ini + PAGINA - 1) & !(PAGINA - 1);
+    let b = fim & !(PAGINA - 1);
+    if b <= a {
+        return;
+    }
+    unsafe {
+        madvise(a as *mut core::ffi::c_void, b - a, MADV_HUGEPAGE);
+        madvise(a as *mut core::ffi::c_void, b - a, MADV_COLLAPSE);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pede_paginas_enormes<T>(_v: &[T]) {}
+
 static REDE: OnceLock<Option<RedeSf>> = OnceLock::new();
 
 /// Caminho posto pela opcao UCI `EvalFile`.
@@ -1069,7 +1111,16 @@ pub fn rede() -> Option<&'static RedeSf> {
             .filter(|p| !p.is_empty())
             .or_else(procura_ao_lado)?;
         let bytes = std::fs::read(&path).ok()?;
-        carrega(&bytes)
+        let net = carrega(&bytes)?;
+        // So' as tabelas que se leem por linhas dispersas durante a busca. As
+        // pequenas nao valem a chamada: cabem em cache e a fatia nem chega a uma
+        // pagina enorme.
+        pede_paginas_enormes(&net.ft_threat_w);
+        pede_paginas_enormes(&net.ft_piece_w);
+        pede_paginas_enormes(&net.ft_pair_w);
+        pede_paginas_enormes(&net.ft_threat_psqt);
+        pede_paginas_enormes(&net.ft_piece_psqt);
+        Some(net)
     })
     .as_ref()
 }
@@ -1941,6 +1992,23 @@ pub fn relatorio_feats() -> String {
     s
 }
 
+/// Medicao: quanto custa o bloco de ameacas, em nps.
+///
+/// A nossa rede e' SFNNv16 -- `HalfKAv2_hm` + `Full_Threats` + `PP_3Wide`,
+/// 86896 entradas. Um motor com uma rede da linha v13 tem so' `HalfKAv2_hm`,
+/// 22528, e por isso muda ~2.2 features por lance onde nos mudamos 9.76, das
+/// quais 77% sao ameacas e pares. Mesma largura de acumulador, mesmo custo por
+/// linha -- ele carrega um quarto das linhas.
+///
+/// Com KESTREL_SEM_AMEACAS=1 os dois blocos deixam de ser calculados e
+/// aplicados. A AVALIACAO FICA ERRADA e a assinatura do bench muda: isto nao e'
+/// uma opcao de jogo, e' uma regua. Serve para saber se vale a pena treinar uma
+/// rede sem esses blocos antes de gastar dias a treina-la.
+fn sem_ameacas() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("KESTREL_SEM_AMEACAS").as_deref() == Ok("1"))
+}
+
 fn lote_activo() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("KESTREL_LOTE").as_deref() != Ok("0"))
@@ -2468,7 +2536,7 @@ fn delta_por_lance(
     // chamada de `acc_incremental` chega aqui com o mesmo `antes`/`agora` --
     // `st.bb` so' avanca depois das duas -- e antes refazia todo este passeio
     // para obter a mesma lista.
-    if st.rels_chave != Some((antes.pieces, agora.pieces)) {
+    if !sem_ameacas() && st.rels_chave != Some((antes.pieces, agora.pieces)) {
     st.rels.clear();
     let mut corrente = antes;
     for capturada in [true, false] {
@@ -2533,7 +2601,7 @@ fn delta_por_lance(
         REL_ENUM.fetch_add(rels.len() as u64, std::sync::atomic::Ordering::Relaxed);
         REL_CHAM.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
-    if ksq_pov < 64 {
+    if ksq_pov < 64 && !sem_ameacas() {
         let hm = crate::sf_features::hm_de_rei(ksq_pov);
         for r in rels.iter() {
             let idx = crate::sf_features::indice_relacao(r, pov, hm);
@@ -2582,7 +2650,7 @@ fn delta_por_lance(
     // so every pawn move left the accumulator holding the previous position's
     // pairs. Cheap to redo properly -- the feature only reads the two pawn
     // bitboards, so it is skipped entirely unless a pawn actually moved.
-    let mexeu_peao = ev.iter().any(|&(_, t, _, _)| t == 0);
+    let mexeu_peao = !sem_ameacas() && ev.iter().any(|&(_, t, _, _)| t == 0);
     if mexeu_peao {
         let mut sai = std::mem::take(&mut st.par_sai);
         let mut entra = std::mem::take(&mut st.par_entra);
