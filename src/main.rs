@@ -470,6 +470,74 @@ fn main() {
         bullet_data(&args[2], &args[3], d, t);
         return;
     }
+    // psqtbase <saida.bin> -- a semente do PSQT para o treino do SFNNv16.
+    //
+    // O treinador de referencia nao manda a rede descobrir quanto vale uma dama:
+    // escreve os valores no PSQT a' partida (`halfka_psqts`) e o treino so' os
+    // AFINA. O bullet inicializa `psqtw` a zeros de proposito e espera este
+    // ficheiro em `SF_PSQT_BASE`.
+    //
+    // Gerado AQUI, com `sf_features::indice_peca`, e nao por um script a' parte:
+    // a semente que existia (`E:/psqt_base.bin`, 19 Ago) tinha os valores certos
+    // mas noutra ordem de indices, e como o ficheiro carrega sem erro ninguem
+    // dava por isso. Medido na rede treinada a 28 Ago: PSQT indiferenciado entre
+    // peao e dama, |media| 0.0012 -- e o motor avaliava BRANCAS A MENOS UMA DAMA
+    // em +49. Enquanto o gerador viver ao lado da funcao de indexacao, as duas
+    // nao podem divergir sem que o compilador se queixe.
+    //
+    // Escala: o PSQT entra como `(psqt(stm) - psqt(ntm)) * 0.5`, e a mesma dama
+    // e' +v de um lado e -v do outro, logo a diferenca e' 2v e o 0.5 cancela-a.
+    // O valor guardado e' portanto `cp / nnue2score` directo, sem correccao.
+    if args.len() >= 3 && args[1] == "psqtbase" {
+        const FACT: usize = 704;
+        const FEAT: usize = 86896;
+        const DUST: usize = 1;
+        const NIN: usize = FACT + FEAT + DUST;
+        const NB: usize = 8;
+        const NNUE2SCORE: f32 = 600.0;
+        // `halfka_psqts` do nnue-pytorch, em centipeoes. O rei nao entra: esta'
+        // sempre presente dos dois lados e o valor anular-se-ia.
+        const CP: [f32; 6] = [126.0, 781.0, 825.0, 1276.0, 2538.0, 0.0];
+
+        let mut w = vec![0f32; NB * NIN];
+        let mut escritos = 0usize;
+        for ksq in 0..64usize {
+            for pov in 0..2usize {
+                for sq in 0..64usize {
+                    for peca in 0..6usize {
+                        for cor in 0..2usize {
+                            // peoes nao vivem nas filas 1 e 8
+                            if peca == 0 && (sq < 8 || sq >= 56) { continue; }
+                            let idx = crate::sf_features::indice_peca(ksq, pov, sq, peca, cor);
+                            if idx >= FEAT { continue; }
+                            let sinal = if cor == pov { 1.0 } else { -1.0 };
+                            let v = sinal * CP[peca] / NNUE2SCORE;
+                            for b in 0..NB {
+                                w[b * NIN + FACT + idx] = v;
+                            }
+                            escritos += 1;
+                        }
+                    }
+                }
+            }
+        }
+        let mut saida: Vec<u8> = Vec::with_capacity(14 + w.len() * 4);
+        saida.extend_from_slice(b"psqtw\n");
+        saida.extend_from_slice(&(w.len() as u64).to_le_bytes());
+        for v in &w { saida.extend_from_slice(&v.to_le_bytes()); }
+        match std::fs::write(&args[2], &saida) {
+            Ok(()) => {
+                let nz = w.iter().filter(|x| **x != 0.0).count();
+                println!("escrito: {} ({} bytes)", args[2], saida.len());
+                println!("  {escritos} escritas, {nz} pesos nao-zero de {}", w.len());
+                println!("  dama {:+.4}  torre {:+.4}  peao {:+.4}",
+                         CP[4] / NNUE2SCORE, CP[3] / NNUE2SCORE, CP[0] / NNUE2SCORE);
+            }
+            Err(e) => eprintln!("nao consegui escrever {}: {e}", args[2]),
+        }
+        return;
+    }
+
     if args.len() >= 5 && args[1] == "sfconvert" {
         // sfconvert <raw.bin do bullet> <molde.nnue> <saida.nnue>
         //
