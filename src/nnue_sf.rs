@@ -1021,6 +1021,35 @@ fn pede_paginas_enormes<T>(v: &[T]) {
 #[cfg(not(target_os = "linux"))]
 fn pede_paginas_enormes<T>(_v: &[T]) {}
 
+// REORDENAR AS LINHAS DE AMEACA POR FREQUENCIA -- medido e REJEITADO.
+//
+// A tabela tem THREAT_DIM * L1 = 61 MB e le'-se por linhas dispersas, ~7.5 por
+// lance. O histograma (`KESTREL_HISTO_AMEACAS=1`) diz que a distribuicao e'
+// muito enviesada: das 59808 features, 36963 chegam a ser usadas, e
+//
+//     as 64 mais usadas cobrem 15.1% dos acessos   (64 KB)
+//     as 256                    30.6%              (256 KB)
+//     as 1024                   53.8%              (1 MB, cabe em L2)
+//     as 4096                   81.7%              (4 MB, cabe em L3)
+//
+// Metade dos acessos vai a 1024 linhas espalhadas por 61 MB. Juntas cabiam em
+// L2. Implementou-se a permutacao inteira -- tabelas reordenadas ao carregar,
+// indice mapeado uma vez onde a relacao e' calculada, e o mesmo mapeamento no
+// caminho de reconstrucao para as duas vias nao divergirem. Ficou correcta:
+// assinatura 1715838 com e sem, byte a byte.
+//
+// E deu **4.3% MAIS ciclos, a 2.6 sigma, com 10% MAIS faltas de dTLB**
+// (29.08G contra 27.89G, media de 8 corridas).
+//
+// Porque: o mapeamento obriga a uma consulta numa tabela de 119 KB por cada
+// relacao, ~9.5 por chamada, e essa consulta custa mais do que a localidade que
+// compra. Nao ha' forma de a evitar -- uma ordem por frequencia nao e' uma
+// funcao calculavel, tem de ser uma tabela. E as paginas enormes ja' tinham
+// apanhado a maior parte do problema de TLB, portanto sobrava menos do que o
+// histograma fazia parecer.
+//
+// O histograma fica, porque a medicao vale e nao custa nada desligada.
+
 static REDE: OnceLock<Option<RedeSf>> = OnceLock::new();
 
 /// Caminho posto pela opcao UCI `EvalFile`.
@@ -2019,6 +2048,74 @@ pub fn relatorio_feats() -> String {
 pub static ACT_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static ACT_C: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Histograma de acessos por feature de ameaca.
+///
+/// A tabela tem THREAT_DIM * L1 = 61 MB e le'-se por linhas dispersas. Se os
+/// acessos forem enviesados -- ha' ameacas comuns e ameacas que quase nunca
+/// acontecem -- reordenar as linhas por frequencia poe as quentes juntas e a
+/// cache passa a servi-las. E' uma PERMUTACAO: a rede e' a mesma, a assinatura
+/// do bench nao muda, e nao se treina nada. `KESTREL_HISTO_AMEACAS=1`.
+pub static HISTO_AM: std::sync::OnceLock<Vec<std::sync::atomic::AtomicU32>> = std::sync::OnceLock::new();
+
+fn histo_activo() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("KESTREL_HISTO_AMEACAS").as_deref() == Ok("1"))
+}
+
+fn histo_conta(idx: usize) {
+    if !histo_activo() {
+        return;
+    }
+    let h = HISTO_AM.get_or_init(|| (0..THREAT_DIM).map(|_| std::sync::atomic::AtomicU32::new(0)).collect());
+    if let Some(c) = h.get(idx) {
+        c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// A permutacao que poe as linhas mais usadas primeiro.
+///
+/// Medido no bench: as 1024 mais usadas cobrem 53.8% dos acessos e as 4096
+/// cobrem 81.7%. Hoje estao espalhadas por 61 MB; juntas cabem em L2 e L3.
+pub fn permutacao_por_uso() -> Vec<u32> {
+    let Some(h) = HISTO_AM.get() else { return Vec::new() };
+    let mut ord: Vec<(u64, u32)> = h
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.load(std::sync::atomic::Ordering::Relaxed) as u64, i as u32))
+        .collect();
+    // Decrescente por uso; empates pelo indice, para ser determinista.
+    ord.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    // `perm[antigo] = novo`
+    let mut perm = vec![0u32; THREAT_DIM];
+    for (novo, &(_, antigo)) in ord.iter().enumerate() {
+        perm[antigo as usize] = novo as u32;
+    }
+    perm
+}
+
+pub fn relatorio_histo() -> String {
+    let Some(h) = HISTO_AM.get() else {
+        return "sem histograma\n".to_string();
+    };
+    let mut v: Vec<u64> = h.iter().map(|c| c.load(std::sync::atomic::Ordering::Relaxed) as u64).collect();
+    let tot: u64 = v.iter().sum();
+    let usadas = v.iter().filter(|x| **x > 0).count();
+    v.sort_unstable_by(|a, b| b.cmp(a));
+    let mut s = format!(
+        "ameacas: {} acessos, {} das {} features usadas ({:.1}%)\n",
+        tot, usadas, THREAT_DIM, usadas as f64 / THREAT_DIM as f64 * 100.0
+    );
+    for k in [64usize, 256, 1024, 4096, 16384] {
+        let acc: u64 = v.iter().take(k).sum();
+        s += &format!(
+            "  as {k} mais usadas cobrem {:.1}% dos acessos ({} KB de pesos)\n",
+            acc as f64 / tot.max(1) as f64 * 100.0,
+            k * L1 / 1024
+        );
+    }
+    s
+}
+
 fn sem_pares() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("KESTREL_SEM_PARES").as_deref() == Ok("1"))
@@ -2626,6 +2723,7 @@ fn delta_por_lance(
         for r in rels.iter() {
             let idx = crate::sf_features::indice_relacao(r, pov, hm);
             if idx < THREAT_DIM {
+                histo_conta(idx);
                 if st.conta[idx] == 0 {
                     adianta(&net.ft_threat_w, idx * L1, L1);
                     adianta(&net.ft_threat_psqt, idx * NB, NB);

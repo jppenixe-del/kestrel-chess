@@ -495,6 +495,27 @@ fn main() {
     // que muda: se as activas forem muitas mais que as ~7.5 que mudam por
     // lance, calcular de raiz e' pior e a pergunta fica respondida sem
     // escrever uma linha de codigo novo.
+    // permameacas <saida.bin> -- correr o bench a contar e escrever a permutacao
+    // que ordena as linhas de ameaca por frequencia de uso.
+    if args.len() >= 3 && args[1] == "permameacas" {
+        std::env::set_var("KESTREL_HISTO_AMEACAS", "1");
+        bench(11);
+        let p = nnue_sf::permutacao_por_uso();
+        if p.is_empty() {
+            eprintln!("sem histograma -- o bench nao tocou em ameacas nenhumas");
+            return;
+        }
+        let mut out = Vec::with_capacity(p.len() * 4);
+        for v in &p {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        match std::fs::write(&args[2], &out) {
+            Ok(()) => println!("escrito: {} ({} entradas, {} bytes)", args[2], p.len(), out.len()),
+            Err(e) => eprintln!("nao consegui escrever: {e}"),
+        }
+        return;
+    }
+
     if args.len() >= 3 && args[1] == "ameacasativas" {
         let mut tot = 0usize;
         let mut n = 0usize;
@@ -1907,6 +1928,9 @@ fn bench(depth: i32) {
     println!("{} nodes {} nps", total, total * 1000 / ms);
     if std::env::var("KESTREL_CONTA_FEATS").as_deref() == Ok("1") {
         println!("{}", crate::nnue_sf::relatorio_feats());
+    }
+    if std::env::var("KESTREL_HISTO_AMEACAS").as_deref() == Ok("1") {
+        print!("{}", crate::nnue_sf::relatorio_histo());
     }
     if std::env::var_os("KESTREL_CORTES").is_some() {
         let p = |n: u64| 100.0 * n as f64 / total as f64;
