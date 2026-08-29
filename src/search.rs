@@ -1707,8 +1707,8 @@ pub struct Searcher<'a> {
     /// assinatura do bench nao mexeu, que foi como se viu.
     ///
     /// Reduzir e' uma aposta feita ANTES de olhar para a posicao. Guardar a
-    /// aposta permite ao filho revê-la depois de a ter visto -- ver o bloco
-    /// `hindsight` no `negamax`.
+    /// bet lets the child reconsider it after seeing the position -- see the
+    /// `RECONSIDER` block in `negamax`.
     pub ply_reducao: [i32; MAX_PLY],
     pub root_best: Option<Move>,
     /// Per root move: the score from the current iteration, and the score
@@ -3032,6 +3032,13 @@ impl<'a> Searcher<'a> {
         // Motivado pelo que os nossos jogos mostram: 2368 empates pela regra dos
         // 50 e 1856 por material insuficiente em 16000 partidas -- finais
         // jogados as cegas que uma tabela resolve de imediato.
+        //
+        // NAO REMOVER por causa do SPRT: 17538 jogos a 5+0.05 deram -0.6 +/- 2.6,
+        // ou seja nada. Mas isso mede-os onde eles nao servem -- a cinco segundos
+        // as partidas quase nunca chegam a um final de cinco pecas com tempo para
+        // o aproveitar. O tempo em que valem e' o longo, e e' a esse que a CCRL
+        // joga (40/40 e 40/15). Ficam por decisao explicita, sabendo que o teste
+        // rapido nao os mostra.
         if ply > 0 {
             if let Some(wdl) = crate::syzygy::probe_wdl(board) {
                 return wdl.to_score();
@@ -3290,7 +3297,7 @@ impl<'a> Searcher<'a> {
             self.static_evals[ply] = raw_static_eval;
         }
 
-        // HINDSIGHT: rever a reducao depois de a poder julgar.
+        // RECONSIDER: judge the reduction once there is something to judge it by.
         //
         // Reduzir e' uma aposta feita ANTES de olhar para a posicao -- a partir
         // do historico, do numero de ordem do lance, do `improving`. Chegados
@@ -3310,11 +3317,11 @@ impl<'a> Searcher<'a> {
         // mais 2.0%: cirurgica. Com 4, +0.5%, quase nunca dispara. Motiva-o a medicao de que procuramos 2.03x mais nos que o
         // Stockfish para a mesma profundidade nominal -- se estamos a cortar de
         // mais, e' aqui que se paga.
-        const HINDSIGHT_LIMIAR: i32 = 3;
+        const RECONSIDER_THRESHOLD: i32 = 3;
         if ply > 0
             && ply < MAX_PLY
             && depth >= 1
-            && self.ply_reducao[ply] >= HINDSIGHT_LIMIAR
+            && self.ply_reducao[ply] >= RECONSIDER_THRESHOLD
             && self.static_evals[ply] + self.static_evals[ply - 1] < 0
         {
             depth += 1;
