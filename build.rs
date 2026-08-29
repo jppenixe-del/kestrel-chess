@@ -33,6 +33,7 @@ fn embute(var: &str, ficheiro: &str, cfg: &str) {
 
 
 fn main() {
+    liga_fathom();
     // A escala da rede, decidida em tempo de COMPILACAO e nao pela ponte.
     //
     // As margens de poda sao centipeoes absolutos, portanto a escala e' uma
@@ -82,6 +83,37 @@ fn main() {
 /// Stockfish (GPLv3). Ligá-la torna o binário resultante GPLv3 e obriga a
 /// preservar os avisos de copyright do Stockfish. Sem a biblioteca o motor
 /// compila na mesma e usa o caminho em Rust, que é todo nosso.
+/// Compila o Fathom, o probador Syzygy de referencia, como C simples.
+///
+/// Porque em vez de o escrever: o nosso `src/syzygy.rs` le' os cabeçalhos dos
+/// ficheiros e tem a descompressao, mas o indexador canonico -- dobrar a
+/// posicao pelas oito simetrias e ordenar as pecas iguais por ranking binomial
+/// -- nunca foi escrito, e o `probe_wdl` devolvia sempre "desconhecido". Sao
+/// centenas de linhas em que um erro nao da erro: devolve o valor de OUTRA
+/// posicao, calado.
+///
+/// Licenca MIT (Ronald de Man, basil00, Jon Dart -- ver `syzygy_shim/LICENSE.md`
+/// e os cabecalhos de cada ficheiro), compativel com a GPL-3.0 deste motor
+/// desde que os avisos de copyright se mantenham, que e' o que aquela pasta faz.
+///
+/// Sem a pasta o motor compila na mesma, sem tablebases.
+fn liga_fathom() {
+    let c = std::path::Path::new("syzygy_shim/tbprobe.c");
+    println!("cargo:rerun-if-changed=syzygy_shim/tbprobe.c");
+    println!("cargo:rerun-if-changed=syzygy_shim/tbchess.c");
+    if !c.exists() {
+        return;
+    }
+    cc::Build::new()
+        .file("syzygy_shim/tbprobe.c")
+        .include("syzygy_shim")
+        // Biblioteca externa que nao editamos: os avisos dela nao sao accionaveis
+        // e so' escondiam os nossos.
+        .flag_if_supported("-w")
+        .compile("fathom");
+    println!("cargo:rustc-cfg=tem_fathom");
+}
+
 fn liga_ponte_sf() {
     let lib = std::path::Path::new("sfbridge/libsfbridge.a");
     println!("cargo:rerun-if-changed=sfbridge/libsfbridge.a");

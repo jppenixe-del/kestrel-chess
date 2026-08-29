@@ -3015,6 +3015,29 @@ impl<'a> Searcher<'a> {
         // possivel a este ply ja' esta' garantido/impossivel de bater,
         // aperta a janela -- corte trivial e sempre correcto (nao
         // interfere com scores normais, so' com scores de mate).
+        // SYZYGY: um resultado conhecido vale mais do que qualquer heuristica.
+        //
+        // O leitor (`src/syzygy.rs`, 401 linhas) existia e nunca esteve ligado a
+        // nada -- zero chamadas na busca, nenhuma opcao anunciada. Faltava-lhe
+        // uma opcao UCI e este bloco.
+        //
+        // Sem restricao ao relogio dos 50: exigir `halfmove == 0` tornava o
+        // probe inerte, porque num final de rei e torre o contador so' volta a
+        // zero com captura ou lance de peao, e nenhum acontece. As proprias
+        // tabelas ja' tratam o caso com `CursedWin`/`BlessedLoss`, que valem
+        // pouco acima de zero em vez de valerem um ganho.
+        //
+        // Nunca na raiz: essa precisa de devolver um lance, nao uma pontuacao.
+        //
+        // Motivado pelo que os nossos jogos mostram: 2368 empates pela regra dos
+        // 50 e 1856 por material insuficiente em 16000 partidas -- finais
+        // jogados as cegas que uma tabela resolve de imediato.
+        if ply > 0 {
+            if let Some(wdl) = crate::syzygy::probe_wdl(board) {
+                return wdl.to_score();
+            }
+        }
+
         let mating_value = MATE_SCORE - ply as i32;
         if mating_value < beta {
             beta = mating_value;

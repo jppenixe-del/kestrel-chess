@@ -371,31 +371,87 @@ fn material_key(board: &Board) -> (String, bool) {
 /// current limit and it is deliberate: a tablebase that is occasionally wrong
 /// is worse than no tablebase at all, because the search trusts it absolutely
 /// and stops looking.
+/// Consultar o tablebase.
+///
+/// Passa pelo Fathom (`syzygy_shim/`, MIT), e nao pelo leitor em Rust que este
+/// ficheiro tem por cima: esse le' os cabeçalhos e sabe descomprimir, mas o
+/// indexador canonico -- dobrar a posicao pelas oito simetrias do tabuleiro e
+/// ordenar as pecas iguais por ranking binomial -- nunca foi escrito, e o probe
+/// devolvia sempre "desconhecido". Sao centenas de linhas em que um erro nao
+/// da' erro nenhum: devolve o valor de OUTRA posicao, calado.
+///
+/// So' com `castling == 0`: as tabelas nao conhecem roque.
+#[cfg(tem_fathom)]
 pub fn probe_wdl(board: &Board) -> Option<Wdl> {
-    let tables = TABLES.get()?.as_ref()?;
-    if board.occ_all.count_ones() as usize > tables.max_men {
+    use crate::types::Color;
+    if !fathom_pronto() || board.castling != 0 {
         return None;
     }
-    if board.castling != 0 {
+    let n = board.occ_all.count_ones();
+    if n as u32 > unsafe { TB_LARGEST } {
         return None;
     }
-    let (key, _flipped) = material_key(board);
-    if !tables.available.contains_key(&key) {
-        return None;
+    let bb = |c: usize, p: usize| board.pieces[c][p];
+    let r = unsafe {
+        tb_probe_wdl_impl(
+            board.occ_color[Color::White.idx()],
+            board.occ_color[Color::Black.idx()],
+            bb(0, 5) | bb(1, 5),
+            bb(0, 4) | bb(1, 4),
+            bb(0, 3) | bb(1, 3),
+            bb(0, 2) | bb(1, 2),
+            bb(0, 1) | bb(1, 1),
+            bb(0, 0) | bb(1, 0),
+            if board.ep_square < 64 { board.ep_square as u32 } else { 0 },
+            //  do Fathom e' TRUE para brancas. Passei o contrario a'
+            // primeira e o sinal saiu invertido: K+R vs K com as brancas a
+            // jogar dava "Loss" e K vs K+Q dava "Win".
+            board.side == Color::White,
+        )
+    };
+    match r {
+        0 => Some(Wdl::Loss),
+        1 => Some(Wdl::BlessedLoss),
+        2 => Some(Wdl::Draw),
+        3 => Some(Wdl::CursedWin),
+        4 => Some(Wdl::Win),
+        _ => None,
     }
-    // Reading and decompressing a table is implemented above (PairsData /
-    // setup_pairs / value_at). What is not yet implemented is the canonical
-    // index: mapping a position to its slot requires the board symmetries
-    // (horizontal, vertical and diagonal folding) plus binomial ranking of
-    // like pieces, and for pawn tables a separate file/rank encoding.
-    //
-    // Until that exists this returns "unknown" rather than a value it cannot
-    // justify. See probe_wdl's contract above for why that is the only
-    // acceptable half-built state.
-    let _ = &tables.cache;
-    let _ = Wdl::from_raw;
-    let _ = |d: &PairsData, i: u64| d.value_at(i);
-    let _ = |data: &[u8], p: &mut usize, s: u64| setup_pairs(data, p, s);
-    let _ = WDL_MAGIC;
+}
+
+#[cfg(not(tem_fathom))]
+pub fn probe_wdl(_board: &Board) -> Option<Wdl> {
     None
+}
+
+#[cfg(tem_fathom)]
+extern "C" {
+    fn tb_init(path: *const std::os::raw::c_char) -> bool;
+    fn tb_probe_wdl_impl(
+        white: u64, black: u64, kings: u64, queens: u64, rooks: u64,
+        bishops: u64, knights: u64, pawns: u64, ep: u32, turn: bool,
+    ) -> u32;
+    static TB_LARGEST: u32;
+}
+
+#[cfg(tem_fathom)]
+static FATHOM_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(tem_fathom)]
+fn fathom_pronto() -> bool {
+    FATHOM_OK.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Abrir os ficheiros. Devolve quantas pecas o maior tablebase cobre, 0 se nada.
+#[cfg(tem_fathom)]
+pub fn init_fathom(dir: &str) -> u32 {
+    let Ok(c) = std::ffi::CString::new(dir) else { return 0 };
+    let ok = unsafe { tb_init(c.as_ptr()) };
+    FATHOM_OK.store(ok, std::sync::atomic::Ordering::Relaxed);
+    if ok { unsafe { TB_LARGEST } } else { 0 }
+}
+
+#[cfg(not(tem_fathom))]
+pub fn init_fathom(_dir: &str) -> u32 {
+    0
 }

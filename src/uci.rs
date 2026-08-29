@@ -2016,6 +2016,11 @@ impl Engine {
                         "option name EvalFile type string default {}",
                         crate::nnue_sf::caminho_evalfile()
                     );
+                    // Tablebases Syzygy. O leitor (`src/syzygy.rs`, 401 linhas)
+                    // existia e nunca esteve ligado a nada: zero chamadas na
+                    // busca, nenhuma opcao anunciada. Codigo morto a que faltava
+                    // uma opcao e tres linhas no `negamax`.
+                    let _ = writeln!(out, "option name SyzygyPath type string default <empty>");
                     let _ = writeln!(
                         out,
                         "option name EvalScale type spin default {} min 100 max 2000",
@@ -2176,6 +2181,21 @@ impl Engine {
                         && tokens[3] == "value" {
                         let on = tokens[4].eq_ignore_ascii_case("true") || tokens[4] == "1";
                         crate::search::set_lmr_captures(on);
+                    } else if tokens.len() >= 5 && tokens[1] == "name" && tokens[2] == "SyzygyPath"
+                        && tokens[3] == "value" {
+                        // Junta o resto: caminhos com espacos sao vulgares.
+                        let caminho = tokens[4..].join(" ");
+                        if caminho.is_empty() || caminho == "<empty>" {
+                            let _ = writeln!(out, "info string SyzygyPath vazio");
+                        } else {
+                            let n = crate::syzygy::init_fathom(&caminho);
+                            if n > 0 {
+                                let _ = writeln!(out, "info string Syzygy: ate {n} pecas, de {caminho}");
+                            } else {
+                                let _ = writeln!(out, "info string Syzygy: nada legivel em {caminho}");
+                            }
+                        }
+                        let _ = out.flush();
                     } else if tokens.len() >= 5 && tokens[1] == "name" && tokens[2] == "EvalFile"
                         && tokens[3] == "value" {
                         // Junta-se tudo o que vem depois de `value`: um caminho

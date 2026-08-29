@@ -497,6 +497,19 @@ fn main() {
     // escrever uma linha de codigo novo.
     // permameacas <saida.bin> -- correr o bench a contar e escrever a permutacao
     // que ordena as linhas de ameaca por frequencia de uso.
+    // tbprobe <dir> <fen> -- consultar o tablebase directamente.
+    if args.len() >= 4 && args[1] == "tbprobe" {
+        println!("init: {} pecas", syzygy::init_fathom(&args[2]));
+        
+        let b = board::Board::from_fen(&args[3]);
+        println!("pecas: {}  roque: {}", b.occ_all.count_ones(), b.castling);
+        match syzygy::probe_wdl(&b) {
+            Some(w) => println!("wdl: {:?}  score: {}", w, w.to_score()),
+            None => println!("wdl: NADA"),
+        }
+        return;
+    }
+
     if args.len() >= 3 && args[1] == "permameacas" {
         std::env::set_var("KESTREL_HISTO_AMEACAS", "1");
         bench(11);
