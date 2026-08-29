@@ -300,11 +300,8 @@ fn compute_time_budget(
     let sp_t = crate::search::search_params();
     // `.max(1)`: a banda anunciada ao afinador chega a zero, e zero aqui e'
     // divisao por zero -- um panico que so' aparecia a meio de um jogo.
-    let moves_left = movestogo
-        .map(|m| m * 100)
-        .unwrap_or(sp_t.tempo_divisor as i64)
-        .max(1);
-    let mut base = safe_time * 100 / moves_left + my_inc * 3 / 4;
+    let moves_left = movestogo.unwrap_or(sp_t.tempo_divisor as i64).max(1);
+    let mut base = safe_time / moves_left + my_inc * 3 / 4;
 
     // Fase do jogo. A fatia constante do relogio e' geometricamente pesada no
     // inicio, que e' precisamente onde pensar rende menos. Ver as constantes.
@@ -321,7 +318,7 @@ fn compute_time_budget(
     } else {
         100
     };
-    base = base * fase / 10_000;
+    base = base * fase / 100;
 
     // Pressao pelo relogio: com folga confortavel investe-se mais, atras
     // investe-se menos. Saude geral do relogio, nao ritmo do momento.
@@ -412,7 +409,7 @@ fn compute_time_budget(
     // 1+1 num convite a gastar o relogio todo num lance.
     let fatia = (safe_time / moves_left).max(1);
     let folga_inc = (100 + (my_inc * 100 / fatia)).clamp(100, 200);
-    let mut hard_cap = (safe_time * sp_t.tempo_hard_cap_pct as i64 / 10_000)
+    let mut hard_cap = (safe_time * sp_t.tempo_hard_cap_pct as i64 / 100)
         .min((safe_time / horizon) * emergency_mult / 10)
         .min(soft * HARD_CAP_BUDGET_MULT / 10)
         .max(soft);
@@ -2091,13 +2088,13 @@ impl Engine {
                             // divisor, e um divisor perto de zero gasta o
                             // relogio inteiro num lance -- perde-se por tempo
                             // antes de o afinador aprender que foi mau.
-                            "tempo_divisor" => 3500,
-                            "tempo_fase_abertura" => 2500,
-                            "tempo_fase_meio_cedo" => 4000,
-                            "tempo_fase_meio" => 5000,
-                            "tempo_fase_meio_tarde" => 5000,
-                            "tempo_fase_simplificado" => 4000,
-                            "tempo_hard_cap_pct" => 1500,
+                            "tempo_divisor" => 35,
+                            "tempo_fase_abertura" => 25,
+                            "tempo_fase_meio_cedo" => 40,
+                            "tempo_fase_meio" => 50,
+                            "tempo_fase_meio_tarde" => 50,
+                            "tempo_fase_simplificado" => 40,
+                            "tempo_hard_cap_pct" => 15,
                             _ => (d.abs()).max(10),
                         };
                         // A default below zero exists (`hist_malus_offset`),
