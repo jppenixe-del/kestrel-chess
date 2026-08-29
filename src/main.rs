@@ -1095,6 +1095,7 @@ fn play_one_selfplay_game(
             corr_hist_threats: vec![0i32; CORR_HIST_SIZE * 2].into_boxed_slice(),
             ply_last_move: [None; MAX_PLY],
             static_evals: [0i32; MAX_PLY],
+            ply_reducao: [0; crate::search::MAX_PLY],
             root_best: None,
                         root_scores: Vec::new(),
                         nmp_min_ply: 0,
@@ -1379,6 +1380,7 @@ fn play_one_selfplay_game_tc(
             corr_hist_threats: vec![0i32; CORR_HIST_SIZE * 2].into_boxed_slice(),
             ply_last_move: [None; MAX_PLY],
             static_evals: [0i32; MAX_PLY],
+            ply_reducao: [0; crate::search::MAX_PLY],
             root_best: None,
                         root_scores: Vec::new(),
                         nmp_min_ply: 0,
@@ -1883,6 +1885,7 @@ fn bench(depth: i32) {
             corr_hist_threats: vec![0i32; search::CORR_HIST_SIZE * 2].into_boxed_slice(),
             ply_last_move: [None; search::MAX_PLY],
             static_evals: [0i32; search::MAX_PLY],
+            ply_reducao: [0; crate::search::MAX_PLY],
             root_best: None,
                         root_scores: Vec::new(),
                         nmp_min_ply: 0,
@@ -2102,5 +2105,6 @@ fn novo_searcher_raso<'a>(
         excluded_move: None, excluded_root_moves: vec![], style_book: None,
         root_move_nodes: Vec::new(), capture_history: [[[0; 6]; 6]; 2],
         dextensions: [0; MAX_PLY], cutoff_cnt: [0; MAX_PLY], ult_margem: [-1; MAX_PLY], ameacas_reduzidos: [0; 4], ameacas_bateram: [0; 4], cutcnt_reduzidos: [0; 4], cutcnt_bateram: [0; 4], subalfa_reduzidos: [0; 4], subalfa_bateram: [0; 4], margem_reduzidos: [0; 4], margem_bateram: [0; 4], report: false,
+        ply_reducao: [0; crate::search::MAX_PLY],
     }
 }

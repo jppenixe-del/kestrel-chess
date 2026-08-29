@@ -1737,6 +1737,7 @@ impl Engine {
                         corr_hist_threats: ht.corr_hist_threats,
                         ply_last_move: [None; crate::search::MAX_PLY],
                         static_evals: [0i32; crate::search::MAX_PLY],
+                        ply_reducao: [0; crate::search::MAX_PLY],
                         root_best: None,
                         root_scores: Vec::new(),
                         nmp_min_ply: 0,

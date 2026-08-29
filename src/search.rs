@@ -1699,6 +1699,17 @@ pub struct Searcher<'a> {
     /// went up, we're "improving" -- position getting better, so we
     /// spend less time (tighter futility, more aggressive pruning).
     pub static_evals: [i32; MAX_PLY],
+    /// Reducao LMR com que se entrou neste ply, em PLIES INTEIROS.
+    ///
+    /// Inteiros e nao mili-plies: no sitio onde e' guardada, `r` ja' passou por
+    /// `new_depth - r`, portanto ja' foi convertido. Escrevi isto a mal a`
+    /// primeira, com o limiar em mili-plies, e a condicao nunca disparava -- a
+    /// assinatura do bench nao mexeu, que foi como se viu.
+    ///
+    /// Reduzir e' uma aposta feita ANTES de olhar para a posicao. Guardar a
+    /// aposta permite ao filho revê-la depois de a ter visto -- ver o bloco
+    /// `hindsight` no `negamax`.
+    pub ply_reducao: [i32; MAX_PLY],
     pub root_best: Option<Move>,
     /// Per root move: the score from the current iteration, and the score
     /// from the previous one. `NO_SCORE` means "not measured this iteration".
@@ -2971,7 +2982,7 @@ impl<'a> Searcher<'a> {
     fn negamax(
         &mut self,
         board: &mut Board,
-        depth: i32,
+        mut depth: i32,
         mut alpha: i32,
         beta: i32,
         ply: usize,
@@ -3264,6 +3275,36 @@ impl<'a> Searcher<'a> {
         };
         if ply < MAX_PLY {
             self.static_evals[ply] = raw_static_eval;
+        }
+
+        // HINDSIGHT: rever a reducao depois de a poder julgar.
+        //
+        // Reduzir e' uma aposta feita ANTES de olhar para a posicao -- a partir
+        // do historico, do numero de ordem do lance, do `improving`. Chegados
+        // aqui a posicao ja' foi avaliada, e ha' informacao que nao existia
+        // quando se apostou.
+        //
+        // O sinal usado e' a soma da avaliacao deste ply com a do anterior. As
+        // avaliacoes alternam de perspectiva, portanto num par ply/ply-1 a soma
+        // ronda zero quando nada mudou; fica NEGATIVA quando o lado que acabou
+        // de jogar piorou a sua situacao dos dois pontos de vista. Se se reduziu
+        // muito e o par diz que a posicao azedou, a reducao estava errada e
+        // devolve-se um ply.
+        //
+        // TRES plies de reducao. Medido, a diferenca e' toda: com limiar 2 o
+        // bench passa de 1715838 para 2161238 nos, mais 26% -- a extensao
+        // dispara em quase todo o lado e paga-se em largura. Com 3 sao 1750092,
+        // mais 2.0%: cirurgica. Com 4, +0.5%, quase nunca dispara. Motiva-o a medicao de que procuramos 2.03x mais nos que o
+        // Stockfish para a mesma profundidade nominal -- se estamos a cortar de
+        // mais, e' aqui que se paga.
+        const HINDSIGHT_LIMIAR: i32 = 3;
+        if ply > 0
+            && ply < MAX_PLY
+            && depth >= 1
+            && self.ply_reducao[ply] >= HINDSIGHT_LIMIAR
+            && self.static_evals[ply] + self.static_evals[ply - 1] < 0
+        {
+            depth += 1;
         }
         // `improving`: at a same-side ply, are we better than 2 plies
         // ago (last time we moved)? If so, position is trending our
@@ -4231,6 +4272,10 @@ impl<'a> Searcher<'a> {
                 // Floor the reduced DEPTH at 1 (never 0 = plain quiescence),
                 // exactly as the reference does: max(newDepth - reduction, 1).
                 let reduced_depth = (new_depth - r).max(1);
+                // Registar com que reducao se entrou no filho.
+                if ply + 1 < MAX_PLY {
+                    self.ply_reducao[ply + 1] = r;
+                }
                 let probe_cutnode = if r > 0 { true } else { !cutnode };
                 let mut s = -self.negamax(board, reduced_depth, -alpha - 1, -alpha, ply + 1, false, probe_cutnode);
                 if r > 0 {
