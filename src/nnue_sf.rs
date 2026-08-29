@@ -2004,6 +2004,26 @@ pub fn relatorio_feats() -> String {
 /// aplicados. A AVALIACAO FICA ERRADA e a assinatura do bench muda: isto nao e'
 /// uma opcao de jogo, e' uma regua. Serve para saber se vale a pena treinar uma
 /// rede sem esses blocos antes de gastar dias a treina-la.
+/// Regua: desligar SO' os pares de peoes, mantendo as ameacas.
+///
+/// Existe para medir a variante "HalfKA + PP_3Wide, sem Full_Threats" sem
+/// treinar nada: o custo por lance de cada bloco e' independente do que a rede
+/// aprendeu, portanto mede-se agora e so' depois se decide se vale a pena
+/// treinar. `KESTREL_SEM_PARES=1`.
+/// Quantas ameacas estao ACTIVAS numa posicao, contra as que MUDAM num lance.
+///
+/// Decide se vale a pena calcular o bloco de ameacas de raiz so' onde se avalia
+/// (a ideia de "so' nas ultimas profundidades") em vez de o manter incremental.
+/// Se as activas forem muitas mais que as que mudam, calcular de raiz e' pior --
+/// e o acumulador incremental ja' e' a resposta certa.
+pub static ACT_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static ACT_C: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn sem_pares() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("KESTREL_SEM_PARES").as_deref() == Ok("1"))
+}
+
 fn sem_ameacas() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("KESTREL_SEM_AMEACAS").as_deref() == Ok("1"))
@@ -2650,7 +2670,7 @@ fn delta_por_lance(
     // so every pawn move left the accumulator holding the previous position's
     // pairs. Cheap to redo properly -- the feature only reads the two pawn
     // bitboards, so it is skipped entirely unless a pawn actually moved.
-    let mexeu_peao = !sem_ameacas() && ev.iter().any(|&(_, t, _, _)| t == 0);
+    let mexeu_peao = !sem_ameacas() && !sem_pares() && ev.iter().any(|&(_, t, _, _)| t == 0);
     if mexeu_peao {
         let mut sai = std::mem::take(&mut st.par_sai);
         let mut entra = std::mem::take(&mut st.par_entra);

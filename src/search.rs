@@ -1890,6 +1890,10 @@ pub const CONT_HIST_LAGS: usize = 3;
 pub const CONT_HIST_SIZE: usize = CONT_HIST_LAGS * 6 * 64 * 6 * 64;
 const CONT_HIST_MAX: i32 = 16000;
 
+/// Divisor da escala pelo relogio dos 50 lances. Aos 100 meios-lances a
+/// avaliacao fica a metade; a 0 fica intacta.
+const RELOGIO50_BASE: i32 = 200;
+
 /// History update with gravity: the closer an entry already sits to the
 /// ceiling, the less a new observation moves it.
 ///
@@ -2551,7 +2555,21 @@ impl<'a> Searcher<'a> {
             + self.corr_hist_minor[minor_idx] * CORR_WEIGHT_MINOR
             + self.corr_hist_major[major_idx] * CORR_WEIGHT_MAJOR
             + self.corr_hist_threats[threats_idx] * CORR_WEIGHT_THREATS;
-        raw + sum / (CORR_HIST_GRAIN * CORR_WEIGHT_SCALE)
+        let e = raw + sum / (CORR_HIST_GRAIN * CORR_WEIGHT_SCALE);
+        // Encolher a avaliacao a` medida que o relogio dos 50 lances corre.
+        //
+        // 2368 dos nossos 16000 jogos de afinacao acabaram pela regra dos 50 --
+        // 14.8%. Sao posicoes onde o motor continuou a achar que tinha vantagem
+        // enquanto o relogio se esgotava, e depois nao tinha nada. Uma vantagem
+        // que nao se converte em 50 lances vale menos do que a avaliacao diz, e
+        // vale progressivamente menos quanto mais perto do limite se esta'.
+        //
+        // Linear e nao por degraus: um degrau cria um lance em que a avaliacao
+        // salta sem que nada tenha mudado no tabuleiro, e a busca ve' isso como
+        // ganho ou perda de material. `halfmove` chega a 100 antes do empate, o
+        // divisor 200 leva a avaliacao a metade nesse ponto.
+        let restante = (RELOGIO50_BASE - board.halfmove.min(RELOGIO50_BASE as u32) as i32).max(0);
+        e * restante / RELOGIO50_BASE
     }
 
     /// Called once a node's real search has settled on `best_score`

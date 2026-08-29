@@ -488,6 +488,32 @@ fn main() {
     // Escala: o PSQT entra como `(psqt(stm) - psqt(ntm)) * 0.5`, e a mesma dama
     // e' +v de um lado e -v do outro, logo a diferenca e' 2v e o 0.5 cancela-a.
     // O valor guardado e' portanto `cp / nnue2score` directo, sem correccao.
+    // ameacasativas <fen> ... -- quantas ameacas estao activas numa posicao.
+    //
+    // Serve para decidir se o bloco de ameacas pode ser calculado de raiz so'
+    // onde se avalia, em vez de mantido incremental. Mede-se o que ha' contra o
+    // que muda: se as activas forem muitas mais que as ~7.5 que mudam por
+    // lance, calcular de raiz e' pior e a pergunta fica respondida sem
+    // escrever uma linha de codigo novo.
+    if args.len() >= 3 && args[1] == "ameacasativas" {
+        let mut tot = 0usize;
+        let mut n = 0usize;
+        for fen in &args[2..] {
+            let b = board::Board::from_fen(fen);
+            let pos = nnue_sf::board_para_posbb_pub(&b);
+            for pov in 0..2 {
+                let mut v: Vec<usize> = Vec::new();
+                nnue_sf::threats_pad_pub(&pos, pov, &mut v);
+                tot += v.len();
+                n += 1;
+            }
+        }
+        if n > 0 {
+            println!("{} perspectivas, {} ameacas activas, media {:.1}", n, tot, tot as f64 / n as f64);
+        }
+        return;
+    }
+
     if args.len() >= 3 && args[1] == "psqtbase" {
         const FACT: usize = 704;
         const FEAT: usize = 86896;
