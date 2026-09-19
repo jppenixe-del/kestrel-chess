@@ -41,3 +41,6 @@ docs/
 *.bin
 DESENHO_*.md
 w_r2long.txt
+
+# Copias locais antes de alterar. O historico do git ja e a versao anterior.
+*.antes_*

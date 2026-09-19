@@ -612,6 +612,9 @@ pub struct SearchParams {
     /// discriminate between the two kinds of node, so a node that is
     /// refuting easily must not also hand its TT move a discount.
     pub lmr_ttmove: i32,
+    /// Not-improving reduction as a fraction of the base reduction,
+    /// in 512ths. 0 keeps the flat whole ply this term has always been.
+    pub lmr_non_imp_mult: i32,
     /// MILLI-PLIES of reduction REMOVED at a PV node (subtracted). 0 = off.
     pub lmr_pvnode: i32,
     /// Multiplicative scaling of the whole reduction at an ALL node:
@@ -749,6 +752,25 @@ pub struct SearchParams {
     /// LMR, pela mesma razão; não o usávamos para NÃO PODAR. Uma posição que
     /// foi PV é precisamente onde uma poda por eval estática custa mais caro.
     pub rfp_skip_ttpv: i32,
+    /// 1 = só faz RFP quando a tabela não tem lance, ou o que tem é uma captura.
+    ///
+    /// Esta ideia já foi medida aqui e REJEITADA em 26-08-2026 -- mas por
+    /// CONTAGEM DE NÓS (1970705 -> ~2742000, +39%), que é exactamente a métrica
+    /// que nos enganou seis vezes desde então (killers, geração por estágios,
+    /// `pior_adv`, `iir_sem_all`, `alpha_desc`, margem). No KestrelStrike a
+    /// mesma ideia foi medida em PARTIDAS e deu positivo três vezes:
+    ///
+    ///     lote a quatro    2670 partidas   +5,5 sobre a base
+    ///     SPRT a  5+0,05    582 partidas   +7,76 +/- 14,27
+    ///     SPRT a 20+0,2    5020 partidas   +3,05 +/-  4,76
+    ///
+    /// E a conjuntura mudou: desde Agosto entraram aqui o termo da profundidade
+    /// no lance nulo, a avaliação completa, o Fathom e a devolução de ply na
+    /// LMR. Uma ideia posta de lado sozinha pode pagar depois de conjugada com
+    /// outras que na altura não tínhamos.
+    ///
+    /// Nasce a ZERO: a base tem de continuar a ser o motor que está a jogar.
+    pub rfp_tt_capt: i32,
     /// Divisor da magnitude da correcção somada à margem RFP (0 = desligado).
     ///
     /// A correcção mede o quanto a eval estática costuma errar nesta família de
@@ -848,6 +870,8 @@ impl Default for SearchParams {
             lmr_cutoffcnt_allnode: std::env::var("KESTREL_LMR_CUTOFFCNT_ALLNODE")
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(0),
             lmr_ttmove: std::env::var("KESTREL_LMR_TTMOVE")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+            lmr_non_imp_mult: std::env::var("KESTREL_LMR_NON_IMP_MULT")
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(0),
             lmr_pvnode: 0,
             lmr_allnode: 0,
@@ -999,6 +1023,18 @@ impl Default for SearchParams {
             // base, e o proximo candidato mede-se contra ela.
             rfp_corr_divisor: 4,
             rfp_skip_ttpv: 0,
+            // ACEITE EM PARTIDAS a 15-09-2026 e por isso passa a omissao:
+            //   tt_capt vs base, 5+0,05, 1t, 128MB, UHO_4060_v2
+            //   +10,84 +/- 5,81 Elo, nElo +19,62, LOS 99,99%
+            //   4202 partidas, LLR 2,95 -- H1 ACEITE
+            //
+            // Isto foi medido e REJEITADO aqui a 26-08-2026, mas por CONTAGEM
+            // DE NOS (1970705 -> ~2742000, +39%). E' a metrica que enganou seis
+            // decisoes em cinco dias. A rejeicao nao estava errada: estava
+            // feita com a regua errada, e noutra conjuntura -- desde Agosto
+            // entrou o termo da profundidade no lance nulo, a avaliacao
+            // completa, o Fathom e a devolucao de ply na LMR.
+            rfp_tt_capt: 1,
         }
     }
 }
@@ -1080,6 +1116,8 @@ impl SearchParams {
             self.tempo_fase_meio_tarde,
             self.tempo_fase_simplificado,
             self.tempo_hard_cap_pct,
+            // No fim, pela mesma razao que os de cima: nao deslocar indices.
+            self.rfp_tt_capt,
         ]
     }
     pub fn from_vec(v: &[i32]) -> Self {
@@ -1154,6 +1192,8 @@ impl SearchParams {
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(0),
             lmr_ttmove: std::env::var("KESTREL_LMR_TTMOVE")
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+            lmr_non_imp_mult: std::env::var("KESTREL_LMR_NON_IMP_MULT")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(0),
             lmr_pvnode: 0,
             lmr_allnode: 0,
             lmr_killer: 0,
@@ -1173,6 +1213,7 @@ impl SearchParams {
             tempo_fase_meio_tarde: v[64],
             tempo_fase_simplificado: v[65],
             tempo_hard_cap_pct: v[66],
+            rfp_tt_capt: v[67],
         }
     }
 }
@@ -1185,7 +1226,7 @@ impl SearchParams {
 /// Generated from `to_vec`, never hand-written. A list that drifts out of
 /// order does not fail: it quietly sets the wrong parameter, and the sweep
 /// reports whatever that other parameter happens to do.
-pub const PARAM_NAMES: [&str; 67] = [
+pub const PARAM_NAMES: [&str; 68] = [
     "rfp_improving_base",
     "rfp_improving_slope",
     "rfp_not_improving_base",
@@ -1253,6 +1294,7 @@ pub const PARAM_NAMES: [&str; 67] = [
     "tempo_fase_meio_tarde",
     "tempo_fase_simplificado",
     "tempo_hard_cap_pct",
+    "rfp_tt_capt",
 ];
 
 /// Overrides applied on top of the defaults, set over UCI before the first
@@ -1365,6 +1407,19 @@ const HISTORY_MAX: i32 = 16000;
 
 #[derive(Copy, Clone)]
 pub struct SearchLimits {
+    /// Ha' incremento nesta partida?
+    ///
+    /// Nao e' um limite de tempo como os outros -- e' uma regra do JOGO que a
+    /// busca precisa de conhecer. Sem incremento, uma posicao arrastada acaba
+    /// a` bandeira e ganha quem tem mais relogio: aceitar uma repeticao ai' e'
+    /// oferecer um ponto que ainda estava em jogo. COM incremento nao ha' final
+    /// a` bandeira, a repeticao e' resultado legitimo, e fugir-lhe so' piora a
+    /// posicao.
+    ///
+    /// Medido no KestrelStrike a 30+0 contra o classical-leela: nove vitorias
+    /// por bandeira em doze partidas, e as tres que faltaram foram as tres em
+    /// que fomos NOS a repetir.
+    pub tem_incremento: bool,
     pub deadline: Option<Instant>,
     pub max_depth: i32,
     pub max_nodes: Option<u64>,
@@ -1509,6 +1564,10 @@ const TM_ALERT_CP: i32 = 50;
 pub static NO_STOP: AtomicBool = AtomicBool::new(false);
 
 /// Quanto custa um empate, em centipeoes. Ver `valor_empate`.
+/// A tabela cuckoo, construida uma vez. Nao ha' estado por partida aqui -- so'
+/// as diferencas de chave dos lances reversiveis, que sao as mesmas sempre.
+static CUCKOO: std::sync::OnceLock<crate::cuckoo::Cuckoo> = std::sync::OnceLock::new();
+
 pub static CONTEMPT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(20);
 
 /// Whether losing-or-equal captures are eligible for LMR at all, on top of
@@ -1532,6 +1591,12 @@ pub struct Searcher<'a> {
     /// Quem manda na raiz. Um empate e' mau para ESTE lado, e um no' qualquer
     /// da arvore pode ser de qualquer um dos dois.
     pub root_side: crate::types::Color,
+    /// A nota da raiz quando a iteracao ANTERIOR acabou.
+    ///
+    /// Serve o travao do desprezo: se ja' estamos a perder, um empate e' bom e
+    /// nao se lhe foge. Sem isto o desprezo troca empates por DERROTAS, que e'
+    /// deitar fora meio ponto pela razao oposta.
+    pub nota_raiz_ant: i32,
     pub atk: &'a Attacks,
     pub zob: &'a Zobrist,
     pub tt: &'a TranspositionTable,
@@ -2259,6 +2324,15 @@ impl<'a> Searcher<'a> {
     fn valor_empate(&self, board: &Board) -> i32 {
         let c = CONTEMPT.load(std::sync::atomic::Ordering::Relaxed);
         if c == 0 {
+            return 0;
+        }
+        // Com incremento nao ha' final a` bandeira: a repeticao e' legitima e
+        // fugir-lhe so' piora a posicao.
+        if self.limits.tem_incremento {
+            return 0;
+        }
+        // Se ja' estamos a perder, um empate e' bom: nao se lhe foge.
+        if self.nota_raiz_ant < 0 {
             return 0;
         }
         // Escalado com a avaliacao, nao fixo em centipeoes.
@@ -3011,6 +3085,32 @@ impl<'a> Searcher<'a> {
             return self.valor_empate(board);
         }
 
+        // REPETICAO A` DISTANCIA DE UM LANCE.
+        //
+        // O teste acima so' sabe que repetiu DEPOIS de repetir. Se o adversario
+        // pode forcar a repeticao a partir daqui, isso ja' e' um empate
+        // garantido para ele: uma linha que estamos a pontuar em +0,4 nao vale
+        // +0,4 nenhum, porque ele nao tem de a jogar.
+        //
+        // Levanta-se o alpha para o valor do empate, que com o desprezo activo
+        // e' NEGATIVO para quem manda na raiz -- ou seja, deixa de ser um piso
+        // garantido e passa a ser uma perda pequena. E' assim que se desencoraja
+        // o perpetuo sem deixar de o ver quando ele e' mesmo o melhor que ha'.
+        //
+        // MEDIDO no KestrelStrike: +10,34 +/- 5,59 em 4234 partidas.
+        if ply > 0 && !self.limits.tem_incremento {
+            let empate = self.valor_empate(board);
+            if alpha < empate {
+                let cuc = CUCKOO.get_or_init(|| crate::cuckoo::Cuckoo::novo(self.zob, self.atk));
+                if cuc.repeticao_a_vista(board, &self.history, self.atk) {
+                    alpha = empate;
+                    if alpha >= beta {
+                        return alpha;
+                    }
+                }
+            }
+        }
+
         // Mate distance pruning: se um mate mais curto do que o melhor
         // possivel a este ply ja' esta' garantido/impossivel de bater,
         // aperta a janela -- corte trivial e sempre correcto (nao
@@ -3372,6 +3472,16 @@ impl<'a> Searcher<'a> {
             // instead of feeding the null move. Not repeated.
             && (search_params().rfp_skip_ttpv == 0
                 || !tt_entry_captured.map(|e| e.pv).unwrap_or(false))
+            // `!ttMove || ttCapture`: sem lance na tabela, ou com uma captura
+            // lá guardada, a entrada não promete nenhum plano tranquilo bom, e
+            // cortar pela estática não descarta um. Com um tranquilo guardado,
+            // descarta. Ver a nota do campo -- e a rejeição de 26-08, que foi
+            // por contagem de nós e está a ser refeita com partidas.
+            && (search_params().rfp_tt_capt == 0
+                || tt_entry_captured
+                    .and_then(|e| e.best)
+                    .map(|m| m.is_capture())
+                    .unwrap_or(true))
             && beta.abs() < MATE_SCORE - MAX_PLY as i32
         {
             let sp = search_params();
@@ -4141,10 +4251,30 @@ impl<'a> Searcher<'a> {
                     // says so in milli-plies now, like the rest.
                     let corrplexity = (static_eval - raw_static_eval).abs();
                     let corrplexity_adj = if corrplexity > 89 { -LMR_ESCALA } else { 0 };
-                    // Reduce MORE (one whole ply) when !improving -- the same
-                    // `improving` signal RFP/futility already use. Also a
-                    // threshold, also exactly one ply.
-                    let non_imp_adj = if !improving { LMR_ESCALA } else { 0 };
+                    // Reduce MORE when !improving -- the same `improving`
+                    // signal RFP/futility already use.
+                    //
+                    // A whole flat ply until now, which is the wrong shape: it
+                    // is the entire base reduction over again at depth 6 move 4,
+                    // and a third of it at depth 20 move 10. The signal should
+                    // say "reduce this much more of what you were already going
+                    // to reduce", not "reduce one more ply wherever you are" --
+                    // searches with a fine-grained reduction all make this term
+                    // a fraction of the base. Measured here first: branching
+                    // factor 2.40 against 1.85 for a reference search on the
+                    // same network at the same node count.
+                    //
+                    // With `lmr_non_imp_mult` at 0 the flat ply is kept exactly,
+                    // so the binary is unchanged until it is set.
+                    let non_imp_adj = if !improving {
+                        if sp_lmr.lmr_non_imp_mult != 0 {
+                            base * sp_lmr.lmr_non_imp_mult / 512
+                        } else {
+                            LMR_ESCALA
+                        }
+                    } else {
+                        0
+                    };
                     // The two compile-time terms. Both 0 unless their build
                     // variable was set, so the default binary is unchanged.
                     let cutnode_adj = if cutnode { sp_lmr.lmr_cutnode } else { 0 };
@@ -4720,19 +4850,27 @@ impl<'a> Searcher<'a> {
             (-MATE_SCORE - 1, MATE_SCORE + 1)
         };
         let mut asp_depth = depth;
-        let nos_antes = self.nodes;
+        // Reset every pass. Held outside the loop, the difference below is
+        // measured from the same point each time, so a three-pass window
+        // reports n1 + (n1+n2) + (n1+n2+n3) -- which is how the counter came
+        // to claim 109% of all nodes were spent re-searching. It also counted
+        // the successful pass as a re-search, so the number of re-searches was
+        // the number of passes.
+        let mut nos_antes = self.nodes;
         loop {
             let score = self.negamax(board, asp_depth.max(1), alpha, beta, 0, false, false);
             if self.stop {
                 return score;
             }
-            self.asp_re += 1;
             self.asp_nos = self.asp_nos.saturating_add(self.nodes - nos_antes);
+            nos_antes = self.nodes;
             if score <= alpha {
+                self.asp_re += 1;
                 beta = (alpha + beta) / 2;
                 alpha = (alpha - delta).max(-MATE_SCORE - 1);
                 asp_depth = depth;
             } else if score >= beta {
+                self.asp_re += 1;
                 beta = (beta + delta).min(MATE_SCORE + 1);
                 asp_depth = (asp_depth - 1).max(depth - 5);
             } else {
@@ -4748,6 +4886,7 @@ impl<'a> Searcher<'a> {
         let mut best_score = 0;
         let mut last_depth = 0;
         let mut prev_score = 0;
+        self.nota_raiz_ant = 0;
         // Sliding average of the root score across iterations. Currently
         // unread -- see `search_root`, where the variant that would have used
         // it measured worse and was reverted.
@@ -4927,11 +5066,13 @@ impl<'a> Searcher<'a> {
                     Some(v) => {
                         best_score = v;
                         prev_score = v;
+                        self.nota_raiz_ant = prev_score;
                     }
                     None => {
                         if !self.stop {
                             best_score = score;
                             prev_score = score;
+                            self.nota_raiz_ant = prev_score;
                         }
                     }
                 }

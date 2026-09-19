@@ -842,6 +842,30 @@ impl Engine {
                 if let Some(mv) = self.find_move(tokens[i]) {
                     self.board.make_move(&mv);
                     self.history.push(self.board.hash);
+                } else {
+                    // UM LANCE QUE NAO EXISTE E' ERRO CRITICO.
+                    //
+                    // Isto SALTAVA o lance e continuava a aplicar os
+                    // seguintes, sem dizer nada: os lances de depois eram
+                    // aplicados fora de contexto e a posicao ficava baralhada.
+                    // Um motor que joga a partir de uma posicao em que nao
+                    // acredita devolve lances legais NELA e ilegais na
+                    // verdadeira -- e um motor que emite um lance ilegal e'
+                    // chumbado.
+                    //
+                    // A referencia mata-se aqui (`terminate_on_critical_error`
+                    // no `UCIEngine::position`). Faz-se o mesmo, e diz-se em
+                    // `stdout` como `info string`: em `stderr` nenhum arbitro
+                    // ve' a mensagem.
+                    println!(
+                        "info string ERRO CRITICO: lance '{}' nao existe em {} \
+-- a posicao ficaria errada, nao jogo",
+                        tokens[i],
+                        self.board.to_fen()
+                    );
+                    use std::io::Write as _;
+                    let _ = std::io::stdout().flush();
+                    std::process::exit(1);
                 }
                 i += 1;
             }
@@ -1401,7 +1425,7 @@ impl Engine {
         };
 
         let max_depth = depth.unwrap_or(64);
-        let limits = SearchLimits { deadline, max_depth, max_nodes: nodes, soft_budget };
+        let limits = SearchLimits { tem_incremento: my_inc > 0, deadline, max_depth, max_nodes: nodes, soft_budget };
         let board_now = self.board.clone();
         // Per-move piece values, when asked for. Printed BEFORE the search
         // so the numbers describe the position the engine is about to think
@@ -1684,6 +1708,7 @@ impl Engine {
                     let ht = pool_iter.next().unwrap_or_default();
                     let searcher = Searcher {
                     root_side: board.side,
+                    nota_raiz_ant: 0,
                         atk: atk_ref,
                         zob: zob_ref,
                         tt: tt_ref,

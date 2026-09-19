@@ -2,6 +2,7 @@ mod advisor;
 mod attacks;
 mod bitboard;
 mod board;
+mod cuckoo;
 mod book;
 mod endgame;
 mod magic;
@@ -1057,6 +1058,7 @@ fn play_one_selfplay_game(
         let mut searcher = Searcher {
             thread_idx: 0,
             root_side: board.side,
+                    nota_raiz_ant: 0,
             stop_flag: &crate::search::NO_STOP,
             asp_re: 0,
                 asp_nos: 0,
@@ -1093,7 +1095,7 @@ fn play_one_selfplay_game(
             zob,
             tt: &tt,
             nodes: 0,
-            limits: SearchLimits { deadline: None, max_depth: 64, max_nodes: Some(node_limit), soft_budget: None },
+            limits: SearchLimits { tem_incremento: true, deadline: None, max_depth: 64, max_nodes: Some(node_limit), soft_budget: None },
             stop: false,
             history: hash_history.clone(),
             killers: [[None; 2]; MAX_PLY],
@@ -1337,6 +1339,7 @@ fn play_one_selfplay_game_tc(
         let mut searcher = Searcher {
             thread_idx: 0,
             root_side: board.side,
+                    nota_raiz_ant: 0,
             stop_flag: &crate::search::NO_STOP,
             asp_re: 0,
                 asp_nos: 0,
@@ -1374,6 +1377,7 @@ fn play_one_selfplay_game_tc(
             tt: &tt,
             nodes: 0,
             limits: SearchLimits {
+                tem_incremento: true,
                 deadline: Some(move_t0 + Duration::from_millis(budget_ms)),
                 max_depth: 64,
                 max_nodes: None,
@@ -1847,6 +1851,7 @@ fn bench(depth: i32) {
         let mut searcher = search::Searcher {
             thread_idx: 0,
             root_side: board.side,
+                    nota_raiz_ant: 0,
             stop_flag: &stop,
             asp_re: 0,
                 asp_nos: 0,
@@ -1883,7 +1888,7 @@ fn bench(depth: i32) {
             zob: &zob,
             tt: &tt,
             nodes: 0,
-            limits: search::SearchLimits { deadline: None, max_depth: depth, max_nodes: None, soft_budget: None },
+            limits: search::SearchLimits { tem_incremento: true, deadline: None, max_depth: depth, max_nodes: None, soft_budget: None },
             stop: false,
             history: Vec::new(),
             killers: [[None; 2]; search::MAX_PLY],
@@ -2091,6 +2096,7 @@ fn novo_searcher_raso<'a>(
     search::Searcher {
         thread_idx: 0,
         root_side: crate::types::Color::White,
+                    nota_raiz_ant: 0,
         stop_flag: &crate::search::NO_STOP,
         asp_re: 0, asp_nos: 0,
         cut_nodes: 0, cut_first: 0, cut_idx: [0; 17], cut_noisy: 0, cut_etapa: [0; 7],
@@ -2103,7 +2109,7 @@ fn novo_searcher_raso<'a>(
         lmr_skip_check: 0, lmr_skip_depth: 0, lmr_skip_extend: 0,
         lmr_skip_early: 0, lmr_tried: 0, lmr_research: 0, lmr_sum: 0,
         atk, zob, tt, nodes: 0,
-        limits: SearchLimits { deadline: None, max_depth: depth, max_nodes: None, soft_budget: None },
+        limits: SearchLimits { tem_incremento: true, deadline: None, max_depth: depth, max_nodes: None, soft_budget: None },
         stop: false, history: Vec::new(), killers: [[None; 2]; MAX_PLY],
         history_scores: [[[0; 64]; 64]; 2], countermoves: [[None; 64]; 6],
         cont_hist: vec![0i32; CONT_HIST_SIZE].into_boxed_slice(),

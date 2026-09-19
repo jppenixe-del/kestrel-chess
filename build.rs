@@ -43,7 +43,17 @@ fn main() {
     // proporcionalmente erradas, sem nada a avisar. Aqui as duas coisas
     // viajam juntas.
     println!("cargo:rerun-if-env-changed=KESTREL_ESCALA");
-    let escala = std::env::var("KESTREL_ESCALA").unwrap_or_else(|_| "200".to_string());
+    // 176 e nao 200. Os 200 eram a escala da rede v1; a rede de agora foi
+    // MEDIDA contra a referencia em 130 posicoes de jogos reais e tres
+    // estimadores independentes deram 176-178 (minimos quadrados 0,731 e 0,741;
+    // a mediana dos quocientes da' 203, mas e' a menos robusta na cauda). A
+    // 176 o erro de p95 cai de 216 para 137 cp.
+    //
+    // Estava so' no Makefile, portanto so' o OpenBench a apanhava: um
+    // `cargo build` simples -- que e' como o binario do bot foi feito --
+    // ficava com 200. A escala tem de viajar com o codigo, nao com quem
+    // compila.
+    let escala = std::env::var("KESTREL_ESCALA").unwrap_or_else(|_| "176".to_string());
     println!("cargo:rustc-env=KESTREL_ESCALA_COMPILADA={escala}");
 
 

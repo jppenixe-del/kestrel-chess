@@ -1,0 +1,231 @@
+{
+    "resign": {
+        "move_count": 1,
+        "score": 0,
+        "twosided": false,
+        "enabled": false
+    },
+    "draw": {
+        "move_number": 0,
+        "move_count": 1,
+        "score": 0,
+        "enabled": false
+    },
+    "maxmoves": {
+        "move_count": 1,
+        "enabled": false
+    },
+    "tb_adjudication": {
+        "syzygy_dirs": "",
+        "max_pieces": 0,
+        "ignore_50_move_rule": false,
+        "enabled": false
+    },
+    "opening": {
+        "file": "/root/UHO_4060_v2.epd",
+        "format": 0,
+        "order": 0,
+        "plies": -1,
+        "start": 1
+    },
+    "pgn": {
+        "additional_lines_rgx": [],
+        "event_name": "Fastchess Tournament",
+        "site": "?",
+        "file": "/root/tm60.pgn",
+        "notation": 0,
+        "append_file": true,
+        "track_nodes": false,
+        "track_seldepth": false,
+        "track_nps": false,
+        "track_hashfull": false,
+        "track_tbhits": false,
+        "track_timeleft": false,
+        "track_latency": false,
+        "track_pv": false,
+        "min": false,
+        "crc": false
+    },
+    "epd": {
+        "file": "",
+        "append_file": true
+    },
+    "sprt": {
+        "alpha": 0.05,
+        "beta": 0.05,
+        "elo0": 0.0,
+        "elo1": 5.0,
+        "model": "normalized",
+        "enabled": true
+    },
+    "config_name": "config.json",
+    "output": 0,
+    "seed": 5699772609354292159,
+    "variant": 0,
+    "type": 0,
+    "gauntlet_seeds": 1,
+    "ratinginterval": 10,
+    "scoreinterval": 1,
+    "wait": 0,
+    "autosaveinterval": 20,
+    "games": 2,
+    "rounds": 1500,
+    "concurrency": 4,
+    "force_concurrency": false,
+    "recover": false,
+    "noswap": false,
+    "reverse": false,
+    "report_penta": true,
+    "affinity": false,
+    "check_mate_pvs": false,
+    "show_latency": false,
+    "log": {
+        "file": "",
+        "level": 3,
+        "append_file": true,
+        "compress": false,
+        "realtime": true,
+        "engine_coms": false
+    },
+    "engines": [
+        {
+            "name": "tm60_n20",
+            "dir": "",
+            "cmd": "/root/contempt-half2k/target/release/half2k",
+            "args": "",
+            "restart": false,
+            "options": [
+                [
+                    "EvalFile",
+                    "/root/kestrel_joao/f2e189.nnue"
+                ],
+                [
+                    "Hash",
+                    "64"
+                ],
+                [
+                    "Threads",
+                    "1"
+                ],
+                [
+                    "SyzygyPath",
+                    "/root/syzygy"
+                ],
+                [
+                    "LmrFino",
+                    "true"
+                ],
+                [
+                    "LmrPiora",
+                    "true"
+                ],
+                [
+                    "Razoring",
+                    "true"
+                ],
+                [
+                    "TmPawn",
+                    "true"
+                ],
+                [
+                    "HistContexto",
+                    "true"
+                ],
+                [
+                    "RfpMargin",
+                    "110"
+                ],
+                [
+                    "TmPawnN",
+                    "20"
+                ]
+            ],
+            "limit": {
+                "tc": {
+                    "increment": 0,
+                    "fixed_time": 0,
+                    "time": 60000,
+                    "moves": 0,
+                    "timemargin": 0
+                },
+                "nodes": 0,
+                "plies": 0
+            },
+            "variant": 0
+        },
+        {
+            "name": "tm60_base",
+            "dir": "",
+            "cmd": "/root/contempt-half2k/target/release/half2k",
+            "args": "",
+            "restart": false,
+            "options": [
+                [
+                    "EvalFile",
+                    "/root/kestrel_joao/f2e189.nnue"
+                ],
+                [
+                    "Hash",
+                    "64"
+                ],
+                [
+                    "Threads",
+                    "1"
+                ],
+                [
+                    "SyzygyPath",
+                    "/root/syzygy"
+                ],
+                [
+                    "LmrFino",
+                    "true"
+                ],
+                [
+                    "LmrPiora",
+                    "true"
+                ],
+                [
+                    "Razoring",
+                    "true"
+                ],
+                [
+                    "TmPawn",
+                    "true"
+                ],
+                [
+                    "HistContexto",
+                    "true"
+                ],
+                [
+                    "RfpMargin",
+                    "110"
+                ]
+            ],
+            "limit": {
+                "tc": {
+                    "increment": 0,
+                    "fixed_time": 0,
+                    "time": 60000,
+                    "moves": 0,
+                    "timemargin": 0
+                },
+                "nodes": 0,
+                "plies": 0
+            },
+            "variant": 0
+        }
+    ],
+    "stats": {
+        "tm60_n20 vs tm60_base": {
+            "wins": 129,
+            "losses": 129,
+            "draws": 322,
+            "penta_WW": 0,
+            "penta_WD": 73,
+            "penta_WL": 56,
+            "penta_DD": 90,
+            "penta_LD": 69,
+            "penta_LL": 2
+        }
+    }
+}
