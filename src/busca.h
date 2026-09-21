@@ -334,6 +334,14 @@ struct Parametros {
     // O divisor do historico tem FORMA, nao e' um escalar: menor no meio da
     // arvore, onde o historico ja' aprendeu alguma coisa, maior nas pontas.
     int pdiv_base   = 700;
+    /// ORFAOS os quatro (`pdiv_base`, `pdiv_curva`, `pdiv_centro`, `pdiv_tecto`).
+    /// Nenhum e' lido. A ideia esta' escrita acima -- o divisor do historico com
+    /// FORMA em vez de escalar -- e nunca foi implementada: o que corre hoje e'
+    /// o `lmr_hist_div = 22000`, plano em toda a arvore.
+    ///
+    /// Ficam como ideia por fazer e NAO como manete desligada. A diferenca
+    /// importa: uma manete desligada poe-se a um e mede-se; isto precisa de
+    /// codigo que nao existe.
     int pdiv_curva  = 0;
     int pdiv_centro = 8;
     int pdiv_tecto  = 16;
@@ -761,12 +769,30 @@ struct Parametros {
     // Um limite superior quer dizer que naquele no' todos os lances falharam em
     // baixo: o guardado e' o menos mau. Vai primeiro 21.538 vezes e corta 13,8%,
     // contra 66,8% de um limite inferior.
+    /// ORFAO, e e' um RESTO DE NOME. Esta ideia vive hoje em `tt_sup_nota`, que
+    /// e' lida e tem interruptor (`KS_TT_SUP`). Este campo nao e' lido em lado
+    /// nenhum -- ficou do baptismo anterior.
+    ///
+    /// Mas nao se apaga ainda, porque guarda uma coisa que o outro nao guarda:
+    /// **o valor proposto**. O `tt_sup_nota` esta' em 1.000.000, que a nota dele
+    /// diz ser "como estava (topo, sempre)", e este tem 550.000 -- a dose que a
+    /// medicao acima justifica e que ninguem chegou a experimentar.
     int tt_fraco_pont = 550000;
 
     // --- quiescencia ---
+    /// ORFAO. Nao e' lido. Era a margem para saltar uma captura que nem
+    /// ganhando tudo chega perto do alpha -- o `QsFutility` do outro motor, que
+    /// la' foi MEDIDO CINCO VEZES e saiu negativo das cinco. Aqui nunca chegou a
+    /// ser ligado, e a nota do outro motor explica porque nao vale a pena: em
+    /// cima de um filtro por troca que ja' corta o que perde material, esta
+    /// margem so' remove as capturas sas que a quiescencia existe para ver.
     int qs_margem   = 100;
+    /// ORFAO. Nao e' lido. Limitaria quantas capturas se veem por no' na
+    /// quiescencia. Sem medicao nenhuma associada e sem codigo.
     int travao_qs_n = 3;
 
+    /// ORFAO. Nao e' lido. Estender um xeque conforme a avaliacao estatica, em
+    /// vez de sempre ou nunca. Sem medicao nenhuma associada e sem codigo.
     int ext_xeque_aval = 75;
 
     // --- gestao de tempo ---
