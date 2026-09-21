@@ -2428,6 +2428,56 @@ void Busca::arranca(Position& pos, const Limites& lim, Avaliador& avaliador) {
         }
     }
 
+    // A LINHA QUE O ARBITRO LE'. Extraida para lambda porque ha' DOIS
+    // sitios que precisam dela: o fim de uma iteracao completa, e o corte a
+    // meio de uma iteracao que ja' tinha provado um lance melhor.
+    auto anuncia = [&](int prof_a, int nota_a, std::int64_t passou_a) {
+            // A nota vai para fora a DIVIDIR POR DOIS, como o half2k.
+            //
+            // A escala interna dos dois motores e' a mesma -- as estaticas batem ao
+            // ponto -- mas o half2k faz `score/2` ao imprimir e eu mostrava o valor
+            // cru. Nao mudava a busca nada, mas mudava o TESTE: o arbitro decide o
+            // abandono a 600 e o empate a 10 pelo que o motor ANUNCIA, e os dois
+            // estavam a ser julgados por reguas diferentes.
+            //
+            // E os mates passam a ser anunciados como mates. Sem isto um mate ia
+            // como um `cp` enorme, e nem a interface nem o arbitro o viam.
+            saida() << "info depth " << prof_a << " seldepth " << sel_prof << " score ";
+            if (std::abs(nota_a) >= VALUE_MATE_IN_MAX_PLY) {
+                int plies = VALUE_MATE - std::abs(nota_a);
+                int mv    = (plies + 1) / 2;
+                saida() << "mate " << (nota_a > 0 ? mv : -mv);
+            } else {
+                saida() << "cp " << nota_a / 2;
+            }
+            // WDL: vitoria, empate e derrota em milesimos, do ponto de vista de quem
+            // joga.
+            //
+            // As duas constantes NAO sao uma escolha nem um valor por omissao: sao o
+            // `in-offset` e o `in-scaling` com que a REDE foi treinada. Por isso e'
+            // que se aplicam directamente a` nossa nota, sem conversao nenhuma -- a
+            // quantizacao guarda cada peso ja' multiplicado pela escala do treino.
+            //
+            // E por isso tambem e' que o modelo da referencia ter mudado nao nos
+            // afecta: este nao vem de la', vem do treino desta rede. Mudar um destes
+            // numeros sem mudar o treino faz o motor anunciar probabilidades que a
+            // rede nunca aprendeu a produzir.
+            {
+                auto sig = [](double x) { return 1.0 / (1.0 + std::exp(-x)); };
+                double cp = double(nota_a);
+                int w = int(std::lround(1000.0 * sig((cp - 285.2706341467852) / 295.6539508488627)));
+                int l = int(std::lround(1000.0 * sig((-cp - 285.2706341467852) / 295.6539508488627)));
+                saida() << " wdl " << w << " " << (1000 - w - l) << " " << l;
+            }
+            saida() << (tb_acertos ? " tbhits " + std::to_string(tb_acertos) : std::string())
+                      << " hashfull " << p_tab->cheia() << " nodes " << nos_totais()
+                      << " time " << passou_a << " nps "
+                      << (passou_a > 0 ? nos_totais() * 1000 / std::uint64_t(passou_a) : 0) << " pv";
+            for (int j = 0; j < pv_n[0]; ++j)
+                saida() << " " << UCIEngine::move(pv_tab[0][j], false);
+            saida() << std::endl;
+    };
+
     for (int prof = 1; prof <= prof_max; ++prof) {
         auto antes_iter = std::chrono::steady_clock::now();
         std::uint64_t nos_antes = nos;
@@ -2439,8 +2489,37 @@ void Busca::arranca(Position& pos, const Limites& lim, Avaliador& avaliador) {
         int nota = aspiracao(pos, prof, anterior);
         // Uma iteracao cortada a meio nao tem lance em que se confie: o que ela
         // tem e' o primeiro da lista, que ainda nao foi comparado com nada.
-        if (parado && prof > 1)
+        if (parado && prof > 1) {
+            // MAS pode ter provado um lance melhor antes de ser cortada. So' se
+            // escreve em `melhor_raiz` com o alpha subido, ou seja com o lance
+            // ja' pesquisado ate' ao fim e ja' melhor do que tudo o que veio
+            // antes -- e esse joga-se. O que faltava era CONTA-LO: a iteracao
+            // saia por aqui sem imprimir, o arbitro ficava com a variante da
+            // iteracao anterior, e o `bestmove` nao batia certo com ela.
+            //
+            // Nao e' cosmetica: a interface mostra uma linha que ja' nao e' a
+            // nossa, e um arbitro que verifique a coerencia avisa -- ou, pior,
+            // acredita na linha velha.
+            if (melhor_raiz != Move::none() && melhor_raiz != melhor_anterior) {
+                // A VARIANTE PODE ESTAR VAZIA e o lance continuar bom.
+                //
+                // A aspiracao re-pesquisa quando falha a janela, e cada
+                // re-busca limpa `pv_n[0]` ao entrar. Cortada A MEIO de uma
+                // re-busca, fica-se com `melhor_raiz` de uma passagem anterior
+                // -- que subiu o alpha e portanto vale -- e sem linha nenhuma
+                // para o acompanhar. Anunciar assim dava `... pv` e mais nada,
+                // que e' pior do que nao anunciar: o arbitro le uma variante
+                // vazia em vez de uma desactualizada.
+                if (pv_n[0] == 0) {
+                    pv_tab[0][0] = melhor_raiz;
+                    pv_n[0]      = 1;
+                }
+                auto ate_agora = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   std::chrono::steady_clock::now() - t0).count();
+                anuncia(prof, nota_raiz, ate_agora);
+            }
             break;
+        }
         anterior = nota;
 
         auto agora = std::chrono::steady_clock::now();
@@ -2449,50 +2528,7 @@ void Busca::arranca(Position& pos, const Limites& lim, Avaliador& avaliador) {
           std::chrono::duration_cast<std::chrono::milliseconds>(agora - antes_iter).count();
         (void) nos_antes;
 
-        // A nota vai para fora a DIVIDIR POR DOIS, como o half2k.
-        //
-        // A escala interna dos dois motores e' a mesma -- as estaticas batem ao
-        // ponto -- mas o half2k faz `score/2` ao imprimir e eu mostrava o valor
-        // cru. Nao mudava a busca nada, mas mudava o TESTE: o arbitro decide o
-        // abandono a 600 e o empate a 10 pelo que o motor ANUNCIA, e os dois
-        // estavam a ser julgados por reguas diferentes.
-        //
-        // E os mates passam a ser anunciados como mates. Sem isto um mate ia
-        // como um `cp` enorme, e nem a interface nem o arbitro o viam.
-        saida() << "info depth " << prof << " seldepth " << sel_prof << " score ";
-        if (std::abs(nota) >= VALUE_MATE_IN_MAX_PLY) {
-            int plies = VALUE_MATE - std::abs(nota);
-            int mv    = (plies + 1) / 2;
-            saida() << "mate " << (nota > 0 ? mv : -mv);
-        } else {
-            saida() << "cp " << nota / 2;
-        }
-        // WDL: vitoria, empate e derrota em milesimos, do ponto de vista de quem
-        // joga.
-        //
-        // As duas constantes NAO sao uma escolha nem um valor por omissao: sao o
-        // `in-offset` e o `in-scaling` com que a REDE foi treinada. Por isso e'
-        // que se aplicam directamente a` nossa nota, sem conversao nenhuma -- a
-        // quantizacao guarda cada peso ja' multiplicado pela escala do treino.
-        //
-        // E por isso tambem e' que o modelo da referencia ter mudado nao nos
-        // afecta: este nao vem de la', vem do treino desta rede. Mudar um destes
-        // numeros sem mudar o treino faz o motor anunciar probabilidades que a
-        // rede nunca aprendeu a produzir.
-        {
-            auto sig = [](double x) { return 1.0 / (1.0 + std::exp(-x)); };
-            double cp = double(nota);
-            int w = int(std::lround(1000.0 * sig((cp - 285.2706341467852) / 295.6539508488627)));
-            int l = int(std::lround(1000.0 * sig((-cp - 285.2706341467852) / 295.6539508488627)));
-            saida() << " wdl " << w << " " << (1000 - w - l) << " " << l;
-        }
-        saida() << (tb_acertos ? " tbhits " + std::to_string(tb_acertos) : std::string())
-                  << " hashfull " << p_tab->cheia() << " nodes " << nos_totais()
-                  << " time " << passou << " nps "
-                  << (passou > 0 ? nos_totais() * 1000 / std::uint64_t(passou) : 0) << " pv";
-        for (int j = 0; j < pv_n[0]; ++j)
-            saida() << " " << UCIEngine::move(pv_tab[0][j], false);
-        saida() << std::endl;
+        anuncia(prof, nota, passou);
 
         // --- o elastico ---
         //
@@ -2596,16 +2632,32 @@ void Busca::arranca(Position& pos, const Limites& lim, Avaliador& avaliador) {
                 melhor_alt = sc;
                 alt        = m;
             }
-        if (alt != Move::none() && melhor_alt >= nota_raiz - p.recusa_margem)
+        if (alt != Move::none() && melhor_alt >= nota_raiz - p.recusa_margem) {
             melhor_raiz = alt;
+            // Trocado DEPOIS da ultima linha anunciada. Sem isto o arbitro fica
+            // com a variante do lance que se acabou de recusar, e o `bestmove`
+            // nao bate certo com ela -- o mesmo defeito do corte de iteracao,
+            // por outro caminho. A variante aqui e' de um lance so': nao ha'
+            // linha pesquisada para este, ha' a pontuacao que a raiz lhe deu.
+            saida() << "info string recusada a repeticao: "
+                    << UCIEngine::move(melhor_raiz, false) << " em vez do melhor"
+                    << std::endl;
+            saida() << "info depth " << sel_prof << " score cp " << melhor_alt / 2
+                    << " pv " << UCIEngine::move(melhor_raiz, false) << std::endl;
+        }
     }
 
     // Nunca devolver nada: se ate' a profundidade um foi cortada, joga-se o
     // primeiro lance legal em vez de perder a partida.
     if (melhor_raiz == Move::none()) {
         MoveList<LEGAL> ml(pos);
-        if (ml.size() > 0)
+        if (ml.size() > 0) {
             melhor_raiz = *ml.begin();
+            // Tambem este tem de ser anunciado: e' um lance que nenhuma linha
+            // anterior menciona.
+            saida() << "info depth 1 score cp 0 pv "
+                    << UCIEngine::move(melhor_raiz, false) << std::endl;
+        }
     }
     if (DIAG.forma) {
         {
