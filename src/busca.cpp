@@ -2147,6 +2147,15 @@ void Busca::arranca(Position& pos, const Limites& lim, Avaliador& avaliador) {
     if (const char* v = std::getenv("KS_HP_M"))    p.hist_poda = std::atoi(v);
     if (const char* v = std::getenv("KS_HP_LIN"))  p.hpoda_lin = std::atoi(v);
     if (const char* v = std::getenv("KS_PIOR_ADV")) p.usa_pior_adv = std::atoi(v);
+    // O PESO do termo, que nao tinha interruptor. Sem ele, varrer `rfp_adv_f`
+    // exigia recompilar -- e a assinatura do ramo morto denunciou-o: 290 e 335
+    // davam arvores IDENTICAS ao no', porque as duas corridas usavam 335.
+    //
+    // O valor importa: o nosso `CONSTANTES.md` regista `RfpAdv | 290 | varrido;
+    // outro usa 335`, e o que esta' aqui por omissao e' o 335 DELES. Uma peca
+    // nossa, ja' varrida na nossa arvore, a correr com a constante da
+    // referencia.
+    if (const char* v = std::getenv("KS_ADV_F")) p.rfp_adv_f = std::atoi(v);
     if (const char* v = std::getenv("KS_TT_CAPT"))  p.usa_tt_capt = std::atoi(v);
     if (const char* v = std::getenv("KS_CORR_MARG")) p.corr_marg_div = std::atoi(v);
 

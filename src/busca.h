@@ -934,6 +934,21 @@ struct Parametros {
     /// perceber porque e' que `corrigida(pos, estatica, ply) - estatica` e' nulo
     /// AQUI quando a tabela da correccao esta' alocada e e' escrita.
     int corr_marg_div = 0;      // 0 = nao usar; deles: 198435
+    /// O termo do `opponentWorsening`: desconta da margem da futilidade inversa
+    /// quando a estatica do adversario acabou de piorar.
+    ///
+    /// **ESTE VALOR E' DELES, E TEMOS O NOSSO VARRIDO.** O `doc/CONSTANTES.md`
+    /// regista `RfpAdv | 290 | varrido; outro usa 335`. Ficou aqui o 335 porque
+    /// a peca foi escrita a partir do codigo deles e ninguem foi ver a nossa
+    /// propria folha.
+    ///
+    /// E nao tinha interruptor -- `KS_ADV_F` nao existia -- portanto nao se
+    /// podia varrer sem recompilar. Isso foi apanhado pela assinatura do ramo
+    /// morto: 290 e 335 davam arvores IDENTICAS ao no', porque as duas corridas
+    /// usavam 335. Com o interruptor, 979.434 desligado, 1.216.521 a 290 e
+    /// 1.143.797 a 335.
+    ///
+    /// So' age com `usa_pior_adv = 1`, que esta' a zero.
     int rfp_adv_f     = 335;    // termo do `opponentWorsening`, /1024
     int low_f       = 0;
     int low_bonus   = 712;
