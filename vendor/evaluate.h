@@ -33,7 +33,12 @@ namespace Eval {
 // for the build process (profile-build and fishtest) to work. Do not change the
 // name of the macro or the location where this macro is defined, as it is used
 // in the Makefile/Fishtest.
-#define EvalFileDefaultName "nn-134a887f4c8f.nnue"
+// KESTREL: o nome por omissao e' a NOSSA rede, nao a deles. Fica atras de um
+// `#ifndef` para o Makefile o poder trocar sem editar este ficheiro -- e' o
+// nome que o `incbin` recebe quando se embebe a rede no executavel.
+#ifndef EvalFileDefaultName
+    #define EvalFileDefaultName "f2e189.nnue"
+#endif
 
 namespace NNUE {
 class Network;

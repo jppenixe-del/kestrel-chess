@@ -41,6 +41,37 @@ bool Avaliador::carrega(const std::string& caminho, std::string& erro) {
     return true;
 }
 
+bool Avaliador::carrega_embebida(std::string& erro) {
+#ifdef KESTREL_REDE_EMBEBIDA
+    tem_rede = false;
+    // Mesma armadilha da `carrega`: o `current` e' a SAIDA. Se ficar preenchido
+    // de uma tentativa anterior, o substrato salta o carregamento calado e a
+    // rede fica a zeros.
+    ficheiro.current.reset();
+    rede.load_internal(ficheiro);
+    // E a mesma verificacao: a `load` falha sem dizer nada e deixa os pesos a
+    // zero. Uma rede a zeros avalia tudo a zero e nada levanta erro.
+    if (ficheiro.netDescription.empty()) {
+        erro = "a rede embebida nao foi aceite";
+        return false;
+    }
+    caches   = std::make_unique<Eval::NNUE::AccumulatorCaches>(rede);
+    tem_rede = true;
+    return true;
+#else
+    erro = "este executavel foi construido sem rede embebida";
+    return false;
+#endif
+}
+
+const char* Avaliador::nome_por_omissao() {
+#ifdef KESTREL_REDE_EMBEBIDA
+    return EvalFileDefaultName;
+#else
+    return "<vazio>";
+#endif
+}
+
 void Avaliador::repoe() { acumuladores.reset(); }
 
 void Avaliador::partes(const Position& pos, int& psqt, int& posicional) {

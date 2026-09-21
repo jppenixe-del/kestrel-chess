@@ -22,6 +22,11 @@ class Avaliador {
     Avaliador();
 
     bool  carrega(const std::string& caminho, std::string& erro);
+    // A rede que veio dentro do executavel. Devolve falso quando se construiu
+    // sem ela -- ai' o motor exige `EvalFile`, como antes.
+    bool  carrega_embebida(std::string& erro);
+    // O nome da rede que esta' a ser usada, para o `uci` o poder anunciar.
+    static const char* nome_por_omissao();
     void  repoe();
     void  partes(const Position& pos, int& psqt, int& posicional);
     Value avalia_cheia(const Position& pos, int escala_x100, int otimismo = 0);

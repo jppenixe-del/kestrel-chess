@@ -99,9 +99,10 @@ void faz_go(std::istringstream& is) {
         else if (tok == "infinite")  lim.infinito = true;
     }
     if (!g_aval.tem_rede) {
-        std::cout << "info string ERRO: sem rede -- "
-                     "`setoption name EvalFile value <ficheiro>`. Sem rede a "
-                     "avaliacao seria zero em toda a parte." << std::endl;
+        std::cout << "info string ERRO: sem rede -- este executavel foi "
+                     "construido sem rede embebida; use `setoption name EvalFile "
+                     "value <ficheiro>`. Sem rede a avaliacao seria zero em toda "
+                     "a parte." << std::endl;
         std::cout << "bestmove 0000" << std::endl;
         return;
     }
@@ -149,6 +150,17 @@ int main() {
     g_pilha.emplace_back();
     g_pos.set(INICIAL, false, &g_pilha.back());
 
+    // A REDE EMBEBIDA, ao arrancar. Assim o motor joga sem configuracao
+    // nenhuma: e' o que a CCRL espera de um executavel e o que evita que
+    // alguem o corra com a rede de outro motor por engano. O `EvalFile`
+    // continua a funcionar e substitui esta.
+    {
+        std::string erro;
+        if (g_aval.carrega_embebida(erro))
+            std::cout << "info string rede embebida: " << Avaliador::nome_por_omissao()
+                      << std::endl;
+    }
+
     std::string linha;
     while (std::getline(std::cin, linha)) {
         std::istringstream is(linha);
@@ -158,7 +170,8 @@ int main() {
         if (tok == "uci") {
             std::cout << "id name KestrelStrike " KS_VERSAO "\n"
                       << "id author Joao\n"
-                      << "option name EvalFile type string default <vazio>\n"
+                      << "option name EvalFile type string default "
+                      << Avaliador::nome_por_omissao() << "\n"
                       << "option name Hash type spin default 16 min 1 max 65536\n"
                       << "option name Threads type spin default 1 min 1 max 1\n"
                       << "uciok" << std::endl;

@@ -22,7 +22,23 @@ NOME     ?= kestrelstrike
 ARCH     ?= native
 EXE      ?= $(NOME)
 
-COMUM    = -std=c++20 -O3 -DNDEBUG -DNNUE_EMBEDDING_OFF -Ivendor -Isrc \
+# A REDE DENTRO DO EXECUTAVEL.
+#
+# Com a rede embebida o motor joga sozinho: sem `EvalFile`, sem ficheiro ao
+# lado, sem maneira de alguem correr o motor com a rede errada. E' tambem a
+# unica forma de distribuir um so' ficheiro para a CCRL.
+#
+# O `incbin` resolve o caminho a partir do directorio onde o make corre, por
+# isso a rede tem de estar na raiz do repositorio. Se nao estiver, constroi-se
+# na mesma -- mas o motor passa a exigir `EvalFile`, e o aviso abaixo diz-lo.
+REDE     ?= f2e189.nnue
+ifeq ($(wildcard $(REDE)),)
+  EMBEBE  = -DNNUE_EMBEDDING_OFF
+else
+  EMBEBE  = -DKESTREL_REDE_EMBEBIDA
+endif
+
+COMUM    = -std=c++20 -O3 -DNDEBUG $(EMBEBE) -Ivendor -Isrc \
            -funroll-loops -fno-exceptions -fno-rtti
 LDFLAGS  = -lpthread
 
