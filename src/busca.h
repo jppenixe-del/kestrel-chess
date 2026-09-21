@@ -295,18 +295,24 @@ struct Parametros {
     int lmr_nonpv_f   = 1024;
     /// O TERMO DO NO' DE CORTE. Reduz mais onde se espera cortar.
     ///
-    /// **ESTE VALOR ESTA' PROVAVELMENTE ERRADO, e ha' medicao a dize-lo.**
+    /// **NAO ESTABELECIDO.** Ha' medicao, ela aponta para 1024, e ela ENCOLHEU
+    /// a` medida que as partidas entraram. Tres doses do par (este termo e o
+    /// `lmr_ttpv` movidos juntos), o mesmo binario nas tres pontas, 10+0,1:
     ///
-    /// Tres doses do par (este termo e o `lmr_ttpv` movidos juntos), o mesmo
-    /// binario nas tres pontas, 10+0,1, ~1014 partidas cada:
+    ///      960 partidas   1024 +15,57 +/- 11,22    2048 -14,88 +/- 10,93
+    ///     1014 partidas   1024 +14,74 +/- 10,96    2048 -13,37 +/- 10,64
+    ///     1402 partidas   1024  +7,68 +/-  9,52    2048  -6,70 +/-  9,36
     ///
-    ///     1024   +14,74 +/- 10,96     <- o optimo
-    ///     0       -1,37 +/- 11,18
-    ///     2048   -13,37 +/- 10,64     <- o que temos aqui
+    /// A vantagem caiu de 16 Elo para 8, o intervalo passou a apanhar o zero, e
+    /// os DOIS extremos vieram para o meio ao mesmo tempo. Essa e' a assinatura
+    /// de ruido com forma de sinal a desfazer-se -- um efeito real ganha
+    /// definicao com as partidas, nao a perde.
     ///
-    /// Monotono nos dois sentidos a partir de 1024, e as duas pontas com o
-    /// intervalo inteiro fora do zero. Vinte e oito Elo entre a nossa dose e a
-    /// melhor.
+    /// A primeira versao desta nota dizia "vinte e oito Elo entre a nossa dose
+    /// e a melhor". Estava escrita sobre as 1014 e nao se aguentou. Fica aqui
+    /// porque o erro e' instrutivo: ler uma diferenca a meio de uma corrida e
+    /// trata-la como fechada e' o mesmo engano que a contagem de nos, por outro
+    /// caminho.
     ///
     /// Porque e' que o 2048 ficou: **a corrida morreu a meio.** Estava em 1014
     /// de 60.000 partidas planeadas quando as maquinas se foram abaixo a 19-09,
@@ -320,11 +326,14 @@ struct Parametros {
     /// `ttPv 1024 + cut 2048` -- uma mistura que nenhuma das tres pontas cobriu.
     /// Ha' um teste a correr que mede exactamente isso, com o `ttPv` fixo.
     ///
-    /// E ATENCAO ao transferir isto para o outro motor: no half2k o mesmo
-    /// mecanismo e' melhor DESLIGADO (+10,25 +/- 8,65 contra +3,85 a 1024, em
-    /// 1628 partidas). Sinais opostos, mais de mil partidas de cada lado. As
-    /// reducoes base dos dois motores sao diferentes, e empilhar no no' de corte
-    /// so' serve onde a base deixa espaco.
+    /// No outro motor a mesma coisa aconteceu e com a mesma licao. Aos 1548
+    /// jogos o desligado parecia ganhar por +10,25; aos 2200 esta' a +7,58
+    /// contra +5,69 do 1024 -- 1,9 Elo com margem de 7,5, ou seja EMPATADOS. So'
+    /// o 4096 e' claramente mau (-13,27). A conclusao pratica nao muda (fica
+    /// desligado la'), mas a razao e' outra: o termo e' neutro naquele motor,
+    /// nao prejudicial.
+    ///
+    /// Duas leituras precipitadas na mesma manha, uma em cada motor.
     int lmr_cut_f     = 2048;
     int lmr_hist_div  = 22000;
     int lmr_pecas_fim = 0;
