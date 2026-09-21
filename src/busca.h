@@ -32,6 +32,44 @@ namespace Kestrel {
 // Everything the engine compares against a number lives here; nothing is
 // hardcoded in the middle of the search. That rule is what made it possible to
 // sweep ninety-eight parameters without recompiling once.
+// UM DEFEITO QUE VIVE TEMPO SUFICIENTE E' ABSORVIDO PELA AFINACAO FEITA POR
+// CIMA DELE, E CORRIGI-LO SOZINHO PODE PIORAR O MOTOR.
+//
+// Isto nao e' teoria. Aconteceu aqui, com medida, argumento e forma derivada dos
+// nossos proprios dados:
+//
+// A margem do RFP e' `110 * prof`, fixa e sem tecto, contra `min(45+4p, 85)*p`
+// da referencia. Mediu-se o que a margem devia cobrir -- `estatica - nota
+// final` -- e da' um p90 plano em ~150 a partir do quarto ply. A` profundidade
+// 12 a nossa margem e' 1.320 contra 147: nove vezes o que a busca alguma vez
+// recupera. Construiram-se duas formas nossas sobre esses dados e cortavam 45%
+// dos nos E do tempo.
+//
+// Em 2.602 partidas por ponta, a margem "errada" ganhou e as duas corrigidas
+// foram as piores das quatro.
+//
+// A razao: as outras margens, as reducoes e as podas foram todas varridas com
+// esta margem no sitio. Ela nao e' um erro isolado -- e' o eixo a` volta do qual
+// o resto foi calibrado. Corrigi-la sozinha nao devolve o motor a um estado bom;
+// devolve-o a um estado que ninguem afinou.
+//
+// COMO ISTO MUDA O METODO:
+//
+//   1. Um defeito antigo so' se corrige COM os vizinhos, ou nao se corrige.
+//      Medir "com e sem" mede a mudanca agrilhoada a constantes que ja' nao lhe
+//      servem, e o resultado e' quase sempre negativo mesmo quando a mudanca
+//      esta' certa.
+//   2. Os defeitos que PAGARAM hoje foram os que ninguem tinha afinado a` volta:
+//      um parametro declarado e nunca lido, e tres camadas de avaliacao
+//      amputadas. Nao havia calibracao por cima porque o mecanismo nunca correu.
+//   3. Por isso vale mais procurar mecanismos MORTOS do que mecanismos mal
+//      afinados. Um morto nao tem vizinhos desafinados a defende-lo.
+//
+// E O TESTE PARA OS ENCONTRAR: contagens de nos IDENTICAS ao ultimo digito com
+// valores diferentes da manete. Isso nao e' "nao faz diferenca" -- e' codigo
+// morto. Apanhou aqui um `low_ply` posto na funcao errada (arvore igual com peso
+// 8 e com peso 100.000) e um `KS_AMEACA_F` que se chamava `KS_AMEACA`.
+
 // VARRER MANETES PELA CONTAGEM DE NOS NAO FUNCIONA. Nao e' que engane as
 // vezes: nao produz gradiente nenhum.
 //
