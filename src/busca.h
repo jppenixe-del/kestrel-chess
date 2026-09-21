@@ -130,6 +130,27 @@ struct Parametros {
     /// existiu.
     int qs_recaptura  = 0;
     int usa_killers = 0;
+    /// BAIXAR A PROFUNDIDADE QUANDO UM LANCE SOBE O ALPHA.
+    ///
+    /// A ideia: se este lance ja' provou ser melhor do que tudo o que veio
+    /// antes, os que vem a seguir tem mais a provar e podem ser vistos mais
+    /// raso. Soa bem, e o mecanismo funciona -- mede-se a mexer: a arvore vai
+    /// de 123.557 nos para 195.386 e depois 235.019 conforme se aumenta.
+    ///
+    /// MEDIDO EM PARTIDAS E REJEITADO, tres vezes e das tres negativo:
+    ///
+    ///     -21,37 +/- 9,41    contra o binario que estava no bot
+    ///     -44,06 +/- 11,92   sozinho, 888 partidas
+    ///     -74                registado na lista dos rejeitados
+    ///
+    /// Fica a ZERO e fica esta nota, que e' o que falta a uma manete rejeitada
+    /// para nao voltar a ser tentada. Estava aqui sem comentario nenhum -- um
+    /// zero sem explicacao le-se como "ainda nao experimentado", que e' o
+    /// convite exacto para alguem o experimentar outra vez.
+    ///
+    /// `ad_min` e `ad_max` sao a janela de profundidade onde agiria. Nao servem
+    /// de nada com isto a zero, e ficam porque um dia se pode querer medir a
+    /// ideia noutra forma -- nao esta.
     int alpha_desc  = 0;
     /// A JANELA DE PROFUNDIDADE do desconto do alpha. Estava CRAVADA em
     /// `prof > 2 && prof < 16`; o binario que jogava traz 3 e 12.
