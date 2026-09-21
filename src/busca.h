@@ -160,6 +160,26 @@ struct Parametros {
     /// existe para o desconto so' agir onde ele paga.
     int ad_min      = 3;
     int ad_max      = 12;
+    /// A EXTENSAO SINGULAR -- a peca mais cara e a mais valiosa deste motor.
+    ///
+    /// Medida com o interruptor `KS_OFF_SING`, o mesmo binario dos dois lados,
+    /// 1 fio, 5+0,05:
+    ///
+    ///     com singulares contra sem:  **+83,82 +/- 19,83** em 338 partidas
+    ///
+    /// E o que ela custa, a` profundidade 12:
+    ///
+    ///     Kiwipete   87.098 -> 26.119 nos sem ela   -- 70% da arvore
+    ///     inicial    88.599 -> 67.803 nos sem ela   -- 23% da arvore
+    ///
+    /// Setenta por cento da arvore numa posicao rica. A busca de verificacao em
+    /// si e' so' 16% dos nos; o resto e' a profundidade que ela distribui, a
+    /// compor-se por cada ramo que toca.
+    ///
+    /// Porque isto fica escrito: olhando so' para a contagem de nos, este e' o
+    /// maior bloco de arvore que ha' para recuperar, e a tentacao de o apertar
+    /// e' enorme. As partidas dizem que seria o pior negocio do motor. A arvore
+    /// e' grande porque as extensoes a COMPRAM, e compram-na bem.
     int sing_prof   = 5;
     int sing_margem = 2;
     int ext_dupla   = 40;
