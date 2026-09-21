@@ -16,6 +16,7 @@
 #include "misc.h"
 #include "movegen.h"
 #include "position.h"
+#include "syzygy/tbprobe.h"
 #include "tt.h"
 #include "uci.h"
 
@@ -31,7 +32,7 @@ Position               g_pos;
 std::deque<StateInfo>  g_pilha;
 Busca                  g_busca;
 Avaliador              g_aval;
-int                    g_hash_mb = 16;
+int                    g_hash_mb = 64;
 // O tecto dos fios sai da maquina e nao de um numero cravado: um `Threads` que
 // aceita mais fios do que ha' nucleos so' serve para os por a disputar cache.
 const int              FIOS_MAX = std::max(1, int(std::thread::hardware_concurrency()));
@@ -144,6 +145,29 @@ void faz_setoption(std::istringstream& is) {
     } else if (nome == "hash") {
         g_hash_mb = std::max(1, std::atoi(valor.c_str()));
         g_busca.minha_tabela()->redimensiona(std::size_t(g_hash_mb));
+    } else if (nome == "syzygypath") {
+        // AS TABLEBASES ESTAVAM COMPILADAS E INALCANCAVEIS.
+        //
+        // A busca ja' as sonda -- `probe_wdl`, `MaxCardinality`, o contador de
+        // acertos, tudo la'. So' que ninguem chamava `Tablebases::init`, e sem
+        // essa chamada o `MaxCardinality` fica a zero e o codigo nunca dispara.
+        // O motor anunciava tablebases que nao tinha maneira de receber.
+        //
+        // A configuracao de producao do bot passava
+        // `SyzygyPath=/home/kestrel/syzygy` por UCI; esta opcao era o caminho
+        // por onde isso entrava.
+        Tablebases::init(valor);
+        if (Tablebases::MaxCardinality > 0)
+            std::cout << "info string tablebases ate' " << Tablebases::MaxCardinality
+                      << " pecas" << std::endl;
+        else
+            std::cout << "info string sem tablebases em " << valor << std::endl;
+    } else if (nome == "move overhead") {
+        // Quanto se guarda de cada orcamento para o que nao e' pensar: o
+        // arbitro, a rede, o processo. Cravado a 30 e nao lido; a producao
+        // corria a 200, e enganar-se aqui e' assimetrico -- a mais custa um
+        // pouco de forca, a menos custa partidas inteiras pela bandeira.
+        g_busca.sobrecarga_ms = std::clamp(std::atoi(valor.c_str()), 0, 5000);
     } else if (nome == "threads") {
         g_fios = std::clamp(std::atoi(valor.c_str()), 1, FIOS_MAX);
     }
@@ -182,7 +206,9 @@ int main() {
                       << "id author Joao\n"
                       << "option name EvalFile type string default "
                       << Avaliador::nome_por_omissao() << "\n"
-                      << "option name Hash type spin default 16 min 1 max 65536\n"
+                      << "option name Hash type spin default 64 min 1 max 65536\n"
+                      << "option name SyzygyPath type string default <empty>\n"
+                      << "option name Move Overhead type spin default 30 min 0 max 5000\n"
                       << "option name Threads type spin default 1 min 1 max "
                       << FIOS_MAX << "\n"
                       << "uciok" << std::endl;
