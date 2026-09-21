@@ -293,6 +293,38 @@ struct Parametros {
     int lmr_div       = 236;   // centesimos
     int lmr_piora_f   = 197;
     int lmr_nonpv_f   = 1024;
+    /// O TERMO DO NO' DE CORTE. Reduz mais onde se espera cortar.
+    ///
+    /// **ESTE VALOR ESTA' PROVAVELMENTE ERRADO, e ha' medicao a dize-lo.**
+    ///
+    /// Tres doses do par (este termo e o `lmr_ttpv` movidos juntos), o mesmo
+    /// binario nas tres pontas, 10+0,1, ~1014 partidas cada:
+    ///
+    ///     1024   +14,74 +/- 10,96     <- o optimo
+    ///     0       -1,37 +/- 11,18
+    ///     2048   -13,37 +/- 10,64     <- o que temos aqui
+    ///
+    /// Monotono nos dois sentidos a partir de 1024, e as duas pontas com o
+    /// intervalo inteiro fora do zero. Vinte e oito Elo entre a nossa dose e a
+    /// melhor.
+    ///
+    /// Porque e' que o 2048 ficou: **a corrida morreu a meio.** Estava em 1014
+    /// de 60.000 partidas planeadas quando as maquinas se foram abaixo a 19-09,
+    /// e o resultado nunca chegou a ser aplicado. Nao ha' registo de decisao
+    /// nenhuma sobre esta manete -- so' o inventario a anotar o valor que o
+    /// binario trazia. O mesmo que aconteceu ao `TmPawnN`, que morreu na
+    /// partida 13.126 de 18.000.
+    ///
+    /// NAO se muda aqui ainda por uma razao: aquele teste moveu os DOIS termos
+    /// juntos, portanto o `dose_2048` era `ttPv 2048 + cut 2048`. O nosso e'
+    /// `ttPv 1024 + cut 2048` -- uma mistura que nenhuma das tres pontas cobriu.
+    /// Ha' um teste a correr que mede exactamente isso, com o `ttPv` fixo.
+    ///
+    /// E ATENCAO ao transferir isto para o outro motor: no half2k o mesmo
+    /// mecanismo e' melhor DESLIGADO (+10,25 +/- 8,65 contra +3,85 a 1024, em
+    /// 1628 partidas). Sinais opostos, mais de mil partidas de cada lado. As
+    /// reducoes base dos dois motores sao diferentes, e empilhar no no' de corte
+    /// so' serve onde a base deixa espaco.
     int lmr_cut_f     = 2048;
     int lmr_hist_div  = 22000;
     int lmr_pecas_fim = 0;
