@@ -32,6 +32,32 @@ namespace Kestrel {
 // Everything the engine compares against a number lives here; nothing is
 // hardcoded in the middle of the search. That rule is what made it possible to
 // sweep ninety-eight parameters without recompiling once.
+// JA' MEDIDO E REJEITADO EM 8 DE SETEMBRO, e redescoberto a 21 a custo de um
+// dia inteiro. Do `PLANO.md` que se perdeu com a maquina:
+//
+//   "alinhar a arvore pela forma        -65 Elo. A forma nao e' qualidade"
+//   "transplantar a reducao inteira     arvore x5. As constantes nao transferem"
+//   "geracao por etapas                 -4,5% de instrucoes, -3,9 pontos de ordem"
+//   "bonus de killer no historico       -16,4% de arvore, +0,8 de acerto,
+//                                       -2,48 +/- 9,62 em partidas"
+//
+// As duas primeiras sao as duas maiores experiencias de 21-09. A forma da arvore
+// foi usada o dia inteiro como instrumento -- ja' estava medida a -65 Elo. O
+// bloco de constantes da referencia foi montado e testado -- ja' estava escrito
+// que nao transferem.
+//
+// A licao nao e' sobre busca, e' sobre onde se guarda o que se mede: aquele
+// documento vivia num ficheiro solto e morreu com a maquina. Os numeros que
+// sobreviveram foram os que estavam ao lado do codigo. E' por isso que este
+// ficheiro esta' cheio de paragrafos como este.
+//
+// E FICA A PEDRA POR VIRAR que esse plano deixou: "killers fora da banda --
+// corte ao primeiro lance 76,6% -> 79,7%". Medido hoje, o nosso corte ao
+// primeiro lance e' **76,71%** -- exactamente o valor de partida. Os tres
+// pontos nunca chegaram ao motor. E `usa_killers = 1`, que e' o que temos,
+// PIORA para 75,85%: o que ca' esta' nao e' a versao "fora da banda". A
+// referencia esta' em 85,74%.
+
 // NAO SAO AS CONSTANTES. Medido dos dois lados.
 //
 // A pergunta: a referencia corre com os parametros DELA e, com a NOSSA rede,
