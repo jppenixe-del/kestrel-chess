@@ -69,6 +69,44 @@ struct Parametros {
     // `rfp_mult = 0` the per-ply multiplier is constant and the cap never
     // bites; a default pinned to the edge of its own range (the cap at 100000)
     // is the signature of a term that is deliberately inert.
+    /// A MARGEM DA FUTILIDADE INVERSA. 110 por ply, fixa, sem tecto.
+    ///
+    /// **MEDIDA E DEFENDIDA.** Parece errada e nao e'. A historia vale mais do
+    /// que o numero:
+    ///
+    /// A forma da referencia e' `min(45 + 4*prof, 85) * prof` -- cresce e
+    /// satura. A nossa e' `110 * prof` -- cresce sem travao. Em unidades de
+    /// peao, 0,55 por ply contra 0,41: exigimos 34% mais vantagem antes de
+    /// podar. Trocar pela forma deles corta **45% dos nos E do tempo**.
+    ///
+    /// Depois mediu-se o que a margem devia cobrir -- `estatica - nota final`,
+    /// por ply, no nosso proprio motor:
+    ///
+    ///     prof  1   p90  94       prof  6   p90 158
+    ///     prof  2   p90  61       prof  8   p90 228
+    ///     prof  4   p90 147       prof 12   p90 147
+    ///
+    /// Plana a partir do quarto ply. A` profundidade 12 a nossa margem e' 1.320
+    /// contra um p90 de 147 -- NOVE vezes o que a busca alguma vez recupera.
+    /// Com isso construiram-se duas formas nossas, varridas nos nossos dados,
+    /// que batiam a deles em 10% de nos.
+    ///
+    /// Em partidas, quatro pontas, 2.602 partidas cada:
+    ///
+    ///     hoje (110 fixo)   **+11,75 +/- 5,33**   <- a melhor
+    ///     forma deles        +4,15 +/- 5,46
+    ///     nossa 45/4/70      -6,95 +/- 5,41
+    ///     nossa 35/5/85      -8,96 +/- 5,63
+    ///
+    /// Os -45% de nos e de tempo compraram Elo NEGATIVO. A margem larga corta
+    /// menos, e os cortes que ela evita valem mais do que os nos que gasta.
+    ///
+    /// A LICAO, que e' o que fica: medir "quanto a busca desmente a estatica"
+    /// NAO mede "quanto custa cortar mal" -- e e' a segunda que manda. A
+    /// primeira tem instrumento e a segunda nao. Um argumento elegante
+    /// construido sobre a medida errada e' so' um erro bem apresentado.
+    ///
+    /// Nao mexer sem 2.500 partidas a dizer o contrario.
     int rfp_margem     = 110;
     int rfp_mult       = 0;
     int rfp_tecto      = 100000;
