@@ -2130,6 +2130,7 @@ void Busca::arranca(Position& pos, const Limites& lim, Avaliador& avaliador) {
         p.nmp_prof_div = std::atoi(v);
     if (const char* v = std::getenv("KS_NMP_BASE"))
         p.nmp_base = std::atoi(v);
+    if (const char* v = std::getenv("KS_NMP_PROF_DIV")) p.nmp_prof_div = std::atoi(v);
     if (const char* v = std::getenv("KS_NMP_DIVEST")) p.nmp_div_est = std::atoi(v);
     if (const char* v = std::getenv("KS_NMP_TECTO"))  p.nmp_div = std::atoi(v);
     if (const char* v = std::getenv("KS_REB_FUNDO"))

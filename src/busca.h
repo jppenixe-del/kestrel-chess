@@ -32,6 +32,37 @@ namespace Kestrel {
 // Everything the engine compares against a number lives here; nothing is
 // hardcoded in the middle of the search. That rule is what made it possible to
 // sweep ninety-eight parameters without recompiling once.
+// VARRER MANETES PELA CONTAGEM DE NOS NAO FUNCIONA. Nao e' que engane as
+// vezes: nao produz gradiente nenhum.
+//
+// Medido a 21-09 em tres manetes diferentes, na mesma noite, sempre sobre
+// posicoes fixas a` profundidade 12:
+//
+//   margem do ProbCut, 4 posicoes somadas
+//     600 -2,5%   700 -0,9%   800 +5,5%    -- e a 700 poupa 9% numa posicao e
+//                                             DUPLICA outra
+//   `nmp_prof_div`, 6 posicoes somadas
+//     2: 1.123.052   3: 1.194.733   4: 1.395.874
+//     5: 1.310.421   7: 1.051.079  99: 1.338.237
+//     -- o 7 da' a menor, o 4 a maior, e o "desligado" fica no meio
+//   margens do SEE, uma posicao
+//     capturas=20 tranquilos=1 -> 45.625
+//     capturas=20 tranquilos=0 -> 77.714
+//     -- uma unidade de diferenca, setenta por cento de arvore
+//
+// A razao e' simples quando se ve: mudar uma margem muda a ORDEM pela qual a
+// busca encontra as coisas, e a arvore a uma profundidade fixa depende de
+// acertar ou nao na variante cedo. Isso e' quase binario por posicao. Somar
+// meia duzia de posicoes nao faz media nenhuma -- faz uma soma de meia duzia de
+// moedas ao ar.
+//
+// O que a contagem de nos SERVE para: dizer se uma manete esta' viva. Arvore
+// identica ao no' com valores diferentes significa que ela nao esta' a ser lida
+// -- e isso ja' apanhou aqui um `KS_AMEACA_F` que se chamava `KS_AMEACA`.
+//
+// Para saber quanto vale, so' partidas. Nao ha' atalho, e procurar um custou a
+// este projecto mais tempo do que qualquer outra coisa.
+
 struct Parametros {
     // --- reverse futility: the form this engine uses by default ---
     // A margin linear in depth, with a fixed discount when improving. With
