@@ -724,6 +724,29 @@ struct Parametros {
     // partidas. Perde Elo. Fica a nota para nao voltar a ser tentado por
     // parecer boa ideia -- e parece.
     int tm_estim     = 7;
+    /// QUANTOS LANCES SE ASSUME QUE FALTAM, para repartir o relogio.
+    ///
+    /// **A medicao mais forte deste projecto, e quase se perdeu com a maquina
+    /// que a estava a fazer.** Tres valores em paralelo, 10+0, 8.746 partidas
+    /// por motor:
+    ///
+    ///     n=20    +18,49 +/- 3,97   nElo +33,95
+    ///     n=30     -2,30 +/- 3,96   nElo  -4,24
+    ///     n=14    -16,18 +/- 4,03   nElo -29,27
+    ///
+    /// O 20 subiu de +16,6 +/- 6,4 para +18,49 +/- 3,97 ao dobrar as partidas
+    /// e a barra fechou para menos de metade -- ou seja, nao foi sorte a
+    /// desfazer-se, foi um efeito real a ganhar definicao. O optimo e'
+    /// INTERIOR: 30 e 14 sao ambos piores, portanto nao ha' para onde empurrar.
+    ///
+    /// A corrida morreu a 19-09 as 07:47, na partida 13.126 de 18.000, quando a
+    /// maquina se foi abaixo. As 4.874 que faltavam nao mudariam nada -- com
+    /// esta barra o veredicto ja' estava fechado.
+    ///
+    /// Nao confundir com o `tm_curva_pct` la' em cima: aquilo discute substituir
+    /// este numero plano por uma curva, e a nota de la' -- "no primeiro lance
+    /// faltam sessenta e cinco" -- e' o argumento PARA a curva, nao contra o 20.
+    /// Enquanto o horizonte for plano, 20 e' o sitio.
     int tm_bolo_n    = 20;
     /// O tecto do tempo por lance, em decimos do optimo.
     ///
