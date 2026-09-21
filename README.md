@@ -110,6 +110,10 @@ parameters listed by `uci`.
   engine an earlier line of this work grew out of.
 - **[Fathom](https://github.com/jdart1/Fathom)** (MIT) — Syzygy tablebase
   probing.
+- **Jonathan Hallström**, for the pawn-pair features, invented for
+  [Pawnocchio](https://github.com/JonathanHallstrom/pawnocchio) and used by the network
+  this engine ships; and **sscg13** and **anematode** (Timothy Herchen), who
+  wrote the trainer support and the inference code for them.
 
 Engines read and learned from, without code taken: Stockfish, Triumviratus,
 Coda, Cinder. Ideas are not code; the comments in the search explain how each

@@ -30,6 +30,22 @@ program has its own search and its own transposition table, and theirs expect an
 interface (`probe`, `new_search`, `hashfull`) that ours does not have and should
 not have.
 
+## The pawn-pair features
+
+`vendor/nnue/features/pp_3wide.cpp` implements pawn-pair features, and those are
+not anonymous. They were **invented by Jonathan Hallström for
+[Pawnocchio](https://github.com/JonathanHallstrom/pawnocchio)**, out of the observation
+that in a network trained on every pair of pawns, the pairs that carried the
+information were the ones at most one file apart — which is what makes the
+feature set small enough to be worth having. **sscg13** wrote the trainer
+support and the first inference code, with **anematode** (Timothy Herchen) as
+co-author.
+
+Stockfish credits them and so does this program. The file itself carries only
+the project's licence header, which names nobody, so the attribution would
+otherwise be lost on the way here — and the network this engine ships was
+trained with those features.
+
 ## What is ours — `src/`
 
 `src/busca.cpp`, `src/busca.h`, `src/tt.cpp`, `src/tt.h`, `src/aval.cpp`,
