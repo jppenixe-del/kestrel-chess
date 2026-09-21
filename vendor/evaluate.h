@@ -37,7 +37,7 @@ namespace Eval {
 // `#ifndef` para o Makefile o poder trocar sem editar este ficheiro -- e' o
 // nome que o `incbin` recebe quando se embebe a rede no executavel.
 #ifndef EvalFileDefaultName
-    #define EvalFileDefaultName "f2e189.nnue"
+    #define EvalFileDefaultName "ks-cf796d1f923d.nnue"
 #endif
 
 namespace NNUE {

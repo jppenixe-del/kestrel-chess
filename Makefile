@@ -31,7 +31,7 @@ EXE      ?= $(NOME)
 # O `incbin` resolve o caminho a partir do directorio onde o make corre, por
 # isso a rede tem de estar na raiz do repositorio. Se nao estiver, constroi-se
 # na mesma -- mas o motor passa a exigir `EvalFile`, e o aviso abaixo diz-lo.
-REDE     ?= f2e189.nnue
+REDE     ?= ks-cf796d1f923d.nnue
 ifeq ($(wildcard $(REDE)),)
   EMBEBE  = -DNNUE_EMBEDDING_OFF
 else
