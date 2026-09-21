@@ -743,6 +743,12 @@ struct Parametros {
     /// maquina se foi abaixo. As 4.874 que faltavam nao mudariam nada -- com
     /// esta barra o veredicto ja' estava fechado.
     ///
+    /// POR CONFIRMAR A 60+0. Fechado esta' a 10+0, e so' la'. A sobrecarga
+    /// fixa de 30 ms por lance pesa de outra maneira quando o relogio e' seis
+    /// vezes maior: a 10+0 ela e' uma fatia visivel de cada orcamento, a 60+0
+    /// quase desaparece -- e e' o orcamento que o `n` reparte. Nao ha' razao
+    /// para o optimo ficar no mesmo sitio nas duas escalas, e nao foi medido.
+    ///
     /// Nao confundir com o `tm_curva_pct` la' em cima: aquilo discute substituir
     /// este numero plano por uma curva, e a nota de la' -- "no primeiro lance
     /// faltam sessenta e cinco" -- e' o argumento PARA a curva, nao contra o 20.
