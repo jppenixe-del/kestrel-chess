@@ -168,6 +168,46 @@ void zera_partilhada(std::vector<std::atomic<int>>& v, std::size_t n) {
 
 int idx_pc(PieceType pt) { return int(pt) - 1; }
 
+// O LANCE MAIS VOTADO, e nao a busca com a nota mais alta.
+//
+// Quatro fios chegam ao fim com quatro respostas. Tomar a do principal deita
+// fora tres buscas; tomar a de nota mais alta entrega a decisao a um unico fio
+// que pode ter tido sorte numa linha. A votacao usa-as todas e pesa-as:
+//
+//     peso = nota - menor_nota + VOTO_PESO
+//
+// Uma busca muito abaixo das outras vota pouco; uma a` frente vota muito. Dois
+// fios que cheguem ao MESMO lance somam os seus pesos, e e' aqui que esta' a
+// forca do metodo -- o lance que varios caminhos independentes encontraram vale
+// mais do que o que so' um encontrou, mesmo que esse um lhe tenha dado mais
+// nota.
+//
+// O peso 24 e' o desta escala. Nao e' um numero redondo escolhido a` mao: e' o
+// piso que impede que uma busca com a nota mais baixa de todas fique com voto
+// zero e deixe de contar.
+Move vota(const std::vector<std::pair<Move, int>>& cand) {
+    if (cand.empty())
+        return Move::none();
+    const int VOTO_PESO = 24;
+    int menor = cand[0].second;
+    for (auto& [m, sc] : cand)
+        menor = std::min(menor, sc);
+    std::vector<std::pair<Move, std::int64_t>> votos;
+    for (auto& [m, sc] : cand) {
+        std::int64_t peso = std::int64_t(sc) - menor + VOTO_PESO;
+        bool achou = false;
+        for (auto& v : votos)
+            if (v.first == m) { v.second += peso; achou = true; break; }
+        if (!achou)
+            votos.emplace_back(m, peso);
+    }
+    Move melhor = votos[0].first;
+    std::int64_t mais = votos[0].second;
+    for (auto& [m, v] : votos)
+        if (v > mais) { mais = v; melhor = m; }
+    return melhor;
+}
+
 
 
 // --- a historia de correccao ---
@@ -2232,6 +2272,7 @@ void Busca::arranca(Position& pos, const Limites& lim, Avaliador& avaliador) {
     inicio = std::chrono::steady_clock::now();
     melhor_raiz = Move::none();
     nota_raiz   = 0;
+    ultima_prof = 0;
     notas_raiz.clear();
     std::memset(pv_n, 0, sizeof(pv_n));
     std::memset(nulo_em, 0, sizeof(nulo_em));
@@ -2520,6 +2561,7 @@ void Busca::arranca(Position& pos, const Limites& lim, Avaliador& avaliador) {
             }
             break;
         }
+        ultima_prof = prof;
         anterior = nota;
 
         auto agora = std::chrono::steady_clock::now();
@@ -2614,6 +2656,42 @@ void Busca::arranca(Position& pos, const Limites& lim, Avaliador& avaliador) {
             if (f.joinable())
                 f.join();
         fios.clear();
+
+        // A VOTACAO.
+        //
+        // Sem ela os ajudantes so' valiam pelo que deixaram na tabela e no
+        // historico, e as respostas deles -- tres buscas inteiras -- eram
+        // deitadas fora no fim.
+        //
+        // Quem vota: o principal, e cada ajudante que NAO tenha ficado mais de
+        // dois plies atras dele. Um fio que o relogio apanhou na 12 nao esta' a
+        // ver o que o principal ve na 17, e deixa-lo votar e' decidir com menos
+        // informacao -- que e' o contrario do que o Lazy SMP e' para fazer. A
+        // divergencia que se quer e' no CAMINHO, nao na profundidade; e' por
+        // isso, tambem, que nenhum ajudante leva desvio de profundidade de
+        // proposito: com fios em profundidades diferentes a votacao passa a
+        // premiar quem saltou para um numero alto por um caminho raso.
+        std::vector<std::pair<Move, int>> cand;
+        if (melhor_raiz != Move::none() && nota_raiz > -VALUE_MATE)
+            cand.emplace_back(melhor_raiz, nota_raiz);
+        for (auto& b : ajudantes)
+            if (b->melhor_raiz != Move::none() && b->ultima_prof + 2 >= ultima_prof)
+                cand.emplace_back(b->melhor_raiz, b->nota_raiz);
+        if (cand.size() > 1) {
+            Move v = vota(cand);
+            if (v != Move::none() && v != melhor_raiz) {
+                // Anunciar: o lance vai mudar depois da ultima linha impressa,
+                // e sem isto o arbitro fica outra vez com uma variante que ja'
+                // nao e' a nossa -- o mesmo defeito, por um terceiro caminho.
+                saida() << "info string votacao: " << UCIEngine::move(v, false)
+                        << " com " << cand.size() << " fios" << std::endl;
+                melhor_raiz = v;
+                pv_tab[0][0] = v;
+                pv_n[0]      = 1;
+                saida() << "info depth " << ultima_prof << " score cp " << nota_raiz / 2
+                        << " pv " << UCIEngine::move(v, false) << std::endl;
+            }
+        }
     }
 
 

@@ -792,6 +792,12 @@ class Busca {
     /// Cria (ou destroi) os ajudantes e liga-lhes a tabela, o historico e a
     /// rede desta busca. Chamar quando o `Threads` muda, nao a cada lance.
     void prepara_fios(int n, Avaliador& av_dono);
+    /// A ULTIMA PROFUNDIDADE QUE ESTA BUSCA COMPLETOU.
+    ///
+    /// Serve para pesar a votacao. Um ajudante que o relogio apanhou na 12 nao
+    /// pode valer o mesmo que o principal na 17 -- e, pior, pode derruba-lo.
+    int ultima_prof = 0;
+
     /// Os nos de TODOS os fios.
     ///
     /// A principal, a quatro fios, anda MENOS nos do que andaria sozinha --
