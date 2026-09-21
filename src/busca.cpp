@@ -2564,7 +2564,23 @@ void Busca::arranca(Position& pos, const Limites& lim, Avaliador& avaliador) {
             // numeros sem mudar o treino faz o motor anunciar probabilidades que a
             // rede nunca aprendeu a produzir.
             {
-                auto sig = [](double x) { return 1.0 / (1.0 + std::exp(-x)); };
+                // POR FAZER, e e' trabalho nosso e nao transcricao: estas duas
+            // constantes sao FIXAS, e a referencia faz o mesmo modelo com um
+            // `a` e um `b` que dependem do MATERIAL, por um polinomio em
+            // (peoes + 3*menores + 5*torres + 9*damas).
+            //
+            // A razao e' boa: a mesma avaliacao nao vale a mesma probabilidade
+            // com trinta e duas pecas e com seis. Uma vantagem de meio peao num
+            // final e' quase decisiva; na abertura nao e' nada.
+            //
+            // Isso NAO vem do treino -- e' um ajuste feito sobre partidas
+            // reais. Podemos fazer o nosso: temos milhares de PGN com resultado
+            // e avaliacao lance a lance. Ajustar sobre os NOSSOS dados, nao
+            // copiar o polinomio deles, que e' da avaliacao deles.
+            //
+            // Nao muda a busca; muda o que o motor ANUNCIA -- e o arbitro decide
+            // o abandono e o empate pelo que se anuncia.
+            auto sig = [](double x) { return 1.0 / (1.0 + std::exp(-x)); };
                 double cp = double(nota_a);
                 int w = int(std::lround(1000.0 * sig((cp - 285.2706341467852) / 295.6539508488627)));
                 int l = int(std::lround(1000.0 * sig((-cp - 285.2706341467852) / 295.6539508488627)));
