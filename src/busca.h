@@ -353,8 +353,17 @@ struct Parametros {
     int lmr_nonpv_f   = 1024;
     /// O TERMO DO NO' DE CORTE. Reduz mais onde se espera cortar.
     ///
-    /// **NAO ESTABELECIDO.** Ha' medicao, ela aponta para 1024, e ela ENCOLHEU
-    /// a` medida que as partidas entraram. Tres doses do par (este termo e o
+    /// **MEDIDO E MUDADO de 2048 para 1024.**
+    ///
+    /// O nosso motor contra si proprio, so' este termo a mover, `lmr_ttpv`
+    /// fixo em 1024, 1 fio, 5+0,05:
+    ///
+    ///     1024 contra 2048:  **+19,97 +/- 10,68** em 1080 partidas
+    ///
+    /// Estavel desde as 500: +9,8 (320), +20,9 (502), +22,6 (800), +20,5
+    /// (1000), +19,97 (1080). Um efeito real assenta assim; ruido nao.
+    ///
+    /// O historico abaixo fica porque explica porque nao se mudou antes. Tres doses do par (este termo e o
     /// `lmr_ttpv` movidos juntos), o mesmo binario nas tres pontas, 10+0,1:
     ///
     ///      960 partidas   1024 +15,57 +/- 11,22    2048 -14,88 +/- 10,93
@@ -392,7 +401,7 @@ struct Parametros {
     /// nao prejudicial.
     ///
     /// Duas leituras precipitadas na mesma manha, uma em cada motor.
-    int lmr_cut_f     = 2048;
+    int lmr_cut_f     = 1024;
     int lmr_hist_div  = 22000;
     int lmr_pecas_fim = 0;
 
