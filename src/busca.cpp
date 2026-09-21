@@ -79,6 +79,10 @@ struct Diag {
     // nos de corte -- que e' o que a referencia faz.
     bool sem_nmp_prof, nmp_todos;
     bool forma;
+    // QUEM PESA NA REDUCAO: conta, por termo, quantas vezes dispara e quanto
+    // vale em MODULO. E' a radiografia que mostra se a reducao escolhe o lance
+    // ou se reduz tudo por igual.
+    bool quem;
     // O estudo da margem: quanto e' que a busca desmente a estatica, por ply.
     bool margem_estudo;
     // A re-busca proporcional (`RebuscaFina` no half2k).
@@ -96,6 +100,7 @@ struct Diag {
           sem_iir(std::getenv("KS_OFF_IIR") != nullptr),
           sem_nmp_prof(std::getenv("KS_SEM_NMP_PROF") != nullptr),
           forma(std::getenv("KS_FORMA") != nullptr),
+          quem(std::getenv("KS_QUEM") != nullptr),
           nmp_todos(std::getenv("KS_NMP_TODOS") != nullptr),
           margem_estudo(std::getenv("KS_MARGEM_ESTUDO") != nullptr),
           reb_fina(std::getenv("KS_REB") != nullptr),
@@ -104,6 +109,18 @@ struct Diag {
           sing_conta(std::getenv("KS_SING_CONTA") != nullptr) {}
 };
 const Diag DIAG;
+
+// Os termos da reducao, por ordem de aplicacao. Conta-se o MODULO: o que
+// interessa nao e' se um termo empurra para cima ou para baixo, e' quanto do
+// numero final e' dele.
+enum { Q_TABELA, Q_CUTCNT, Q_PIORA, Q_CAPT, Q_TTPV, Q_CUT, Q_NAOPV, Q_HIST, Q_AMORT, Q_N };
+const char* const Q_NOMES[Q_N] = {"tabela", "cut_cnt", "piora", "captura",
+                                  "tt-pv", "cut node", "nao-PV", "historico", "amortec."};
+std::uint64_t g_q_vezes[Q_N];
+std::uint64_t g_q_modulo[Q_N];
+inline void conta_q(int i, int d) {
+    if (d != 0) { ++g_q_vezes[i]; g_q_modulo[i] += std::uint64_t(d < 0 ? -d : d); }
+}
 
 
 // A banda dos tranquilos por pontuar. Ver o `pontua_tarde` la' em baixo.
@@ -817,16 +834,25 @@ int Busca::reducao(int prof, int i, int alpha, int beta, bool melhorando, bool t
                    bool cut, bool pv, bool tt_pv, Move tt_lance, int hist_i,
                    bool ttpv_bate_alpha, bool ttpv_fundo, int cortes_filho) const {
     int r = lmr[std::min(prof, 63)][std::min(i, 63)];
+    if (DIAG.quem) conta_q(Q_TABELA, r);
 
     // O ply SEGUINTE ja' cortou muitas vezes: no' facil, reduz-se mais.
-    if (cortes_filho > 1)
-        r += p.cut_cnt_base + p.cut_cnt_mais * int(cortes_filho > 2);
+    if (cortes_filho > 1) {
+        int d = p.cut_cnt_base + p.cut_cnt_mais * int(cortes_filho > 2);
+        r += d;
+        if (DIAG.quem) conta_q(Q_CUTCNT, d);
+    }
 
-
-    if (!melhorando)
-        r += r * p.lmr_piora_f / 512;
-    if (!tranquilo)
-        r -= r / 2;
+    if (!melhorando) {
+        int d = r * p.lmr_piora_f / 512;
+        r += d;
+        if (DIAG.quem) conta_q(Q_PIORA, d);
+    }
+    if (!tranquilo) {
+        int d = -(r / 2);
+        r += d;
+        if (DIAG.quem) conta_q(Q_CAPT, d);
+    }
 
     // O PAR. Ver a nota nos parametros: entram os dois ou nenhum.
     //
@@ -837,31 +863,41 @@ int Busca::reducao(int prof, int i, int alpha, int beta, bool melhorando, bool t
     if (p.lmr_ttpv > 0 || p.lmr_cut_f > 0) {
         // Abre: um no' que ja' foi importante merece mais profundidade.
         if (tt_pv) {
-            r -= p.lmr_ttpv;
-            if (pv)
-                r -= p.lmr_ttpv_pv;
-            r -= p.lmr_ttpv_alpha * int(ttpv_bate_alpha);
-            r -= p.lmr_ttpv_fundo * int(ttpv_fundo);
+            int d = -(p.lmr_ttpv + p.lmr_ttpv_pv * int(pv)
+                      + p.lmr_ttpv_alpha * int(ttpv_bate_alpha)
+                      + p.lmr_ttpv_fundo * int(ttpv_fundo));
+            r += d;
+            if (DIAG.quem) conta_q(Q_TTPV, d);
         }
         // Fecha: num no' onde se espera cortar, e ainda mais sem lance guardado
         // por onde comecar.
-        if (cut)
-            r += p.lmr_cut_f + p.lmr_cut_sem_tt * int(tt_lance == Move::none());
+        if (cut) {
+            int d = p.lmr_cut_f + p.lmr_cut_sem_tt * int(tt_lance == Move::none());
+            r += d;
+            if (DIAG.quem) conta_q(Q_CUT, d);
+        }
     } else {
         (void) cut;
     }
 
-    if (!pv)
+    if (!pv) {
         r += p.lmr_nonpv_f;
+        if (DIAG.quem) conta_q(Q_NAOPV, p.lmr_nonpv_f);
+    }
     (void) tt_pv;
     (void) tt_lance;
     (void) alpha;
     (void) beta;
     // O historico DEVOLVE reducao, com o desvio grampeado nos dois sentidos.
-    r -= std::clamp(hist_i * 1024 / std::max(p.lmr_hist_div, 1), -2048, 2048);
+    int dh = -std::clamp(hist_i * 1024 / std::max(p.lmr_hist_div, 1), -2048, 2048);
+    r += dh;
+    if (DIAG.quem) conta_q(Q_HIST, dh);
     // Amortece o lado negativo: aproxima a extensao do zero sem a proibir.
-    if (r < 0)
+    if (r < 0) {
+        int antes = r;
         r = r * p.lmr_ext_amort / 100;
+        if (DIAG.quem) conta_q(Q_AMORT, r - antes);
+    }
     return r;
 }
 
@@ -2786,6 +2822,17 @@ void Busca::arranca(Position& pos, const Limites& lim, Avaliador& avaliador) {
                   << " | qs: calc=" << n_aval_qs << " tabela=" << n_hit_qs
                   << " (" << (n_aval_qs + n_hit_qs ? 100.0 * n_hit_qs / (n_aval_qs + n_hit_qs) : 0) << "% poupados)"
                   << std::endl;
+    if (DIAG.quem) {
+        std::uint64_t tot = 0;
+        for (int k = 0; k < Q_N; ++k) tot += g_q_modulo[k];
+        saida() << "info string QUEM PESA NA REDUCAO -- modulo, em milesimos de ply" << std::endl;
+        for (int k = 0; k < Q_N; ++k)
+            saida() << "info string   " << Q_NOMES[k] << "\t" << g_q_vezes[k]
+                    << " vezes\tmodulo " << g_q_modulo[k]
+                    << "\tmedio |" << (g_q_vezes[k] ? g_q_modulo[k] / g_q_vezes[k] : 0) << "|"
+                    << "\t" << (tot ? 100.0 * double(g_q_modulo[k]) / double(tot) : 0.0) << "%"
+                    << std::endl;
+    }
     if (DIAG.sing_conta)
         saida() << "info string PC nos_entrados=" << pc_nos << " tentativas=" << pc_tentativas
                   << " passaram_qs=" << pc_passou_qs << " cortes=" << pc_cortes << std::endl;
