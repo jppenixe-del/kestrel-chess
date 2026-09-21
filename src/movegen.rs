@@ -5,7 +5,7 @@ use crate::moves::*;
 use crate::types::*;
 
 pub fn generate_pseudo_legal(board: &Board, atk: &Attacks, out: &mut Vec<Move>) {
-    gera_pseudo::<false>(board, atk, out)
+    gera_pseudo::<false, false>(board, atk, out)
 }
 
 /// Captures, en passant and queen promotions only.
@@ -21,17 +21,24 @@ pub fn generate_pseudo_legal(board: &Board, atk: &Attacks, out: &mut Vec<Move>) 
 /// pawn stepping to the last rank changes material as much as a capture does,
 /// and quiescence has always considered them.
 pub fn generate_pseudo_legal_caps(board: &Board, atk: &Attacks, out: &mut Vec<Move>) {
-    gera_pseudo::<true>(board, atk, out)
+    gera_pseudo::<true, false>(board, atk, out)
 }
 
-fn gera_pseudo<const APENAS_CAPTURAS: bool>(board: &Board, atk: &Attacks, out: &mut Vec<Move>) {
+fn gera_pseudo<const APENAS_CAPTURAS: bool, const APENAS_TRANQUILOS: bool>(board: &Board, atk: &Attacks, out: &mut Vec<Move>) {
     let us = board.side;
     let them = us.opp();
     let own = board.occ_color[us.idx()];
     let occ = board.occ_all;
     // The one line that separates the two generators: everything that is not
     // ours, or only what is theirs.
-    let alvos = if APENAS_CAPTURAS { board.occ_color[them.idx()] } else { !own };
+    let alvos = if APENAS_CAPTURAS {
+        board.occ_color[them.idx()]
+    } else if APENAS_TRANQUILOS {
+        // So' casas vazias: um lance tranquilo e' por definicao o que nao come.
+        !occ
+    } else {
+        !own
+    };
 
     // Pawns
     let pawns = board.pieces[us.idx()][PieceType::Pawn.idx()];
@@ -47,7 +54,12 @@ fn gera_pseudo<const APENAS_CAPTURAS: bool>(board: &Board, atk: &Attacks, out: &
         let one = ((from as i32) + push_dir) as u8;
         if one < 64 && bb(one) & occ == 0 {
             if will_promote {
-                add_promotions(out, from, one, false);
+                // A promocao por avanco sai com as capturas, nao com os
+                // tranquilos: e' um lance que muda material e a ordenacao
+                // trata-a como tal.
+                if !APENAS_TRANQUILOS {
+                    add_promotions(out, from, one, false);
+                }
             } else if !APENAS_CAPTURAS {
                 out.push(Move::quiet(from, one));
             }
@@ -59,7 +71,7 @@ fn gera_pseudo<const APENAS_CAPTURAS: bool>(board: &Board, atk: &Attacks, out: &
             }
         }
         let attacks = atk.pawn[us.idx()][from as usize];
-        let mut caps = attacks & board.occ_color[them.idx()];
+        let mut caps = if APENAS_TRANQUILOS { 0 } else { attacks & board.occ_color[them.idx()] };
         while caps != 0 {
             let to = pop_lsb(&mut caps);
             if will_promote {
@@ -68,7 +80,7 @@ fn gera_pseudo<const APENAS_CAPTURAS: bool>(board: &Board, atk: &Attacks, out: &
                 out.push(Move::capture(from, to));
             }
         }
-        if board.ep_square != NO_SQUARE && attacks & bb(board.ep_square) != 0 {
+        if !APENAS_TRANQUILOS && board.ep_square != NO_SQUARE && attacks & bb(board.ep_square) != 0 {
             out.push(Move { from, to: board.ep_square, promotion: None, flag: MoveFlag::EnPassant });
         }
     }
@@ -211,14 +223,24 @@ pub fn compute_pinned(board: &Board, atk: &Attacks, us: Color, king_sq: Square) 
 /// evasion, quiet ones included, so quiescence keeps calling `generate_legal`
 /// there.
 pub fn generate_legal_caps(board: &mut Board, atk: &Attacks) -> Vec<Move> {
-    gera_legal::<true>(board, atk)
+    gera_legal::<true, false>(board, atk)
+}
+
+/// Os tranquilos legais, sem gerar uma unica captura.
+///
+/// Existe para a busca por etapas: 92% dos nos cortam sem precisar de um lance
+/// tranquilo, e nesses nao ha' razao para os gerar, filtrar por legalidade nem
+/// pontuar. So' correcto FORA de xeque -- em xeque as fugas incluem lances
+/// tranquilos e a lista tem de vir inteira.
+pub fn generate_legal_quiets(board: &mut Board, atk: &Attacks) -> Vec<Move> {
+    gera_legal::<false, true>(board, atk)
 }
 
 pub fn generate_legal(board: &mut Board, atk: &Attacks) -> Vec<Move> {
-    gera_legal::<false>(board, atk)
+    gera_legal::<false, false>(board, atk)
 }
 
-fn gera_legal<const APENAS_CAPTURAS: bool>(board: &mut Board, atk: &Attacks) -> Vec<Move> {
+fn gera_legal<const APENAS_CAPTURAS: bool, const APENAS_TRANQUILOS: bool>(board: &mut Board, atk: &Attacks) -> Vec<Move> {
     // `pseudo`, the intermediate, is a reused thread-local scratch buffer, so
     // that a Vec is not allocated and freed once per NODE -- malloc/free was
     // ~4% of the profile. `legal` stays fresh, because the caller holds it
@@ -232,7 +254,7 @@ fn gera_legal<const APENAS_CAPTURAS: bool>(board: &mut Board, atk: &Attacks) -> 
     PSEUDO.with(|cell| {
     let mut pseudo = cell.borrow_mut();
     pseudo.clear();
-    gera_pseudo::<APENAS_CAPTURAS>(board, atk, &mut pseudo);
+    gera_pseudo::<APENAS_CAPTURAS, APENAS_TRANQUILOS>(board, atk, &mut pseudo);
     let us = board.side;
     let king_sq = board.king_sq(us);
     let in_check = board.in_check(us, atk);
@@ -277,9 +299,25 @@ fn gera_legal<const APENAS_CAPTURAS: bool>(board: &mut Board, atk: &Attacks) -> 
             }
             continue;
         }
+        // The accumulator is lifted out for the duration.
+        //
+        // This make/unmake exists only to ask whether the move leaves our own
+        // king in check. It was free when a board was bitboards and a mailbox;
+        // it is not free now that moving a piece also updates the network, and
+        // a king move on top of that throws away a whole perspective and
+        // rebuilds it -- twice, once each way, for a question that has nothing
+        // to do with evaluation.
+        //
+        // Taking the accumulator out is exactly symmetric by construction:
+        // with nothing there, `add_piece`, `remove_piece` and the refresh all
+        // do nothing, so what goes back is what came out. Measured on a middle
+        // game position, this alone took the search from 131k to the figure in
+        // the commit message.
+        let saved = board.acc.take();
         let undo = board.make_move(&mv);
         let illegal = board.in_check(us, atk);
         board.unmake_move(&mv, &undo);
+        board.acc = saved;
         if !illegal {
             legal.push(mv);
         }

@@ -1,2 +1,13 @@
+# AVX2 e o resto do x86-64-v3.
+#
+# Ate hoje compilavamos para o x86-64 base -- SSE2, de 2003 -- e nao custava
+# nada, porque a avaliacao da v8 e' um produto escalar de mil operacoes e nao ha
+# ali o que vectorizar. Com uma cabeca em camadas deixa de ser assim: medido,
+# 1024 de largura custa 1 771 ns por avaliacao com AVX2 e 6 085 ns sem ele, e o
+# no' inteiro custa 3 165. Sem isto perdiamos metade dos nos por causa de uma
+# opcao de compilacao.
+#
+# `x86-64-v3` e nao `native`: e' portavel por todo o x86 moderno, incluindo a
+# maquina do bot, e `native` produzia um binario que so' corre onde foi feito.
 [build]
-rustflags = ["-C", "target-cpu=native"]
+rustflags = ["-C", "target-cpu=x86-64-v3"]

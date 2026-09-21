@@ -1,4982 +1,6133 @@
-use crate::attacks::{bishop_attacks, rook_attacks, Attacks};
-use crate::bitboard::{bb, Bitboard};
+// The search.
+//
+// Deliberately a small, sound search rather than a full one: iterative
+// deepening with aspiration windows, principal variation search, quiescence,
+// transposition table, killers and history, null move and late move
+// reductions. Everything beyond that is added one at a time and measured, so
+// that what each addition is worth is a number and not an opinion.
+//
+// Time management is here from the start rather than bolted on later, because
+// an engine that loses on the clock is worth nothing whatever it scores at
+// infinite time. See `allocate`.
+
+use crate::attacks::Attacks;
 use crate::board::Board;
-use crate::book::{encode_move, Book};
-use crate::evaluation::evaluate;
-use crate::movegen::{generate_legal, generate_legal_caps};
 use crate::moves::{Move, MoveFlag};
-use crate::tt::{Bound, TranspositionTable};
-use crate::types::{file_of, rank_of, sq, Color, PieceType};
-use crate::zobrist::Zobrist;
-use std::sync::OnceLock;
+use crate::movegen::{generate_legal, generate_legal_caps};
+use crate::nnue;
+use crate::see;
+use crate::tt::{Bound, TranspositionTable, TT_EVAL_NONE};
+use crate::types::*;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// LMR reduction table indexed by [depth][move_index], both clamped to
-/// 63. Logarithmic formula (standard shape used by essentially every
-/// modern alpha-beta engine): reduction grows with ln(depth)*ln(count),
-/// smooth instead of the old fixed tiers (+1/+2/+3 at hard thresholds).
-/// Computed once at first use, cheap (64*64 entries).
+/// How much to reduce a late quiet move by, indexed by depth and by how many
+/// moves have already been tried.
 ///
-/// The divisor (2.1) is A/B-testable via `KESTREL_LMR_DIVISOR`, same
-/// reversible opt-in pattern as `KESTREL_EVAL_MODE`/`KESTREL_TUNED_WEIGHTS`:
-/// unset (every real deployment) reproduces the compiled-in default
-/// bit-for-bit. Smaller divisor -> larger reduction -> more aggressive
-/// pruning. A previous A/B attempt at tuning this used ad-hoc scratch
-/// binaries whose provenance couldn't be reconstructed reliably -- this
-/// env var replaces that with a reproducible single-binary comparison.
-static LMR_TABLE: OnceLock<[[i32; 64]; 64]> = OnceLock::new();
-
-/// A partir de que fila (contada do lado de quem joga) um lance de peao deixa
-/// de ser reduzido pelo LMR. 6 = sexta e setima filas. 0 desliga a regra.
+/// A table rather than an expression because the expression wanted logarithms,
+/// and the first version computed them in integers -- `ln(3)` and `ln(4)` both
+/// truncate to 1, so the reduction was very nearly a constant and the whole
+/// point of reducing later moves harder was lost.
 ///
-/// Porque existe: a avaliacao nao ve peoes passados. Nao ha feature nenhuma
-/// nas 768 entradas que diga "este peao esta passado" ou "faltam-lhe duas
-/// casas" -- ve peca e casa, e se o peao esta livre depende dos peoes do
-/// adversario em tres colunas, que uma camada so' infere mal.
+/// Rebuilt when its two numbers change rather than computed per node: four
+/// thousand logarithms is nothing once a move, and real work once a node.
+/// Para cada tipo de peca, as casas atacadas por uma peca MENOR do adversario.
 ///
-/// Medido nas nossas proprias posicoes, contra o Stockfish em 6000 posicoes
-/// etiquetadas, o erro medio da avaliacao por distancia a promocao:
-///
-///     sem passados   94 cp        a 2 filas   128 cp
-///     a 3 filas     118 cp        a 1 fila    158 cp
-///
-/// Uma posicao com um peao a uma casa de promover e' avaliada com 68% mais
-/// erro do que uma sem passados -- e sao posicoes de resposta binaria, ou se
-/// para o peao ou se perde. O mesmo padrao existe na rede anterior, portanto
-/// nao e' regressao: e' a arquitectura.
-///
-/// Se a avaliacao nao sabe que a linha e' critica, o LMR reduz-a como reduz
-/// qualquer lance quieto tardio, e a promocao cai para alem do horizonte. Nao
-/// reduzir e' a correccao barata: nao toca na rede e devolve a essas linhas a
-/// profundidade que a avaliacao nao sabe pedir.
-///
-/// LIGADO a 6 (sexta e setima filas) depois de medido: +9.9 +/- 13.3 Elo,
-/// LOS 92.7%, em 2000 jogos a 5+0.05.
-///
-/// Nao decidiu formalmente -- o LLR parou nos 0.8 de 2.2 -- e adopta-se na
-/// mesma porque o efeito tem um mecanismo medido por FORA do jogo: o erro da
-/// avaliacao cresce 94 -> 158 cp conforme o peao se aproxima da promocao, nas
-/// duas redes. Nao e' um numero bonito a procura de explicacao; e' uma
-/// explicacao que produziu o numero previsto.
-static PEAO_FILA_SEM_LMR: std::sync::atomic::AtomicI32 =
-    std::sync::atomic::AtomicI32::new(6);
-
-pub fn peao_fila_sem_lmr() -> i32 {
-    PEAO_FILA_SEM_LMR.load(std::sync::atomic::Ordering::Relaxed)
+/// Nao e' o mesmo que "atacada": uma dama onde um peao lhe chega esta' em
+/// perigo, uma dama onde so' uma torre lhe chega nao esta'. E' por isso que a
+/// mascara e' por tipo e nao uma so'.
+fn ameacas_menores(board: &Board, by: Color, atk: &crate::attacks::Attacks) -> [u64; 6] {
+    use crate::attacks::{bishop_attacks, rook_attacks};
+    let p = &board.pieces[by.idx()];
+    let occ = board.occ_all;
+    let mut peoes = 0u64;
+    let mut b = p[PieceType::Pawn.idx()];
+    while b != 0 {
+        let sq = b.trailing_zeros() as usize;
+        b &= b - 1;
+        peoes |= atk.pawn[by.idx()][sq];
+    }
+    let mut menores = 0u64;
+    let mut b = p[PieceType::Knight.idx()];
+    while b != 0 {
+        let sq = b.trailing_zeros() as usize;
+        b &= b - 1;
+        menores |= atk.knight[sq];
+    }
+    let mut b = p[PieceType::Bishop.idx()];
+    while b != 0 {
+        let sq = b.trailing_zeros() as Square;
+        b &= b - 1;
+        menores |= bishop_attacks(sq, occ);
+    }
+    let mut torres = 0u64;
+    let mut b = p[PieceType::Rook.idx()];
+    while b != 0 {
+        let sq = b.trailing_zeros() as Square;
+        b &= b - 1;
+        torres |= rook_attacks(sq, occ);
+    }
+    // Peao e rei nao tem "menor" que os ameace de forma util.
+    [0, peoes, peoes, peoes | menores, peoes | menores | torres, 0]
 }
 
-pub fn set_peao_fila_sem_lmr(v: i32) {
-    PEAO_FILA_SEM_LMR.store(v.clamp(0, 8), std::sync::atomic::Ordering::Relaxed);
+/// Todas as casas atacadas por um lado, peoes e rei incluidos.
+///
+/// Uma vez por no', para as duas perguntas que o historico com contexto faz:
+/// a peca esta' a fugir de uma ameaca? vai para uma casa ameacada?
+fn todas_ameacas(board: &Board, by: Color, atk: &crate::attacks::Attacks) -> u64 {
+    use crate::attacks::{bishop_attacks, rook_attacks};
+    let p = &board.pieces[by.idx()];
+    let occ = board.occ_all;
+    let mut m = 0u64;
+    // Os peoes todos de uma vez, em dois deslocamentos.
+    //
+    // Antes iterava-se peao a peao com uma consulta a` tabela por cada um: ate'
+    // oito voltas de ciclo e oito acessos a memoria para produzir o mesmo
+    // bitboard que duas instrucoes dao. Os ataques de peao sao a unica coisa
+    // aqui que nao depende das pecas que estao no caminho, portanto sao os
+    // unicos que se podem calcular em bloco.
+    let peoes = p[PieceType::Pawn.idx()];
+    m |= if by == Color::White {
+        ((peoes & !crate::bitboard::FILE_A) << 7) | ((peoes & !crate::bitboard::FILE_H) << 9)
+    } else {
+        ((peoes & !crate::bitboard::FILE_H) >> 7) | ((peoes & !crate::bitboard::FILE_A) >> 9)
+    };
+    let mut b = p[PieceType::Knight.idx()];
+    while b != 0 {
+        let sq = b.trailing_zeros() as usize;
+        b &= b - 1;
+        m |= atk.knight[sq];
+    }
+    // A dama entra nas duas listas em vez de ter ciclo proprio.
+    //
+    // Ela ataca como bispo E como torre, portanto o trabalho e' o mesmo -- as
+    // duas consultas magicas fazem-se de qualquer maneira. O que se poupa e' um
+    // ciclo inteiro de controlo e a leitura repetida do bitboard das damas.
+    let damas = p[PieceType::Queen.idx()];
+    let mut b = p[PieceType::Bishop.idx()] | damas;
+    while b != 0 {
+        let sq = b.trailing_zeros() as Square;
+        b &= b - 1;
+        m |= bishop_attacks(sq, occ);
+    }
+    let mut b = p[PieceType::Rook.idx()] | damas;
+    while b != 0 {
+        let sq = b.trailing_zeros() as Square;
+        b &= b - 1;
+        m |= rook_attacks(sq, occ);
+    }
+    m |= atk.king[board.king_sq(by) as usize];
+    m
 }
 
-/// Este lance leva um peao a uma fila avancada?
+/// Em que dos quatro baldes do historico este lance cai.
 ///
-/// Chamado DEPOIS de `make_move`, portanto quem jogou e' `board.side.opp()` e
-/// a peca ja esta em `mv.to` -- as duas coisas que o bug de 2026-07-25 nesta
-/// mesma funcao de reducao apanhou da maneira dificil.
+/// A ideia vem do motor de referencia, cuja tabela e' indexada por sete coisas
+/// onde a nossa usa tres. As duas que importam sao estas: a peca esta' a fugir
+/// de uma ameaca, e vai para uma casa ameacada.
+///
+/// O mesmo lance de b1 para b5 quer dizer coisas opostas conforme b1 estiver
+/// atacada (foge) ou nao (manobra), e conforme b5 estiver atacada (pendura-se)
+/// ou nao (segura). Nos metiamos os quatro casos no mesmo balde e perguntavamos
+/// a` media o que fazer.
 #[inline]
-fn peao_avancado(board: &crate::board::Board, mv: &crate::moves::Move) -> bool {
-    let fila_min = peao_fila_sem_lmr();
-    if fila_min == 0 {
-        return false;
-    }
-    let mover = board.side.opp();
-    match board.piece_at(mv.to) {
-        Some((crate::types::PieceType::Pawn, c)) if c == mover => {
-            let r = (mv.to as i32) / 8;                  // 0..7, absoluta
-            let rel = if mover == crate::types::Color::White { r } else { 7 - r };
-            rel + 1 >= fila_min                          // rel 0 = 1a fila
-        }
-        _ => false,
-    }
+fn balde(ameacadas: u64, mv: &Move) -> usize {
+    let de = (ameacadas >> mv.from) & 1;
+    let para = (ameacadas >> mv.to) & 1;
+    (de * 2 + para) as usize
 }
 
-/// Same reasoning as `evaluation::warmup`: build the search-side globals before
-/// the clock matters, not inside the first search.
-pub fn warmup() {
-    let _ = lmr_table();
-    // Deliberately NOT `search_params()`. It is a OnceLock, so the first read
-    // fixes it for the life of the process -- warming it here means every
-    // `setoption` that arrives afterwards is folded into a value nobody will
-    // ever read again. The engine accepts the option, reports nothing wrong,
-    // and searches with the old number: a sweep of five values returns five
-    // identical results and looks like a finding. Building it lazily costs one
-    // branch on the first node.
-}
-fn lmr_table() -> &'static [[i32; 64]; 64] {
-    LMR_TABLE.get_or_init(|| {
-        let divisor = std::env::var("KESTREL_LMR_DIVISOR")
-            .ok()
-            .and_then(|s| s.parse::<f64>().ok())
-            .unwrap_or(2.1);
-        if divisor != 2.1 {
-            eprintln!("KESTREL_LMR_DIVISOR: using {} (default 2.1)", divisor);
-        }
-        let mut t = [[0i32; 64]; 64];
-        for d in 1..64 {
-            for m in 1..64 {
-                let r = 0.5 + (d as f64).ln() * (m as f64).ln() / divisor;
-                // Stored in MILLI-PLIES (see `LMR_ESCALA`), not whole plies.
-                // Same curve as before, same divisor -- only the resolution
-                // changes. Truncating this to an integer here was discarding
-                // 42% of the reduction the formula asks for at depth 5,
-                // move 5 (1.733 -> 1), and 21% at depth 14 (3.816 -> 3).
-                t[d][m] = (r * LMR_ESCALA as f64).round() as i32;
-            }
-        }
-        t
-    })
-}
-
-/// Fixed-point scale for LMR reductions: they accumulate in 1/1024 of a ply
-/// and are divided down to whole plies ONCE, at the end.
+/// As casas de onde cada tipo de peca daria xeque ao rei adversario.
 ///
-/// Every modulator used to be rounded to a whole ply on its own -- the base
-/// truncated from its float, history integer-divided, the rest a flat +/-1 --
-/// so each term could only say "nothing" or "a whole ply". Measured on our own
-/// constants, that threw away up to 42% of the base reduction and silenced the
-/// history term entirely below h=8846 (a move at 8845, over half of
-/// HISTORY_MAX, asked for -1.000 ply and got 0).
+/// Calculado do rei para fora, que e' uma vez por no' em vez de uma por lance.
+fn casas_de_xeque(board: &Board, contra: Color, atk: &crate::attacks::Attacks) -> [u64; 6] {
+    use crate::attacks::{bishop_attacks, rook_attacks};
+    let k = board.king_sq(contra);
+    let occ = board.occ_all;
+    let b = bishop_attacks(k, occ);
+    let r = rook_attacks(k, occ);
+    [
+        atk.pawn[contra.idx()][k as usize],
+        atk.knight[k as usize],
+        b,
+        r,
+        b | r,
+        0,
+    ]
+}
+
+/// Quem reduz o que: [vezes, milesimos somados] por termo.
 ///
-/// The mechanism is common practice, arrived at independently by every engine
-/// that carries several modulators; engines that do this accumulate in
-/// fixed point, typically in 1/1024 or 1/100. The
-/// scale is arbitrary; 1024 is chosen
-/// here because it makes the final division a shift.
+/// Sete termos empilham-se no mesmo numero, e o total nao diz qual deles fez o
+/// trabalho. Dois podem estar a anular-se e um a fazer tudo.
+/// Quantas vezes a ponte estava ligada e nao respondeu.
 ///
-/// The constants below are NOT taken from any of them. Every term keeps the
-/// value this engine already had tuned (divisor 2.1, history divisor 8846,
-/// the +/-1 ply caps), expressed exactly instead of rounded.
-const LMR_ESCALA: i32 = 1024;
+/// Deve ser ZERO sempre. Qualquer valor acima disso quer dizer que houve
+/// avaliacoes feitas por outro avaliador sem ninguem pedir.
+pub static FALHAS_PONTE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-
-
-static ROOT_TRACE: OnceLock<bool> = OnceLock::new();
-/// Is the root trace switched on? Read once -- the check sits in the root
-/// move loop, so it must not cost an environment lookup per move.
-fn root_trace() -> bool {
-    *ROOT_TRACE.get_or_init(|| std::env::var("KESTREL_ROOT_TRACE").is_ok())
-}
-
-pub const MATE_SCORE: i32 = 30000;
-/// A root move that failed low this iteration has no usable score.
-pub const NO_SCORE: i32 = -MATE_SCORE - 100;
-pub const MAX_PLY: usize = 128;
-
-/// Percent multiplier for the eval-margin pruning thresholds (RFP, NMP,
-/// razoring, futility) -- 100 = unchanged. A foreign network read through
-/// our own port has a different noise/volatility profile than the one these
-/// margins were tuned against, and margins tuned for a hand-crafted
-/// evaluation fire too early against a network. The usual answer is a second
-/// set of constants for the network path; this is one pragmatic knob
-/// instead, widening every eval-margin site the same way while it gets
-/// measured.
-#[inline]
-pub fn eval_margin_scale() -> i32 {
-    // Widening by 1.5x was tried and measured WORSE against the same
-    // baseline. Widening buys width at the cost of depth, and that trade
-    // only pays for a search fast enough per node to afford the extra
-    // exploration; ours, already slow per node on this network, just loses
-    // effective depth. Off until the cause is better understood.
-    100
-}
-
-/// Every scalar pruning margin/threshold in the search, in one runtime-
-/// swappable place -- same reversible pattern as `Weights`/
-/// `KESTREL_TUNED_WEIGHTS` in eval.rs, but for the SEARCH side. Before
-/// this, these were scattered `const`s and inline literals (RFP margin,
-/// razoring, futility x2, qsearch delta pruning, qsearch LMP, TT
-/// extended cutoff, history pruning) with no way to swap them without
-/// editing and recompiling -- noticed while building an eval "profile"
-/// that the search side had no equivalent, even though these margins
-/// deserve tuning just as much (each carries a measurable Elo value
-/// under SPSA, see NOTAS_PROXIMA_SESSAO.md). `KESTREL_SEARCH_PARAMS=
-/// <path>` loads a `to_vec()`-shaped file the same way
-/// `KESTREL_TUNED_WEIGHTS` does; unset reproduces every default exactly.
-/// No coordinate-descent tuner for this yet (these interact with node
-/// counts nonlinearly -- the static-position tuning method doesn't apply,
-/// real tuning here needs SPSA over actual games, same self-play
-/// infrastructure this session already uses for A/B validation) -- this
-/// commit only makes the values swappable, doesn't add a tuner.
-/// Margin shape `base + slope*depth`, generalizing the old pure-
-/// multiplier form (`slope*depth`, base=0 -- what every Kestrel default
-/// already was, so this changes zero behavior by default) to also
-/// represent margins that have a flat component (e.g. a quiet futility
-/// of the form `77 + lmrDepth*52`). The pure-multiplier form is just the
-/// base=0 special case, so either shape can be expressed exactly.
-#[derive(Clone, Copy)]
-pub struct DepthMargin {
-    pub base: i32,
-    pub slope: i32,
-}
-
-/// Static Exchange Evaluation, as free functions.
-///
-/// Moved out of `Searcher` so the EVALUATION can use it too. The static
-/// evaluation had no way to price a piece that is about to be captured: a
-/// bishop left en prise scored a flat -58 penalty when the bishop is worth
-/// 355, so a position that was really -215 evaluated as -73. That 142-point
-/// error is larger than every pruning margin we have -- 35 per ply for RFP,
-/// 265 for null move -- which means whole-node pruning was deciding on a
-/// number that could be wrong by more than the margin it was compared against.
-///
-/// Nothing here needs searcher state; the only dependency was the attack
-/// tables, which are a global.
-pub mod see {
-    use crate::attacks::{bishop_attacks, rook_attacks, Attacks};
-    use crate::board::Board;
-    use crate::bitboard::*;
-    use crate::moves::{Move, MoveFlag};
-    use crate::types::{file_of, rank_of, sq, Color, PieceType, Square};
-
-    /// Static Exchange Evaluation: simula a sequencia completa de
-    /// capturas/recapturas na casa `mv.to`, sempre com o atacante menos
-    /// valioso de cada lado (a jogada optima para ambos), e devolve o
-    /// ganho material líquido assumindo optimo jogo de ambos os lados
-    /// (cada lado escolhe parar ou continuar a troca, o que for melhor
-    /// para si -- minimax classico sobre a "swap list"). Nao verifica
-    /// se a recaptura deixaria o proprio rei em xeque (limitacao
-    /// standard/aceite de SEE simples, presente em praticamente todos
-    /// os motores). So' chamar em lances de captura (incl. en passant).
-    pub fn see(a: &Attacks, board: &Board, mv: &Move) -> i32 {
-        let to = mv.to;
-        let Some((attacker_pt0, attacker_color0)) = board.piece_at(mv.from) else {
-            return 0;
-        };
-        let victim_val0 = if mv.flag == MoveFlag::EnPassant {
-            PieceType::Pawn.value()
-        } else {
-            match board.piece_at(to) {
-                Some((pt, _)) => pt.value(),
-                // Quiet move: nothing is captured, so the exchange starts
-                // at zero -- but the sequence below still runs, because the
-                // piece we just moved can be taken on `to`. That makes this
-                // a general "does this move lose material?" test rather
-                // than a capture-only one (it used to bail out with 0 here,
-                // which silently made any SEE-based test on a quiet move a
-                // no-op). Every existing caller guards on is_capture(), so
-                // their behaviour is unchanged.
-                None => 0,
-            }
-        };
-
-        let mut occ = board.occ_all;
-        occ &= !bb(mv.from);
-        if mv.flag == MoveFlag::EnPassant {
-            let ep_captured = sq(file_of(to), rank_of(mv.from));
-            occ &= !bb(ep_captured);
-        }
-
-        // Era um Vec com capacidade 1: uma alocacao no heap por CHAMADA, e
-        // cada push a realocar (1->2->4->8). SEE e' chamado na ordenacao de
-        // lances, na poda e na avaliacao de pecas penduradas -- milhoes de
-        // vezes por segundo. A sequencia de trocas tem um tecto de 32, por
-        // isso cabe na pilha e nunca precisou do heap.
-        let mut gains = [0i32; 34];
-        gains[0] = victim_val0;
-        let mut n_gains = 1usize;
-        let mut attacker_val = attacker_pt0.value();
-        let mut side = attacker_color0.opp();
-
-        // Os atacantes eram revarridos DO ZERO a cada troca -- ate' 32 vezes
-        // por SEE, cada uma com duas consultas de peao, uma de cavalo, uma de
-        // rei, duas magias e oito ORs para montar as mascaras. Mas ao tirar
-        // uma peca do tabuleiro so' um deslizante pode passar a atacar a casa
-        // (a bateria atras dele); cavalos, peoes e reis nunca aparecem de
-        // novo. Entao calcula-se o conjunto uma vez e a seguir so' se
-        // reexaminam os deslizantes, com as mascaras montadas ca' fora.
-        let diag = board.pieces[Color::White.idx()][PieceType::Bishop.idx()]
-            | board.pieces[Color::Black.idx()][PieceType::Bishop.idx()]
-            | board.pieces[Color::White.idx()][PieceType::Queen.idx()]
-            | board.pieces[Color::Black.idx()][PieceType::Queen.idx()];
-        let orth = board.pieces[Color::White.idx()][PieceType::Rook.idx()]
-            | board.pieces[Color::Black.idx()][PieceType::Rook.idx()]
-            | board.pieces[Color::White.idx()][PieceType::Queen.idx()]
-            | board.pieces[Color::Black.idx()][PieceType::Queen.idx()];
-        let mut attackers = attackers_to(a, board, to, occ);
-        loop {
-            let side_attackers = attackers & board.occ_color[side.idx()];
-            let Some((lva_sq, lva_pt)) = least_valuable_attacker(board, side_attackers, side) else {
-                break;
-            };
-            gains[n_gains] = attacker_val - gains[n_gains - 1];
-            n_gains += 1;
-            attacker_val = lva_pt.value();
-            occ &= !bb(lva_sq);
-            // Tira o atacante usado e junta o que ele tapava.
-            attackers |= (bishop_attacks(to, occ) & diag) | (rook_attacks(to, occ) & orth);
-            attackers &= occ;
-            side = side.opp();
-            if n_gains > 32 {
-                break;
-            }
-        }
-
-        for i in (1..n_gains).rev() {
-            gains[i - 1] = (-gains[i]).min(gains[i - 1]);
-        }
-        gains[0]
-    }
-    /// `see(mv) >= limiar`, mas sem calcular o valor exacto.
-    ///
-    /// O SEE completo constroi a sequencia de trocas toda e so' no fim, na
-    /// passagem inversa, e' que sabe o resultado. Quando a pergunta e' apenas
-    /// "isto passa a fasquia?" -- e e' o que a maioria dos sitios pergunta:
-    /// `>= 0` na quiescencia, `< see_allowance` na poda -- a resposta costuma
-    /// ficar decidida a' primeira ou segunda troca. Aqui leva-se um valor
-    /// corrente com o truque negamax (`valor = peca - valor`) e sai-se assim
-    /// que o sinal deixa de poder mudar.
-    ///
-    /// Tem de concordar com `see(..) >= limiar` em TODAS as posicoes; se
-    /// discordar numa que seja, a contagem de nos do bench muda.
-    pub fn see_ge(a: &Attacks, board: &Board, mv: &Move, limiar: i32) -> bool {
-        let to = mv.to;
-        let Some((attacker_pt0, attacker_color0)) = board.piece_at(mv.from) else {
-            return 0 >= limiar;
-        };
-        let victim_val0 = if mv.flag == MoveFlag::EnPassant {
-            PieceType::Pawn.value()
-        } else {
-            match board.piece_at(to) {
-                Some((pt, _)) => pt.value(),
-                None => 0,
-            }
-        };
-
-        let mut valor = victim_val0 - limiar;
-        if valor < 0 {
-            return false;
-        }
-        valor = attacker_pt0.value() - valor;
-        if valor <= 0 {
-            return true;
-        }
-
-        let mut occ = board.occ_all;
-        occ &= !bb(mv.from);
-        if mv.flag == MoveFlag::EnPassant {
-            let ep_captured = sq(file_of(to), rank_of(mv.from));
-            occ &= !bb(ep_captured);
-        }
-
-        let diag = board.pieces[Color::White.idx()][PieceType::Bishop.idx()]
-            | board.pieces[Color::Black.idx()][PieceType::Bishop.idx()]
-            | board.pieces[Color::White.idx()][PieceType::Queen.idx()]
-            | board.pieces[Color::Black.idx()][PieceType::Queen.idx()];
-        let orth = board.pieces[Color::White.idx()][PieceType::Rook.idx()]
-            | board.pieces[Color::Black.idx()][PieceType::Rook.idx()]
-            | board.pieces[Color::White.idx()][PieceType::Queen.idx()]
-            | board.pieces[Color::Black.idx()][PieceType::Queen.idx()];
-        let mut attackers = attackers_to(a, board, to, occ);
-
-        let mut side = attacker_color0.opp();
-        let mut res = true;
-        loop {
-            attackers &= occ;
-            let side_attackers = attackers & board.occ_color[side.idx()];
-            let Some((lva_sq, lva_pt)) = least_valuable_attacker(board, side_attackers, side)
-            else {
-                break;
-            };
-            res = !res;
-            valor = lva_pt.value() - valor;
-            // `res` diz de quem e' a vez de ficar a ganhar: o limite muda de
-            // 0 para 1 conforme o lado, tal como na formulacao classica.
-            if valor < res as i32 {
-                break;
-            }
-            occ &= !bb(lva_sq);
-            attackers |= (bishop_attacks(to, occ) & diag) | (rook_attacks(to, occ) & orth);
-            side = side.opp();
-        }
-        res
-    }
-
-    pub fn attackers_to(a: &Attacks, board: &Board, s: crate::types::Square, occ: crate::bitboard::Bitboard) -> crate::bitboard::Bitboard {
-        let a = a;
-        let mut att = 0u64;
-        att |= a.pawn[Color::Black.idx()][s as usize] & board.pieces[Color::White.idx()][PieceType::Pawn.idx()];
-        att |= a.pawn[Color::White.idx()][s as usize] & board.pieces[Color::Black.idx()][PieceType::Pawn.idx()];
-        att |= a.knight[s as usize]
-            & (board.pieces[Color::White.idx()][PieceType::Knight.idx()] | board.pieces[Color::Black.idx()][PieceType::Knight.idx()]);
-        att |= a.king[s as usize]
-            & (board.pieces[Color::White.idx()][PieceType::King.idx()] | board.pieces[Color::Black.idx()][PieceType::King.idx()]);
-        let diag = board.pieces[Color::White.idx()][PieceType::Bishop.idx()]
-            | board.pieces[Color::Black.idx()][PieceType::Bishop.idx()]
-            | board.pieces[Color::White.idx()][PieceType::Queen.idx()]
-            | board.pieces[Color::Black.idx()][PieceType::Queen.idx()];
-        att |= bishop_attacks(s, occ) & diag;
-        let orth = board.pieces[Color::White.idx()][PieceType::Rook.idx()]
-            | board.pieces[Color::Black.idx()][PieceType::Rook.idx()]
-            | board.pieces[Color::White.idx()][PieceType::Queen.idx()]
-            | board.pieces[Color::Black.idx()][PieceType::Queen.idx()];
-        att |= rook_attacks(s, occ) & orth;
-        att & occ
-    }
-    pub fn least_valuable_attacker(
-        board: &Board,
-        attackers: crate::bitboard::Bitboard,
-        side: Color,
-    ) -> Option<(crate::types::Square, PieceType)> {
-        for pt in [
-            PieceType::Pawn,
-            PieceType::Knight,
-            PieceType::Bishop,
-            PieceType::Rook,
-            PieceType::Queen,
-            PieceType::King,
-        ] {
-            let bbp = attackers & board.pieces[side.idx()][pt.idx()];
-            if bbp != 0 {
-                return Some((bbp.trailing_zeros() as crate::types::Square, pt));
-            }
-        }
-        None
-    }
-}
-
-impl DepthMargin {
-    #[inline]
-    pub fn at(&self, depth: i32) -> i32 {
-        self.base + self.slope * depth
-    }
-}
-
-#[derive(Clone, Copy)]
-pub struct SearchParams {
-    /// RFP margin, quadratic in depth: `step*d*d/2 - step*d/2 + base*d`.
-    /// 2026-08-03: adopted from a reference engine's own RFP wholesale --
-    /// not just the numbers, the SHAPE. That reference does not split on
-    /// `improving` and has none of the three modulators below; one curve,
-    /// unconditional. `rfp_base`/`rfp_step` are close to identical to its
-    /// own constants (65 and 5). The three modulators and the old linear
-    /// `rfp_improving`/`rfp_not_improving` pair stay in the struct --
-    /// removing fields would shift every index after them in `to_vec` and
-    /// break unrelated UCI tuning options -- but RFP itself no longer reads
-    /// them.
-    pub rfp_base: i32,
-    pub rfp_step: i32,
-    /// Extra margin per depth when the opponent has a capture that wins
-    /// material outright. See the note at the RFP block.
-    pub rfp_opp_easy_capture: i32,
-    /// Margin removed when the opponent's position is deteriorating.
-    pub rfp_opp_worsening: i32,
-    /// Divides the previous move's continuation-history score into the margin.
-    pub rfp_hist_divisor: i32,
-    /// Slack above beta that promotes a cutoff to a deeper history bonus.
-    pub hist_beta_margin: i32,
-    /// Depth ceiling for history pruning. The reference this concept comes
-    /// from prunes up to 7 and then BREAKS out of the move loop; we cannot
-    /// break, because our ordering mixes countermove and book bonuses into
-    /// the quiet score and places losing captures AFTER quiets, so leaving
-    /// the loop on one bad quiet would also discard every sacrifice behind
-    /// it. Skipping one move at a time is the safe half of the mechanism;
-    /// this is the half that was left at 4 without ever being measured.
-    pub hist_pruning_max_depth: i32,
-    /// Extra slack below s_beta that turns a double extension into a triple.
-    pub triple_ext_margin: i32,
-    /// How far below zero a move's history must sit to be skipped in quiescence.
-    pub qs_hist_prune_margin: i32,
-    pub hist_bonus_quad: i32,
-    pub hist_bonus_linear: i32,
-    pub hist_bonus_offset: i32,
-    pub hist_bonus_max: i32,
-    pub hist_malus_quad: i32,
-    pub hist_malus_linear: i32,
-    pub hist_malus_offset: i32,
-    pub hist_malus_max: i32,
-    /// Divides continuation history into the LMR reduction step.
-    pub lmr_hist_divisor: i32,
-    /// LMR reduction subtracted per move index, in MILLI-PLIES (1/1024 ply).
-    ///
-    /// Our base curve grows as `ln(depth)*ln(move)` and never flattens, so the
-    /// deeper into a move list we go the harder we cut -- by the 20th move we
-    /// reduce ~0.6 ply more than a reference engine does at the same point,
-    /// which is where a late tactic stops being seen at all. A linear term is
-    /// what bends that tail back.
-    ///
-    /// Fitted against the reference SHAPE, never copied from it: the
-    /// coefficient that maps OUR curve onto that shape is ~31, half the value
-    /// that engine applies to its own differently-shaped base curve. 0 = off.
-    pub lmr_move_linear: i32,
-    /// MILLI-PLIES removed when the move is a killer (a refutation). 0 = off.
-    ///
-    /// A move that refuted a sibling is not a late move in spirit, whatever its
-    /// index says. We already give killers an ordering slot; this says the LMR
-    /// should know about them too.
-    pub lmr_killer: i32,
-    /// MILLI-PLIES added per time alpha has already been raised at this node.
-    ///
-    /// Each raise means the remaining moves have a higher bar to clear, so the
-    /// later ones are progressively less likely to matter. Ours had no notion
-    /// of this at all.
-    pub lmr_alpha_raise: i32,
-    /// MILLI-PLIES removed when the move gives check, INSTEAD of exempting it.
-    ///
-    /// We exclude checks from LMR outright, which is a switch where the others
-    /// use a dial -- our own counters put 1% of quiets escaping through it.
-    /// Reducing them less is strictly more expressive than not reducing them.
-    /// 0 = off (keeps the exemption).
-    pub lmr_check: i32,
-    /// Extra MILLI-PLY reduction when the TT move is a capture. 0 = off.
-    pub lmr_ttcapture: i32,
-    /// MILLI-PLIES of reduction REMOVED at a PV node (subtracted). 0 = off.
-    pub lmr_pvnode: i32,
-    /// Multiplicative scaling of the whole reduction at an ALL node:
-    /// `r += r * g / (256 * depth + 285)`. Multiplicative because an all-node
-    /// expects every move to fail low, so the deeper the search the more the
-    /// reduction can grow -- an additive term cannot say that. 0 = off.
-    pub lmr_allnode: i32,
-    /// Extra LMR reduction at a cutnode, in MILLI-PLIES.
-    ///
-    /// A cutnode is where a fail-high is expected, so it is the one place a
-    /// deeper cut costs least. Tried once as a flat +2 whole plies and it was
-    /// catastrophic; the term only works as a fraction, which the fixed-point
-    /// accumulator now allows. 0 = off.
-    pub lmr_cutnode: i32,
-    /// Flat MILLI-PLY offset applied only to captures reduced under
-    /// `LmrCaptures` (see `lmr_captures_enabled`). Quiets never read this.
-    ///
-    /// Every move type we reduce needs its own zero point: a losing
-    /// exchange still resolves a tension a quiet never does, so the same
-    /// curve that fits quiets is not assumed to fit captures too. Starts at
-    /// 0 -- SPRT decides whether captures want reducing lighter, harder, or
-    /// not at all.
-    pub lmr_capture_base: i32,
-    /// Divides `capture_history[moving][captured]` into the capture LMR
-    /// term, same role `lmr_hist_divisor` plays for continuation history on
-    /// quiets. Never 0 (divide-by-zero guarded at the call site regardless).
-    pub lmr_capture_hist_divisor: i32,
-    pub rfp_improving: DepthMargin,
-    pub rfp_not_improving: DepthMargin,
-    pub razor_base: i32,
-    pub razor_per_depth: i32,
-    pub futility_improving: DepthMargin,
-    pub futility_not_improving: DepthMargin,
-    pub cap_futility_improving: DepthMargin,
-    pub cap_futility_not_improving: DepthMargin,
-    /// Quiescence delta pruning margin (both the negamax entry point and
-    /// the tuning-dataset quiescence_leaf path use the same value).
-    pub delta_margin: i32,
-    pub qs_lmp_limit: i32,
-    pub tt_extended_cutoff_margin: i32,
-    /// History pruning threshold multiplier: a quiet move is skipped
-    /// outright (not even reduced-searched) when its history score is
-    /// below `-history_prune_mult * depth`.
-    pub history_prune_mult: i32,
-    /// Null-move pruning gating/reduction, driven by an eval-adaptive
-    /// formula -- see NMP block in negamax(). Previously a flat
-    /// depth>6?3:2 reduction with no eval awareness at all; this is a
-    /// genuinely different (more capable) mechanism, not just
-    /// recalibrated constants.
-    pub nmp_min_depth: i32,
-    pub nmp_eval_margin: i32,
-    pub nmp_static_eval_base_margin: i32,
-    pub nmp_static_eval_depth_margin: i32,
-    pub nmp_base_reduction: i32,
-    pub nmp_depth_reduction_scale: i32,
-    pub nmp_eval_reduction_scale: i32,
-    pub nmp_max_eval_reduction: i32,
-    /// ProbCut margin above beta for the cheap verification search
-    /// (was a hardcoded `beta + 150`).
-    pub probcut_beta_margin: i32,
-    /// Aspiration window fields. Reverted once in 2026-07 after a single
-    /// A/B of one integration measured 39%, then adopted again in 2026-07-27
-    /// as part of the whole mechanism rather than as a swap of the widening
-    /// formula alone -- the starting width, the response to each kind of
-    /// failure and the growth rate are one thing, and testing them apart
-    /// tests none of them.
-    pub asp_init_delta: i32,
-    pub asp_widening_factor: i32,
-    pub min_asp_depth: i32,
-    /// doDeeper/doShallower margins -- 2026-07-23: the MECHANISM is a
-    /// real technique (adjust the LMR re-search depth by +/-1 based on
-    /// how far the reduced search beat alpha, relative to this node's
-    /// best score so far). First attempt used raw margins (36/141/8)
-    /// carried over from an eval whose centipawn scale is ~1.92x smaller
-    /// than ours (pawn 65 vs Kestrel's 125), and bisection localized it
-    /// as the day's single biggest regression (-6.2%): the margins
-    /// compare against SCORES in KESTREL's eval units, so at that scale
-    /// they fired "go deeper" ~2x too eagerly -> unsound extra depth.
-    /// This is a CALIBRATION error, not a wrong mechanism (user's point
-    /// 2026-07-23: "não são as funções que estão mal, mas a calibração
-    /// dos valores"). Fixed by rescaling the raw margins (36/141/8) to
-    /// Kestrel's eval scale. Factor picked EMPIRICALLY, not assumed: swept 1.7/1.8/1.9
-    /// (user's request) -- all clustered 57-59% vs 0c1b388, 1.8 best
-    /// (59.0%, reproduced in two independent 200-game runs). Final:
-    /// 36*1.8=65, 141*1.8=254, 8*1.8=14. NOTE: rescaling was applied
-    /// ONLY to doDeeper -- a parallel test rescaling ALL eval-unit
-    /// search margins (RFP/razor/NMP/ProbCut) by 1.8 scored WORSE
-    /// (54.2% vs doDeeper-only 59.0%), so the calibration bug was
-    /// specific to doDeeper (whose effect ADDS depth -- dangerous when
-    /// it over-fires); the pruning margins were already ~fine at their
-    /// raw values (matching their individually-neutral A/Bs). Lesson:
-    /// calibration is per-parameter and empirical, not one blanket
-    /// rescale factor.
-    pub do_deeper_margin_base: i32,
-    pub do_deeper_margin_depth: i32,
-    pub do_shallower_margin: i32,
-    /// Quanto do valor devolvido pelo corte RFP vem de `beta` (em 1024), com o
-    /// resto a vir de `static_eval - margem`.
-    ///
-    /// Devolvíamos `static_eval - margem` inteiro. Isso é o valor mais
-    /// OPTIMISTA compatível com o corte: assume que a estimativa estática está
-    /// certa. Quando ela está errada -- e é para isso que existe margem -- o
-    /// erro sobe na árvore inteiro. `beta` é o que sabemos com certeza (o corte
-    /// prova >= beta); a eval é a estimativa. Puxar o valor devolvido para beta
-    /// mantém o corte e devolve menos ficção. 1024 = só beta, 0 = só a eval
-    /// (o comportamento antigo).
-    pub rfp_return_beta: i32,
-    /// Profundidade máxima onde o RFP dispara. Estava fixo em 6.
-    pub rfp_max_depth: i32,
-    /// 1 = não faz RFP em nós que a TT marca como tendo sido PV (0 = como antes).
-    ///
-    /// O bit TTPV diz que esta posição já foi procurada com janela completa,
-    /// ou seja já foi considerada importante. Já o usamos para reduzir menos no
-    /// LMR, pela mesma razão; não o usávamos para NÃO PODAR. Uma posição que
-    /// foi PV é precisamente onde uma poda por eval estática custa mais caro.
-    pub rfp_skip_ttpv: i32,
-    /// Divisor da magnitude da correcção somada à margem RFP (0 = desligado).
-    ///
-    /// A correcção mede o quanto a eval estática costuma errar nesta família de
-    /// posições. Onde ela é grande, a eval é pouco fiável -- e podar por eval
-    /// pouco fiável é o pior negócio. Com divisor 4, uma correcção de 100 cp
-    /// (grande, para o nosso grão) sobe a margem 25 cp, comparável ao termo de
-    /// depth-1; uma correcção pequena não faz praticamente nada.
-    pub rfp_corr_divisor: i32,
-}
-
-impl Default for SearchParams {
-    fn default() -> Self {
-        // 2026-07-22: rfp_improving/rfp_not_improving, razor_base/
-        // razor_per_depth, cap_futility_improving/not_improving and
-        // history_prune_mult are SPSA-tuned margin values adopted where
-        // their formula genuinely matches this shape. A/B (300 games,
-        // 30000 nodes/move) came back exactly neutral -- 50.0%/50.0%,
-        // W138-L138-D24 -- against our own previously hand-set values,
-        // so a calibrated set replaces a guess rather than being
-        // discarded for lack of a positive delta ("os testes sao so'
-        // para verificar, e' sempre para implementar").
-        SearchParams {
-            // Close to identical to a reference engine's own constants (65
-            // and 5) -- see the field doc comment for why the shape, not
-            // just the numbers, was adopted.
-            rfp_base: 75,
-            rfp_step: 4,
-            // Reasoned from this engine's own history scale (see the note
-            // at the RFP block), not copied. Starting points, not tuned
-            // values -- exposed by name so they can be swept without a
-            // rebuild.
-            rfp_opp_easy_capture: 15,
-            rfp_opp_worsening: 12,
-            rfp_hist_divisor: 150,
-            hist_beta_margin: 46,
-            hist_pruning_max_depth: 4,
-            triple_ext_margin: 155,
-            qs_hist_prune_margin: 6144,
-            hist_bonus_quad: 439,
-            hist_bonus_linear: 196,
-            hist_bonus_offset: 100,
-            hist_bonus_max: 2121,
-            hist_malus_quad: 235,
-            hist_malus_linear: 277,
-            hist_malus_offset: -44,
-            hist_malus_max: 992,
-            lmr_hist_divisor: 36000,
-            lmr_move_linear: 0,
-            // Ligavel por ambiente para o SPRT poder medir os dois lados sem
-            // dois binarios. O de referencia usa 3687 milesimos aqui e chama-lhe
-            // "o desnivel numero 1" -- mas a curva base deles nao e' a nossa,
-            // portanto o valor tem de sair de medicao nossa, nao de copia.
-            lmr_cutnode: std::env::var("KESTREL_LMR_CUTNODE")
-                .ok().and_then(|v| v.parse().ok()).unwrap_or(0),
-            lmr_ttcapture: 0,
-            lmr_pvnode: 0,
-            lmr_allnode: 0,
-            lmr_killer: 0,
-            lmr_alpha_raise: 0,
-            lmr_check: 0,
-            // Not zero, but not borrowed either: -LMR_ESCALA is the same
-            // "exactly one ply" step every other threshold term here uses
-            // (ttpv_adj, corrplexity_adj, non_imp_adj), applied to captures
-            // for the same reason those exist -- our own reasoning that a
-            // losing exchange resolves a tension a quiet never does, sized
-            // in our own existing unit rather than invented from scratch.
-            //
-            // A diagnostic run tried a reference engine's own tuned
-            // capture-reduction offset instead (unit-converted, 1372/19750
-            // -- never a raw copy since the two formulas aren't even the
-            // same shape) purely to answer "does the result move at all".
-            // It landed at 49.8% over 284 games against this own-derived
-            // pair's 51.8%: statistically indistinguishable, so there was
-            // nothing there worth keeping foreign for. Reverted; this
-            // engine's own numbers stand.
-            lmr_capture_base: -1024,
-            // capture_history and the quiet history table share the same
-            // HISTORY_MAX (16000, see `update_history`/`update_capture_history`),
-            // so the quiet term's own divisor (8846, tuned for that same
-            // 16000-max table) is the correct starting point for this one
-            // too -- not a guess, our own already-tuned constant for the
-            // mathematically equivalent case.
-            lmr_capture_hist_divisor: 8846,
-            // 2026-08-03: tried lowering these to a reference's raw base
-            // slope (26/85) and measured a real loss (-102 Elo, LOS 0.6%).
-            // Reading the reference's own formula afterward explained why:
-            // its base slope is modulated by three more terms (an easy-
-            // capture bonus, an opponent-worsening discount, a history
-            // term) that this engine already has too -- `rfp_opp_easy_
-            // capture`, `rfp_opp_worsening`, `rfp_hist_divisor` above, added
-            // in an earlier session by reading the same reference. Those
-            // three were tuned TOGETHER with these slopes at 50/159. Taking
-            // just the base slope from the reference and leaving the three
-            // modulating terms at values tuned for a different base broke
-            // the coherence of an already-adapted formula. These two fields
-            // are dead code now regardless -- the RFP block below reads
-            // `rfp_base`/`rfp_step` (a different reference's simpler,
-            // unconditional curve, which measured a real win, +46 Elo).
-            // Left at the values the modulated formula was last tuned
-            // around, in case a future measurement wants that shape back.
-            rfp_improving: DepthMargin { base: 0, slope: 50 },
-            rfp_not_improving: DepthMargin { base: 0, slope: 159 },
-            razor_base: 629,
-            razor_per_depth: 629,
-            // SPSA do OpenBench (teste #3), leitura aos 531 018 jogos.
-            //
-            // Os valores anteriores eram uma leitura INTERMEDIA da mesma
-            // corrida; ela continuou a andar e estes sao os ultimos
-            // registados. Nao sao finais -- a corrida nunca convergiu porque
-            // foi parada -- mas sao estritamente mais informados do que os
-            // que substituem, que e' o criterio que a casa usa para adoptar
-            // ("os testes sao so' para verificar, e' sempre para
-            // implementar").
-            //
-            // AFINADOS PARA A rede_bot v1. A rede 512 nova e' a MESMA
-            // arquitectura com mais dados, portanto herda-os razoavelmente.
-            // A arquitectura de ameacas nao: enumera outras features e le'
-            // noutra escala, e estas margens nao lhe dizem respeito -- e' uma
-            // afinacao por fazer, nao uma que se aproveite.
-            futility_improving: DepthMargin { base: 2, slope: 114 },
-            futility_not_improving: DepthMargin { base: 1, slope: 114 },
-            cap_futility_improving: DepthMargin { base: 1, slope: 186 },
-            cap_futility_not_improving: DepthMargin { base: 2, slope: 97 },
-            delta_margin: 275,
-            qs_lmp_limit: 8,
-            tt_extended_cutoff_margin: 162,
-            history_prune_mult: 2472,
-            // Same adoption rationale as above -- eval-adaptive NMP is a
-            // strictly more informed mechanism than the old flat
-            // depth>6?3:2 reduction, and there was no Kestrel-tuned
-            // value to compare against for these fields at all.
-            nmp_min_depth: 2,
-            nmp_eval_margin: 40,
-            nmp_static_eval_base_margin: 265,
-            nmp_static_eval_depth_margin: 22,
-            nmp_base_reduction: 1343,
-            nmp_depth_reduction_scale: 78,
-            nmp_eval_reduction_scale: 208,
-            nmp_max_eval_reduction: 4,
-            probcut_beta_margin: 251,
-            asp_init_delta: 12,
-            asp_widening_factor: 46,
-            min_asp_depth: 6,
-            do_deeper_margin_base: 81,
-            do_deeper_margin_depth: 318,
-            do_shallower_margin: 18,
-            // Ambos no comportamento ACTUAL, para cada ideia se medir sozinha:
-            // 0 = devolve `static_eval - margem` como antes; 6 = o tecto de sempre.
-            rfp_return_beta: 0,
-            // 10, nao 6. O tecto de 6 vinha de nunca ter sido testado mais
-            // alto, e a 10 poda mais sem gastar mais nos.
-            //
-            // Um primeiro teste deu +22,5 Elo, e esse numero estava errado:
-            // correu numa maquina carregada, e repetido em condicoes limpas
-            // deu 0,509 em 2000 jogos -- indistinguivel de zero com este
-            // orcamento de jogos. Fica em 10 porque nada indica que faca mal,
-            // nao porque esteja provado que faz bem.
-            rfp_max_depth: 10,
-            rfp_corr_divisor: 0,
-            rfp_skip_ttpv: 0,
-        }
-    }
-}
-
-impl SearchParams {
-    pub fn to_vec(&self) -> Vec<i32> {
-        vec![
-            self.rfp_improving.base,
-            self.rfp_improving.slope,
-            self.rfp_not_improving.base,
-            self.rfp_not_improving.slope,
-            self.razor_base,
-            self.razor_per_depth,
-            self.futility_improving.base,
-            self.futility_improving.slope,
-            self.futility_not_improving.base,
-            self.futility_not_improving.slope,
-            self.cap_futility_improving.base,
-            self.cap_futility_improving.slope,
-            self.cap_futility_not_improving.base,
-            self.cap_futility_not_improving.slope,
-            self.delta_margin,
-            self.qs_lmp_limit,
-            self.tt_extended_cutoff_margin,
-            self.history_prune_mult,
-            self.nmp_min_depth,
-            self.nmp_eval_margin,
-            self.nmp_static_eval_base_margin,
-            self.nmp_static_eval_depth_margin,
-            self.nmp_base_reduction,
-            self.nmp_depth_reduction_scale,
-            self.nmp_eval_reduction_scale,
-            self.nmp_max_eval_reduction,
-            self.probcut_beta_margin,
-            self.asp_init_delta,
-            self.asp_widening_factor,
-            self.min_asp_depth,
-            self.do_deeper_margin_base,
-            self.do_deeper_margin_depth,
-            self.do_shallower_margin,
-            // Appended, never inserted: `from_vec` reads this vector by
-            // position, so putting a new parameter anywhere but the end
-            // silently shifts every one after it. It compiles, and every
-            // margin in the search quietly becomes a different margin.
-            self.rfp_opp_easy_capture,
-            self.rfp_opp_worsening,
-            self.rfp_hist_divisor,
-            self.hist_beta_margin,
-            self.hist_pruning_max_depth,
-            self.triple_ext_margin,
-            self.qs_hist_prune_margin,
-            self.hist_bonus_quad,
-            self.hist_bonus_linear,
-            self.hist_bonus_offset,
-            self.hist_bonus_max,
-            self.hist_malus_quad,
-            self.hist_malus_linear,
-            self.hist_malus_offset,
-            self.hist_malus_max,
-            self.lmr_hist_divisor,
-            self.rfp_base,
-            self.rfp_step,
-            self.lmr_move_linear,
-            self.lmr_cutnode,
-            self.lmr_capture_base,
-            self.lmr_capture_hist_divisor,
-            // no FIM, para nao deslocar os indices ja' usados por opcoes UCI
-            self.rfp_return_beta,
-            self.rfp_max_depth,
-            self.rfp_corr_divisor,
-            self.rfp_skip_ttpv,
-        ]
-    }
-    pub fn from_vec(v: &[i32]) -> Self {
-        SearchParams {
-            rfp_improving: DepthMargin { base: v[0], slope: v[1] },
-            rfp_not_improving: DepthMargin { base: v[2], slope: v[3] },
-            razor_base: v[4],
-            razor_per_depth: v[5],
-            futility_improving: DepthMargin { base: v[6], slope: v[7] },
-            futility_not_improving: DepthMargin { base: v[8], slope: v[9] },
-            cap_futility_improving: DepthMargin { base: v[10], slope: v[11] },
-            cap_futility_not_improving: DepthMargin { base: v[12], slope: v[13] },
-            delta_margin: v[14],
-            qs_lmp_limit: v[15],
-            tt_extended_cutoff_margin: v[16],
-            history_prune_mult: v[17],
-            nmp_min_depth: v[18],
-            nmp_eval_margin: v[19],
-            nmp_static_eval_base_margin: v[20],
-            nmp_static_eval_depth_margin: v[21],
-            nmp_base_reduction: v[22],
-            nmp_depth_reduction_scale: v[23],
-            nmp_eval_reduction_scale: v[24],
-            nmp_max_eval_reduction: v[25],
-            probcut_beta_margin: v[26],
-            asp_init_delta: v[27],
-            asp_widening_factor: v[28],
-            min_asp_depth: v[29],
-            do_deeper_margin_base: v[30],
-            do_deeper_margin_depth: v[31],
-            do_shallower_margin: v[32],
-            rfp_opp_easy_capture: v[33],
-            rfp_opp_worsening: v[34],
-            rfp_hist_divisor: v[35],
-            hist_beta_margin: v[36],
-            hist_pruning_max_depth: v[37],
-            triple_ext_margin: v[38],
-            qs_hist_prune_margin: v[39],
-            hist_bonus_quad: v[40],
-            hist_bonus_linear: v[41],
-            hist_bonus_offset: v[42],
-            hist_bonus_max: v[43],
-            hist_malus_quad: v[44],
-            hist_malus_linear: v[45],
-            hist_malus_offset: v[46],
-            hist_malus_max: v[47],
-            lmr_hist_divisor: v[48],
-            rfp_base: v[49],
-            rfp_step: v[50],
-            lmr_move_linear: v[51],
-            lmr_cutnode: v[52],
-            // Fora do vector do SPSA de proposito: o vector e' indexado por
-            // posicao e inserir campos a meio desloca tudo o que vem depois,
-            // que e' exactamente como se invalida uma afinacao inteira sem dar
-            // por isso. Entram quando um SPRT os justificar.
-            lmr_ttcapture: 0,
-            lmr_pvnode: 0,
-            lmr_allnode: 0,
-            lmr_killer: 0,
-            lmr_alpha_raise: 0,
-            lmr_check: 0,
-            lmr_capture_base: v[53],
-            lmr_capture_hist_divisor: v[54],
-            rfp_return_beta: v[55],
-            rfp_max_depth: v[56],
-            rfp_corr_divisor: v[57],
-            rfp_skip_ttpv: v[58],
-        }
-    }
-}
-
-/// Names of the search parameters, in the exact order `to_vec` emits them.
-/// Exposed so they can be set over UCI (`setoption name <n> value <v>`) and
-/// swept without a rebuild -- the difference between an experiment costing
-/// minutes and one costing a compile each.
-///
-/// Generated from `to_vec`, never hand-written. A list that drifts out of
-/// order does not fail: it quietly sets the wrong parameter, and the sweep
-/// reports whatever that other parameter happens to do.
-pub const PARAM_NAMES: [&str; 59] = [
-    "rfp_improving_base",
-    "rfp_improving_slope",
-    "rfp_not_improving_base",
-    "rfp_not_improving_slope",
-    "razor_base",
-    "razor_per_depth",
-    "futility_improving_base",
-    "futility_improving_slope",
-    "futility_not_improving_base",
-    "futility_not_improving_slope",
-    "cap_futility_improving_base",
-    "cap_futility_improving_slope",
-    "cap_futility_not_improving_base",
-    "cap_futility_not_improving_slope",
-    "delta_margin",
-    "qs_lmp_limit",
-    "tt_extended_cutoff_margin",
-    "history_prune_mult",
-    "nmp_min_depth",
-    "nmp_eval_margin",
-    "nmp_static_eval_base_margin",
-    "nmp_static_eval_depth_margin",
-    "nmp_base_reduction",
-    "nmp_depth_reduction_scale",
-    "nmp_eval_reduction_scale",
-    "nmp_max_eval_reduction",
-    "probcut_beta_margin",
-    "asp_init_delta",
-    "asp_widening_factor",
-    "min_asp_depth",
-    "do_deeper_margin_base",
-    "do_deeper_margin_depth",
-    "do_shallower_margin",
-    "rfp_opp_easy_capture",
-    "rfp_opp_worsening",
-    "rfp_hist_divisor",
-    "hist_beta_margin",
-    "hist_pruning_max_depth",
-    "triple_ext_margin",
-    "qs_hist_prune_margin",
-    "hist_bonus_quad",
-    "hist_bonus_linear",
-    "hist_bonus_offset",
-    "hist_bonus_max",
-    "hist_malus_quad",
-    "hist_malus_linear",
-    "hist_malus_offset",
-    "hist_malus_max",
-    "lmr_hist_divisor",
-    "rfp_base",
-    "rfp_step",
-    "lmr_move_linear",
-    "lmr_cutnode",
-    "lmr_capture_base",
-    "lmr_capture_hist_divisor",
-    "rfp_return_beta",
-    "rfp_max_depth",
-    "rfp_corr_divisor",
-    "rfp_skip_ttpv",
+pub static QUEM: [(std::sync::atomic::AtomicU64, std::sync::atomic::AtomicI64); 9] = [
+    (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicI64::new(0)),
+    (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicI64::new(0)),
+    (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicI64::new(0)),
+    (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicI64::new(0)),
+    (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicI64::new(0)),
+    (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicI64::new(0)),
+    (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicI64::new(0)),
+    (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicI64::new(0)),
+    (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicI64::new(0)),
 ];
 
-/// Overrides applied on top of the defaults, set over UCI before the first
-/// search. `SEARCH_PARAMS` is a `OnceLock` and cannot be changed after it is
-/// read, so these are held separately and folded in when it is first built.
-pub static PARAM_OVERRIDES: std::sync::Mutex<Vec<(usize, i32)>> = std::sync::Mutex::new(Vec::new());
+pub const NOMES_QUEM: [&str; 9] = [
+    "tabela", "janela", "piora", "captura", "cut node", "nao-PV", "tt-pv", "historico",
+    "tt captura",
+];
 
-/// Set one parameter by name. Returns false for an unknown name so the caller
-/// can say so out loud -- an ignored typo is indistinguishable from "this
-/// parameter has no effect", and that mistake costs a whole experiment.
-/// Whether a parameter is a quantity in EVALUATION units, i.e. compared
-/// against a score rather than counting plies, moves or history points.
-///
-/// It matters because those are the only ones that stop meaning what they were
-/// calibrated to mean when the evaluation's scale changes -- and it changed by
-/// 1.45x when the fitted weight set arrived. A margin of 629 against an
-/// evaluation that got half again as loud is a margin of 434 in the old money.
-///
-/// Classified by reading each use, not by the name: `nmp_eval_reduction_scale`
-/// divides `static_eval - beta`, so it is an eval quantity even though it
-/// yields plies; `qs_hist_prune_margin`, `rfp_hist_divisor` and the whole
-/// `hist_*` family are history points and are NOT, however much the word
-/// "margin" suggests otherwise. Guessing this from the names is exactly the
-/// mistake that once applied an afternoon of parameter work to the wrong
-/// fields.
-pub fn param_in_eval_units(name: &str) -> bool {
-    matches!(
-        name,
-        "rfp_improving_base"
-            | "rfp_improving_slope"
-            | "rfp_not_improving_base"
-            | "rfp_not_improving_slope"
-            | "razor_base"
-            | "razor_per_depth"
-            | "futility_improving_base"
-            | "futility_improving_slope"
-            | "futility_not_improving_base"
-            | "futility_not_improving_slope"
-            | "cap_futility_improving_base"
-            | "cap_futility_improving_slope"
-            | "cap_futility_not_improving_base"
-            | "cap_futility_not_improving_slope"
-            | "delta_margin"
-            | "tt_extended_cutoff_margin"
-            | "nmp_eval_margin"
-            | "nmp_static_eval_base_margin"
-            | "nmp_static_eval_depth_margin"
-            | "nmp_eval_reduction_scale"
-            | "probcut_beta_margin"
-            | "asp_init_delta"
-            | "do_deeper_margin_base"
-            | "do_deeper_margin_depth"
-            | "do_shallower_margin"
-            | "rfp_opp_easy_capture"
-            | "rfp_opp_worsening"
-            | "hist_beta_margin"
-            | "triple_ext_margin"
-    )
+pub fn quem_ligado() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("HALF2K_QUEM").as_deref() == Ok("1"))
 }
 
-pub fn set_param(name: &str, value: i32) -> bool {
-    match PARAM_NAMES.iter().position(|&n| n == name) {
-        Some(i) => {
-            PARAM_OVERRIDES.lock().unwrap().push((i, value));
-            true
-        }
-        None => false,
+#[inline]
+fn conta_quem(i: usize, d: i32) {
+    if quem_ligado() && d != 0 {
+        // Vezes, soma COM SINAL, e soma dos MODULOS. As duas ultimas dizem
+        // coisas diferentes: a com sinal diz para que lado o termo puxa, a dos
+        // modulos diz quanto ele mexe. Um termo equilibrado soma zero e pode
+        // estar a fazer todo o trabalho.
+        QUEM[i].0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        QUEM[i].1.fetch_add(d as i64, std::sync::atomic::Ordering::Relaxed);
+        QUEM_ABS[i].fetch_add(d.unsigned_abs() as u64, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
-static SEARCH_PARAMS: OnceLock<SearchParams> = OnceLock::new();
-pub fn search_params() -> &'static SearchParams {
-    SEARCH_PARAMS.get_or_init(|| {
-        let overrides = PARAM_OVERRIDES.lock().unwrap().clone();
-        if !overrides.is_empty() {
-            let mut v = SearchParams::default().to_vec();
-            for (i, val) in &overrides {
-                if *i < v.len() {
-                    v[*i] = *val;
-                }
-            }
-            eprintln!("setoption: {} search parameter(s) overridden", overrides.len());
-            return SearchParams::from_vec(&v);
-        }
-        if let Ok(path) = std::env::var("KESTREL_SEARCH_PARAMS") {
-            if let Ok(text) = std::fs::read_to_string(&path) {
-                let parsed: Vec<i32> = text.trim().split(',').filter_map(|s| s.parse().ok()).collect();
-                let default = SearchParams::default();
-                if parsed.len() == default.to_vec().len() {
-                    eprintln!("KESTREL_SEARCH_PARAMS: loaded {} scalars from {}", parsed.len(), path);
-                    return SearchParams::from_vec(&parsed);
-                } else {
-                    eprintln!(
-                        "KESTREL_SEARCH_PARAMS: length mismatch ({} vs expected {}), ignoring",
-                        parsed.len(),
-                        default.to_vec().len()
-                    );
-                }
-            }
-        }
-        SearchParams::default()
-    })
+/// Em que lance o corte aconteceu: 0, 1, 2, 3, 4-7, 8-15, 16+, e "nunca".
+///
+/// Ordenacao que sabe o que faz corta quase sempre no primeiro. Cada corte
+/// mais abaixo e' uma sub-arvore inteira percorrida para nada -- e' ai que a
+/// cegueira custa, nao na formula da reducao.
+pub static CORTES: [std::sync::atomic::AtomicU64; 8] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Escala do numero que julga um lance tranquilo.
+///
+/// [0] quantos lances, [1] soma dos modulos, [2] o maior visto,
+/// [3] soma dos modulos so' da tabela principal,
+/// [4..9] soma dos modulos de cada ply de continuacao.
+pub static ESCALA: [std::sync::atomic::AtomicI64; 10] = [
+    std::sync::atomic::AtomicI64::new(0), std::sync::atomic::AtomicI64::new(0),
+    std::sync::atomic::AtomicI64::new(0), std::sync::atomic::AtomicI64::new(0),
+    std::sync::atomic::AtomicI64::new(0), std::sync::atomic::AtomicI64::new(0),
+    std::sync::atomic::AtomicI64::new(0), std::sync::atomic::AtomicI64::new(0),
+    std::sync::atomic::AtomicI64::new(0), std::sync::atomic::AtomicI64::new(0),
+];
+
+pub fn escala_ligada() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("HALF2K_ESCALA").as_deref() == Ok("1"))
 }
 
-/// Limite de saturacao da history heuristic (bonus/malus acumulados por
-/// [cor][from][to]) -- evita que um par from/to muito bem sucedido
-/// domine a ordenacao para sempre, sem precisar de "aging"/decay mais
-/// complexo.
-const HISTORY_MAX: i32 = 16000;
-
-#[derive(Copy, Clone)]
-pub struct SearchLimits {
-    pub deadline: Option<Instant>,
-    pub max_depth: i32,
-    pub max_nodes: Option<u64>,
-    /// The normal per-move allowance, as a duration from the start of the
-    /// search. `deadline` above is the hard ceiling and exists to stop a
-    /// disaster; THIS is the number the engine actually aims at, and
-    /// iterative_deepening() scales it up or down between iterations
-    /// according to how the search is going (see `time_scale`). A hard move
-    /// can be given several times this; an obvious one gives most of it back.
-    pub soft_budget: Option<Duration>,
+pub fn cego_ligado() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("HALF2K_CEGO").as_deref() == Ok("1"))
 }
 
-/// How much of the soft budget this search has earned, judged between
-/// iterations. Two independent readings of "does this position still need
-/// thinking", multiplied together.
+/// Distribuicao do `lmr_depth` do bloco `PodaSF`, por balde.
 ///
-/// `effort` is the share of nodes that went into the move we intend to play.
-/// A search that has poured almost everything into one move has found its
-/// answer and is re-confirming it; one still splitting nodes across rivals
-/// has not decided yet. This is the sturdier of the two signals, because it
-/// is a ratio over millions of nodes rather than a verdict that can flip on
-/// one.
+/// A pergunta que este contador respondeu: o divisor que converte historia em
+/// profundidade esta' a produzir um sinal ou ruido?
 ///
-/// `settle` counts consecutive iterations that kept the same root move, and
-/// decays fast: a move that just changed is worth far more time than one
-/// that has held for five iterations. It is deliberately the weaker term
-/// here. Lazy SMP makes root-move stability partly a matter of which thread
-/// got where first -- an earlier attempt at elastic time management keyed on
-/// stability ALONE and had to be reverted the same day, because it read
-/// thread timing as position difficulty and burned 10-16s on ordinary moves.
-/// The lesson kept: stability may lengthen a search, never on its own, and
-/// never without the hard ceiling standing behind it.
-fn time_scale(effort_frac: f64, settle: u32, score_drop: i32, changes: u32) -> f64 {
-    let effort = (TM_EFFORT_BASE - effort_frac) * TM_EFFORT_SCALE;
-    let settle = (TM_SETTLE_BASE + TM_SETTLE_SCALE * (settle as f64 + TM_SETTLE_OFFSET).powf(TM_SETTLE_POWER))
-        .max(TM_SETTLE_MIN);
-    // A score that is FALLING between iterations is the clearest sign that a
-    // position deserves more thought: the search is discovering a problem and
-    // has not yet found the way out. Neither of the other two signals sees
-    // this -- effort can stay high while the position collapses under it, and
-    // stability measures whether the MOVE changed, not whether it got worse.
-    //
-    // Only falls count. A score climbing means the news is good and there is
-    // nothing to solve, and paying extra for good news is how a clock is
-    // wasted on won positions.
-    let falling = if score_drop > 0 {
-        (1.0 + score_drop as f64 * TM_FALLING_SCALE).min(TM_FALLING_MAX)
-    } else {
-        1.0
+/// Medido, tres posicoes a` profundidade 11, por divisor:
+///
+///     divisor   negativos   devolucao media   |devolucao| media
+///        700      36,0%        +0,03 plies       2,10 plies
+///       1400      15,6%        -0,05             0,55
+///       2800       3,4%        +0,13             0,29
+///       8000       3,9%        +0,04             0,04
+///
+/// A media COM SINAL e' praticamente zero em toda a amplitude enquanto a media
+/// dos MODULOS vai a 2,10 plies. Um termo util empurra para um lado consoante o
+/// lance presta; este empurra para os dois por igual. E' ruido com dois plies de
+/// amplitude, e por isso o varrimento do divisor da' monotono: quanto maior o
+/// divisor menos ruido entra, e o "optimo" e' o valor que desliga o termo.
+///
+/// Baldes: <=-20, -19..-10, -9..-5, -4..-1, 0, 1..3, 4..7, 8..11, 12+
+pub static LMRD: [std::sync::atomic::AtomicU64; 9] = [
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+/// [0] soma da devolucao do historico, [1] quantas vezes, [2] |devolucao| soma
+pub static LMRD_DEV: [std::sync::atomic::AtomicI64; 3] = [
+    std::sync::atomic::AtomicI64::new(0), std::sync::atomic::AtomicI64::new(0),
+    std::sync::atomic::AtomicI64::new(0),
+];
+pub fn lmrd_ligado() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("HALF2K_LMRD").as_deref() == Ok("1"))
+}
+pub fn conta_lmrd(d: i32, devolucao: i32) {
+    if !lmrd_ligado() { return; }
+    let b = match d {
+        i32::MIN..=-20 => 0, -19..=-10 => 1, -9..=-5 => 2, -4..=-1 => 3,
+        0 => 4, 1..=3 => 5, 4..=7 => 6, 8..=11 => 7, _ => 8,
     };
-    // A move the search keeps changing its mind about is worth paying for.
-    // This is the factor the engine did not have, and it is the one that
-    // separates a hard position from a slow one: effort and settle both read
-    // "several moves are equally good" as difficulty, so they fire on quiet
-    // positions with many reasonable moves. A best move that keeps being
-    // overturned means something concrete was found late, repeatedly.
-    let instability = (1.0 + changes as f64 * TM_INSTABILITY_SCALE).min(TM_INSTABILITY_MAX);
-    (effort * settle * falling * instability).clamp(TM_SCALE_MIN, TM_SCALE_MAX)
-}
-
-/// Extra time per centipawn lost since the previous iteration, and its cap.
-/// Small per unit and capped low: this multiplies two other factors that can
-/// each already stretch the budget, and the hard ceiling still stands behind
-/// all three. An earlier elastic-time attempt keyed on one signal alone burned
-/// 10-16 seconds on ordinary moves and had to be reverted the same day.
-const TM_FALLING_SCALE: f64 = 0.004;
-const TM_FALLING_MAX: f64 = 1.5;
-
-// Effort carries most of the decision. Measured across easy and hard
-// positions the fraction runs from about 0.13 (nothing decided yet) to about
-// 0.80 (everything behind one move): 0.80 -> 0.93x, 0.50 -> 1.40x,
-// 0.30 -> 1.71x. A steeper version that cut to 0.77x at the easy end was
-// tried and pulled back -- it halved the median move time, and cutting that
-// hard is only worth doing on a signal that deserves the confidence.
-const TM_EFFORT_BASE: f64 = 1.40;
-const TM_EFFORT_SCALE: f64 = 1.55;
-// Settle is deliberately the gentler term -- 1.48x when the move has just
-// changed, decaying to 1.0x, never below. A much steeper curve was tried
-// first, and tracing showed why it cannot be trusted here: on a FORCED
-// RECAPTURE, where there is nothing to decide, the root move still changed
-// at three separate depths and each change threw the multiplier back to its
-// maximum. That is Lazy SMP thread timing, not the position being hard, and
-// it is the same signal that made the 2026-07-21 attempt burn 10-16s on
-// ordinary moves. It stays in because a genuinely changing move IS worth
-// more time; it stays small because here it lies often.
-const TM_SETTLE_BASE: f64 = 0.95;
-const TM_SETTLE_SCALE: f64 = 2.2;
-const TM_SETTLE_OFFSET: f64 = 2.6;
-const TM_SETTLE_POWER: f64 = -1.5;
-const TM_SETTLE_MIN: f64 = 1.0;
-// The envelope, on top of which the hard deadline is a second and
-// independent bound.
-/// Um lance obvio custa isto do orcamento. Ver o bloco em
-/// iterative_deepening: o melhor a' frente do segundo por TM_OBVIO_CP,
-/// estavel ha' TM_OBVIO_ITERS profundidades e com o score parado.
-const TM_OBVIO_SCALE: f64 = 0.35;
-/// Quanto o melhor tem de estar a' frente do segundo para o lance ser obvio.
-/// Meia peca menor: abaixo disto ha' escolha a fazer.
-const TM_OBVIO_CP: i32 = 150;
-/// E ha' quantas profundidades tem de ser o mesmo lance.
-const TM_OBVIO_ITERS: u32 = 4;
-
-const TM_SCALE_MIN: f64 = 0.65;
-/// The most the search may award itself over the base allowance.
-///
-/// Was 2.2, which is what a healthy position needs and what a critical one
-/// cannot use. Two real losses were traced to it: a move that turned an equal
-/// game into mate, played in 1.04s with 29.7s on the clock, where three
-/// seconds of thought picks a different move. The ceiling was not reached in
-/// either case -- it was low enough that the signals never bothered to argue
-/// for more. The hard cap in the time budget bounds this from above, and a
-/// percentage of the remaining clock bounds THAT, so a raised ceiling here
-/// buys thinking time on contested moves without putting the game at risk.
-const TM_SCALE_MAX: f64 = 3.4;
-/// Growth per change of heart about the best move.
-const TM_INSTABILITY_SCALE: f64 = 0.22;
-/// ...and its ceiling, so a position that never settles cannot spend the game.
-const TM_INSTABILITY_MAX: f64 = 2.4;
-/// How much the evaluation must move for a change of best move to count as
-/// the search finding something, rather than picking between equals.
-const TM_INSTABILITY_MIN_CP: i32 = 20;
-
-const TM_QUIET_CP: i32 = 10;
-const TM_QUIET_ITERS: u32 = 3;
-/// Ceiling on the allowance while the position is still in the opening book.
-/// Enough to confirm the prepared move and notice if it is refuted, not enough
-/// to spend the opening's share of the clock on a decision already made.
-const TM_BOOK_SCALE: f64 = 0.35;
-/// Ceiling on the allowance during the opening once out of book. Not a cut --
-/// the full slice is still available, it simply cannot be multiplied by
-/// signals that measurement showed to be noise this early.
-const TM_OPENING_SCALE: f64 = 1.0;
-/// How many full moves count as "the opening" for the ceiling above.
-const TM_OPENING_MOVES: u32 = 10;
-/// A score swing this large between iterations is a real change of mind, not
-/// search noise, and lifts the opening ceiling.
-const TM_ALERT_CP: i32 = 50;
-
-
-/// For single-threaded callers that have no search to coordinate with -- the
-/// command-line tools, which stop on node counts and nothing else. Never set.
-pub static NO_STOP: AtomicBool = AtomicBool::new(false);
-
-/// Quanto custa um empate, em centipeoes. Ver `valor_empate`.
-pub static CONTEMPT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(20);
-
-/// Whether losing-or-equal captures are eligible for LMR at all, on top of
-/// quiets. Off by default: extending WHICH moves get reduced is a
-/// structural change no parameter default can neutralise (unlike
-/// `lmr_capture_base`/`lmr_capture_hist_divisor`, which stay inert at their
-/// defaults), so it gets its own switch rather than piggybacking on the
-/// numeric params.
-static LMR_CAPTURES: AtomicBool = AtomicBool::new(false);
-
-pub fn set_lmr_captures(on: bool) {
-    LMR_CAPTURES.store(on, Ordering::Relaxed);
+    LMRD[b].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    LMRD_DEV[0].fetch_add(devolucao as i64, std::sync::atomic::Ordering::Relaxed);
+    LMRD_DEV[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    LMRD_DEV[2].fetch_add(devolucao.unsigned_abs() as i64, std::sync::atomic::Ordering::Relaxed);
 }
 
 #[inline]
-pub fn lmr_captures_enabled() -> bool {
-    LMR_CAPTURES.load(Ordering::Relaxed)
-}
-
-pub struct Searcher<'a> {
-    /// Quem manda na raiz. Um empate e' mau para ESTE lado, e um no' qualquer
-    /// da arvore pode ser de qualquer um dos dois.
-    pub root_side: crate::types::Color,
-    pub atk: &'a Attacks,
-    pub zob: &'a Zobrist,
-    pub tt: &'a TranspositionTable,
-    pub nodes: u64,
-    pub limits: SearchLimits,
-    pub stop: bool,
-    /// Shared across every thread of one search, so that whoever decides the
-    /// move is settled ends the search rather than only its own thread.
-    /// Without it the per-thread stop was near useless: the move takes as
-    /// long as the SLOWEST thread, so one thread giving the clock back saved
-    /// nothing while the others kept going. Set by the reporting thread when
-    /// the soft budget is spent, and by any thread that hits the hard
-    /// deadline (there is no reason for the rest to carry on past that).
-    pub stop_flag: &'a AtomicBool,
-    /// Nodes where a beta cutoff happened, and how many of those took only
-    /// the first move. See the note at the increment.
-    /// Indice desta thread na busca paralela. Zero e a principal.
-    pub thread_idx: usize,
-    pub asp_re: u64,
-    pub asp_nos: u64,
-    pub cut_nodes: u64,
-    pub cut_first: u64,
-    /// Nodes spent in quiescence. It obeys neither the depth limit nor
-    /// LMR nor LMP, so it is the one part of the tree that can grow without
-    /// showing up in any of the other telemetry.
-    /// Null-move telemetry. Both of the last two attempts at this gate were
-    /// built on the assumption that a sharp position explodes because the
-    /// null move FIRES and then has to be verified. Measurement inverted it:
-    /// blocking the null move there doubled the tree, so it was firing and
-    /// paying for itself. These counters replace the assumption with numbers.
-    pub nmp_tried: u64,
-    pub nmp_tried_pv: u64,
-    pub nmp_failed_pv: u64,
-    pub nmp_cutoff_raw: u64,
-    pub nmp_cut_taken: u64,
-    pub nmp_verify_tried: u64,
-    pub nmp_verify_ok: u64,
-    pub nmp_verify_failed: u64,
-    pub nmp_failed_low: u64,
-    pub qnodes: u64,
-    /// How often each shallow, eval-based pruning actually fires. The tree is
-    /// wide and shallow, which points at whatever decides how many low-depth
-    /// nodes get to exist at all -- and constants that look aggressive on the
-    /// page have already fooled me twice tonight.
-    pub cut_rfp: u64,
-    pub cut_razor: u64,
-    pub cut_futility: u64,
-    pub nodes_shallow: u64,
-    pub lmr_quiet_total: u64,
-    pub lmr_skip_check: u64,
-    pub lmr_skip_depth: u64,
-    pub lmr_skip_extend: u64,
-    pub lmr_skip_early: u64,
-    pub lmr_tried: u64,
-    pub lmr_research: u64,
-    pub lmr_sum: u64,
-    pub history: Vec<u64>, // hashes da partida real ate' agora (para repeticao)
-    pub killers: [[Option<Move>; 2]; MAX_PLY],
-    /// History heuristic ("butterfly boards" classicos): [cor][from][to],
-    /// bonus quando um lance tranquilo causa um corte beta, malus nos
-    /// lances tranquilos experimentados antes dele no MESMO no' que nao
-    /// cortaram -- peca canonica que faltava por completo (so' havia
-    /// TT-move/MVV-LVA/killers/livro; todos os outros lances tranquilos
-    /// ficavam sem NENHUM sinal de ordenacao). 2026-07-20, ver
-    /// project_kestrel_achados_2026-07-20.md. Zerada uma vez por `go`
-    /// (o Searcher e' reconstruido a cada `go` em uci.rs), nunca a meio
-    /// da busca -- a mesma licao do bug de killers corrigido antes.
-    pub history_scores: [[[i32; 64]; 64]; 2],
-    /// Countermove heuristic: indexed by [piece type][to square] of the
-    /// move that led INTO this node (the opponent's last move) -> a quiet
-    /// move that previously caused a beta cutoff in reply to that exact
-    /// context. Kept for the picker's tier scoring; overshadowed by the
-    /// finer-grained `cont_hist` below (which gives a numeric weight per
-    /// (prev_piece,prev_to)->(curr_piece,curr_to) pair, at 1 AND 2 plies
-    /// back -- our multi-lag continuation history).
-    pub countermoves: [[Option<Move>; 64]; 6],
-    /// Capture history: indexed by [side][moving piece][captured piece]
-    /// -- a coarser, dedicated signal complementing SEE in noisy move
-    /// ordering. SEE gives the true material outcome of an exchange but
-    /// says nothing about which of several SEE-EQUAL captures tends to
-    /// actually work out (e.g. two captures that both win a pawn cleanly
-    /// -- history says which capture pattern has paid off more at this
-    /// kind of node before). Deliberately used ONLY as a tie-break when
-    /// SEE values are exactly equal (see MovePicker::pick_best_noisy) --
-    /// never mixed into the SEE score itself, which would shift the
-    /// good/bad-noisy partition boundary that many other pruning
-    /// decisions rely on being pure SEE.
-    pub capture_history: [[[i32; 6]; 6]; 2],
-    /// Continuation history: dense i32 table indexed by (prev_piece,
-    /// prev_to, curr_piece, curr_to) -- gives quiet move ordering a
-    /// numeric bonus/malus based on how the SAME curr_move performed in
-    /// the past following the SAME prev_move (piece type + to-square).
-    /// Used at both 1-ply back (opponent's last move) and 2-ply back
-    /// (our own last move) -- multi-lag at plies -1 and -2 (a -4 lag
-    /// could be added later if it proves worth it).
-    /// Heap-allocated (~576KB, 6*64*6*64 * 4 bytes) since it doesn't fit
-    /// on the stack. Zeroed once per `go` (Searcher is rebuilt each go).
-    pub cont_hist: Box<[i32]>,
-    /// Correction history: keyed by a cheap pawn-structure hash, learns
-    /// how far off the raw static eval tends to be for THIS pawn
-    /// structure once real search has settled on a score. The rationale:
-    /// static eval is fast but systematically biased for certain structures
-    /// (e.g. closed positions, specific pawn chains); this nudges it
-    /// toward what search has actually been finding there. Only affects
-    /// pruning-margin decisions (RFP/futility/LMP/razoring), never the
-    /// real leaf/quiescence evaluation.
-    pub corr_hist: Box<[i32]>,
-    /// 2026-07-22: four more correction-history dimensions (a multi-term
-    /// weighted correction; Kestrel previously had only the pawn term
-    /// below). Same table shape/update rule as `corr_hist`, different
-    /// hash input. Continuation-history correction (further terms at
-    /// lags 2-7) deferred (needs a shared 4D per-ply-lag table, real
-    /// scope, own follow-up).
-    pub corr_hist_np_stm: Box<[i32]>,
-    pub corr_hist_np_nstm: Box<[i32]>,
-    pub corr_hist_minor: Box<[i32]>,
-    pub corr_hist_major: Box<[i32]>,
-    /// 2026-07-23: the `threats` term, added once `all_attacks()`
-    /// (a standalone "all squares attacked by side X" helper, not
-    /// dependent on eval.rs's internal loop state) made it possible
-    /// without a real eval.rs refactor -- see `threats_hash()`.
-    pub corr_hist_threats: Box<[i32]>,
-    /// For each ply, the (piece type, to-square) of the move that was
-    /// played to reach that ply (i.e. the opponent's last move as seen
-    /// from this node) -- set by the parent right before recursing, read
-    /// by the picker to look up `cont_hist`.
-    pub ply_last_move: [Option<(PieceType, crate::types::Square)>; MAX_PLY],
-    /// Static eval saved at each ply -- used by the `improving`
-    /// heuristic: at a node, compare the current side's static eval
-    /// against the one from 2 plies back (same side to move). If it
-    /// went up, we're "improving" -- position getting better, so we
-    /// spend less time (tighter futility, more aggressive pruning).
-    pub static_evals: [i32; MAX_PLY],
-    pub root_best: Option<Move>,
-    /// Per root move: the score from the current iteration, and the score
-    /// from the previous one. `NO_SCORE` means "not measured this iteration".
-    pub root_scores: Vec<(Move, i32, i32)>,
-    /// Ply below which the null move is not allowed, used to stop the null
-    /// move recursing inside its own verification search.
-    pub nmp_min_ply: i32,
-    /// Singular extensions: quando estamos a verificar se o tt_move e'
-    /// "singular" (nenhum outro lance bate uma janela restrita), fazemos
-    /// uma re-pesquisa no MESMO no' excluindo o tt_move. Este campo diz
-    /// ao picker para saltar esse lance e ao proprio negamax para NAO
-    /// devolver cedo por TT nem armazenar na TT durante a re-pesquisa
-    /// (a busca a janela restrita nao deve poluir a TT). Restaurado
-    /// para None imediatamente depois da re-pesquisa.
-    pub excluded_move: Option<Move>,
-    /// MultiPV via the "exclusion" method: root moves listed here are
-    /// dropped from the root's legal-move list, so a repeated search at
-    /// the same position finds the next-best line instead of the same
-    /// one. Empty during normal single-PV search (no behavior change).
-    pub excluded_root_moves: Vec<Move>,
-    // Livro de "assinatura" da Judit Polgar (ver book.rs) -- so' influencia
-    // a ORDEM em que a busca experimenta os lances, nunca substitui a
-    // avaliacao real. None se o livro nao carregou (o motor continua a
-    // funcionar normalmente sem ele).
-    pub style_book: Option<&'a Book>,
-    /// Node-count time management: total nodes spent on each
-    /// ROOT move across the whole `go`, accumulated over every
-    /// iterative-deepening iteration (not cleared between depths --
-    /// only `iterative_deepening()` clears it, once per `go`). A small
-    /// Vec, not a HashMap: the root move list is at most a few dozen
-    /// moves, so a linear scan per update is cheaper than hashing.
-    pub root_move_nodes: Vec<(Move, u64)>,
-    /// Double-extension counter, propagated down a search LINE (indexed
-    /// by ply): how many times this exact line has already used a
-    /// double extension. Read from the PARENT ply before deciding to
-    /// grant another one, a guard (`dextensions<=6`) that stops a run
-    /// of double extensions from exploding the tree --
-    /// each one costs an extra full ply, and they can chain if several
-    /// nodes in a row are singular by a wide margin.
-    pub dextensions: [i32; MAX_PLY],
-    /// Report each completed iteration on stdout as a UCI `info` line.
-    /// Set on ONE searcher only (the rest of the Lazy-SMP threads stay
-    /// silent, or every depth would be reported several times over).
-    ///
-    /// Without this the engine only ever announced its final answer, which
-    /// hides how its opinion developed -- the thing you actually need when
-    /// asking why a move was chosen, and what every GUI expects to display.
-    pub report: bool,
-}
-
-/// The learned tables that should OUTLIVE a single `go`.
-///
-/// Until this existed, `uci.rs` built a fresh `Searcher` for every search,
-/// which zeroed every one of these -- so each move in a game started from
-/// nothing. That throws away most of what they are for: correction history
-/// in particular is a slow-learning signal (it accumulates how far the
-/// static eval tends to sit from what search finds for a given structure),
-/// and it can only pay off if it survives across the moves of a game. The
-/// same holds, less dramatically, for history/countermoves/capture history,
-/// where consecutive positions in a game are closely related and last
-/// move's statistics are immediately useful for ordering this one.
-///
-/// The UCI protocol assumes exactly this lifetime: `ucinewgame` exists to
-/// tell an engine to forget, which only means something if it otherwise
-/// remembers between searches.
-///
-/// Killers are deliberately NOT carried over: they are indexed by ply, and
-/// ply N means a different point in the game after each move is played, so
-/// keeping them would just mis-attribute cutoffs.
-///
-/// One instance per search thread (Lazy SMP threads keep independent
-/// statistics), held by the UCI layer and handed back and forth.
-pub struct HistoryTables {
-    pub history_scores: [[[i32; 64]; 64]; 2],
-    pub countermoves: [[Option<Move>; 64]; 6],
-    pub capture_history: [[[i32; 6]; 6]; 2],
-    pub cont_hist: Box<[i32]>,
-    pub corr_hist: Box<[i32]>,
-    pub corr_hist_np_stm: Box<[i32]>,
-    pub corr_hist_np_nstm: Box<[i32]>,
-    pub corr_hist_minor: Box<[i32]>,
-    pub corr_hist_major: Box<[i32]>,
-    pub corr_hist_threats: Box<[i32]>,
-}
-
-impl HistoryTables {
-    /// Fade the move-ordering statistics before reusing them in the next
-    /// search of the same game. CURRENTLY UNUSED: fading at 3/4 measured
-    /// worse than carrying the tables over intact on the blunder replay
-    /// (45/60 blunders avoided vs 47/60, 74 improving deviations vs 83),
-    /// so `uci.rs` does not call it. Kept for a future retry with a
-    /// gentler factor, or applied to only some of the tables.
-    /// Kept at 3/4 per move: strong enough that
-    /// evidence from several moves ago stops dominating (after ~5 moves an
-    /// old score is down to a quarter), gentle enough that the ordering
-    /// carried over is still worth having on the first iterations, which
-    /// is the whole point of keeping the tables at all.
-    ///
-    /// Only the move-ordering tables fade. Correction history is left
-    /// intact on purpose: it is not an ordering preference but a measured
-    /// bias of our own static eval for a given structure, which does not
-    /// go stale as the game advances -- fading it would just slow down the
-    /// one signal that needs the longest to become reliable.
-    pub fn fade(&mut self) {
-        for side in self.history_scores.iter_mut() {
-            for from in side.iter_mut() {
-                for v in from.iter_mut() {
-                    *v = *v * 3 / 4;
-                }
-            }
-        }
-        for side in self.capture_history.iter_mut() {
-            for moved in side.iter_mut() {
-                for v in moved.iter_mut() {
-                    *v = *v * 3 / 4;
-                }
-            }
-        }
-        for v in self.cont_hist.iter_mut() {
-            *v = *v * 3 / 4;
-        }
+pub fn conta_corte(i: usize) {
+    if !cego_ligado() {
+        return;
     }
+    let b = match i {
+        0 => 0,
+        1 => 1,
+        2 => 2,
+        3 => 3,
+        4..=7 => 4,
+        8..=15 => 5,
+        _ => 6,
+    };
+    CORTES[b].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
-impl Default for HistoryTables {
-    fn default() -> Self {
-        let corr = || vec![0i32; CORR_HIST_SIZE * 2].into_boxed_slice();
-        HistoryTables {
-            history_scores: [[[0; 64]; 64]; 2],
-            countermoves: [[None; 64]; 6],
-            capture_history: [[[0; 6]; 6]; 2],
-            cont_hist: vec![0i32; CONT_HIST_SIZE].into_boxed_slice(),
-            corr_hist: corr(),
-            corr_hist_np_stm: corr(),
-            corr_hist_np_nstm: corr(),
-            corr_hist_minor: corr(),
-            corr_hist_major: corr(),
-            corr_hist_threats: corr(),
-        }
-    }
-}
+/// Quem corta, por categoria: 0 tabela, 1 captura, 2 killer, 3 tranquilo.
+pub static CORTE_TIPO: [std::sync::atomic::AtomicU64; 4] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
 
-/// Limiar a partir do qual um score e' considerado "de mate" (nao so'
-/// avaliacao normal) -- MATE_SCORE menos a profundidade maxima possivel,
-/// para nao confundir avaliacoes normais muito altas com mates reais.
-const MATE_THRESHOLD: i32 = MATE_SCORE - MAX_PLY as i32;
-/// How much MORE singular (below s_beta) a move has to be, on top of
-/// just passing the ordinary singular-extension check, before it earns
-/// a double (+2 ply) extension instead of the normal +1.
-const DOUBLE_EXT_MARGIN: i32 = 16;
-/// Cap on chained double extensions along one search line (read from
-/// the parent ply's count).
-const DOUBLE_EXT_MAX: i32 = 6;
+/// Quando o corte veio LOGO ao primeiro lance, de que categoria era esse
+/// primeiro. Com o contador do lado, da' a taxa de acerto de cada estagio
+/// quando ele poe um lance a` frente -- que e' a medida da ordenacao.
+pub static PRIMEIRO_CERTOU: [std::sync::atomic::AtomicU64; 4] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
 
-/// Tamanho da tabela cont_hist -- 6 tipos de peca * 64 casas destino
-/// para o prev-move, vezes o mesmo para o curr-move. Ver campo
-/// `cont_hist` do Searcher.
-pub const CONT_HIST_SIZE: usize = 6 * 64 * 6 * 64;
-const CONT_HIST_MAX: i32 = 16000;
-
-/// History update with gravity: the closer an entry already sits to the
-/// ceiling, the less a new observation moves it.
+/// A CAUDA: nos de corte que precisaram de 17 lances ou mais, pelo estagio de
+/// onde veio o primeiro lance tentado.
 ///
-/// A plain clamped sum does not do this. An entry that reaches the ceiling
-/// stays pinned there, and every later cutoff for that move is discarded --
-/// so does every later failure, which is worse, because a move that stopped
-/// working keeps its maximum score until something drags it all the way back
-/// down one bonus at a time. Gravity makes the table saturate smoothly and
-/// stay responsive: near zero an update lands in full, near the ceiling it is
-/// almost entirely cancelled.
+/// Porque' este balde e nao outro: medido, os cortes ao 17o lance ou depois sao
+/// **2,3% dos nos de corte e 27,3% dos lances procurados neles**. Sao a parte
+/// mais cara da ordem por uma margem enorme, e sao poucos -- portanto se se
+/// perceber o que os caracteriza, ha' muito a ganhar num sitio pequeno.
+pub static CAUDA: [std::sync::atomic::AtomicU64; 4] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+/// Dos nos da cauda, quantos tinham lance da tabela disponivel.
+pub static CAUDA_TT: [std::sync::atomic::AtomicU64; 2] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Killers por posicao: acertou / falhou quando foi ele o primeiro lance.
+/// Os tres pontuam 400k, 390k e 380k, e o melhor tranquilo que o historico
+/// conhece vale 120k -- portanto os tres passam SEMPRE a` frente de todos os
+/// tranquilos. Se o segundo e o terceiro acertarem pouco, estao a ocupar um
+/// lugar que nao merecem.
+pub static KILLER_CERTOU: [std::sync::atomic::AtomicU64; NUM_KILLERS] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; NUM_KILLERS];
+pub static KILLER_FALHOU: [std::sync::atomic::AtomicU64; NUM_KILLERS] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; NUM_KILLERS];
+
+/// Quando o corte NAO veio ao primeiro lance, de que categoria era o primeiro
+/// -- ou seja, o que estamos a por a` frente que nao devia la' estar.
+pub static PRIMEIRO_FALHOU: [std::sync::atomic::AtomicU64; 4] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
 #[inline]
-fn apply_gravity(value: i32, delta: i32, max: i32) -> i32 {
-    (value + delta - value * delta.abs() / max).clamp(-max, max)
+pub fn conta_killer(slot: usize, certou: bool) {
+    if !cego_ligado() || slot >= NUM_KILLERS {
+        return;
+    }
+    let t = if certou { &KILLER_CERTOU } else { &KILLER_FALHOU };
+    t[slot].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Bonus for the move that caused a beta cutoff.
-///
-/// The old formula was `depth * depth`, which at depth 1 is 1 -- against a
-/// ceiling of 16000. Shallow nodes are the overwhelming majority of the tree,
-/// and there the table was effectively frozen: it took thousands of identical
-/// cutoffs to move an entry enough to change any ordering decision. The
-/// linear term is what makes a shallow cutoff worth recording at all; the
-/// quadratic term still makes a deep one worth more.
-fn history_bonus(depth: i32) -> i32 {
-    let sp = search_params();
-    let b = sp.hist_bonus_quad * depth * depth / 64 + sp.hist_bonus_linear * depth
-        - sp.hist_bonus_offset;
-    b.clamp(0, sp.hist_bonus_max)
+pub fn conta_cauda(i: usize, tipo_primeiro: usize, tinha_tt: bool) {
+    if !cego_ligado() || i < 16 {
+        return;
+    }
+    if let Some(c) = CAUDA.get(tipo_primeiro) {
+        c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    CAUDA_TT[usize::from(tinha_tt)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Penalty for the quiet moves tried before the one that cut off.
+pub fn conta_tipos(i: usize, tipo_corte: usize, tipo_primeiro: usize) {
+    if !cego_ligado() {
+        return;
+    }
+    use std::sync::atomic::Ordering::Relaxed;
+    CORTE_TIPO[tipo_corte.min(3)].fetch_add(1, Relaxed);
+    if i > 0 {
+        PRIMEIRO_FALHOU[tipo_primeiro.min(3)].fetch_add(1, Relaxed);
+    } else {
+        PRIMEIRO_CERTOU[tipo_primeiro.min(3)].fetch_add(1, Relaxed);
+    }
+}
+
+#[inline]
+pub fn conta_sem_corte() {
+    if cego_ligado() {
+        CORTES[7].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+pub static QUEM_ABS: [std::sync::atomic::AtomicU64; 8] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// [0] lances procurados, [1] re-buscas por reducao, [2] re-buscas por
+/// janela, [3] nos gastos nas re-buscas.
+pub static REB: [std::sync::atomic::AtomicU64; 4] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// [0] nos, [1] lances pontuados, [2] lances procurados, [3] nos que
+/// cortaram sem chegar a um tranquilo.
+/// De que e' feita a arvore. Ligado por HALF2K_EST=1 e relatado no fim de cada
+/// busca.
 ///
-/// Separate from the bonus, and deliberately so: "this move refuted the node"
-/// and "this move was tried first and did not" are not equally strong claims.
-/// The second is far weaker -- a move can fail simply for being ordered ahead
-/// of a better one -- so punishing it as hard as the cutoff is rewarded
-/// teaches the table noise. Using one number for both is the version we had.
-fn history_malus(depth: i32) -> i32 {
-    let sp = search_params();
-    let m = sp.hist_malus_quad * depth * depth / 64 + sp.hist_malus_linear * depth
-        - sp.hist_malus_offset;
-    m.clamp(0, sp.hist_malus_max)
+/// 0 nos da busca principal   1 nos de quiescencia
+/// 2 lances procurados        3 nos que cortaram ao PRIMEIRO lance
+/// 4 re-buscas por LMR falhada  5 re-buscas de janela cheia
+extern "C" {
+    fn h2k_argmax_i32(v: *const i32, n: usize, inicio: usize) -> usize;
+}
+
+/// Por onde os nos SAEM.
+///
+/// A pergunta do Joao: as funcoes encadeiam-se pela mesma ordem que as dos
+/// outros? Num motor bem organizado a maior parte dos nos sai cedo -- na
+/// tabela, ou numa poda barata -- e nunca chega a gerar um lance. Se nos
+/// gerarmos lances em quase todos, e' ai' que estao os 2,6x de arvore a mais,
+/// e nao na velocidade de cada operacao.
+///
+/// 0 entrou  1 quiescencia  2 empate/limite  3 tabela  4 tablebases
+/// 5 futilidade inversa  6 razoring  7 lance nulo  8 probcut
+/// 9 gerou lances  10 sem lances legais
+pub static SAIDA: [std::sync::atomic::AtomicU64; 14] = [
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+];
+
+#[inline]
+fn marca(i: usize) {
+    if est_ligado() {
+        SAIDA[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+pub static FORMA: [std::sync::atomic::AtomicU64; 6] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+pub static EST: [std::sync::atomic::AtomicU64; 4] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Por limite de origem do lance da tabela: [primeiro, cortou] x
+/// [exacto, inferior, superior].
+pub static TTB: [std::sync::atomic::AtomicU64; 6] = [
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+];
+
+pub fn ttb_ligado() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("HALF2K_TTB").as_deref() == Ok("1"))
+}
+
+pub fn est_ligado() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("HALF2K_EST").as_deref() == Ok("1"))
+}
+
+pub fn reb_ligado() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("HALF2K_REB").as_deref() == Ok("1"))
+}
+
+#[inline]
+fn conta_reb(i: usize, n: u64) {
+    if reb_ligado() {
+        REB[i].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn build_lmr_table(base: i32, div: i32) -> [[i32; 64]; 64] {
+    let base = base as f64 / 100.0;
+    let div = (div as f64 / 100.0).max(0.01);
+    let mut t = [[0i32; 64]; 64];
+    for d in 1..64usize {
+        for m in 1..64usize {
+            // Em MILESIMOS de ply. Truncar aqui deitava fora tudo o que a
+            // formula diz entre um ply e dois, antes de os ajustes -- captura,
+            // cut node, tt-pv, historico -- poderem usar essa precisao.
+            t[d][m] = ((base + (d as f64).ln() * (m as f64).ln() / div) * 1024.0) as i32;
+        }
+    }
+    t
+}
+
+/// Correction history: how wrong the static evaluation usually is here.
+///
+/// The pruning margins are fixed numbers compared against the static score.
+/// When that score is *systematically* wrong for a family of positions -- and
+/// it is, because the network cannot see what only the search finds -- those
+/// margins bite in the wrong place, the same way every time. This keeps a
+/// running average of what the search ended up saying minus what the static
+/// score said, indexed by pawn structure, and feeds it back next time that
+/// structure appears.
+///
+/// The key is the two pawn bitboards mixed together rather than an incremental
+/// key. Derived from the state, it cannot drift out of sync with it, and a
+/// heuristic table tolerates collisions by construction.
+const CORR_SIZE: usize = 16384;
+
+/// Where one table's entry saturates.
+///
+/// It was 8192 with a grain of 256, which meant the whole correction, summed
+/// over every table, could reach thirty two units -- sixteen centipawns. The
+/// reverse futility margin is a hundred and fifty per ply. A correction that
+/// small cannot move a pruning decision, which is the only thing it exists to
+/// do, and measuring it found exactly the nothing that implies.
+const CORR_MAX: i32 = 1024;
+
+/// The most one update may move an entry.
+const CORR_MAX_UPDATE: i32 = CORR_MAX / 4;
+
+/// How much each reading is trusted, out of the divisor below.
+///
+/// Not an average. The tables answer different questions and are not equally
+/// good at it: the pawn structure says the most by a wide margin, what remains
+/// of each side's force says less, and the shape of the last move says less
+/// again. Proportions taken from an engine where they were tuned over games.
+const CORR_WEIGHT: [i32; CORR_KINDS] = [203, 109, 109, 121, 72];
+const CORR_DIVISOR: i32 = 2048;
+
+/// How many separate readings of "what kind of position is this" the
+/// correction is spread over.
+///
+/// Five, and which five matters more than how many. Two of the first set were
+/// a rook-and-queen key and a knight-and-bishop key, and both were dropped:
+/// each is a strict subset of the non-pawn key, so they answered a question
+/// already answered and were only adding their own collisions to it. The
+/// non-pawn key took their place twice, once per colour -- how much force each
+/// side has left are different facts and were being merged into one.
+///
+/// The fifth is the last move as a change rather than as a destination: the
+/// difference between the position key before and after it, which carries
+/// where the piece came from, what it took and whose move it was. What it
+/// learns is "a change of this shape tends to be misread", which is not
+/// something the piece-and-square key can express.
+pub const CORR_KINDS: usize = 5;
+
+#[inline]
+fn mix(x: u64) -> u64 {
+    let mut z = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+/// A Zobrist key over one subset of the pieces.
+///
+/// Built from the same per-piece randoms the position key uses, so two boards
+/// share a key only when the chosen pieces stand on the same squares in the
+/// same colours. That is the whole point and it was what the previous version
+/// threw away: it keyed on the occupancy bitboard, which cannot tell a white
+/// queen on d1 from a black knight on d1, and on `both()` bitboards that merged
+/// the colours outright. A table indexed like that files a correction learned
+/// in one position where an unrelated position will read it, and the two teach
+/// each other nothing -- measured, switching it on cost fourteen Elo.
+#[inline]
+fn subset_key(board: &Board, colors: &[Color], types: &[PieceType]) -> u64 {
+    let z = crate::zobrist::tabelas();
+    let mut k = 0u64;
+    for &c in colors {
+        for &t in types {
+            let mut bb = board.pieces[c.idx()][t.idx()];
+            while bb != 0 {
+                let sq = bb.trailing_zeros() as usize;
+                bb &= bb - 1;
+                k ^= z.piece_sq[c.idx()][t.idx()][sq];
+            }
+        }
+    }
+    k
+}
+
+/// The five indices for this position: pawns, White's remaining force, Black's
+/// remaining force, the last move by piece and destination, and the last move
+/// as a change of position key.
+#[inline]
+fn corr_indices(
+    board: &Board,
+    last: Option<(usize, usize)>,
+    hash_delta: u64,
+) -> [usize; CORR_KINDS] {
+    use Color::{Black, White};
+    use PieceType::{Bishop, Knight, Pawn, Queen, Rook};
+
+    const BOTH: [Color; 2] = [White, Black];
+    const FORCE: [PieceType; 4] = [Knight, Bishop, Rook, Queen];
+
+    let pawns = subset_key(board, &BOTH, &[Pawn]);
+    let np_white = subset_key(board, &[White], &FORCE);
+    let np_black = subset_key(board, &[Black], &FORCE);
+
+    let cont = match last {
+        Some((pc, to)) => mix((pc as u64) << 8 | to as u64 | 0x5eed_0000_0000),
+        None => 0,
+    };
+
+    // Zero when there is no previous position to differ from, which files
+    // everything at the root in one slot rather than in a random one.
+    let trans = if hash_delta == 0 { 0 } else { mix(hash_delta) };
+
+    // The subset keys are XORs of randoms, so mix once more before taking the
+    // low bits as an index.
+    let m = (CORR_SIZE - 1) as u64;
+    [
+        (mix(pawns) & m) as usize,
+        (mix(np_white) & m) as usize,
+        (mix(np_black) & m) as usize,
+        (cont & m) as usize,
+        (trans & m) as usize,
+    ]
+}
+
+/// How many continuation tables, and how far back each looks.
+/// Quiet moves remembered per ply as having caused a cutoff. Three rather
+/// than two: the extra one costs a comparison and catches the case where two
+/// different refutations alternate, which two slots lose to immediately.
+pub const NUM_KILLERS: usize = 3;
+
+pub const CONT_SLOTS: usize = 5;
+/// Quantos plies atras cada tabela de continuacao olha.
+///
+/// Eram tres, em {1, 2, 4}. A referencia usa cinco, em {1, 2, 3, 4, 6} -- os
+/// plies 3 e 6 faltavam-nos. Os dois novos entram com peso zero enquanto a
+/// opcao `ContLongo` estiver desligada, portanto a omissao nao muda nada.
+pub const CONT_BACK: [usize; CONT_SLOTS] = [1, 2, 4, 3, 6];
+/// Os mesmos plies que a busca de referencia le': 1, 3 e 5 -- e sao TODOS do
+/// adversario, porque os lados alternam.
+///
+/// Os nossos sao 1, 2 e 4: um lance do adversario e DOIS nossos. A nota da
+/// referencia diz que a escolha dela e' deliberada, e porque': um lance
+/// tranquilo e' bom ou mau sobretudo em resposta ao que o adversario anda a
+/// fazer, e meter os nossos proprios lances nas mesmas tabelas faz-lhes outra
+/// pergunta. Duas perguntas na mesma tabela sao duas respostas a estragarem-se
+/// uma a` outra.
+pub const CONT_BACK_ADV: [usize; CONT_SLOTS] = [1, 3, 5, 7, 9];
+/// Weight per slot when scoring, the reply carrying twice the rest.
+pub const CONT_WEIGHT: [i32; CONT_SLOTS] = [2, 1, 1, 1, 1];
+
+/// Where a history entry settles. Separate ceilings because the two tables
+/// answer different questions and the continuation one is asked more precisely,
+/// so it is allowed to be more emphatic.
+const HIST_MAX_MAIN: i32 = 15000;
+
+/// Marca de um lance tranquilo ainda por pontuar. Abaixo de qualquer valor de
+/// historico real e de qualquer sentinela, para ficar no fim da lista ate' ser
+/// avaliado.
+/// Onde um tranquilo ainda por pontuar se senta enquanto espera.
+///
+/// Era `i32::MIN + 7`, e ai' estava o defeito. A ordem desta busca e': tabela
+/// um milhao, capturas boas seiscentos mil, promocao a dama quinhentos mil,
+/// killers quatrocentos mil, tranquilos pelo historico (medido: nunca acima de
+/// 120 mil), e as capturas mas em MENOS seiscentos mil. Um sentinela no fundo
+/// do i32 punha os tranquilos por pontuar abaixo das capturas mas -- ou seja, a
+/// busca passava a experimentar sacrificios ja' refutados antes de qualquer
+/// lance tranquilo, e so' os pontuava quando mais nada restava. Nao era a ideia
+/// de adiar que custava os 36% de nos a mais: era isto.
+///
+/// Menos quinhentos mil poe-nos onde os tranquilos pertencem: por baixo dos
+/// killers e por cima de todas as capturas mas, que no pior caso chegam a menos
+/// 585 mil.
+const TRANQUILO_POR_PONTUAR: i32 = -500_000;
+const HIST_MAX_CONT: i32 = 30000;
+
+/// What one cutoff is worth, by the depth that found it.
+///
+/// Linear and generous. It was `min(1200, d*d)` -- at depth ten that is a
+/// hundred against two thousand, so the tables took eighty cutoffs to reach
+/// where they now reach in six, and move ordering spent most of its time acting
+/// on information that had gone stale. Ordering is what decides whether late
+/// move reductions are reducing the right moves, so this is not a small thing.
+/// Escala do bonus do historico, em milesimos do valor herdado.
+///
+/// A medicao que a motivou: as continuacoes tem tecto de 30000 e a media do
+/// que a busca la' le' e' **301** -- um por cento do tecto. Tabelas assim vazias
+/// nao distinguem lances, e e' por isso que o tranquilo tentado em primeiro so'
+/// corta 7,4% das vezes contra 86,4% do lance da tabela.
+pub static HB_ESC: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1000);
+pub static HB_TECTO: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(4000);
+
+#[inline]
+fn hist_bonus(depth: i32) -> i32 {
+    let e = HB_ESC.load(std::sync::atomic::Ordering::Relaxed);
+    let t = HB_TECTO.load(std::sync::atomic::Ordering::Relaxed);
+    ((200 * depth).min(t) * e / 1000).max(1)
+}
+
+/// What one capture cutoff is worth.
+///
+/// Its own curve, steeper and with an offset, rather than the quiet one. A
+/// capture that works is a stronger statement than a quiet move that works --
+/// there were fewer of them to choose from and the material says whether it
+/// paid -- so the table should move further on it. Reusing the quiet bonus made
+/// this three times too small at the depths where it matters.
+#[inline]
+fn capt_bonus(depth: i32) -> i32 {
+    (depth * 680 - 250).clamp(0, 2400)
+}
+
+/// Where a capture history entry settles.
+const HIST_MAX_CAPT: i32 = 16384;
+const HIST_MAX_PC: i32 = 15000;
+
+/// Move towards the ceiling by an amount that shrinks as it is approached, so
+/// an entry saturates instead of running away.
+#[inline]
+fn hist_add(entry: &mut i32, bonus: i32, max: i32) {
+    *entry += bonus - *entry * bonus.abs() / max;
+}
+
+/// Uma tabela de historico partilhavel, a zeros.
+fn cria_hist(n: usize) -> Vec<std::sync::atomic::AtomicI32> {
+    (0..n).map(|_| std::sync::atomic::AtomicI32::new(0)).collect()
+}
+
+/// As tabelas partilhadas sao planas: os indices aninhados nao sobrevivem a
+/// serem atomicos, e um `Vec<AtomicI32>` com aritmetica de indice e' a forma
+/// mais simples que mantem uma so' alocacao para todos os fios.
+#[inline(always)]
+fn ich(k: usize, idx: usize, pc: usize, to: usize) -> usize {
+    ((k * (6 * 64) + idx) * 6 + pc) * 64 + to
+}
+
+/// Quantas chaves de peoes distintas a tabela guarda. Potencia de dois, para o
+/// indice sair de uma mascara e nao de um resto.
+///
+/// 512, que e' o tamanho da referencia. Com 16384 a tabela dava 50 MB e cada
+/// ajudante alocava a sua antes de a trocar pela partilhada -- o texto de 18-09
+/// avisa disso mesmo: "uma ajudante que partilha devolve a memoria da tabela
+/// propria, senao eram 28 MB por ajudante so' para nao os usar". Aqui sao
+/// 1,5 MB.
+const TAM_PEAO: usize = 512;
+
+#[inline(always)]
+fn ipeao(chave: usize, pc12: usize, to: usize) -> usize {
+    (chave * 12 + pc12) * 64 + to
 }
 
 #[inline(always)]
-fn cont_hist_idx(prev_pt: PieceType, prev_to: crate::types::Square, curr_pt: PieceType, curr_to: crate::types::Square) -> usize {
-    let prev = prev_pt.idx() * 64 + prev_to as usize;
-    let curr = curr_pt.idx() * 64 + curr_to as usize;
-    prev * (6 * 64) + curr
+fn icorr(k: usize, side: usize, idx: usize) -> usize {
+    (k * 2 + side) * CORR_SIZE + idx
 }
 
-/// Correction history table size (per color) and clamp. 16384 slots is
-/// plenty for a hash-modulo table at this scale; collisions just blend
-/// two structures' corrections together, self-correcting over time.
-pub const CORR_HIST_SIZE: usize = 16384;
-const CORR_HIST_MAX: i32 = 1200; // clamp on the stored correction itself
-const CORR_HIST_GRAIN: i32 = 256; // internal fixed-point scale
+/// O mesmo que `hist_add`, num sitio que varios fios podem tocar.
+///
+/// `Relaxed` chega: ninguem depende da ORDEM entre duas actualizacoes, so' de
+/// nenhuma delas ler lixo. Em x86-64 compila para o mesmo `mov`.
+#[inline(always)]
+fn hist_add_at(e: &std::sync::atomic::AtomicI32, bonus: i32, max: i32) {
+    let v = e.load(Ordering::Relaxed);
+    e.store(v + bonus - v * bonus.abs() / max, Ordering::Relaxed);
+}
 
-/// SPSA-tuned weights for combining the 5 correction-history dimensions
-/// (pawn, non-pawn side-to-move, non-pawn other side, minor, major).
-/// `CORR_WEIGHT_SCALE`=256 means a weight of 256 is "full 1.0 effect"
-/// (matches the old pawn-only formula's implicit weight).
-const CORR_WEIGHT_SCALE: i32 = 256;
-// 2026-07-22 CORRECTED (see NOTAS): a set of raw reference weights
-// (384/406/280/274/418) had been SPSA-tuned against a DIFFERENT
-// maxCorrHist clamp/grain, not Kestrel's independently-chosen
-// CORR_HIST_MAX=1200 -- applying the raw numbers directly caused a
-// severe regression (300-game A/B: 6.7% vs the pre-change baseline).
-// Rescaled here to preserve the REAL relative proportions between the
-// 5 terms (which term matters more than which) while capping the
-// worst-case total (all 5 tables simultaneously maxed the same
-// direction) close to the same bound the old single-pawn-term system
-// safely operated at: weights sum to 257 (independent per-term
-// rounding of those proportions, not tuned to hit exactly 256) --
-// 0.4% over the old implicit pawn-only weight's bound, instead of the
-// raw set's much larger sum of 1762.
-const CORR_WEIGHT_PAWN: i32 = 56;
-const CORR_WEIGHT_NP_STM: i32 = 59;
-const CORR_WEIGHT_NP_NSTM: i32 = 41;
-const CORR_WEIGHT_MINOR: i32 = 40;
-const CORR_WEIGHT_MAJOR: i32 = 61;
-// 2026-07-23: threats term, added separately from the 5 above rather
-// than folded into the same rescale (which would mean touching the
-// already-validated 5 weights again, bundling a rescale with an
-// addition -- kept isolated instead, same discipline used all
-// session). Same conversion rate as the original 5-term rescale
-// (256/1762 ~= 0.1453) applied individually to a raw threats weight
-// of 252: 252*0.1453 ~= 37.
-const CORR_WEIGHT_THREATS: i32 = 37;
+/// How much of the plan this search has earned, judged between iterations.
+///
+/// Four readings of "does this position still need thinking", multiplied.
+///
+/// `effort` is the share of nodes that went into the move we mean to play. A
+/// search that has poured almost everything into one move has found its answer
+/// and is confirming it; one still splitting nodes across rivals has not
+/// decided. This is the sturdiest of the four, being a ratio over millions of
+/// nodes rather than a verdict that can turn on one.
+///
+/// `settle` counts iterations that kept the same root move, and decays fast. It
+/// is deliberately the weakest term. Keying elastic time on stability ALONE was
+/// tried in an earlier engine of ours and reverted the same day: on a forced
+/// recapture, where there is nothing to decide, the root move still changed at
+/// three separate depths and each change threw the multiplier back to maximum.
+/// Stability may lengthen a search, never on its own, and never without the
+/// wall standing behind it.
+///
+/// `falling` is a score dropping between iterations, which neither of the
+/// others can see: effort stays high while a position collapses under it, and
+/// stability watches whether the move changed rather than whether it got worse.
+/// Only falls count -- paying extra for good news is how a clock is spent on
+/// won positions.
+///
+/// `instability` is a move the search keeps overturning. It separates a hard
+/// position from a slow one, which the first two cannot: both read "several
+/// moves are equally good" as difficulty, so they fire on quiet positions with
+/// many reasonable answers.
+fn time_scale(effort_frac: f64, settle: u32, score_drop: i32, changes: u32,
+              steady: Option<u32>, escala_max: i32, escala_min: i32) -> f64 {
+    let effort = (1.40 - effort_frac) * 1.55;
+    let settle = (0.95 + 2.2 * (settle as f64 + 2.6).powf(-1.5)).max(1.0);
+    // A score that has stopped moving is confidence, and confidence is time
+    // that can be spent elsewhere. The old term only ever added: it paid for a
+    // falling score and did nothing for a settled one, so a position that had
+    // been quiet for six iterations cost exactly as much as one still being
+    // argued about, and there was never anything saved to spend later.
+    //
+    // It also counts movement in BOTH directions. A score climbing fast is as
+    // much a reason to look further as one falling -- something has changed and
+    // the previous iterations were describing a different position.
+    let falling = match steady {
+        Some(k) => [1.39, 1.19, 1.01, 0.93, 0.88][k.min(4) as usize],
+        None => {
+            if score_drop > 0 {
+                (1.0 + score_drop as f64 * 0.004).min(1.5)
+            } else {
+                1.0
+            }
+        }
+    };
+    let instability = (1.0 + changes as f64 * 0.22).min(2.4);
+    // O GRAMPO FINAL, em milesimos. 3400 = 3,4x, que e' como estava cravado.
+    //
+    // Fica ajustavel porque no KestrelStrike o varrimento deste grampo fechou
+    // com um numero: sair de 2,45x para 5,00x valeu +17,76 +/- 7,12 em 2076
+    // partidas (LLR 2,95, aceite), e ha' um PLANALTO de 4,0 a 5,0 -- entre os
+    // dois o motor e' indiferente em 4618 partidas -- com degradacao acima.
+    //
+    // O half2k esta' em 3,4x, abaixo da borda desse planalto. Mas o elastico
+    // dele NAO e' o mesmo: tem outros factores e outros limites por factor,
+    // portanto o numero de la' nao se copia -- e' ponto de partida para varrer,
+    // nao valor validado. Por isso a omissao nao muda: 3400.
+    (effort * settle * falling * instability)
+        .clamp(escala_min as f64 / 1000.0, escala_max as f64 / 1000.0)
+}
 
-/// Cheap, non-incremental pawn-structure hash -- just the two pawn
-/// bitboards mixed together. Not the real Zobrist key (which would
-/// need incremental maintenance in make/unmake_move); recomputed on
-/// demand, which is fine since it's only touched once or twice per
-/// node, not in the hot per-move loop.
+/// How far above the root the continuation tables may reach into the game.
+pub const PRE_MOVES: usize = 6;
+
+/// Floor of the base two logarithm, which is what the alternative reduction
+/// formula is built on.
 #[inline]
-fn pawn_structure_hash(board: &Board) -> u64 {
-    let wp = board.pieces[Color::White.idx()][PieceType::Pawn.idx()];
-    let bp = board.pieces[Color::Black.idx()][PieceType::Pawn.idx()];
-    wp.wrapping_mul(0x9E3779B97F4A7C15) ^ bp.wrapping_mul(0xC2B2AE3D27D4EB4F)
-}
-
-/// Same non-incremental, on-demand approach as `pawn_structure_hash`,
-/// applied to the other correction-history dimensions. Non-pawn
-/// material (knights/bishops/rooks/queens) of a SINGLE side -- called
-/// once for the side to move and once for the other side (the two
-/// non-pawn terms are independent, not one table read from both angles).
-#[inline]
-fn non_pawn_hash(board: &Board, color: Color) -> u64 {
-    let n = board.pieces[color.idx()][PieceType::Knight.idx()];
-    let b = board.pieces[color.idx()][PieceType::Bishop.idx()];
-    let r = board.pieces[color.idx()][PieceType::Rook.idx()];
-    let q = board.pieces[color.idx()][PieceType::Queen.idx()];
-    n.wrapping_mul(0x165667B19E3779F9)
-        ^ b.wrapping_mul(0x27D4EB2F165667C5)
-        ^ r.wrapping_mul(0x9E3779B185EBCA87)
-        ^ q.wrapping_mul(0xC2B2AE3D27D4EB4F)
-}
-
-/// Minor pieces (knights+bishops), both sides mixed together -- same
-/// both-colors-combined shape as `pawn_structure_hash`.
-#[inline]
-fn minor_piece_hash(board: &Board) -> u64 {
-    let wn = board.pieces[Color::White.idx()][PieceType::Knight.idx()];
-    let wb = board.pieces[Color::White.idx()][PieceType::Bishop.idx()];
-    let bn = board.pieces[Color::Black.idx()][PieceType::Knight.idx()];
-    let bb = board.pieces[Color::Black.idx()][PieceType::Bishop.idx()];
-    wn.wrapping_mul(0x9E3779B97F4A7C15)
-        ^ wb.wrapping_mul(0xC2B2AE3D27D4EB4F)
-        ^ bn.wrapping_mul(0x165667B19E3779F9)
-        ^ bb.wrapping_mul(0x27D4EB2F165667C5)
-}
-
-/// Major pieces (rooks+queens), both sides mixed together.
-#[inline]
-fn major_piece_hash(board: &Board) -> u64 {
-    let wr = board.pieces[Color::White.idx()][PieceType::Rook.idx()];
-    let wq = board.pieces[Color::White.idx()][PieceType::Queen.idx()];
-    let br = board.pieces[Color::Black.idx()][PieceType::Rook.idx()];
-    let bq = board.pieces[Color::Black.idx()][PieceType::Queen.idx()];
-    wr.wrapping_mul(0x9E3779B185EBCA87)
-        ^ wq.wrapping_mul(0xFF51AFD7ED558CCD)
-        ^ br.wrapping_mul(0xC4CEB9FE1A85EC53)
-        ^ bq.wrapping_mul(0x2545F4914F6CDD1D)
-}
-
-/// All squares attacked by every piece of `color` (pawns, knights,
-/// bishops/queens via magic sliding attacks, rooks/queens likewise,
-/// king) -- used only by the threats correction-history term below.
-/// Not incremental (recomputed on demand like the other corr-hist
-/// hashes), acceptable since it's touched once or twice per node, not
-/// in the hot per-move loop.
-fn all_attacks(board: &Board, atk: &Attacks, color: Color) -> Bitboard {
-    let us = color.idx();
-    let occ = board.occ_all;
-    let mut att: Bitboard = 0;
-    let mut pawns = board.pieces[us][PieceType::Pawn.idx()];
-    while pawns != 0 {
-        let s = pawns.trailing_zeros() as usize;
-        pawns &= pawns - 1;
-        att |= atk.pawn[us][s];
-    }
-    let mut knights = board.pieces[us][PieceType::Knight.idx()];
-    while knights != 0 {
-        let s = knights.trailing_zeros() as usize;
-        knights &= knights - 1;
-        att |= atk.knight[s];
-    }
-    let mut bishops = board.pieces[us][PieceType::Bishop.idx()] | board.pieces[us][PieceType::Queen.idx()];
-    while bishops != 0 {
-        let s = bishops.trailing_zeros() as u8;
-        bishops &= bishops - 1;
-        att |= bishop_attacks(s, occ);
-    }
-    let mut rooks = board.pieces[us][PieceType::Rook.idx()] | board.pieces[us][PieceType::Queen.idx()];
-    while rooks != 0 {
-        let s = rooks.trailing_zeros() as u8;
-        rooks &= rooks - 1;
-        att |= rook_attacks(s, occ);
-    }
-    let king_sq = board.pieces[us][PieceType::King.idx()].trailing_zeros() as usize;
-    att |= atk.king[king_sq];
-    att
-}
-
-/// Threats correction hash: which of OUR pieces are currently attacked
-/// by the enemy -- hash of (opponent-attacked squares & our pieces).
-fn threats_hash(board: &Board, atk: &Attacks) -> u64 {
-    let enemy_attacks = all_attacks(board, atk, board.side.opp());
-    let own_pieces = board.occ_color[board.side.idx()];
-    let threatened = enemy_attacks & own_pieces;
-    threatened.wrapping_mul(0x2545F4914F6CDD1D) ^ threatened.wrapping_mul(0x9E3779B97F4A7C15).rotate_left(17)
-}
-
-/// 2026-07-20 (BUG REAL encontrado por auditoria -- investigacao da
-/// queda de resultados, ver NOTAS_PROXIMA_SESSAO.md): a TT guardava e
-/// lia scores de mate em BRUTO, sem ajustar pela distancia (ply) entre
-/// o no' onde a entrada foi escrita e o no' onde e' reaproveitada --
-/// bug classico de "corrupcao de mate score" em qualquer motor
-/// alfa-beta com TT. Um "mate em N" escrito a um ply e' relativo a ESSE
-/// ply; reaproveitado sem ajuste noutro ply, o motor pode "ver" mates
-/// que nao existem dali, ou avaliar mal posicoes decisivas perto de
-/// mate -- exatamente onde um estilo agressivo (Polgar) mais precisa de
-/// avaliacoes corretas. Converte para "distancia ao no' ATUAL" antes de
-/// guardar, converte de volta para "distancia a partir da raiz real"
-/// (ou seja, para a escala que negamax() usa) ao ler.
-fn score_to_tt(score: i32, ply: i32) -> i32 {
-    if score >= MATE_THRESHOLD {
-        score + ply
-    } else if score <= -MATE_THRESHOLD {
-        score - ply
-    } else {
-        score
-    }
-}
-fn score_from_tt(score: i32, ply: i32) -> i32 {
-    if score >= MATE_THRESHOLD {
-        score - ply
-    } else if score <= -MATE_THRESHOLD {
-        score + ply
-    } else {
-        score
-    }
-}
-
-impl<'a> Searcher<'a> {
-    /// Reconstructs the full principal variation by walking the TT's
-    /// best-move chain from `board` forward. Not a dedicated PV table --
-    /// cheap and good enough for UCI `info ... pv` output and for
-    /// verifying deep/forced lines (e.g. long mates) actually hold up
-    /// move by move, not just at the root. Defensive against a stale or
-    /// hash-collided entry pointing at an illegal move (stops the line
-    /// there instead of applying it) and against cycles (a repetition
-    /// loop in a corrupted chain would otherwise iterate forever).
-    pub fn extract_pv(&self, board: &Board, max_len: usize) -> Vec<Move> {
-        let mut b = board.clone();
-        let first = match self.tt.probe(b.hash).and_then(|e| e.best) {
-            Some(m) => m,
-            None => return Vec::new(),
-        };
-        self.extract_pv_from(board, first, max_len)
-    }
-
-    /// Same reconstruction, but starting from a move the caller names --
-    /// used to make the reported line begin with the move actually chosen.
-    pub fn extract_pv_from(&self, board: &Board, first: Move, max_len: usize) -> Vec<Move> {
-        let mut pv = Vec::new();
-        let mut b = board.clone();
-        {
-            let legal = generate_legal(&mut b, self.atk);
-            if !legal.contains(&first) {
-                return pv;
-            }
-            b.make_move(&first);
-            pv.push(first);
-        }
-        let mut seen = std::collections::HashSet::new();
-        for _ in 0..max_len {
-            let hash = b.hash;
-            if !seen.insert(hash) {
-                break;
-            }
-            let mv = match self.tt.probe(hash).and_then(|e| e.best) {
-                Some(m) => m,
-                None => break,
-            };
-            let legal = generate_legal(&mut b, self.atk);
-            if !legal.contains(&mv) {
-                break;
-            }
-            b.make_move(&mv);
-            pv.push(mv);
-        }
-        pv
-    }
-
-    fn time_up(&mut self) -> bool {
-        if self.stop {
-            return true;
-        }
-        if self.nodes % 2048 == 0 {
-            if self.stop_flag.load(Ordering::Relaxed) {
-                self.stop = true;
-                return true;
-            }
-            if let Some(d) = self.limits.deadline {
-                if Instant::now() >= d {
-                    self.stop = true;
-                    self.stop_flag.store(true, Ordering::Relaxed);
-                }
-            }
-            if let Some(mx) = self.limits.max_nodes {
-                if self.nodes >= mx {
-                    self.stop = true;
-                    self.stop_flag.store(true, Ordering::Relaxed);
-                }
-            }
-        }
-        self.stop
-    }
-
-    /// Quanto vale um empate -- e nao e' zero.
-    ///
-    /// Valia. E com zero, um empate e' um resultado aceitavel sempre que as
-    /// alternativas nao parecem muito melhores: o adversario repete, a busca
-    /// ve zero, compara com uma linha que a nossa avaliacao pontua em +40, e
-    /// quarenta centipeoes de vantagem incerta nem sempre ganham a um zero
-    /// garantido. O resultado e' meio ponto entregue em posicoes que estavamos
-    /// a ganhar.
-    ///
-    /// Um empate custa-nos alguma coisa, e o numero diz isso: e' pontuado como
-    /// ligeiramente MAU para quem esta a decidir a raiz. Assim, entre repetir
-    /// e continuar a jogar, a busca prefere jogar -- e so' aceita o empate
-    /// quando a alternativa e' mesmo pior, que e' quando um empate e' de facto
-    /// o melhor que ha.
-    ///
-    /// Pequeno de proposito. Grande demais e o motor recusa empates em
-    /// posicoes perdidas, que e' deitar fora meio ponto pela razao oposta.
-    /// Vinte centipeoes e' menos de um quinto de peao: chega para desempatar
-    /// entre repetir e jogar, e nao chega para inventar vantagem nenhuma.
-    fn valor_empate(&self, board: &Board) -> i32 {
-        let c = CONTEMPT.load(std::sync::atomic::Ordering::Relaxed);
-        if c == 0 {
-            return 0;
-        }
-        // Escalado com a avaliacao, nao fixo em centipeoes.
-        //
-        // O valor foi escolhido contra uma escala em que a dama valia 1980, e
-        // a escala passou para metade disso hoje. Sem esta correccao os mesmos
-        // vinte centipeoes valeriam o dobro do que foram afinados para valer:
-        // o comentario acima diz "menos de um quinto de peao" e passariam a
-        // ser mais de um terco.
-        //
-        // E' o mesmo erro que a curva de vitoria/derrota tinha: um numero em
-        // centipeoes so' significa o mesmo enquanto o centipeao significar o
-        // mesmo. Ancorar na escala e' o que faz o contempt querer dizer sempre
-        // a mesma fraccao de peao.
-        let c = c * crate::nnue::escala_pos(board) / 400;
-        if c == 0 {
-            return 0;
-        }
-        // Do ponto de vista de quem joga NESTE no', e negativo para o lado que
-        // manda na raiz: e' a nos que um empate custa.
-        if board.side == self.root_side { -c } else { c }
-    }
-
-    fn is_repetition_or_fifty(&self, board: &Board, hash: u64) -> bool {
-        // DIAGNOSTICO (KESTREL_SEM_REPETICAO=1): desliga a deteccao de
-        // repeticao para testar se e' ela a origem da explosao a varias
-        // threads. O score de um no que repete depende do CAMINHO, e ainda
-        // assim vai parar a uma TT partilhada -- outra thread le-o num
-        // caminho onde nao havia repeticao. Nao e' para producao: sem isto o
-        // motor nao evita linhas de empate.
-        static SEM_REP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *SEM_REP.get_or_init(|| std::env::var_os("KESTREL_SEM_REPETICAO").is_some()) {
-            return false;
-        }
-        if board.halfmove >= 100 {
-            return true;
-        }
-        // conta ocorrencias da mesma posicao no historico real + no
-        // caminho de busca ja percorrido (self.history acumula ambos)
-        let mut cnt = 0;
-        for &h in self.history.iter().rev().take(board.halfmove as usize + 1) {
-            if h == hash {
-                cnt += 1;
-                if cnt >= 1 {
-                    return true; // repeticao simples ja chega para evitar linhas de empate a repetir
-                }
-            }
-        }
-        false
-    }
-
-    /// O lado a jogar tem alguma peca alem de peoes e rei?
-    /// (Condicao anti-zugzwang para o null-move pruning.)
-    fn has_non_pawn_material(&self, board: &Board) -> bool {
-        let us = board.side.idx();
-        board.pieces[us][PieceType::Knight.idx()]
-            | board.pieces[us][PieceType::Bishop.idx()]
-            | board.pieces[us][PieceType::Rook.idx()]
-            | board.pieces[us][PieceType::Queen.idx()]
-            != 0
-    }
-
-    /// Does the opponent have a threat that wins material outright?
-    ///
-    /// Not "is anything attacked" -- specifically a piece of ours attacked by
-    /// a CHEAPER enemy piece, which wins material on any exchange and does not
-    /// need a search to confirm. Pure bitboard intersections against the
-    /// attack tables, no move generation: this runs before the move list
-    /// exists, and paying for the generator inside a test meant to avoid
-    /// searching would defeat the purpose.
-    ///
-    /// Used to make reverse futility pruning careful. A margin that says "we
-    /// are far enough ahead to skip this node" is a statement about the
-    /// evaluation, and the evaluation does not know that a rook is hanging to
-    /// a bishop. Where it is, the node deserves to be searched.
-    fn opponent_has_winning_threat(&self, board: &Board) -> bool {
-        let a = self.atk;
-        let us = board.side.idx();
-        let them = board.side.opp().idx();
-        let occ = board.occ_all;
-
-        let our_q = board.pieces[us][PieceType::Queen.idx()];
-        let our_r = board.pieces[us][PieceType::Rook.idx()];
-        let our_minor =
-            board.pieces[us][PieceType::Knight.idx()] | board.pieces[us][PieceType::Bishop.idx()];
-
-        // Pawns threaten anything above a pawn.
-        let mut pawns = board.pieces[them][PieceType::Pawn.idx()];
-        let valuable = our_q | our_r | our_minor;
-        while pawns != 0 {
-            let sq = pawns.trailing_zeros() as crate::types::Square;
-            pawns &= pawns - 1;
-            if a.pawn[them][sq as usize] & valuable != 0 {
-                return true;
-            }
-        }
-        // Minors threaten rooks and queens.
-        let mut knights = board.pieces[them][PieceType::Knight.idx()];
-        while knights != 0 {
-            let sq = knights.trailing_zeros() as crate::types::Square;
-            knights &= knights - 1;
-            if a.knight[sq as usize] & (our_q | our_r) != 0 {
-                return true;
-            }
-        }
-        let mut bishops = board.pieces[them][PieceType::Bishop.idx()];
-        while bishops != 0 {
-            let sq = bishops.trailing_zeros() as crate::types::Square;
-            bishops &= bishops - 1;
-            if crate::attacks::bishop_attacks(sq, occ) & (our_q | our_r) != 0 {
-                return true;
-            }
-        }
-        // Rooks threaten queens.
-        let mut rooks = board.pieces[them][PieceType::Rook.idx()];
-        while rooks != 0 {
-            let sq = rooks.trailing_zeros() as crate::types::Square;
-            rooks &= rooks - 1;
-            if crate::attacks::rook_attacks(sq, occ) & our_q != 0 {
-                return true;
-            }
-        }
-        false
-    }
-
-    fn mvv_lva(&self, board: &Board, mv: &Move) -> i32 {
-        if !mv.is_capture() {
-            return 0;
-        }
-        let victim = board.piece_at(mv.to).map(|(pt, _)| pt.value()).unwrap_or(100); // en passant = peao
-        let attacker = board.piece_at(mv.from).map(|(pt, _)| pt.value()).unwrap_or(0);
-        victim * 16 - attacker
-    }
-
-    /// Todas as pecas (ambas as cores) que atacam `sq` dada uma
-    /// ocupacao HIPOTETICA `occ` (nao necessariamente `board.occ_all`
-    /// -- usado pelo SEE para simular a troca a medida que remove
-    /// pecas). Ataques de peao usam a tabela do lado CONTRARIO (truque
-    /// classico: "que casas atacaria um peao preto aqui" = "que peoes
-    /// brancos atacam aqui", por simetria do padrao diagonal).
-
-
-
-    /// Bonus de ordenacao para lances que a Judit Polgar realmente jogou
-    /// nesta posicao exata (1825 jogos reais, ver book.rs) -- cresce com
-    /// a frequencia mas satura, para nunca competir com uma captura
-    /// claramente boa (MVV-LVA fica sempre a frente). So' um empurrao de
-    /// preferencia entre lances tranquilos que a busca ja consideraria
-    /// razoaveis de qualquer forma. Recebe o hash JA CALCULADO (nunca o
-    /// recalcula por lance -- bug de desempenho real corrigido: chegou a
-    /// custar 3x o NPS por recalcular o zobrist inteiro por CANDIDATO em
-    /// vez de uma vez por posicao).
-    fn book_bonus(&self, book_entries: &[(u16, u32)], mv: &Move) -> i32 {
-        if book_entries.is_empty() {
-            return 0;
-        }
-        let target = encode_move(mv);
-        for &(m16, cnt) in book_entries {
-            if m16 == target {
-                return 550 + (cnt as i32 * 10).min(200);
-            }
-        }
+fn ilog2i(v: i32) -> i32 {
+    if v <= 0 {
         0
+    } else {
+        31 - (v as u32).leading_zeros() as i32
     }
+}
 
-    /// Aplica bonus/malus de history heuristic -- ver campo `history_scores`.
-    /// `depth*depth` e' a formula classica (peso maior quanto mais fundo o
-    /// corte, um corte a profundidade alta diz muito mais sobre a
-    /// qualidade real do lance do que um corte raso).
-    fn update_history(&mut self, side: usize, mv: &Move, delta: i32) {
-        let v = &mut self.history_scores[side][mv.from as usize][mv.to as usize];
-        *v = apply_gravity(*v, delta, HISTORY_MAX);
-    }
+pub const MAX_PLY: usize = 128;
+pub const INF: i32 = 32_000;
+pub const MATE: i32 = 31_000;
+/// Anything at least this large is a mate score, not an evaluation.
+pub const MATE_IN_MAX: i32 = MATE - MAX_PLY as i32;
 
-    /// Same bonus/malus shape as update_history, for captures -- keyed
-    /// by (moving piece, captured piece) instead of (from, to), since
-    /// what matters for "does this TYPE of capture tend to work out" is
-    /// which pieces are involved, not the exact squares.
-    fn update_capture_history(&mut self, side: usize, moving: PieceType, captured: PieceType, delta: i32) {
-        let v = &mut self.capture_history[side][moving.idx()][captured.idx()];
-        *v = apply_gravity(*v, delta, HISTORY_MAX);
-    }
 
-    /// Actualiza cont_hist para o par (prev_move, curr_move) -- +bonus
-    /// se `curr_move` acabou de cortar beta em resposta a `prev_move`,
-    /// -bonus para os quiets tentados antes que nao cortaram.
-    /// `curr_pt` e a peca que fez `curr_mv` (piece_at(mv.from) no board
-    /// ANTES do make_move). Ver campo cont_hist no Searcher.
-    fn update_cont_hist(&mut self, prev_pt: PieceType, prev_to: crate::types::Square, curr_pt: PieceType, curr_to: crate::types::Square, delta: i32) {
-        let idx = cont_hist_idx(prev_pt, prev_to, curr_pt, curr_to);
-        let v = &mut self.cont_hist[idx];
-        *v = apply_gravity(*v, delta, CONT_HIST_MAX);
-    }
-
-    /// Continuation-history score for moving `curr_pt` to `to` at `ply`:
-    /// how this move has performed before in reply to the SAME preceding
-    /// context, summed over the 1- and 2-ply lags (the same pair the move
-    /// picker scores with). Read where a pruning/reduction decision needs
-    /// the "is this move good IN THIS CONTEXT" signal -- plain history
-    /// alone is context-free and rates a move identically no matter what
-    /// was just played, which is exactly the blind spot continuation
-    /// history fixes.
+/// Every number the search compares something against.
+///
+/// They are options rather than constants because not one of them was measured
+/// -- each was picked to be sane and then left alone, which is a different
+/// thing from being right. Exposed, they can be walked over by a tuner playing
+/// games, which is the only process that has ever produced good ones.
+///
+/// Two are stored multiplied by a hundred, because the shape they belong to is
+/// a logarithm and the option protocol only carries integers.
+#[derive(Clone, Copy)]
+pub struct Params {
+    pub rfp_margin: i32,
+    /// Declive da barra do SEE que separa captura boa de ma', por ply.
+    pub capt_bar_f: i32,
+    /// Tecto dessa barra.
+    pub capt_bar_max: i32,
+    /// O divisor da barra do SEE quando ela vem do MERITO do lance em vez da
+    /// profundidade. 0 = como estava. Item 12 do VALIDACOES.md.
     ///
-    /// Takes the piece type explicitly rather than looking it up: the two
-    /// call sites read it from opposite ends (the pruning site runs BEFORE
-    /// make_move, so the piece is still on `mv.from`; the LMR site runs
-    /// AFTER, when it already sits on `mv.to`).
+    /// As capturas sao 55,5% dos primeiros lances tentados e cortam 77,3% das
+    /// vezes -- e' o termo com mais peso na taxa de corte ao primeiro lance.
+    /// Um ponto ganho aqui vale meio ponto no total.
+    pub capt_bar_div: i32,
+    /// Divisor do peso da historia de capturas na ordem. 256 reproduz o
+    /// comportamento herdado (`capt_score / 16`); menos pesa mais.
+    pub capt_hist_div: i32,
+    pub rfp_improving: i32,
+    /// Quanto cresce a reducao quando nao se melhora, em 512 avos.
+    pub lmr_piora_f: i32,
+    /// Quanto a largura da janela alivia a reducao, em milesimos de ply.
+    pub lmr_janela_f: i32,
+    pub rfp_depth: i32,
+    pub razor_margin: i32,
+    pub razor_depth: i32,
+    pub nmp_base: i32,
+    pub nmp_div: i32,
+    pub nmp_prof_div: i32,
+    pub recusa_margem: i32,
+    pub recusa_limiar: i32,
+    pub triagem_n: i32,
+    pub ord_see: i32,
+    pub ord_mvv: i32,
+    pub ord_killer: i32,
+    pub ord_hist_n: i32,
+    pub ord_xeque: i32,
+    pub xeque_banda: i32,
+    pub lmp_base: i32,
+    pub lmp_depth: i32,
+    pub fut_base: i32,
+    pub fut_slope: i32,
+    pub fut_depth: i32,
+    /// Divisor applied to the history score inside the forward futility
+    /// margin. In OUR history units, which run about five and a half times
+    /// smaller than the scale this value was originally written for.
+    pub fut_hist_div: i32,
+    pub hist_prune: i32,
+    /// Static exchange threshold for quiet moves, as `-x * (d + d*d)`.
+    pub see_prune_quiet: i32,
+    /// A check is only worth extending for when the position is not already
+    /// decided.
+    pub check_ext_eval: i32,
+    /// What a draw is worth to the side to move, in the units the network
+    /// speaks, where two are a centipawn.
+    ///
+    /// Zero means a draw is a draw. Above zero means the engine would rather
+    /// keep playing than repeat, which is worth something when the opponent
+    /// evaluates positions the same way we do -- against an engine sharing our
+    /// network, agreement about what is equal turns into a repetition, and half
+    /// the games end that way.
+    ///
+    /// It is not free: an engine that refuses a draw it should take loses games
+    /// it should have halved. Small, and measured.
+    pub contempt: i32,
+    pub see_prune: i32,
+    pub fut_capt_base: i32,
+    pub fut_slope_red: i32,
+    pub see_quiet_red: i32,
+    pub poda_hist_div: i32,
+    pub poda_sf_ttpv: i32,
+    pub poda_sf_capt_base: i32,
+    pub poda_sf_capt_slope: i32,
+    pub poda_sf_capt_hist: i32,
+    pub poda_sf_capt_see: i32,
+    pub poda_sf_cont_prune: i32,
+    pub poda_sf_div: i32,
+    pub poda_sf_fut_slope: i32,
+    pub poda_sf_fut_base: i32,
+    pub poda_sf_see: i32,
+    /// x100
+    pub lmr_base: i32,
+    /// x100
+    pub lmr_div: i32,
+    /// Quanto a reducao cresce quando o ply SEGUINTE ja' cortou muitas vezes,
+    /// em milesimos de ply. 0 = como estava.
+    ///
+    /// Do KestrelStrike. Um no' cujos filhos nao param de cortar e' um no'
+    /// facil. Medido la': 64.076 -> 37.695 nos a` mesma profundidade.
+    /// Quanta profundidade se desconta depois de o alpha subir. 0 = como
+    /// estava. Do KestrelStrike.
+    pub alpha_desc: i32,
+    /// A janela em que o desconto age. No binario que jogava: 3 e 12.
+    pub ad_min: i32,
+    pub ad_max: i32,
+    pub cut_cnt_base: i32,
+    pub cut_cnt_mais: i32,
+    pub lmr_cut: i32,
+    pub lmr_hist_div: i32,
+    /// O divisor quando o historico fala alto.
+    pub lmr_hist_div_forte: i32,
+    /// Peso da ameaca por peca menor, em centesimos do valor da peca.
+    pub ordem_ameaca_f: i32,
+    /// Numerador do optimism. 114 e' o valor da referencia e o do KestrelStrike.
+    pub otimismo_f: i32,
+    /// Grampo final do elastico do tempo, em milesimos. 3400 = 3,4x.
+    pub tm_escala_max: i32,
+    /// Peso da historia de peoes, em 32 avos. 32 = peso um.
+    pub peao_f: i32,
+    /// TECTO DURO SEM INCREMENTO, em percentagem do relogio. 0 = desligado.
+    ///
+    /// O tecto normal e' um MULTIPLO do optimo, e um multiplo do optimo nao e'
+    /// tecto nenhum: se o optimo sobe, o tecto sobe com ele. Com incremento
+    /// tudo bem, que o gasto e' reposto; sem incremento cada milissegundo
+    /// gasto foi-se para sempre.
+    ///
+    /// O QUE ISSO CUSTOU, medido no KestrelStrike (PDaYgQnB, 600+0, perdida a`
+    /// bandeira ao lance 163): no lance 12, com 501s no relogio, o optimo era
+    /// 24,9s e o tecto 24,9 x 5,5 = 137s. O motor gastou 73s e passou por
+    /// baixo do tecto a` vontade. Com 10% do relogio o tecto era 50s e aquele
+    /// lance nao tinha existido.
+    ///
+    /// A regra vem do Coda (GPL-3), que a escreveu depois das mesmas derrotas:
+    /// "For no-inc sudden death: cap max at 15% of clock, hard at 10%". O
+    /// numero transfere-se porque a unidade e' percentagem de relogio e nao
+    /// depende da arvore de ninguem.
+    ///
+    /// E' TECTO, nao orcamento: nao muda o que o motor planeia gastar, so'
+    /// impede o lance unico que arruina a partida.
+    pub tm_sem_inc_tecto: i32,
+    /// CHAO do elastico, em milesimos. 650 = 0,65, que e' como estava cravado.
+    ///
+    /// Nos lances obvios o motor pede menos do que o chao o deixa gastar, e o
+    /// que sobra nao volta. No KestrelStrike baixar de 0,65 para 0,50 estava a
+    /// dar +4,01 +/- 12,92 sem veredicto quando a maquina se perdeu.
+    pub tm_escala_min: i32,
+    /// QUAL PERCENTIL da duracao. 0=p50 1=p60 2=p70 3=p75 4=p80.
+    ///
+    /// OMISSAO 0 (p50). O KestrelStrike TEM isto -- a mesma tabela, os mesmos
+    /// cinco percentis, os mesmos nos (em plies la', em lances aqui) -- e
+    /// tambem com a omissao a 0. Recuperado a 20-09 da conversa exportada.
+    ///
+    /// Nao esta' no binario `ks_1.20260919` porque entrou DEPOIS de esse
+    /// binario ser construido: a cadeia KS_TM_CURVA_PCT nao existe em nenhum
+    /// dos nove binarios guardados. Por isso nao ha' afinacao para transportar
+    /// -- o que ha' e' a peca, e a peca esta' aqui igual.
+    ///
+    /// O que o binario que JOGAVA ja' tinha, e esta' medido: o horizonte que
+    /// cresce (`KS_TM_CURVA = 1`). Com 480.000 ms no relogio ele gasta 16,4 s
+    /// ao lance 16 e 5,6 s ao lance 30 -- assume ~19 lances a faltar no
+    /// primeiro caso e ~56 no segundo. Com `KS_TM_CURVA=0` volta aos ~20
+    /// fixos. Logo a decisao de que o horizonte cresce esta' tomada do lado de
+    /// la'; o que falta decidir e' o percentil.
+    ///
+    /// E isso decide-se com partidas -- p75 contra p50 -- porque orcar pela
+    /// mediana e' orcar para metade das partidas rebentarem o orcamento, e sao
+    /// essas que acabam a zero.
+    pub tm_curva_pct: i32,
+    /// O HORIZONTE CRESCE depois de a estimativa ser desmentida, em centesimos
+    /// de lance por lance de excesso. 0 = desligado.
+    ///
+    /// A tabela acaba no lance 110. Sem isto, dai' para a frente dizia sempre
+    /// o mesmo numero. Uma partida que passou o ultimo degrau provou que e'
+    /// das longas, e sao essas que acabam a` bandeira.
+    ///
+    /// 100 = um por um.
+    pub tm_cresce: i32,
+    /// Quanto vale dar xeque sem perder material.
+    pub ordem_xeque_f: i32,
+    /// Peso da historia peca-casa, em centesimos do peso da tabela principal.
+    pub hist_pc_f: i32,
+    /// Quantas capturas vulgares se procuram na quiescencia antes de travar.
+    pub travao_qs_n: i32,
+    /// Credito de um killer, somado ao historico em vez de o substituir.
+    /// 30000 e' um quarto do maior historico observado (120293).
+    pub killer_bonus: i32,
+    pub asp_delta: i32,
+    pub asp_depth: i32,
+    pub sing_depth: i32,
+    pub sing_margin: i32,
+    /// How far below the singular window a move has to fall to earn a second
+    /// ply rather than one.
+    pub double_ext: i32,
+    /// Reductions accumulate in 1024ths and divide at the end, so a term can be
+    /// worth a third of a ply instead of all or nothing. These are in those
+    /// units.
+    pub lmr_cut_f: i32,
+    /// Reducao a MAIS num no' de corte que nao tem lance da tabela.
+    ///
+    /// A hipotese era: um no' de corte sem lance da tabela e' onde a ordem nao
+    /// tem nada de bom para tentar primeiro, logo devia reduzir-se mais la'.
+    /// Sustentava-a a medicao das taxas de acerto do primeiro lance -- tabela
+    /// 86,4%, captura 77,3%, killer 49,4%, tranquilo 7,4%.
+    ///
+    /// MEDIDO E NAO PRESTA, tres posicoes a` profundidade 10:
+    ///
+    ///     base                       corte ao 1o 73,0%   78.993 nos
+    ///     CutNodeLmr                             72,6%   85.490
+    ///     CutNodeLmr + LmrCutF=4026              73,5%   82.616
+    ///
+    /// Pior nos dois eixos, ou quase. Fica o parametro porque custa nada tendo o
+    /// `CutNodeLmr` desligado, mas a ideia esta' respondida.
+    pub lmr_cut_sem_tt: i32,
+    pub lmr_tt_capt_f: i32,
+    pub lmr_nonpv_f: i32,
+    pub lmr_ttpv_f: i32,
+    /// A stored lower bound this far above beta already answers the question.
+    ///
+    /// In OUR units. The value it came from belongs to a program whose pawn is
+    /// about 255 where ours is 200, so it is scaled by that ratio -- the third
+    /// time today a constant has been carried across a scale boundary, and the
+    /// first two both silently disabled the thing they were meant to control.
+    pub probcut_margin: i32,
+    /// How far the score may move and still count as settled. Two hundred
+    /// is a pawn here, so forty is a fifth of one -- converted, not
+    /// carried across from the scale the shape came from.
+    pub tm_trend_window: i32,
+    /// What a capture is credited with beyond the piece it takes, before the
+    /// quiescence margin gives up on it.
+    ///
+    /// Two hundred is exactly one pawn here, and it got there by reading a
+    /// number off another engine without converting it: in the scale it came
+    /// from, the same test allows about a pawn and a half. Measured at one
+    /// pawn, this threw away 45% of the captures it looked at in a tactical
+    /// position -- a great deal for a search whose only job is not to miss
+    /// tactics -- and switching it on cost 63 Elo over a thousand games.
+    pub qs_margin: i32,
+    /// Below this many pieces on the board, nothing is reduced at all.
+    pub lmr_endgame_pieces: i32,
+    /// A gestao de tempo do pawn. Ver o ramo em `allocate`.
+    pub tm_mtg: i32,
+    /// Onde entra o lance da tabela que veio de um limite superior. Abaixo das
+    /// capturas boas (600.000) e acima dos killers (400.000).
+    pub tt_fraco_pont: i32,
+    /// Lances estimados no inicio da partida, quando a curva esta' ligada.
+    pub tm_mtg_base: i32,
+    /// Quanto a estimativa desce por lance, em centesimos.
+    pub tm_mtg_declive: i32,
+    /// O chao da estimativa, para o fim da partida nao ficar sem reserva.
+    pub tm_mtg_min: i32,
+    /// Que fraccao do ritmo dele podemos igualar, em por cento. Noventa e
+    /// cinco em vez de cem: sempre que ambos vamos ao limite, ganhamos.
+    pub tm_predador_pct: i32,
+    /// Ate' que relogio o predador se aplica, em segundos. Acima disto ha'
+    /// tempo para pensar e acompanhar o ritmo dele nao acrescenta nada.
+    pub tm_predador_ate_s: i32,
+    /// percent of the increment spent each move
+    pub tm_inc_pct: i32,
+    pub tm_hard_mult: i32,
+    /// percent of what is left that the wall may reach
+    pub tm_hard_pct: i32,
+    /// Percent of the base allowance by game phase. The opening is played
+    /// rather than calculated, and a simplified position has less to find.
+    pub tm_open_pct: i32,
+    pub tm_early_pct: i32,
+    pub tm_mid_pct: i32,
+    pub tm_late_pct: i32,
+    pub tm_simple_pct: i32,
+    /// What to do about the other clock: more when comfortably ahead on it,
+    /// less when behind.
+    pub tm_ahead_pct: i32,
+    pub tm_behind_pct: i32,
+    /// Never think for less than this, so a low clock still buys a move that
+    /// was looked at rather than one that was guessed.
+    /// Ate' onde o orcamento planeia, quando o arbitro nao diz quantos lances
+    /// faltam. Nao e' a duracao esperada da partida.
+    pub tm_horizonte_max: i32,
+    /// Por quantos lances o TmPawn reparte o bolo quando nao ha' movestogo.
+    pub tm_pawn_n: i32,
+    /// Tecto duro do TmPawn, em centesimos do optimo (200 = 2x, como estava).
+    pub tm_pawn_tecto: i32,
+    /// Minimo dos lances que faltam na curva do TmPawn.
+    pub tm_pawn_curva_min: i32,
+    pub tm_floor_ms: i32,
+}
+
+impl Default for Params {
+    fn default() -> Self {
+        Params {
+            rfp_margin: 110,
+            capt_bar_f: 50,
+            capt_bar_max: 250,
+            capt_bar_div: 0,
+            capt_hist_div: 256,
+            rfp_improving: 150,
+            lmr_piora_f: 197,
+            lmr_janela_f: 577,
+            rfp_depth: 9,
+            razor_margin: 348,
+            razor_depth: 5,
+            nmp_base: 4,
+            nmp_div: 6,
+            nmp_prof_div: 3,
+            recusa_margem: 30,
+            recusa_limiar: 0,
+            triagem_n: 6,
+            ord_see: 150,
+            ord_mvv: 16,
+            ord_killer: 54_000,
+            ord_hist_n: 106,
+            ord_xeque: 60_000,
+            xeque_banda: 0,
+            lmp_base: 3,
+            lmp_depth: 6,
+            fut_base: 100,
+            fut_slope: 150,
+            fut_depth: 12,
+            fut_hist_div: 75,
+            hist_prune: 600,
+            see_prune: 70,
+            fut_capt_base: 234,
+            fut_slope_red: 100,
+            see_quiet_red: 100,
+            poda_hist_div: 4000,
+            poda_sf_ttpv: 929,
+            poda_sf_capt_base: 234,
+            poda_sf_capt_slope: 247,
+            poda_sf_capt_hist: 134,
+            poda_sf_capt_see: 177,
+            poda_sf_cont_prune: 965,
+            poda_sf_div: 700,
+            poda_sf_fut_slope: 119,
+            poda_sf_fut_base: 164,
+            poda_sf_see: 23,
+            see_prune_quiet: 5,
+            check_ext_eval: 75,
+            contempt: 0,
+            lmr_base: 77,
+            lmr_div: 236,
+            alpha_desc: 0,
+            ad_min: 3,
+            ad_max: 12,
+            cut_cnt_base: 0,
+            cut_cnt_mais: 0,
+            lmr_cut: 2,
+            lmr_hist_div: 22000,
+            lmr_hist_div_forte: 4000,
+            ordem_ameaca_f: 2000,
+            otimismo_f: 114,
+            tm_escala_max: 3400,
+            peao_f: 32,
+            tm_sem_inc_tecto: 0,
+            tm_escala_min: 650,
+            tm_curva_pct: 0,
+            tm_cresce: 0,
+            ordem_xeque_f: 16384,
+            hist_pc_f: 2400,
+            travao_qs_n: 2,
+            killer_bonus: 30000,
+            asp_delta: 25,
+            asp_depth: 4,
+            sing_depth: 5,
+            sing_margin: 2,
+            double_ext: 40,
+            lmr_cut_f: 2048,
+            lmr_cut_sem_tt: 933,
+            lmr_tt_capt_f: 1079,
+            lmr_nonpv_f: 1024,
+            lmr_ttpv_f: 1024,
+            probcut_margin: 294,
+            tm_trend_window: 40,
+            qs_margin: 450,
+            lmr_endgame_pieces: 0,
+            tm_mtg: 27,
+            tt_fraco_pont: 550_000,
+            tm_mtg_base: 35,
+            tm_mtg_declive: 67,
+            tm_mtg_min: 14,
+            tm_predador_pct: 95,
+            tm_predador_ate_s: 120,
+            tm_inc_pct: 75,
+            tm_hard_mult: 4,
+            tm_hard_pct: 25,
+            tm_open_pct: 30,
+            tm_early_pct: 70,
+            tm_mid_pct: 110,
+            tm_late_pct: 100,
+            tm_simple_pct: 60,
+            tm_ahead_pct: 115,
+            tm_behind_pct: 85,
+            tm_horizonte_max: 50,
+            tm_pawn_n: 20,
+            tm_pawn_tecto: 200,
+            tm_pawn_curva_min: 14,
+            tm_floor_ms: 10,
+        }
+    }
+}
+
+/// Name, current value, and the range a tuner may walk it over.
+pub type ParamSpec = (&'static str, fn(&Params) -> i32, fn(&mut Params, i32), i32, i32);
+
+pub const PARAM_SPECS: &[ParamSpec] = &[
+    ("HistBonusEsc", |_| crate::search::HB_ESC.load(std::sync::atomic::Ordering::Relaxed),
+       |_, v| crate::search::HB_ESC.store(v, std::sync::atomic::Ordering::Relaxed), 100, 8000),
+    ("HistBonusTecto", |_| crate::search::HB_TECTO.load(std::sync::atomic::Ordering::Relaxed),
+       |_, v| crate::search::HB_TECTO.store(v, std::sync::atomic::Ordering::Relaxed), 500, 30000),
+    ("CaptBarF", |p| p.capt_bar_f, |p, v| p.capt_bar_f = v, 0, 300),
+    ("CaptBarMax", |p| p.capt_bar_max, |p, v| p.capt_bar_max = v, 0, 1200),
+    ("CaptBarDiv", |p| p.capt_bar_div, |p, v| p.capt_bar_div = v, 0, 200),
+    ("CaptHistDiv", |p| p.capt_hist_div, |p, v| p.capt_hist_div = v, 16, 2048),
+    ("RfpMargin", |p| p.rfp_margin, |p, v| p.rfp_margin = v, 40, 300),
+    ("RfpImproving", |p| p.rfp_improving, |p, v| p.rfp_improving = v, 0, 300),
+    ("LmrPioraF", |p| p.lmr_piora_f, |p, v| p.lmr_piora_f = v, 0, 512),
+    ("LmrJanelaF", |p| p.lmr_janela_f, |p, v| p.lmr_janela_f = v, 0, 1500),
+    ("RfpDepth", |p| p.rfp_depth, |p, v| p.rfp_depth = v, 2, 12),
+    ("RazorMargin", |p| p.razor_margin, |p, v| p.razor_margin = v, 50, 900),
+    ("RazorDepth", |p| p.razor_depth, |p, v| p.razor_depth = v, 1, 10),
+    ("NmpBase", |p| p.nmp_base, |p, v| p.nmp_base = v, 2, 8),
+    ("NmpDiv", |p| p.nmp_div, |p, v| p.nmp_div = v, 2, 12),
+    ("NmpProfDiv", |p| p.nmp_prof_div, |p, v| p.nmp_prof_div = v, 2, 12),
+    ("RecusaMargem", |p| p.recusa_margem, |p, v| p.recusa_margem = v, 0, 200),
+    ("RecusaLimiar", |p| p.recusa_limiar, |p, v| p.recusa_limiar = v, 0, 600),
+    ("TriagemN", |p| p.triagem_n, |p, v| p.triagem_n = v, 1, 32),
+    ("OrdSee", |p| p.ord_see, |p, v| p.ord_see = v, 0, 1000),
+    ("OrdMvv", |p| p.ord_mvv, |p, v| p.ord_mvv = v, 0, 200),
+    ("OrdKiller", |p| p.ord_killer, |p, v| p.ord_killer = v, 0, 300000),
+    ("OrdHistN", |p| p.ord_hist_n, |p, v| p.ord_hist_n = v, 0, 600),
+    ("OrdXeque", |p| p.ord_xeque, |p, v| p.ord_xeque = v, 0, 300000),
+    ("XequeBanda", |p| p.xeque_banda, |p, v| p.xeque_banda = v, 0, 900000),
+    ("LmpBase", |p| p.lmp_base, |p, v| p.lmp_base = v, 1, 10),
+    ("LmpDepth", |p| p.lmp_depth, |p, v| p.lmp_depth = v, 2, 12),
+    ("FutBase", |p| p.fut_base, |p, v| p.fut_base = v, 20, 400),
+    ("FutSlope", |p| p.fut_slope, |p, v| p.fut_slope = v, 30, 300),
+    ("FutDepth", |p| p.fut_depth, |p, v| p.fut_depth = v, 2, 16),
+    ("FutHistDiv", |p| p.fut_hist_div, |p, v| p.fut_hist_div = v, 20, 200),
+    ("HistPrune", |p| p.hist_prune, |p, v| p.hist_prune = v, 100, 2000),
+    ("SeePrune", |p| p.see_prune, |p, v| p.see_prune = v, 20, 250),
+    // A inclinacao da futilidade e a margem do SEE, em percentagem, para quando
+    // a poda usa a profundidade REDUZIDA. Cem deixa como esta'; duzentos duplica,
+    // que e' o que compensa uma profundidade que fica tipicamente a metade.
+    ("FutSlopeRed", |p| p.fut_slope_red, |p, v| p.fut_slope_red = v, 50, 400),
+    ("SeeQuietRed", |p| p.see_quiet_red, |p, v| p.see_quiet_red = v, 50, 400),
+    ("PodaHistDiv", |p| p.poda_hist_div, |p, v| p.poda_hist_div = v, 500, 40000),
+    ("PodaSfTtpv", |p| p.poda_sf_ttpv, |p, v| p.poda_sf_ttpv = v, 0, 3000),
+    ("PodaSfCaptBase", |p| p.poda_sf_capt_base, |p, v| p.poda_sf_capt_base = v, 0, 800),
+    ("PodaSfCaptSlope", |p| p.poda_sf_capt_slope, |p, v| p.poda_sf_capt_slope = v, 0, 800),
+    ("PodaSfCaptHist", |p| p.poda_sf_capt_hist, |p, v| p.poda_sf_capt_hist = v, 0, 600),
+    ("PodaSfCaptSee", |p| p.poda_sf_capt_see, |p, v| p.poda_sf_capt_see = v, 20, 500),
+    ("PodaSfContPrune", |p| p.poda_sf_cont_prune, |p, v| p.poda_sf_cont_prune = v, 100, 8000),
+    ("PodaSfDiv", |p| p.poda_sf_div, |p, v| p.poda_sf_div = v, 100, 8000),
+    ("PodaSfFutSlope", |p| p.poda_sf_fut_slope, |p, v| p.poda_sf_fut_slope = v, 0, 400),
+    ("PodaSfFutBase", |p| p.poda_sf_fut_base, |p, v| p.poda_sf_fut_base = v, 0, 600),
+    ("PodaSfSee", |p| p.poda_sf_see, |p, v| p.poda_sf_see = v, 1, 120),
+    ("FutCaptBase", |p| p.fut_capt_base, |p, v| p.fut_capt_base = v, 0, 800),
+    ("SeePruneQuiet", |p| p.see_prune_quiet, |p, v| p.see_prune_quiet = v, 1, 40),
+    ("CheckExtEval", |p| p.check_ext_eval, |p, v| p.check_ext_eval = v, 0, 400),
+    ("Contempt", |p| p.contempt, |p, v| p.contempt = v, 0, 100),
+    ("LmrBase", |p| p.lmr_base, |p, v| p.lmr_base = v, 0, 200),
+    ("LmrDiv", |p| p.lmr_div, |p, v| p.lmr_div = v, 120, 400),
+    ("AlphaDesc", |p| p.alpha_desc, |p, v| p.alpha_desc = v, 0, 3),
+    ("AdMin", |p| p.ad_min, |p, v| p.ad_min = v, 0, 12),
+    ("AdMax", |p| p.ad_max, |p, v| p.ad_max = v, 4, 32),
+    ("CutCnt", |p| p.cut_cnt_base, |p, v| p.cut_cnt_base = v, 0, 1024),
+    ("CutCntMais", |p| p.cut_cnt_mais, |p, v| p.cut_cnt_mais = v, 0, 2048),
+    ("LmrCut", |p| p.lmr_cut, |p, v| p.lmr_cut = v, 0, 4),
+    ("LmrHistDiv", |p| p.lmr_hist_div, |p, v| p.lmr_hist_div = v, 4096, 65536),
+    ("LmrHistDivForte", |p| p.lmr_hist_div_forte, |p, v| p.lmr_hist_div_forte = v, 1000, 30000),
+    ("OrdemAmeacaF", |p| p.ordem_ameaca_f, |p, v| p.ordem_ameaca_f = v, 0, 8000),
+    ("OtimismoF", |p| p.otimismo_f, |p, v| p.otimismo_f = v, 0, 400),
+    ("TmEscalaMax", |p| p.tm_escala_max, |p, v| p.tm_escala_max = v, 1000, 8000),
+    ("PeaoF", |p| p.peao_f, |p, v| p.peao_f = v, 0, 256),
+    ("TmSemIncTecto", |p| p.tm_sem_inc_tecto, |p, v| p.tm_sem_inc_tecto = v, 0, 60),
+    ("TmEscalaMin", |p| p.tm_escala_min, |p, v| p.tm_escala_min = v, 300, 1000),
+    ("TmCurvaPct", |p| p.tm_curva_pct, |p, v| p.tm_curva_pct = v, 0, 4),
+    ("TmCresce", |p| p.tm_cresce, |p, v| p.tm_cresce = v, 0, 200),
+    ("OrdemXequeF", |p| p.ordem_xeque_f, |p, v| p.ordem_xeque_f = v, 0, 65536),
+    ("HistPecaCasaF", |p| p.hist_pc_f, |p, v| p.hist_pc_f = v, 0, 12800),
+    ("TravaoQsN", |p| p.travao_qs_n, |p, v| p.travao_qs_n = v, 1, 32),
+    ("KillerBonus", |p| p.killer_bonus, |p, v| p.killer_bonus = v, 0, 400000),
+    ("AspDelta", |p| p.asp_delta, |p, v| p.asp_delta = v, 8, 80),
+    ("AspDepth", |p| p.asp_depth, |p, v| p.asp_depth = v, 2, 10),
+    ("SingDepth", |p| p.sing_depth, |p, v| p.sing_depth = v, 4, 12),
+    ("SingMargin", |p| p.sing_margin, |p, v| p.sing_margin = v, 1, 8),
+    ("DoubleExt", |p| p.double_ext, |p, v| p.double_ext = v, 5, 200),
+    ("LmrCutF", |p| p.lmr_cut_f, |p, v| p.lmr_cut_f = v, 0, 6000),
+    ("LmrCutSemTt", |p| p.lmr_cut_sem_tt, |p, v| p.lmr_cut_sem_tt = v, 0, 3000),
+    ("LmrTtCaptF", |p| p.lmr_tt_capt_f, |p, v| p.lmr_tt_capt_f = v, 0, 3000),
+    ("LmrNonPvF", |p| p.lmr_nonpv_f, |p, v| p.lmr_nonpv_f = v, 0, 2048),
+    ("LmrTtPvF", |p| p.lmr_ttpv_f, |p, v| p.lmr_ttpv_f = v, 0, 2048),
+    ("ProbcutMargin", |p| p.probcut_margin, |p, v| p.probcut_margin = v, 100, 1024),
+    ("TmTrendWindow", |p| p.tm_trend_window, |p, v| p.tm_trend_window = v, 5, 200),
+    ("QsMargin", |p| p.qs_margin, |p, v| p.qs_margin = v, 50, 900),
+    ("LmrEndgamePieces", |p| p.lmr_endgame_pieces,
+     |p, v| p.lmr_endgame_pieces = v, 0, 12),
+    ("TmMtg", |p| p.tm_mtg, |p, v| p.tm_mtg = v, 15, 70),
+    ("TtFracoPont", |p| p.tt_fraco_pont, |p, v| p.tt_fraco_pont = v, 300_000, 900_000),
+    ("TmMtgBase", |p| p.tm_mtg_base, |p, v| p.tm_mtg_base = v, 20, 60),
+    ("TmMtgDeclive", |p| p.tm_mtg_declive, |p, v| p.tm_mtg_declive = v, 0, 200),
+    ("TmMtgMin", |p| p.tm_mtg_min, |p, v| p.tm_mtg_min = v, 6, 30),
+    ("TmPredadorPct", |p| p.tm_predador_pct, |p, v| p.tm_predador_pct = v, 50, 120),
+    ("TmPredadorAteS", |p| p.tm_predador_ate_s, |p, v| p.tm_predador_ate_s = v, 0, 600),
+    ("TmIncPct", |p| p.tm_inc_pct, |p, v| p.tm_inc_pct = v, 20, 95),
+    ("TmHardMult", |p| p.tm_hard_mult, |p, v| p.tm_hard_mult = v, 1, 8),
+    ("TmHardPct", |p| p.tm_hard_pct, |p, v| p.tm_hard_pct = v, 15, 70),
+    ("TmOpenPct", |p| p.tm_open_pct, |p, v| p.tm_open_pct = v, 20, 120),
+    ("TmEarlyPct", |p| p.tm_early_pct, |p, v| p.tm_early_pct = v, 40, 140),
+    ("TmMidPct", |p| p.tm_mid_pct, |p, v| p.tm_mid_pct = v, 60, 160),
+    ("TmLatePct", |p| p.tm_late_pct, |p, v| p.tm_late_pct = v, 60, 160),
+    ("TmSimplePct", |p| p.tm_simple_pct, |p, v| p.tm_simple_pct = v, 30, 140),
+    ("TmAheadPct", |p| p.tm_ahead_pct, |p, v| p.tm_ahead_pct = v, 100, 180),
+    ("TmBehindPct", |p| p.tm_behind_pct, |p, v| p.tm_behind_pct = v, 40, 100),
+    ("TmHorizonteMax", |p| p.tm_horizonte_max, |p, v| p.tm_horizonte_max = v, 10, 80),
+    ("TmPawnN", |p| p.tm_pawn_n, |p, v| p.tm_pawn_n = v, 8, 40),
+    ("TmPawnTecto", |p| p.tm_pawn_tecto, |p, v| p.tm_pawn_tecto = v, 200, 800),
+    ("TmPawnCurvaMin", |p| p.tm_pawn_curva_min, |p, v| p.tm_pawn_curva_min = v, 8, 40),
+    ("TmFloorMs", |p| p.tm_floor_ms, |p, v| p.tm_floor_ms = v, 1, 200),
+];
+
+impl Params {
+    pub fn set(&mut self, name: &str, value: i32) -> bool {
+        for (n, _, put, lo, hi) in PARAM_SPECS {
+            if n.eq_ignore_ascii_case(name) {
+                put(self, value.clamp(*lo, *hi));
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Techniques that are switched off until they have earned their place.
+///
+/// Every one is off by default, so the engine out of the box searches with the
+/// smaller, settled set of ideas. What each is worth then has an answer
+/// rather than an opinion: turn exactly one on, play a match, read the number.
+/// A feature that cannot be switched off is a feature nobody ever measured.
+///
+/// Measured at 8+0.08 against this engine with everything off, roughly two
+/// hundred games each, so the interval on any one of them is about seventy Elo
+/// wide and only the extremes below mean anything:
+///
+///   NmpCutNode  +24    RfpDamp  +20    Razoring  +14
+///   Rule50Fade   -4    TtCutCredit -4   CheckExt   -6
+///   CaptureHist  -8    Probcut -12     CorrHist  -14
+///   LmpImproving -24   TtPvLmr -25     QsFutility -130
+///
+/// The last one is the only result that needed no second sample: three wins
+/// against forty-eight losses. It was not the idea, it was a line of it, and
+/// the same turned out to be true of the correction history -- both are
+/// commented where they are implemented. That is the lesson these numbers
+/// actually carry: a technique that is worth Elo in every strong engine and
+/// negative here is a bug report, not a measurement.
+#[derive(Clone, Copy)]
+pub struct Features {
+    /// O horizonte do orcamento sai do relogio em vez de ser uma constante.
+    pub tm_horizonte: bool,
+
+    /// A gestao de tempo do pawn: bolo com o incremento dentro, tecto simples.
+
+    /// A reducao do lance nulo a crescer com a profundidade.
+    /// Recusar a repeticao imediata quando estamos a` frente e ha' alternativa.
+    /// As tabelas de continuacao a ler SO' os lances do adversario.
+    /// Dentro da busca de referencia: usar a NOSSA reducao em vez da dela.
+    /// O argmax do `pick` em C++ com AVX2, em vez do ciclo em Rust.
+    /// Gerar e pontuar os tranquilos so' quando a busca chega a eles.
+    /// Exame caro so' a quem o olhar barato poe a` frente.
+    /// Ordenacao por soma continua, sem bandas.
+    /// O termo do xeque somado a` ordenacao por bandas.
+    /// O historico separado por contexto de ameaca.
+    /// Podar pela profundidade REDUZIDA, nao pela nominal.
+    /// Futilidade tambem para capturas, descontando o que a captura ganha.
+    pub fut_capturas: bool,
+    pub poda_reduzida: bool,
+
+    /// O historico devolve profundidade a` poda reduzida: um lance que as
+    /// tabelas preferem e' julgado a uma profundidade maior do que a reducao
+    /// crua lhe daria, e um que elas desprezam a uma menor.
+    ///
+    /// Sozinha esta linha custou 54 e 63 Elo em duas doses (`ph_4000`,
+    /// `ph_2000`), o que diz que a devolucao nao se transplanta a` parte do
+    /// conjunto em que vive.
+    pub poda_hist: bool,
+
+    /// O Step 15 deles inteiro, em vez de pecas soltas.
+    pub poda_sf: bool,
+    pub hist_contexto: bool,
+    pub xeque_na_ordem: bool,
+    pub ordem_continua: bool,
+    pub triagem: bool,
+    /// A singular so' com limite INFERIOR, como a referencia. Do
+    /// KestrelStrike: aceitar exactos abre um conjunto muito maior de
+    /// sondagens, e la' media-se 749 sondagens a` profundidade 14 das quais 74%
+    /// estendem e 0,1% reduzem.
+    pub sing_so_inferior: bool,
+    pub gera_etapas: bool,
+    pub pick_cpp: bool,
+    pub cont_adversario: bool,
+    pub recusa_repeticao: bool,
+    pub nmp_profundidade: bool,
+    pub contempt_atento: bool,
+    pub tm_pawn: bool,
+    /// Limpar os killers do ply filho ao entrar num no'.
+    pub killer_fresco: bool,
+    /// Os lances que faltam calculados por uma curva, e o incremento no bolo.
+    pub tm_curva: bool,
+    /// A forma da curva vinda do relogio em vez do numero do lance.
+    pub tm_relogio: bool,
+    /// Devolver logo quando so' ha' um lance legal.
+    pub lance_unico: bool,
+    /// Olhar para o relogio do adversario: tecto pela razao, piso pelo ritmo.
+    pub tm_adversario: bool,
+    /// Pontuar os lances tranquilos so' quando a busca chega a eles.
+    pub pontua_tarde: bool,
+    /// O lance da tabela vindo de um limite superior entra depois das capturas
+    /// boas, em vez de a` frente de tudo.
+    pub tt_fraco: bool,
+    /// O lance da tabela de limite superior nao gasta um lugar da poda por
+    /// indice.
+    pub tt_sem_lmp: bool,
+    /// Learn how wrong the static evaluation usually is for a pawn structure,
+    /// and feed it back.
+    pub corr_hist: bool,
+    /// Ask quiescence directly when a node is far enough behind.
+    pub razoring: bool,
+    /// Fade the evaluation towards a draw as the fifty move counter runs out.
+    pub rule50_fade: bool,
+    /// Reduce less at a node that once earned a full window.
+    pub ttpv_lmr: bool,
+    /// Search a ply shallower when the table has no move to try first.
+    pub iir: bool,
+    /// A IIR nao se aplica a nos ALL (nao-PV e nao-corte). Ver o patch.
+    pub iir_no_all: bool,
+    /// Politica de escrita da TT (preservar o lance + guarda de profundidade, em par).
+    pub tt_politica: bool,
+    /// Repeticao a distancia de um lance (tabela cuckoo). Ver `cuckoo.rs`.
+    pub cuckoo: bool,
+
+    /// O optimism da referencia, informado a` avaliacao a cada iteracao.
+    ///
+    ///     optimism = OTIMISMO_F * media / (|media| + 85)
+    ///
+    /// e a avaliacao usa-o como `(nnue*material + optimism*7675) / 91000`,
+    /// depois de o abrir pela discordancia das cabecas (`/476`). A `media` e' a
+    /// nota da raiz alisada entre iteracoes -- nao a ultima, que salta.
+    ///
+    /// O numerador 114 e' o que o KestrelStrike expoe como `KS_OTIMISMO` e
+    /// traz LIGADO na versao que o bot joga (medido no binario: omissao 114).
+    ///
+    /// So' tem efeito pela ponte: e' la' que a formula vive.
+    pub otimismo: bool,
+
+    /// A historia de peoes na ordenacao dos tranquilos.
+    ///
+    /// O que ela sabe e a de-para nao: que um lance e' bom NESTA estrutura de
+    /// peoes. A chave muda quando a estrutura muda, e a tabela esquece o que
+    /// aprendeu para uma estrutura que ja' nao existe.
+    pub hist_peao: bool,
+
+    /// As continuacoes e a correccao passam a ser UMA tabela para todos os
+    /// fios, em vez de uma por fio.
+    ///
+    /// A sessao de 18-09 isolou isto a ler o SF19: eles partilham tres
+    /// familias de historico, nos partilhavamos so' a tabela de transposicao.
+    /// Medido la': "a quatro fios fazemos 3,17x os nos de um fio, mas chegamos
+    /// ao ply 21 onde ela chega ao 25. Os nos estao la'; a aprendizagem e' que
+    /// nao circula." No KestrelStrike deu +2,75 +/- 8,21 em 1640 partidas.
+    ///
+    /// A uma thread nao muda nada -- nao ha' com quem partilhar.
+    pub hist_part: bool,
+    /// Futilidade inversa so' sem lance na TT, ou com uma captura la' guardada.
+    pub rfp_tt_capt: bool,
+    /// TmPawn: os lances que faltam vem da curva medida, nao de `TmPawnN` plano.
+    pub tm_pawn_curva: bool,
+    /// Cut the late move count in half when things are not improving.
+    pub lmp_improving: bool,
+    /// In quiescence, skip a capture that cannot come near alpha even if it
+    /// wins everything it takes.
+    ///
+    /// Measured five times and negative every time: minus a hundred and thirty
+    /// as first written, minus sixty-three after four structural fixes, minus
+    /// twenty-eight once the margin was converted into this engine's units.
+    /// Rather than a sixth attempt, a count of what it actually discards.
+    ///
+    /// Of the captures it throws away, 71% in an opening and 62% in a tactical
+    /// position pass the static exchange test. They win material or trade
+    /// level, and the exchange filter running in the same loop would have kept
+    /// every one of them.
+    ///
+    /// That is the whole answer. Quiescence here already prunes by exchange at
+    /// a threshold of zero, so anything losing material is gone before this
+    /// test is reached, and what it is left deciding about are the sound
+    /// captures. A static margin then removes the moves the search exists to
+    /// examine. The technique is not wrong in general; it is wrong on top of a
+    /// filter that has already done its work.
+    pub qs_futility: bool,
+    /// Spend less when most of the tree went to the move that won anyway.
+    pub tm_node_effort: bool,
+    /// Let a settled score buy time back, instead of only paying for a
+    /// falling one. Measured in the sibling engine at +15.0 Elo over 1003
+    /// games, together with a moves-left curve that this one already has
+    /// in another form.
+    pub tm_trend: bool,
+    /// Trust a stored lower bound far enough above beta without re-searching.
+    pub probcut: bool,
+    /// Only try the null move where the node is expected to fail high.
+    pub nmp_cut_node: bool,
+    /// On a reverse futility cutoff, return part of the way to the estimate
+    /// rather than all of it.
+    pub rfp_damp: bool,
+    /// Extend a move that gives check.
+    pub check_ext: bool,
+    /// Credit the stored move when the table itself produces the cutoff.
+    pub tt_cut_credit: bool,
+    /// Remember which captures worked, not only what they take.
+    pub capture_hist: bool,
+    /// Use the transcribed search instead of this one.
+    ///
+    /// Not a feature but an experiment: same board, same network, same table,
+    /// same clock, and the search swapped whole. Whichever way it comes out
+    /// says where the difference lives.
+    /// A reducao com a fraccao que a formula lhe da'.
+    pub lmr_fino: bool,
+    /// Reduzir proporcionalmente mais quando a posicao nao esta' a melhorar.
+    pub lmr_piora: bool,
+    /// Reduzir menos onde a janela ainda e' larga.
+    pub lmr_janela: bool,
+    /// O histórico com peso comparavel aos termos cegos.
+    pub lmr_hist_forte: bool,
+    /// A ordenacao a olhar para a posicao, e nao so' para o passado.
+    pub ordem_posicao: bool,
+    /// O que costuma resultar com esta peca nesta casa.
+    pub hist_pc: bool,
+    /// Travao na quiescencia: a partir da enesima captura vulgar, saltar.
+    pub travao_qs: bool,
+    pub killer_compete: bool,
+    pub cont_longo: bool,
+    pub sem_killers: bool,
+    /// Baixar a profundidade a cada falha por cima seguida.
+    pub asp_baixa: bool,
+    /// Use the integer-logarithm reduction formula instead of the table.
+    ///
+    /// The last place where a number in this search is an invention rather
+    /// than something measured. Everything else came across with its value;
+    /// the reduction shape did not, because it was written before the
+    /// reference was read closely, and it is the highest-leverage part of a
+    /// search to be guessing at.
+    pub log_lmr: bool,
+
+    /// Reduce harder at a node that is expected to fail high.
+    ///
+    /// Unlike the rest, this is ON by default: it belongs in the baseline
+    /// rather than on top of it, and the switch is here to measure it, not to
+    /// leave it out.
+    pub cut_node_lmr: bool,
+
+    /// Reduzir mais quando o lance da tabela e' uma captura.
+    pub lmr_tt_captura: bool,
+
+    /// Skip a quiet move the history has consistently disliked.
+    pub history_prune: bool,
+    /// Spend longer when the score is falling, less when the best move has
+    /// stopped changing.
+    pub tm_stability: bool,
+
+    /// Reduce late captures too, not only late quiet moves.
+    pub lmr_captures: bool,
+}
+
+impl Default for Features {
+    fn default() -> Self {
+        Features {
+            // On by default since 2026-09-01: 1302 games at 16+0.16 put it at
+            // +4.8 Elo either way of 19, which is not a gain anyone can bank but
+            // is not a loss either, and it was measured after the keys were
+            // rebuilt to tell pieces apart -- before that it cost fourteen.
+            corr_hist: true,
+            tm_horizonte: false,
+
+            fut_capturas: false,
+            poda_reduzida: false,
+            poda_hist: false,
+            poda_sf: false,
+            hist_contexto: false,
+            xeque_na_ordem: false,
+            ordem_continua: false,
+            triagem: false,
+            sing_so_inferior: false,
+            gera_etapas: false,
+            pick_cpp: false,
+            cont_adversario: false,
+            recusa_repeticao: false,
+            nmp_profundidade: false,
+            contempt_atento: false,
+            tm_pawn: false,
+            killer_fresco: false,
+            tm_curva: false,
+            tm_relogio: false,
+            lance_unico: false,
+            tm_adversario: false,
+            pontua_tarde: false,
+            tt_fraco: false,
+            tt_sem_lmp: false,
+            razoring: false,
+            rule50_fade: false,
+            ttpv_lmr: false,
+            iir: true,
+            iir_no_all: false,
+            tt_politica: false,
+            cuckoo: false,
+            otimismo: false,
+            hist_peao: false,
+            hist_part: false,
+            rfp_tt_capt: false,
+            tm_pawn_curva: false,
+            lmp_improving: false,
+            qs_futility: false,
+            tm_node_effort: true,
+            tm_trend: false,
+            probcut: false,
+            // On by default since 2026-09-01: 1015 games at 16+0.16,
+            // +5.8 Elo either way of 21.
+            nmp_cut_node: true,
+            // On by default since 2026-09-01: 1000 games at 16+0.16, +10.8 Elo
+            // either way of 22. Not proof, and not negative, which is the bar.
+            rfp_damp: true,
+            check_ext: false,
+            tt_cut_credit: false,
+            capture_hist: false,
+            asp_baixa: false,
+            lmr_fino: false,
+            lmr_piora: false,
+            lmr_janela: false,
+            lmr_hist_forte: false,
+            ordem_posicao: false,
+            hist_pc: false,
+            travao_qs: false,
+            killer_compete: false,
+            cont_longo: false,
+            sem_killers: false,
+            log_lmr: false,
+            // Off since 2026-09-01. Switching it OFF measured +6.5 Elo over
+            // 1021 games at 16+0.16 -- inside the noise like everything at
+            // this sample size, but the direction is that it was costing.
+            //
+            // It had been on since the search was written, on the strength
+            // of belonging in the baseline, and nobody had ever asked it for
+            // a number. That is the point of measuring removals: a technique
+            // that arrived with the first draft is no more entitled to its
+            // place than one proposed yesterday.
+            cut_node_lmr: false,
+            lmr_tt_captura: false,
+            history_prune: true,
+            tm_stability: true,
+            // Off since 2026-09-01. Switching it OFF measured +9.6 Elo over
+            // 1009 games at 16+0.16, the second of two reduction extras to
+            // fail the same way -- reducing harder at cut nodes cost 6.5.
+            //
+            // Two independent measurements saying the same thing is worth
+            // more than either: the reduction here is already too deep, and
+            // anything that deepens it takes. Which fits what the game
+            // records were saying about conversion -- winning positions
+            // drawn rather than finished.
+            lmr_captures: false,
+        }
+    }
+}
+
+impl Features {
+    /// UCI option name to field, for `setoption`.
+    pub fn set(&mut self, name: &str, on: bool) -> bool {
+        match name {
+            "tmhorizonte" => self.tm_horizonte = on,
+
+            "futcapturas" => self.fut_capturas = on,
+            "podareduzida" => self.poda_reduzida = on,
+            "podahist" => self.poda_hist = on,
+            // O `PodaSF` IMPLICA o `CaptureHist`.
+            //
+            // O bloco le' o historico de capturas em dois sitios; sem a tabela
+            // ligada o `capt_score` devolve 0 e o `credit_capture` nem a enche,
+            // portanto testar um sem o outro mede a forma incompleta -- que e'
+            // exactamente o erro que os `ph_*` a -54 e -63 Elo ja' pagaram.
+            // A tabela sozinha continua a poder ser ligada por si.
+            "podasf" => {
+                self.poda_sf = on;
+                if on {
+                    self.capture_hist = true;
+                }
+            }
+            "histcontexto" => self.hist_contexto = on,
+            "xequenaordem" => self.xeque_na_ordem = on,
+            "ordemcontinua" => self.ordem_continua = on,
+            "triagem" => self.triagem = on,
+            "singsoinferior" => self.sing_so_inferior = on,
+            "geraetapas" => self.gera_etapas = on,
+            "pickcpp" => self.pick_cpp = on,
+            "contadversario" => self.cont_adversario = on,
+            "recusarepeticao" => self.recusa_repeticao = on,
+            "nmpprofundidade" => self.nmp_profundidade = on,
+            "contemptatento" => self.contempt_atento = on,
+            "tmpawn" => self.tm_pawn = on,
+
+
+            "semponte" => set_sem_ponte(on),
+
+
+
+            // `SemAmeacas` e `SemPares` NAO sao opcoes de jogo e por isso
+            // deixaram de estar aqui.
+            //
+            // As ameacas e os pares de peoes sao arquitectura da rede, nao
+            // ideias em prova: nao ha' configuracao em que se queira jogar sem
+            // eles. Enquanto estiveram neste `match` -- que e' um match livre,
+            // alcancavel por `setoption` venha o nome de onde vier -- qualquer
+            // interface ou arbitro podia partir a avaliacao com uma linha, e o
+            // motor jogava na mesma sem se queixar. E' a mesma familia de
+            // desfecho que a guarda da rede em falta existe para impedir.
+            //
+            // Continuam a existir como REGUA, so' por ambiente:
+            // `KESTREL_SEM_AMEACAS=1` / `KESTREL_SEM_PARES=1`, que ninguem
+            // define por acidente e que o motor anuncia alto quando ve'.
+
+
+            "semhibrido" => crate::nnue_sf::set_sem_hibrido(on),
+            "killerfresco" => self.killer_fresco = on,
+            "tmcurva" => self.tm_curva = on,
+            "tmrelogio" => self.tm_relogio = on,
+            "lanceunico" => self.lance_unico = on,
+            "tmadversario" => self.tm_adversario = on,
+            "pontuatarde" => self.pontua_tarde = on,
+            "ttfraco" => self.tt_fraco = on,
+            "ttsemlmp" => self.tt_sem_lmp = on,
+            "corrhist" => self.corr_hist = on,
+            "razoring" => self.razoring = on,
+            "rule50fade" => self.rule50_fade = on,
+            "ttpvlmr" => self.ttpv_lmr = on,
+            "iir" => self.iir = on,
+            "iirnoall" => self.iir_no_all = on,
+            "cuckoo" => self.cuckoo = on,
+            "h2kotimismo" => self.otimismo = on,
+            "h2khistpeao" => self.hist_peao = on,
+            "h2khistpart" => self.hist_part = on,
+            "rfpttcapt" => self.rfp_tt_capt = on,
+            "tmpawncurva" => self.tm_pawn_curva = on,
+            "ttpolitica" => { self.tt_politica = on; crate::tt::set_politica(on); }
+            "lmpimproving" => self.lmp_improving = on,
+            "qsfutility" => self.qs_futility = on,
+            "tmnodeeffort" => self.tm_node_effort = on,
+            "tmtrend" => self.tm_trend = on,
+            "probcut" => self.probcut = on,
+            "nmpcutnode" => self.nmp_cut_node = on,
+            "rfpdamp" => self.rfp_damp = on,
+            "checkext" => self.check_ext = on,
+            "ttcutcredit" => self.tt_cut_credit = on,
+            "capturehist" => self.capture_hist = on,
+            "aspbaixa" => self.asp_baixa = on,
+            "lmrfino" => self.lmr_fino = on,
+            "lmrpiora" => self.lmr_piora = on,
+            "lmrjanela" => self.lmr_janela = on,
+            "lmrhistforte" => self.lmr_hist_forte = on,
+            "ordemposicao" => self.ordem_posicao = on,
+            "histpecacasa" => self.hist_pc = on,
+            "travaoqs" => self.travao_qs = on,
+            "killercompete" => self.killer_compete = on,
+            "contlongo" => self.cont_longo = on,
+            "semkillers" => self.sem_killers = on,
+            "loglmr" => self.log_lmr = on,
+            "cutnodelmr" => self.cut_node_lmr = on,
+            "lmrttcaptura" => self.lmr_tt_captura = on,
+            "historyprune" => self.history_prune = on,
+            "tmstability" => self.tm_stability = on,
+            "lmrcaptures" => self.lmr_captures = on,
+            _ => return false,
+        }
+        true
+    }
+
+    /// The ones outside the settled set. All default off.
+    pub const EXTRA: [&'static str; 52] = [
+        "FutCapturas",
+        "PodaReduzida",
+        "PodaHist",
+        "PodaSF",
+        "HistContexto",
+        "XequeNaOrdem",
+        "OrdemContinua",
+        "Triagem",
+        "SingSoInferior",
+        "GeraEtapas",
+        "PickCpp",
+        "ContAdversario",
+        "RecusaRepeticao",
+        "NmpProfundidade",
+        "ContemptAtento",
+        "TmHorizonte",
+        "TmPawn",
+        "SemPonte",
+        "SemHibrido",
+        "KillerFresco",
+        "TmCurva",
+        "TmRelogio",
+        "LanceUnico",
+        "TmAdversario",
+        "PontuaTarde",
+        "TtFraco",
+        "TtSemLmp",
+        "TmTrend",
+        "CutNodeLmr",
+        "LmrTtCaptura",
+        "LmrCaptures",
+        "Razoring",
+        "Rule50Fade",
+        "TtPvLmr",
+        "LmpImproving",
+        "QsFutility",
+        "Probcut",
+        "CheckExt",
+        "TtCutCredit",
+        "CaptureHist",
+        "LogLmr",
+        // Aqui e nao na linha de base: e' uma pergunta em aberto ate' mil
+        // partidas dizerem alguma coisa.
+        "AspBaixa",
+        "LmrFino",
+        "LmrPiora",
+        "LmrJanela",
+        "LmrHistForte",
+        "OrdemPosicao",
+        "HistPecaCasa",
+        "TravaoQs",
+        "KillerCompete",
+        "ContLongo",
+        "SemKillers",
+    ];
+
+    /// The ones it does have, so they are in the baseline. All default on.
+    pub const BASELINE: [&'static str; 7] =
+        ["HistoryPrune", "TmStability", "IIR", "TmNodeEffort",
+     "CorrHist", "RfpDamp", "NmpCutNode"];
+}
+
+/// Os lances a que a medicao foi feita. Irregulares de proposito: a densidade
+/// das partidas cai com o comprimento, e medir de dez em dez para la' do lance
+/// 60 seria medir ruido.
+const FALTAM_LANCE: [f64; 9] = [0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 80.0, 110.0];
+
+/// Lances que FALTAM a quem joga, por percentil da duracao, medido em 2224
+/// partidas nossas.
+///
+/// ORCAR PELA MEDIANA E' ORCAR PARA METADE DAS PARTIDAS REBENTAREM O ORCAMENTO,
+/// e sao essas que acabam a zero. E' o defeito de desenho por inteiro, e a
+/// unica maneira de lhe fugir e' escolher um percentil mais alto:
+///
+///     p50   rebentam 50% das partidas
+///     p60   rebentam 40%
+///     p70   rebentam 30%
+///     p75   rebentam 25%
+///     p80   rebentam 20%
+///
+/// Nao se gasta menos tempo no total -- distribui-se por um horizonte que esta'
+/// certo para tres partidas em quatro em vez de uma em duas.
+///
+/// A p50 e' a que foi validada (+36,97 +/- 12,92) e e' a omissao. Subir daqui
+/// passa pelo mesmo crivo.
+const FALTAM_PCT: [[f64; 9]; 5] = [
+    [65.5, 55.5, 45.5, 37.0, 29.5, 23.5, 19.0, 15.5, 14.0], // p50
+    [71.5, 61.5, 51.5, 43.0, 35.0, 28.5, 23.5, 20.5, 20.5], // p60
+    [78.0, 68.0, 58.5, 49.5, 41.5, 35.0, 30.5, 27.5, 27.0], // p70
+    [82.0, 72.0, 62.5, 53.5, 45.5, 39.5, 34.5, 31.5, 30.5], // p75
+    [87.0, 77.0, 67.0, 59.0, 51.0, 44.0, 39.5, 36.5, 37.5], // p80
+];
+
+/// Estimativa dos lances que faltam a quem joga, para `jogados` lances ja' feitos por cada lado.
+///
+/// Os dois ultimos nos -- lances 80 e 110 -- NAO estavam aqui, e a falta deles
+/// era um defeito e nao uma simplificacao. A tabela ia so' ate' ao lance 60 e
+/// seguia o declive do ultimo troco, que ao lance 80 dava DEZ lances quando a
+/// medida diz quinze e meio, e ao lance 110 dava MENOS TRES. O `minimo` tapava
+/// isso -- ou seja, o chao de seguranca estava a fazer o trabalho dos pontos
+/// que faltavam, e era por isso que tinha de valer 14.
+///
+/// Com os dois nos no sitio, o `minimo` volta a ser o que diz que e'. E o erro
+/// corrigia-se precisamente onde dói: nas partidas longas, que sao as que
+/// acabam a` bandeira.
+pub(crate) fn faltam_lances_pct(jogados: u32, minimo: i32, pct: i32, cresce: i32) -> u64 {
+    let tab = &FALTAM_PCT[(pct.clamp(0, 4)) as usize];
+    let x = jogados as f64;
+    // Antes do primeiro no' e depois do ultimo, fica o valor da ponta: a
+    // medicao nao diz nada para la' dela e inventar um declive foi o que
+    // causou o problema.
+    if x <= FALTAM_LANCE[0] {
+        return (tab[0].round() as i64).max(minimo.max(1) as i64) as u64;
+    }
+    let ultimo = FALTAM_LANCE.len() - 1;
+    if x >= FALTAM_LANCE[ultimo] {
+        // DEPOIS DO FIM DA TABELA A ESTIMATIVA JA' FOI DESMENTIDA.
+        //
+        // Devolver o valor da ponta parece prudente -- a medicao nao diz nada
+        // para la' dela -- e esta' errado na consequencia: dai' para a frente
+        // dizia sempre o mesmo numero, fizesse a partida 120 lances ou 250.
+        // Deixava de ser estimativa e voltava a ser constante, que e' o defeito
+        // que a tabela veio corrigir. So' que escondido no ultimo degrau em vez
+        // de em todos.
+        //
+        // Uma partida que passou o ultimo degrau PROVOU que e' das longas. A
+        // partir dai' o horizonte cresce com o que ela ja' durou.
+        //
+        // 100 = um por um: cada lance de excesso acrescenta um lance ao que
+        // falta. 0 = como estava.
+        let base = tab[ultimo];
+        let extra = if cresce > 0 {
+            (x - FALTAM_LANCE[ultimo]) * cresce as f64 / 100.0
+        } else {
+            0.0
+        };
+        return ((base + extra).round() as i64).max(minimo.max(1) as i64) as u64;
+    }
+    let mut i = 0;
+    while i + 1 < ultimo && x > FALTAM_LANCE[i + 1] {
+        i += 1;
+    }
+    let (x0, x1) = (FALTAM_LANCE[i], FALTAM_LANCE[i + 1]);
+    let v = tab[i] + (tab[i + 1] - tab[i]) * (x - x0) / (x1 - x0);
+    (v.round() as i64).max(minimo.max(1) as i64) as u64
+}
+
+/// A tabela cuckoo, construida uma vez. Nao ha' estado por partida aqui.
+static CUCKOO: std::sync::OnceLock<crate::cuckoo::Cuckoo> = std::sync::OnceLock::new();
+
+#[derive(Default, Clone)]
+pub struct Limits {
+    pub wtime: Option<u64>,
+    pub btime: Option<u64>,
+    pub winc: u64,
+    pub binc: u64,
+    pub movestogo: Option<u64>,
+    pub movetime: Option<u64>,
+    pub depth: Option<u32>,
+    pub nodes: Option<u64>,
+    pub infinite: bool,
+}
+
+pub struct Searcher {
+    pub tt: std::sync::Arc<TranspositionTable>,
+    pub atk: Attacks,
+    pub stop: Arc<AtomicBool>,
+    /// Milliseconds held back from every allocation to cover the time between
+    /// deciding on a move and the move being seen by whoever is counting.
+    ///
+    /// Not a nicety. Measured over sixty games at 5+0.05 without it, thirty-one
+    /// were lost on the clock; with it, none of twenty-eight were. The default
+    /// is deliberately generous, because the cost of being wrong is asymmetric:
+    /// too large loses a little strength, too small loses whole games.
+    pub move_overhead: u64,
+    /// Quantas buscas correm ao mesmo tempo. 1 = como sempre foi, e nesse caso
+    /// nao nasce fio nenhum -- a arvore fica identica ao byte.
+    pub threads: usize,
+    pub features: Features,
+    /// A pontuacao da ultima iteracao completa na raiz, do nosso lado. E' o
+    /// unico sitio da busca que sabe se estamos a ganhar ou a perder.
+    raiz_aval: i32,
+    pub params: Params,
+    pub(crate) lmr: [[i32; 64]; 64],
+
+    pub(crate) nodes: u64,
+    start: Instant,
+    soft: Duration,
+    hard: Duration,
+    pub(crate) stopped: bool,
+
+    killers: [[Option<Move>; NUM_KILLERS]; MAX_PLY],
+    history: [[[[i32; 4]; 64]; 64]; 2],
+    /// O mapa de ameacas, guardado POR PLY.
+    ///
+    /// Calcula-lo por lance seria dezasseis ciclos sobre as pecas vezes dez
+    /// lances por no'. Dentro de um no' a posicao e' a mesma, portanto calcula-se
+    /// uma vez e reaproveita-se.
+    ///
+    /// A primeira versao tinha um so' lugar, e isso duplicava o trabalho sem se
+    /// dar por ela: o filho calculava o seu mapa e despejava o do pai, e quando
+    /// o pai voltava para creditar o historico no corte tinha de o calcular
+    /// outra vez. Dois mapas por no' em vez de um.
+    ///
+    /// Um lugar por ply resolve-o de forma exacta, porque a recursao e' em
+    /// profundidade: o do pai so' e' preciso outra vez depois de todos os filhos
+    /// voltarem, e nessa altura ninguem lhe mexeu. O indice sai de
+    /// `self.keys.len()`, que ja' e' a profundidade -- a pilha das chaves e'
+    /// empilhada antes de recursar e desempilhada ao voltar.
+    cache_ameacas: Vec<std::cell::Cell<(u64, u64)>>,
+    /// O que costuma resultar com esta peca nesta casa: [peca][para].
+    ///
+    /// A tabela principal e' de-para e nunca pode dizer isto: aprende que
+    /// g3-f5 resulta, nao que um cavalo em f5 e' bom, porque cada casa de
+    /// partida guarda a sua propria conta.
+    histpc: [[i32; 64]; 6],
+    /// `[side][pawn structure]`.
+    /// `[kind][side][key]`.
+    corr: std::sync::Arc<Vec<std::sync::atomic::AtomicI32>>,
+    /// What was played at each ply, as (piece, destination). Continuation
+    /// history is indexed by this: a move is good or bad largely in reply to
+    /// something, and a table that ignores what came before cannot say which.
+    played: [Option<(usize, usize)>; MAX_PLY],
+    /// `[slot][prev piece * 64 + prev to][piece][to]`, one table per distance
+    /// back.
+    conthist: std::sync::Arc<Vec<std::sync::atomic::AtomicI32>>,
+    /// [chave de peoes][peca COM COR][casa]. Doze pecas e nao seis: a cor
+    /// conta, porque um peao branco em e4 e um preto em e5 nao dizem a mesma
+    /// coisa sobre a estrutura.
+    ///
+    /// O KestrelStrike tem-na (`hist_peao`, `KS_PEAO_F`, omissao 32 e LIGADA na
+    /// versao que o bot joga) e partilha-a entre fios, como as continuacoes e a
+    /// correccao. Aqui e' igual.
+    histpeao: std::sync::Arc<Vec<std::sync::atomic::AtomicI32>>,
+    /// Estas duas tabelas sao minhas, ou sao emprestadas de quem me lancou?
+    /// So' quem e' dono as limpa -- uma ajudante a limpar apagava a cada busca
+    /// tudo o que a principal aprendeu.
+    hist_proprio: bool,
+    /// `[moving piece][destination][captured piece]`.
+    ///
+    /// What a capture takes is known before it is played; whether taking it
+    /// works is not. Most valuable victim answers the first question and calls
+    /// it the second -- so a queen recapture that always loses to a pin keeps
+    /// being tried first, forever, because the queen is still the biggest piece
+    /// on the square.
+    capthist: Vec<[[i32; 6]; 64]>,
+    /// Zobrist keys along the path plus the game so far, for repetition.
+    pub(crate) keys: Vec<u64>,
+    /// How many of `keys` are game history rather than search path.
+    root_keys: usize,
+
+    pub(crate) pv: [[Option<Move>; MAX_PLY]; MAX_PLY],
+    pub(crate) pv_len: [usize; MAX_PLY],
+    /// O maior relogio visto nesta partida, que e' o do primeiro lance. Serve
+    /// de referencia para saber que fraccao ainda la' esta'.
+    pub(crate) relogio_maximo: u64,
+    /// O relogio dele no nosso lance anterior, para se lhe medir o ritmo.
+    pub(crate) relogio_dele: u64,
+    /// Quanto ele gastou no ultimo lance.
+    pub(crate) ritmo_dele: u64,
+    /// The static score at each ply, so a node can ask whether things have
+    /// been getting better for the side to move. A position that is improving
+    /// deserves a tighter margin than one that is falling apart, because the
+    /// reason to prune is confidence and there is less of it on the way down.
+    pub(crate) eval_stack: [i32; MAX_PLY],
+    /// A move this ply is pretending does not exist, while it finds out
+    /// whether that move was the only one holding the position up.
+    pub(crate) excluded: [Option<Move>; MAX_PLY],
+    /// The move played at each ply, for the transcribed search's continuation
+    /// tables, which index by a move rather than by a piece and square.
+    pub(crate) played_moves: Vec<Option<Move>>,
+    /// The transcribed search keeps its own tables: same shapes and ceilings as
+    /// the transcribed search, which are not the shapes the other one uses.
+    /// The last few moves of the game, for the plies above the root.
+    pub(crate) pre_moves: [Option<Move>; PRE_MOVES],
+    /// How many nodes each root move cost this iteration. A move that took
+    /// most of the tree and still came out best was not a close call, and time
+    /// management can read that.
+    root_effort: Vec<(Move, u64)>,
+    /// How often the tables answered instead of the search.
+    pub tb_hits: u64,
+    /// A largura da janela na raiz. Sem isto, a largura de um no' nao tem com
+    /// o que ser comparada -- `delta` vivia dentro do ciclo da aspiracao e
+    /// morria la'.
+    pub(crate) root_delta: i32,
+    /// Every root move with what this iteration thought of it.
+    ///
+    /// Keeping only the best one leaves nothing to fall back on when the best
+    /// one repeats: there is no second opinion, only a move and no reason to
+    /// prefer anything else. With the whole list scored, a repetition can be
+    /// declined in favour of something that is nearly as good, and how much
+    /// worse we are willing to accept is a number rather than an accident.
+    root_scores: Vec<(Move, i32)>,
+    /// Which plies got there by passing. Two passes in a row prove nothing:
+    /// the side to move has effectively been given a free tempo twice, and the
+    /// position being searched is not one that can occur.
+    pub(crate) null_at: [bool; MAX_PLY],
+    /// Quantas vezes cada ply ja' cortou por beta nesta busca.
+    ///
+    /// Vem do KestrelStrike, recuperado a 20-09. Um no' cujos filhos nao param
+    /// de cortar e' um no' facil, e reduz-se mais la'. Nos nao tinhamos nem o
+    /// contador nem o termo.
+    pub(crate) cut_cnt: [i32; MAX_PLY + 8],
+}
+
+/// The score of a position from the side to move's point of view.
+/// Material left on the board, from White, in the units the network speaks.
+///
+/// The endgame knowledge asks who has the material before it asks anything
+/// else, and a network answers with a position rather than a count. This is the
+/// count.
+fn material_white(board: &Board) -> i32 {
+    let mut v = 0;
+    for pt in [
+        PieceType::Pawn,
+        PieceType::Knight,
+        PieceType::Bishop,
+        PieceType::Rook,
+        PieceType::Queen,
+    ] {
+        let val = value_in_eval_units(pt);
+        v += val * board.pieces[Color::White.idx()][pt.idx()].count_ones() as i32;
+        v -= val * board.pieces[Color::Black.idx()][pt.idx()].count_ones() as i32;
+    }
+    v
+}
+
+/// Avaliar sem a ponte importada, com o nosso leitor em Rust.
+///
+/// `H2K_SEM_PONTE=1` ou `setoption name SemPonte value true`.
+static ATTACKS: std::sync::OnceLock<crate::attacks::Attacks> = std::sync::OnceLock::new();
+/// Um so' `Attacks` para todo o processo: construi-lo por avaliacao custaria
+/// mais do que a avaliacao.
+pub fn atk() -> &'static crate::attacks::Attacks {
+    ATTACKS.get_or_init(crate::attacks::Attacks::new)
+}
+
+pub fn sem_ponte() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    if SEM_PONTE.load(Relaxed) {
+        return true;
+    }
+    static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENV.get_or_init(|| std::env::var_os("H2K_SEM_PONTE").is_some())
+}
+pub static SEM_PONTE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+pub fn set_sem_ponte(v: bool) {
+    SEM_PONTE.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `H2K_ORC=1` faz o motor imprimir o orcamento de cada lance.
+pub fn tempo_debug() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("H2K_ORC").is_some())
+}
+
+fn evaluate(board: &mut Board, fade: bool) -> i32 {
+    // A rede do outro motor, quando pedida. O conhecimento de finais e o
+    // amortecimento por cima continuam a ser nossos -- e' so' o valor cru que
+    // muda de origem.
+    // `SemPonte`: avalia com o NOSSO leitor em Rust em vez do importado.
+    //
+    // Faltava-nos a manete mais importante de todas. Cem manetes cobrem a
+    // busca, mas a avaliacao inteira -- os 70 ficheiros vendorizados e a ponte
+    // que conduz o tabuleiro -- entrava sempre, sem forma de a desligar.
+    //
+    // Isto da' tres respostas de uma vez. Se o bloqueio de 14 segundos
+    // desaparecer, esta' provado que e' da ponte e nao da busca, sem depurador.
+    // Se a forca nao mudar muito, a importacao nao paga a complicacao que
+    // custa. E da' a base a que o Triumviratus chama "byte-identico": com ela
+    // ligada, nada de importado entra na avaliacao, e qualquer diferenca
+    // medida dai' para a frente e' da importacao e de mais nada.
+    //
+    // Os dois caminhos leem a MESMA rede e ja' se provou que concordam:
+    // declive 1,177 (que e' o `factor` de 0,85 invertido) com R2 de 0,999999 e
+    // residuo de 0,57 centipeoes em 80 posicoes.
+    if !sem_ponte() && crate::ponte::ligado() {
+        if let Some(v) = crate::ponte::avalia(&|| board.to_fen()) {
+            let mut raw = v;
+            if fade {
+                raw = raw * (200 - board.halfmove.min(100) as i32) / 200;
+            }
+            return raw;
+        }
+        // A ponte esta' ligada e NAO respondeu. Nao se cai daqui em silencio.
+        //
+        // O contexto da ponte e' `thread_local` e nasce UMA vez por thread: se
+        // uma thread lhe tocar antes de a rede estar carregada, `Ponte::nova()`
+        // devolve `None` e essa thread fica sem ponte para sempre. A cascata
+        // abaixo apanhava-a e seguia para o `nnue.rs`, que e' o NOSSO leitor e
+        // nao tem ameacas nenhumas -- ou, sem rede la', devolvia zero.
+        //
+        // Jogar com um avaliador diferente do que se pensa nao pode ser uma
+        // coisa que aconteca calada. Diz-se alto, nos dois canais, e conta-se.
+        FALHAS_PONTE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        static AVISADO: std::sync::Once = std::sync::Once::new();
+        AVISADO.call_once(|| {
+            let m = "ERRO: a ponte esta' ligada mas nao respondeu -- esta thread \
+                     ficou sem contexto e a avaliacao ia cair para o leitor \
+                     proprio, que NAO tem ameacas. Os resultados desta sessao \
+                     nao tem significado.";
+            println!("info string {m}");
+            eprintln!("{m}");
+        });
+    }
+    if sem_ponte() {
+        if let Some(net) = crate::nnue_sf::rede() {
+            let mut raw = crate::nnue_sf::evaluate(net, atk(), board);
+            if fade {
+                raw = raw * (200 - board.halfmove.min(100) as i32) / 200;
+            }
+            return raw;
+        }
+    }
+    let net = match nnue::net() {
+        Some(n) => n,
+        None => return 0,
+    };
+    // AMEACAS, por diferenca.
+    //
+    // A versao anterior reconstruia TUDO a cada no' (`Accumulator::fresh`), o
+    // que estava correcto e custava caro: 103k nps contra 352k. O bloco tem
+    // ~192 features activas e so' ~9,8 mudam por lance, portanto aplicar o
+    // delta em vez de tudo corta a aplicacao 19x.
+    //
+    // As pecas e os pares continuam a vir do acumulador incremental do motor
+    // (`board.acc`), que ja' estava certo; as ameacas vivem num acumulador
+    // proprio e sao somadas aqui.
+    let acc = match board.acc.as_ref() {
+        Some(a) => a,
+        None => return 0,
+    };
+    let mut raw = acc.eval(net, board.side, board.occ_all.count_ones());
+
+    // Endgame knowledge, where counting material is simply wrong.
+    //
+    // A network trained on positions is confident about endings it has barely
+    // seen, and confidently wrong in a particular way: it scores two knights
+    // against a bare king as an advantage, when that position cannot be won at
+    // all, and it scores a rook against a bare king as an advantage of the same
+    // size, when that one is a forced mate. An engine that cannot tell those
+    // apart will trade into the draw and decline the win.
+    //
+    // Two kinds of answer, because endings need two. Some positions have a
+    // known value and the evaluation should be replaced rather than nudged --
+    // a theoretical draw is worth nothing whatever the material says, and a won
+    // ending is about progress rather than material: driving the defending king
+    // to the edge, and to the right corner. Others are right about who is
+    // better and wrong about whether it can be converted, and those are scaled.
+    if board.occ_all.count_ones() <= 7 {
+        let mat = material_white(board);
+        let q_minus_p = 0;
+        if let Some((strong, verdict)) = crate::endgame::probe(board, mat, q_minus_p) {
+            let mut v = match verdict {
+                crate::endgame::Verdict::Exact(x) => x,
+                crate::endgame::Verdict::Scale(s) => {
+                    let base = if strong == Color::White { raw } else { -raw };
+                    let base = if board.side == Color::White { base } else { -base };
+                    base * s / crate::endgame::SCALE_NORMAL
+                }
+            };
+            // The module speaks for the strong side; the search wants the side
+            // to move.
+            if strong != board.side {
+                v = -v;
+            }
+            return v;
+        }
+        // Nothing known, but a decisive material edge with the loser's king
+        // still running: give the search a reason to walk it to the edge, which
+        // is the one thing the material count cannot say.
+        let drive = crate::endgame::conversion_drive(board, mat);
+        raw += if board.side == Color::White { drive } else { -drive };
+    }
+
+    // Fade towards a draw as the fifty move counter runs out. A network trained
+    // on positions is confident about a position that is about to stop counting
+    // for anything, and without this the search happily walks into a draw it
+    // thinks it is winning.
+    if fade {
+        raw * (200 - board.halfmove.min(100) as i32) / 200
+    } else {
+        raw
+    }
+}
+
+/// A piece value in the units the network speaks.
+///
+/// The table that travels with the board is in ordinary centipawns, where a
+/// pawn is 100. This network answers on a scale with two units to the
+/// centipawn, so anything that compares a piece against an evaluation has to
+/// convert. Not converting made the quiescence margin twice as harsh as
+/// intended -- the same class of mistake that made history pruning never fire
+/// at all, in the other direction. Static exchange is exempt: it is centipawns
+/// end to end, input and output, so a threshold handed to it belongs in
+/// centipawns too.
+#[inline]
+fn value_in_eval_units(pt: PieceType) -> i32 {
+    pt.value() * 2
+}
+
+/// Does this side have anything but pawns and a king?
+///
+/// The question null move pruning asks: with only pawns left, having to move is
+/// often a disadvantage, so a side that passes and still looks fine proves
+/// nothing about a side that has to play.
+pub(crate) fn has_pieces_pub(board: &Board, side: Color) -> bool {
+    has_pieces(board, side)
+}
+
+fn has_pieces(board: &Board, side: Color) -> bool {
+    let p = &board.pieces[side.idx()];
+    p[PieceType::Knight.idx()]
+        | p[PieceType::Bishop.idx()]
+        | p[PieceType::Rook.idx()]
+        | p[PieceType::Queen.idx()]
+        != 0
+}
+
+/// The evaluation, exposed for the UCI `eval` command.
+pub fn debug_eval(board: &mut Board, fade: bool) -> i32 {
+    // A ponte conduz um tabuleiro a par do nosso, e quem o move e' a busca.
+    // Fora dela ela fica onde a ultima procura a deixou, por isso um pedido de
+    // avaliacao respondia sempre sobre essa posicao e nao sobre a que lhe
+    // davam: devolvia o mesmo numero na posicao inicial, com as pretas sem dama
+    // e num final de dama contra rei nu.
+    //
+    // Um diagnostico que devolve uma constante plausivel e' pior do que um que
+    // falha: quem o usa para conferir duas versoes ve' numeros iguais e conclui
+    // que estao de acordo. E' a mesma familia do motor que jogava com avaliacao
+    // zero sem se queixar.
+    if crate::ponte::ligado() {
+        crate::ponte::raiz(&board.to_fen());
+    }
+    evaluate(board, fade)
+}
+
+fn mate_score(ply: usize) -> i32 {
+    -MATE + ply as i32
+}
+
+pub fn is_mate(score: i32) -> bool {
+    score.abs() >= MATE_IN_MAX
+}
+
+/// Moving a mate score in and out of the table: stored relative to the node it
+/// was found at, used relative to the root. Without this a mate found deep in
+/// one branch is reported as being that many moves away from wherever the entry
+/// is read next.
+pub(crate) fn score_to_tt(score: i32, ply: usize) -> i32 {
+    if score >= MATE_IN_MAX {
+        score + ply as i32
+    } else if score <= -MATE_IN_MAX {
+        score - ply as i32
+    } else {
+        score
+    }
+}
+
+pub(crate) fn score_from_tt(score: i32, ply: usize) -> i32 {
+    if score >= MATE_IN_MAX {
+        score - ply as i32
+    } else if score <= -MATE_IN_MAX {
+        score + ply as i32
+    } else {
+        score
+    }
+}
+
+impl Searcher {
+    pub fn new(hash_mb: usize, stop: Arc<AtomicBool>) -> Self {
+        Searcher {
+            tt: std::sync::Arc::new(TranspositionTable::new(hash_mb)),
+            atk: Attacks::new(),
+            stop,
+            move_overhead: 30,
+            threads: 1,
+            features: Features::default(),
+            raiz_aval: 0,
+            params: Params::default(),
+            lmr: build_lmr_table(Params::default().lmr_base, Params::default().lmr_div),
+            nodes: 0,
+            start: Instant::now(),
+            soft: Duration::from_secs(0),
+            hard: Duration::from_secs(0),
+            stopped: false,
+            killers: [[None; NUM_KILLERS]; MAX_PLY],
+            history: [[[[0; 4]; 64]; 64]; 2],
+            cache_ameacas: (0..MAX_PLY + 8).map(|_| std::cell::Cell::new((0, 0))).collect(),
+            histpc: [[0; 64]; 6],
+            corr: std::sync::Arc::new(cria_hist(CORR_KINDS * 2 * CORR_SIZE)),
+            played: [None; MAX_PLY],
+            conthist: std::sync::Arc::new(cria_hist(CONT_SLOTS * 6 * 64 * 6 * 64)),
+            histpeao: std::sync::Arc::new(cria_hist(TAM_PEAO * 12 * 64)),
+            hist_proprio: true,
+            capthist: vec![[[0; 6]; 64]; 6],
+            keys: Vec::with_capacity(1024),
+            root_keys: 0,
+            pv: [[None; MAX_PLY]; MAX_PLY],
+            pv_len: [0; MAX_PLY],
+            relogio_maximo: 0,
+            relogio_dele: 0,
+            ritmo_dele: 0,
+            eval_stack: [0; MAX_PLY],
+            excluded: [None; MAX_PLY],
+            played_moves: vec![None; MAX_PLY],
+            pre_moves: [None; PRE_MOVES],
+            root_effort: Vec::with_capacity(256),
+            tb_hits: 0,
+            root_delta: 1,
+            root_scores: Vec::with_capacity(256),
+            null_at: [false; MAX_PLY],
+            cut_cnt: [0; MAX_PLY + 8],
+        }
+    }
+
+    /// Uma busca irma: partilha a TABELA e o sinal de paragem, e mais nada.
+    ///
+    /// Os historicos ficam de fora de proposito, para ja'. E' a diferenca que a
+    /// sessao de 18-09 isolou ao ler o SF19: eles partilham tres familias
+    /// inteiras -- continuacao, peoes e correccao -- e nos so' partilhamos a
+    /// tabela. Medido la': a quatro fios fazemos 3,17x os nos de um, mas
+    /// chegamos ao ply 21 onde eles chegam ao 25. "Os nos estao la'; a
+    /// aprendizagem e' que nao circula." Isso e' o passo seguinte e mede-se
+    /// contra ISTO, senao nao se sabe o que cada metade rendeu.
+    fn ajudante(&self) -> Searcher {
+        let mut a = Searcher::new(1, std::sync::Arc::clone(&self.stop));
+        a.tt = std::sync::Arc::clone(&self.tt);
+        a.features = self.features.clone();
+        a.params = self.params.clone();
+        a.move_overhead = self.move_overhead;
+        a.threads = 1;
+        if self.features.hist_part {
+            // As duas familias que o half2k tem. A terceira -- historia de
+            // peoes -- nao existe aqui e fica na lista do que falta.
+            a.conthist = std::sync::Arc::clone(&self.conthist);
+            a.histpeao = std::sync::Arc::clone(&self.histpeao);
+            a.corr = std::sync::Arc::clone(&self.corr);
+            a.hist_proprio = false;
+        }
+        a.params_changed();
+        a
+    }
+
+    /// O laco de um ajudante: as mesmas profundidades, a mesma raiz, sem
+    /// imprimir nada e sem relogio proprio.
+    ///
+    /// Sem desvio de profundidade de proposito. A sessao de 18-09 explica
+    /// porque': com fios em profundidades DIFERENTES a votacao pesa por
+    /// profundidade e "uma thread que saltou para um numero alto por um caminho
+    /// raso ganha peso exactamente por isso". Todos percorrem as mesmas
+    /// profundidades e divergem no caminho, que e' o que se quer.
+    fn corre_ajudante(&mut self, board: &mut Board, max_depth: u32) -> Option<(Move, i32, u32)> {
+        // A RAIZ, neste fio. O contexto da ponte e' `thread_local` e nasce
+        // vazio em cada fio novo: sem isto o ajudante avalia sobre um tabuleiro
+        // por inicializar, e o motor pendura logo a seguir a` profundidade 1.
+        // E' o mesmo aviso que a sessao de 18-09 deixou escrito -- "uma thread
+        // que lhe toque antes de a rede estar carregada fica sem ponte para
+        // sempre".
+        if crate::ponte::ligado() {
+            crate::ponte::raiz(&board.to_fen());
+        }
+        // So' o `stop` partilhado o para: o relogio e' do fio principal.
+        self.hard = Duration::from_secs(86_400);
+        self.soft = Duration::from_secs(86_400);
+        self.start = Instant::now();
+        let mut melhor: Option<(Move, i32, u32)> = None;
+        let mut anterior = 0;
+        let mut media: Option<i32> = None;
+        for depth in 1..=max_depth {
+            self.root_scores.clear();
+            let nota = self.aspiration(board, depth as i32, anterior);
+            if self.stopped {
+                break;
+            }
+            anterior = nota;
+            if self.features.otimismo {
+                let m = match media { None => nota, Some(a) => (nota + a) / 2 };
+                media = Some(m);
+                crate::ponte::otimismo(self.params.otimismo_f * m / (m.abs() + 85));
+            }
+            if let Some(&(m, sc)) = self.root_scores.iter().max_by_key(|(_, sc)| *sc) {
+                // Com a profundidade a que ESTE resultado foi obtido. Sem ela,
+                // um ajudante que o relogio apanhou na 12 vota com o mesmo peso
+                // que o principal na 17 -- e pode derruba-lo.
+                melhor = Some((m, sc, depth));
+            }
+        }
+        melhor
+    }
+
+    /// O LANCE mais votado, nao a busca com a nota mais alta.
+    ///
+    /// Peso `nota - menor_nota + VOTO_PESO`. Uma busca muito abaixo das outras
+    /// vota pouco; uma a` frente vota muito. O peso 24 e' o do KestrelStrike e
+    /// transfere-se sem conversao -- os dois motores tem a mesma escala interna
+    /// (o dobro do centipeao: ambos imprimem `cp` a dividir por dois).
+    fn vota(cand: &[(Move, i32)]) -> Option<Move> {
+        const VOTO_PESO: i64 = 24;
+        let menor = cand.iter().map(|(_, s)| *s).min()?;
+        let mut votos: Vec<(Move, i64)> = Vec::with_capacity(cand.len());
+        for &(m, sc) in cand {
+            let peso = (sc as i64 - menor as i64) + VOTO_PESO;
+            match votos.iter_mut().find(|(vm, _)| *vm == m) {
+                Some((_, v)) => *v += peso,
+                None => votos.push((m, peso)),
+            }
+        }
+        votos.into_iter().max_by_key(|(_, v)| *v).map(|(m, _)| m)
+    }
+
+    /// Call after changing any parameter, so anything derived from one is
+    /// rebuilt rather than left describing the old value.
+    pub fn params_changed(&mut self) {
+        self.lmr = build_lmr_table(self.params.lmr_base, self.params.lmr_div);
+    }
+
+    pub fn set_game_history(&mut self, keys: Vec<u64>) {
+        self.keys = keys;
+        self.root_keys = self.keys.len();
+    }
+
+    /// The moves actually played before this search started.
+    ///
+    /// Continuation history asks "what is a good reply to what just happened",
+    /// and at the top of the tree what just happened is in the GAME, not in the
+    /// search. Without this the tables are empty for the first plies of every
+    /// search -- which is where most of the tree is -- and the ordering there
+    /// runs on the butterfly table alone.
+    ///
+    /// Measured against the program this search was transcribed from: its
+    /// average history score per reduced move was -7757 against ours at -1219,
+    /// six times less opinionated, and this was why.
+    ///
+    /// Stored in the slots below zero, so that `ply - 1` at the root reaches
+    /// the last move of the game rather than nothing.
+    pub fn set_game_moves(&mut self, moves: &[Move]) {
+        self.pre_moves = [None; PRE_MOVES];
+        for (i, mv) in moves.iter().rev().take(PRE_MOVES).enumerate() {
+            self.pre_moves[i] = Some(*mv);
+        }
+    }
+
+    /// The move `back` plies before `ply`, reaching into the game when the
+    /// search runs out.
     #[inline]
-    fn cont_hist_score(&self, curr_pt: PieceType, to: crate::types::Square, ply: usize) -> i32 {
-        let mut ch = 0i32;
-        if ply >= 1 {
-            if let Some((p_pt, p_to)) = self.ply_last_move.get(ply).and_then(|x| *x) {
-                ch += self.cont_hist[cont_hist_idx(p_pt, p_to, curr_pt, to)];
-            }
+    pub(crate) fn move_back(&self, ply: usize, back: usize) -> Option<Move> {
+        if ply >= back {
+            self.played_moves[ply - back]
+        } else {
+            self.pre_moves.get(back - ply - 1).copied().flatten()
         }
-        if ply >= 2 {
-            if let Some((p_pt, p_to)) = self.ply_last_move.get(ply - 1).and_then(|x| *x) {
-                ch += self.cont_hist[cont_hist_idx(p_pt, p_to, curr_pt, to)];
-            }
-        }
-        // Four plies back as well, not just one and two. One and two capture
-        // the immediate exchange -- what the opponent just did and what we did
-        // before that. Four reaches past it, to the move that set up the
-        // structure the current one is working within, and a plan that takes
-        // several moves to pay off is invisible at the shorter lags.
-        if ply >= 4 {
-            if let Some((p_pt, p_to)) = self.ply_last_move.get(ply - 3).and_then(|x| *x) {
-                ch += self.cont_hist[cont_hist_idx(p_pt, p_to, curr_pt, to)];
-            }
-        }
-        ch
     }
 
+    pub fn clear(&mut self) {
+        self.tt.clear();
+        self.killers = [[None; NUM_KILLERS]; MAX_PLY];
+        self.history = [[[[0; 4]; 64]; 64]; 2];
+        self.histpc = [[0; 64]; 6];
+        // So' o DONO limpa. Ver a nota no campo `hist_proprio`.
+        if self.hist_proprio {
+            for e in self.corr.iter() {
+                e.store(0, Ordering::Relaxed);
+            }
+            for e in self.conthist.iter() {
+                e.store(0, Ordering::Relaxed);
+            }
+            for e in self.histpeao.iter() {
+                e.store(0, Ordering::Relaxed);
+            }
+        }
+        self.capthist = vec![[[0; 6]; 64]; 6];
+    }
+
+    /// What the last move changed about the position key.
+    ///
+    /// The key stack holds every position back to the start of the game, with
+    /// the current one on top, so the difference between the top two is the
+    /// move that was just made -- from, to, what it took and whose it was, all
+    /// in one number. Zero when there is nothing above.
     #[inline]
-    fn corr_idx(&self, board: &Board, hash: u64) -> usize {
-        board.side.idx() * CORR_HIST_SIZE + (hash as usize % CORR_HIST_SIZE)
+    fn hash_delta(&self) -> u64 {
+        let n = self.keys.len();
+        if n >= 2 {
+            self.keys[n - 1] ^ self.keys[n - 2]
+        } else {
+            0
+        }
     }
 
-    /// Static eval adjusted by the learned correction (see `corr_hist`
-    /// and friends). Used only where the raw static eval feeds a
-    /// PRUNING margin decision, never for the real leaf value.
+    /// The static score, adjusted by what the search has been saying about
+    /// positions with this pawn structure.
+    #[inline]
+    fn corrected(&self, board: &Board, raw: i32, ply: usize) -> i32 {
+        let last = if ply > 0 { self.played[ply - 1] } else { None };
+        let idx = corr_indices(board, last, self.hash_delta());
+        let side = board.side.idx();
+        let mut total = 0i32;
+        for k in 0..CORR_KINDS {
+            total += self.corr[icorr(k, side, idx[k])].load(Ordering::Relaxed) * CORR_WEIGHT[k];
+        }
+        let c = total / CORR_DIVISOR;
+        (raw + c).clamp(-MATE_IN_MAX + 1, MATE_IN_MAX - 1)
+    }
+
+    /// Learn from the difference, weighted by how deep the search that found
+    /// it went.
+    /// Move each reading towards what the search actually said.
     ///
-    /// 2026-07-22/23: weighted sum of 6 correction-history dimensions
-    /// (pawn structure, non-pawn material of each side, minor pieces,
-    /// major pieces, threats), with SPSA-tuned per-term weights.
-    /// Previously just the pawn term alone with an implicit weight of
-    /// `CORR_HIST_GRAIN` (i.e. "full effect", no partial trust) -- the
-    /// recalibrated pawn weight is 384/256 = 1.5x that, so this is a
-    /// real recalibration of the existing term too, not just new
-    /// additions. `threats`/continuation-history terms deliberately
-    /// not included here, see the field doc comment on
-    /// `corr_hist_np_stm` for why.
-    /// Quanto e' que a correccao esta' a mexer na eval estatica, em centipeoes
-    /// e sem sinal.
+    /// The amount is the miss scaled by how deep the search that found it went,
+    /// capped, and then applied so that an entry approaches its ceiling instead
+    /// of slamming into it. The previous version multiplied the miss by 256
+    /// before capping, so any miss above thirty two units saturated the target
+    /// and every update looked the same size.
+    #[inline]
+    fn learn_correction(&mut self, board: &Board, diff: i32, depth: i32, ply: usize) {
+        let last = if ply > 0 { self.played[ply - 1] } else { None };
+        let idx = corr_indices(board, last, self.hash_delta());
+        let side = board.side.idx();
+        let bonus = (diff * depth / 8).clamp(-CORR_MAX_UPDATE, CORR_MAX_UPDATE);
+        for k in 0..CORR_KINDS {
+            let e = &self.corr[icorr(k, side, idx[k])];
+            let v = e.load(Ordering::Relaxed);
+            let v = v + bonus - v * bonus.abs() / CORR_MAX;
+            e.store(v.clamp(-CORR_MAX, CORR_MAX), Ordering::Relaxed);
+        }
+    }
+
+    /// Which continuation table each slot points at, this ply.
     ///
-    /// Serve para as margens de poda: uma correccao grande quer dizer que a
-    /// estimativa estatica ANDA A ERRAR nesta familia de posicoes -- e' isso
-    /// que as tabelas de correccao registam. Podar com base numa eval que
-    /// sabemos pouco fiavel e' o pior momento para poupar trabalho, portanto a
-    /// margem sobe com ela. Nao e' o valor corrigido (esse ja' entra no
-    /// `static_eval`), e' a CONFIANCA nele.
-    fn corr_magnitude(&self, board: &Board, raw: i32) -> i32 {
-        (self.corrected_static_eval(board, raw) - raw).abs()
+    /// One, two and four plies back. The first is the move being replied to and
+    /// carries twice the weight of the others: what makes a quiet move good is
+    /// most often what the opponent just did, and only after that what we were
+    /// doing before.
+    #[inline]
+    fn cont_slots(&self, ply: usize) -> [Option<usize>; CONT_SLOTS] {
+        let mut out = [None; CONT_SLOTS];
+        let tabela: &[usize; CONT_SLOTS] = if self.features.cont_adversario {
+            &CONT_BACK_ADV
+        } else {
+            &CONT_BACK
+        };
+        for (k, back) in tabela.iter().enumerate() {
+            if ply >= *back {
+                if let Some((pc, to)) = self.played[ply - back] {
+                    out[k] = Some(pc * 64 + to);
+                }
+            } else if let Some(mv) = self.pre_moves.get(back - ply - 1).copied().flatten() {
+                // Above the root: the piece is unknown here, so the move itself
+                // stands in for it. Consistent within the table, which is all
+                // an index has to be.
+                out[k] = Some((mv.from as usize % 6) * 64 + mv.to as usize);
+            }
+        }
+        out
     }
 
-    fn corrected_static_eval(&self, board: &Board, raw: i32) -> i32 {
-        let pawn_idx = self.corr_idx(board, pawn_structure_hash(board));
-        let np_stm_idx = self.corr_idx(board, non_pawn_hash(board, board.side));
-        let np_nstm_idx = self.corr_idx(board, non_pawn_hash(board, board.side.opp()));
-        let minor_idx = self.corr_idx(board, minor_piece_hash(board));
-        let major_idx = self.corr_idx(board, major_piece_hash(board));
-        let threats_idx = self.corr_idx(board, threats_hash(board, self.atk));
-        let sum = self.corr_hist[pawn_idx] * CORR_WEIGHT_PAWN
-            + self.corr_hist_np_stm[np_stm_idx] * CORR_WEIGHT_NP_STM
-            + self.corr_hist_np_nstm[np_nstm_idx] * CORR_WEIGHT_NP_NSTM
-            + self.corr_hist_minor[minor_idx] * CORR_WEIGHT_MINOR
-            + self.corr_hist_major[major_idx] * CORR_WEIGHT_MAJOR
-            + self.corr_hist_threats[threats_idx] * CORR_WEIGHT_THREATS;
-        raw + sum / (CORR_HIST_GRAIN * CORR_WEIGHT_SCALE)
-    }
+    /// Decide how long this move may take.
+    ///
+    /// Two limits, because they answer different questions. `soft` is checked
+    /// only between iterations: passing it means there is not enough left to
+    /// make another depth worthwhile, and the move we have is the move we play.
+    /// `hard` is checked inside the search and is a wall -- crossing it means
+    /// abandoning the iteration in progress and using the last completed one.
+    ///
+    /// Everything is taken from the clock AFTER the overhead is removed, and
+    /// `hard` is capped so that even the wall cannot spend what we do not have.
+    fn allocate(&mut self, limits: &Limits, board: &Board) {
+        let side = board.side;
+        self.start = Instant::now();
 
-    /// Called once a node's real search has settled on `best_score`
-    /// (not a stopped/aborted search, not a mate score, not near the
-    /// static-eval-unreliable zone): nudge each of the 5 correction
-    /// tables toward the gap between what the fast static eval guessed
-    /// and what real search found. Small learning-rate style update so
-    /// a single unusual position doesn't dominate any one table.
-    /// Learning-rate cap raised from 16 to 32 (2026-07-22, following the
-    /// form `weight = 2*min(1+depth,16)`) -- was under-weighting
-    /// high-depth updates before.
-    fn update_corr_hist(&mut self, board: &Board, static_eval: i32, best_score: i32, depth: i32) {
-        if best_score.abs() >= MATE_THRESHOLD {
+        if limits.infinite || limits.depth.is_some() || limits.nodes.is_some() {
+            self.soft = Duration::from_secs(86_400);
+            self.hard = Duration::from_secs(86_400);
             return;
         }
-        let diff = (best_score - static_eval) * CORR_HIST_GRAIN;
-        let weight = 2 * (depth + 1).min(16);
-        let pawn_idx = self.corr_idx(board, pawn_structure_hash(board));
-        let np_stm_idx = self.corr_idx(board, non_pawn_hash(board, board.side));
-        let np_nstm_idx = self.corr_idx(board, non_pawn_hash(board, board.side.opp()));
-        let minor_idx = self.corr_idx(board, minor_piece_hash(board));
-        let major_idx = self.corr_idx(board, major_piece_hash(board));
-        let threats_idx = self.corr_idx(board, threats_hash(board, self.atk));
-        for (table, idx) in [
-            (&mut self.corr_hist, pawn_idx),
-            (&mut self.corr_hist_np_stm, np_stm_idx),
-            (&mut self.corr_hist_np_nstm, np_nstm_idx),
-            (&mut self.corr_hist_minor, minor_idx),
-            (&mut self.corr_hist_major, major_idx),
-            (&mut self.corr_hist_threats, threats_idx),
-        ] {
-            let v = &mut table[idx];
-            *v += (diff - *v) * weight / 256;
-            *v = (*v).clamp(-CORR_HIST_MAX * CORR_HIST_GRAIN, CORR_HIST_MAX * CORR_HIST_GRAIN);
-        }
-    }
 
-    fn order_moves(&self, board: &Board, mut moves: Vec<Move>, tt_move: Option<Move>, ply: usize, hash: Option<u64>) -> Vec<Move> {
-        let killers = self.killers[ply];
-        let side = board.side.idx();
-        let book_entries: Vec<(u16, u32)> = match (self.style_book, hash) {
-            (Some(b), Some(h)) => b.lookup(h),
-            _ => Vec::new(),
+        if let Some(mt) = limits.movetime {
+            let usable = mt.saturating_sub(self.move_overhead).max(1);
+            self.soft = Duration::from_millis(usable);
+            self.hard = Duration::from_millis(usable);
+            return;
+        }
+
+        let (time, inc, opp_time) = match side {
+            Color::White => (limits.wtime, limits.winc, limits.btime),
+            Color::Black => (limits.btime, limits.binc, limits.wtime),
         };
-        // Countermove heuristic: look up whether there's a recorded reply
-        // for the exact context that led into this node (the opponent's
-        // last move, piece type + destination square).
-        let countermove = self
-            .ply_last_move
-            .get(ply)
-            .and_then(|x| *x)
-            .and_then(|(pt, to)| self.countermoves[pt.idx()][to as usize]);
-        // sort_by_cached_key (found in review, 2026-07-21), not
-        // sort_by_key: the key closure calls see::see(self.atk, ) for every
-        // capture, a full exchange simulation -- sort_by_key doesn't
-        // guarantee calling the key function exactly once per element,
-        // so that SEE could be recomputed more than once per move
-        // during the sort. This runs in quiescence, visited far more
-        // often than main-search nodes (every horizon leaf resolves
-        // through it). Pure perf fix, same ordering/behavior either
-        // way -- caching a key is never observable, only its cost is.
-        moves.sort_by_cached_key(|m| {
-            if Some(*m) == tt_move {
-                -1_000_000
-            } else if m.promotion == Some(PieceType::Queen) && !m.is_capture() {
-                // A quiet queen promotion had NO branch of its own here: it
-                // fell through to the quiet arm below and scored `-h`, and the
-                // history of a promotion is ~0 because the (from, to) square
-                // pair almost never repeats. So a move that turns a pawn into
-                // a queen -- worth ~800cp on the spot -- sorted behind every
-                // good capture and every killer.
-                //
-                // In quiescence that is not merely untidy, it is a cut: the
-                // move list there is captures + queen promotions, and
-                // `qs_lmp_limit` stops after 8. Eight good captures and the
-                // promotion is never searched at all.
-                //
-                // Scored as the capture it effectively is -- the piece gained
-                // is the difference between a queen and the pawn spent -- so
-                // it lands among the good captures at its real worth instead
-                // of below them all.
-                let ganho = PieceType::Queen.value() - PieceType::Pawn.value();
-                -200_000 - ganho
-            } else if m.is_capture() {
-                // SEE replaces plain MVV-LVA for ordering: good/neutral
-                // captures (SEE>=0) go to the top, ranked by the real
-                // exchange value (not just "bigger piece first"); bad
-                // captures (SEE<0, lose material in the full exchange)
-                // sink below quiet moves -- MVV-LVA couldn't tell "Bxf7"
-                // against a defended bishop (loses the piece) apart from
-                // a genuinely good capture.
-                let see = see::see(self.atk, board, m);
-                if see >= 0 {
-                    -200_000 - see
+
+        // A gestao de tempo do pawn, portada tal e qual.
+        //
+        // Sao cinco linhas e nao precisa de ser afinada por controlo, ao
+        // contrario da nossa. Duas diferencas fazem-na funcionar:
+        //
+        //   * o incremento entra no BOLO -- `relogio + inc*(n-1)` -- em vez de
+        //     ser somado uma vez a` parte. A nossa faz `relogio/mtg + inc`, que
+        //     conta UM incremento: a 120+1 orca 5,4 s e recebe 1 s, e a
+        //     diferenca sai do capital ate' a bandeira cair.
+        //
+        //   * o tecto e' `min(80% do relogio, 2x o optimo)`. Simples e
+        //     impossivel de furar. O nosso e' o minimo de tres termos com um
+        //     multiplicador de emergencia que a 5+0.05 esta' presto no piso e a
+        //     120+1 esta' solto no tecto -- o mesmo parametro partido pelas
+        //     duas pontas.
+        //
+        // Aplicado a 120+1: bolo 149000, optimo 4867 ms, tecto 9634 ms.
+        // Sustentavel, e nunca perde por bandeira.
+        //
+        // Entra DESLIGADO. Ver `TmPawn`.
+        if self.features.tm_pawn {
+            if let Some(t) = time {
+                let i = inc;
+                // Sem movestogo -- morte subita, que e' o caso no Lichess -- o
+                // pawn reparte por 30. Isso e' um decaimento geometrico: gasta-se
+                // sempre 1/30 do que RESTA, portanto o relogio nunca se acaba e
+                // sobra sempre. Medido no bot a 1+0: mediana de 12,4 s por usar
+                // em 60, com 0,57 s por lance. Para um motor que ganha 239 Elo
+                // ao passar de 1x para 4x o tempo, devolver um quinto do relogio
+                // e' das piores maneiras de perder forca. Fica em parametro para
+                // se poder medir onde e' o joelho.
+                let nn = if self.features.tm_pawn_curva && limits.movestogo.is_none() {
+                    // `fullmove` comeca em 1; a curva e' por lances JA' JOGADOS.
+                    faltam_lances_pct(
+                        board.fullmove.saturating_sub(1),
+                        self.params.tm_pawn_curva_min,
+                        self.params.tm_curva_pct,
+                        self.params.tm_cresce,
+                    )
                 } else {
-                    100_000 - see
-                }
-            } else if Some(*m) == killers[0] {
-                -700 - self.book_bonus(&book_entries, m)
-            } else if Some(*m) == killers[1] {
-                -600 - self.book_bonus(&book_entries, m)
-            } else {
-                // Countermove folded in as an ADDITIVE bonus on top of
-                // history, not a hard priority slot -- a single recorded
-                // reply can be wrong; letting it outrank every other
-                // quiet move unconditionally (as a fixed slot did) can
-                // force a bad move to the front. Better to treat this
-                // (continuation history) as a weighted signal blended
-                // into the ordinary history score, not a rigid tier --
-                // here simplified to a single ply-lag rather than the
-                // full multi-lag sum.
-                let h = self.history_scores[side][m.from as usize][m.to as usize];
-                let cm_bonus = if Some(*m) == countermove { 2000 } else { 0 };
-                -h - cm_bonus - self.book_bonus(&book_entries, m)
-            }
-        });
-        moves
-    }
-
-    fn quiescence(&mut self, board: &mut Board, alpha: i32, beta: i32, ply: usize) -> i32 {
-        // MEASURED AND REJECTED (2026-08-06), and worth knowing before
-        // trying it: reusing a stored static eval here instead of
-        // recomputing costs ~3.2% NPS rather than saving anything
-        // (1123k -> 1087k, five interleaved runs, node count identical).
-        //
-        // 54% of all evaluations do come from this line, so the premise was
-        // right -- but with the lazy accumulator in place, evaluating the
-        // piece-square network here is reading an accumulator that is
-        // usually already current plus one 2x512 output pass, while a table
-        // probe is a cache miss into several megabytes. The cheap thing was
-        // already the eval.
-        //
-        // This is NOT a general verdict. It pays for an evaluation with no
-        // accumulator behind it, one that re-enumerates its features from
-        // scratch on every call: there the probe is far cheaper than what it
-        // replaces. An expensive evaluation is exactly the condition that
-        // makes probing here worthwhile, and this engine's is not one.
-        let stand_pat = crate::evaluation::amortece_rule50(
-            crate::evaluation::evaluate_fast(board),
-            board.halfmove,
-        );
-        self.quiescence_from(board, alpha, beta, ply, stand_pat)
-    }
-
-    /// Same search as quiescence(), but also returns the board reached
-    /// at the leaf of the best line found -- for tuning dataset prep
-    /// (resolve a training position to a tactically quiet successor
-    /// before scoring it with the candidate eval weights, instead of
-    /// scoring a position mid-exchange). Not used by real gameplay
-    /// search (negamax calls quiescence()/quiescence_from(), unchanged)
-    /// -- purely additive, zero behavior change for the live engine.
-    pub fn quiescence_leaf(&mut self, board: &mut Board, alpha: i32, beta: i32, ply: usize) -> (i32, Board) {
-        let stand_pat = crate::evaluation::evaluate_fast(board);
-        self.quiescence_leaf_from(board, alpha, beta, ply, stand_pat)
-    }
-
-    fn quiescence_leaf_from(&mut self, board: &mut Board, mut alpha: i32, beta: i32, ply: usize, stand_pat: i32) -> (i32, Board) {
-        self.nodes += 1;
-        self.qnodes += 1;
-        let leaf_here = board.clone();
-        if self.time_up() || ply >= MAX_PLY - 1 {
-            return (stand_pat, leaf_here);
-        }
-        let in_check = board.in_check(board.side, self.atk);
-        if !in_check {
-            if stand_pat >= beta {
-                return (beta, leaf_here);
-            }
-            if stand_pat > alpha {
-                alpha = stand_pat;
+                    self.params.tm_pawn_n.max(1) as u64
+                };
+                let n = match limits.movestogo {
+                    Some(m) => m.max(1).min(nn),
+                    None => nn,
+                };
+                let bolo = t + i * n.saturating_sub(1);
+                let optimo = (bolo / n).saturating_sub(self.move_overhead).max(1);
+                let tecto = (8 * t / 10)
+                    .min(optimo * self.params.tm_pawn_tecto.max(100) as u64 / 100)
+                    .saturating_sub(self.move_overhead)
+                    .max(1);
+                let tecto = self.aperta_sem_inc(tecto, t, i);
+                self.soft = Duration::from_millis(optimo);
+                self.hard = Duration::from_millis(tecto.max(optimo.min(tecto)));
+                return;
             }
         }
-        let mut moves = generate_legal(board, self.atk);
-        if in_check {
-            if moves.is_empty() {
-                return (-MATE_SCORE + ply as i32, leaf_here);
+        let time = match time {
+            Some(t) => t,
+            None => {
+                self.soft = Duration::from_secs(86_400);
+                self.hard = Duration::from_secs(86_400);
+                return;
             }
-        } else {
-            moves.retain(|m| m.is_capture() || m.promotion == Some(PieceType::Queen));
-            moves.retain(|m| !m.is_capture() || see::see_ge(self.atk, board, m, 0));
-            if alpha.abs() < MATE_SCORE - MAX_PLY as i32 {
-                let delta_margin = search_params().delta_margin;
-                moves.retain(|m| {
-                    if m.promotion.is_some() {
-                        return true;
-                    }
-                    let captured_value = if m.flag == MoveFlag::EnPassant {
-                        PieceType::Pawn.value()
-                    } else {
-                        board.piece_at(m.to).map(|(pt, _)| pt.value()).unwrap_or(0)
-                    };
-                    stand_pat + captured_value + delta_margin >= alpha
-                });
-            }
-        }
-        let moves = self.order_moves(board, moves, None, ply.min(MAX_PLY - 1), None);
-
-        let mut best = if in_check { -MATE_SCORE - 1 } else { alpha };
-        let mut best_leaf = leaf_here;
-        for mv in moves {
-            let undo = board.make_move(&mv);
-            let (child_score, child_leaf) = self.quiescence_leaf(board, -beta, -alpha, ply + 1);
-            let score = -child_score;
-            board.unmake_move(&mv, &undo);
-            if self.stop {
-                return (if in_check { best.max(alpha) } else { alpha }, best_leaf);
-            }
-            let beats_beta = score >= beta;
-            if score > best {
-                best = score;
-                if beats_beta {
-                    return (beta, child_leaf);
-                }
-                best_leaf = child_leaf;
-            } else if beats_beta {
-                return (beta, child_leaf);
-            }
-            if score > alpha {
-                alpha = score;
-            }
-        }
-        if in_check { (best, best_leaf) } else { (alpha, best_leaf) }
-    }
-
-    /// Nucleo da quiescence, recebendo o stand-pat ja' calculado (completo
-    /// na 1a chamada vinda do negamax, rapido nas recursoes seguintes --
-    /// ver negamax()).
-    fn quiescence_from(&mut self, board: &mut Board, mut alpha: i32, beta: i32, ply: usize, stand_pat: i32) -> i32 {
-        self.nodes += 1;
-        self.qnodes += 1;
-        if self.time_up() {
-            return stand_pat;
-        }
-        // "Standing pat" (declining to search further, taking the
-        // static eval as-is) is only a legal option when NOT in check
-        // -- a side in check has no "do nothing" move, it MUST respond.
-        // Applying the stand-pat cutoff/floor while in check would
-        // silently accept an illegal null move and could miss forced
-        // mates or misjudge a check sequence entirely. When in check,
-        // every legal reply must be searched (not just captures), same
-        // as the main search's check-evasion handling.
-        let in_check = board.in_check(board.side, self.atk);
-        if !in_check {
-            if stand_pat >= beta {
-                return beta;
-            }
-            if stand_pat > alpha {
-                alpha = stand_pat;
-            }
-        }
-        if ply >= MAX_PLY - 1 {
-            return stand_pat;
-        }
-
-        // Out of check, generate only what quiescence searches instead of
-        // generating everything and discarding the quiet moves -- see
-        // `generate_legal_caps`. In check, every legal evasion counts, so the
-        // full generator stays.
-        let mut moves = if in_check {
-            generate_legal(board, self.atk)
-        } else {
-            generate_legal_caps(board, self.atk)
         };
-        if in_check {
-            if moves.is_empty() {
-                return -MATE_SCORE + ply as i32;
+
+        // What is actually ours to spend. `saturating_sub` and the floor of one
+        // millisecond matter: in time trouble the clock can be below the
+        // overhead, and an allocation of zero would still have to make a move,
+        // just without having thought about it.
+        let usable = time.saturating_sub(self.move_overhead).max(1);
+
+        // How many more moves to plan for. With a real count given, use it.
+        //
+        // Without one this is a guess, and the guess decides how much of the
+        // clock is ever spent: dividing what REMAINS by n means spending 1/n
+        // and keeping the rest, every move, so after k moves ((n-1)/n)^k of the
+        // clock is still there. It was 46, and our games run 81 moves a side --
+        // (45/46)^81 is 0.17, and 32 games at 40+0.4 measured 0.15 left over,
+        // 10.6 seconds a game never used. At 27, (26/27)^81 is 0.05.
+        //
+        // Pessimism here is not free: it is a permanent tax on every move, paid
+        // to insure against flagging in games that run long.
+        if self.features.tm_relogio {
+            self.relogio_maximo = self.relogio_maximo.max(time);
+        }
+        let mtg = match limits.movestogo {
+            Some(n) => n.max(1),
+            None if self.features.tm_relogio && self.relogio_maximo > 0 => {
+                // A fraccao do relogio que ainda la' esta'. Cheio quer dizer
+                // muito jogo pela frente e gasta-se com conta; a acabar quer
+                // dizer repartir o que resta por poucos lances.
+                let frac = (time * 1000 / self.relogio_maximo).min(1000) as i32;
+                let base = self.params.tm_mtg_base;
+                let min = self.params.tm_mtg_min;
+                (min + (base - min) * frac / 1000).max(min) as u64
             }
-            // No capture-only filter here: any legal evasion may be the
-            // only way out (blocking, king move, or capturing the
-            // checker). SEE pruning also doesn't apply -- a losing
-            // capture can still be the only legal escape from check.
+            None if self.features.tm_curva => {
+                // Lances por jogar sao muitos no inicio e poucos no fim; uma
+                // constante trata as duas pontas por igual. A curva desce com
+                // a partida, que e' o que evita gastar de mais na abertura.
+                let lance = board.fullmove as i32;
+                let est = self.params.tm_mtg_base - self.params.tm_mtg_declive * lance / 100;
+                est.max(self.params.tm_mtg_min) as u64
+            }
+            None if self.features.tm_horizonte => {
+                // O horizonte encolhe com o relogio: com pouco tempo nao ha'
+                // margem para planear longe, e planear longe com pouco tempo e'
+                // exactamente como se perde por bandeira.
+                if time < 1000 {
+                    (time / 20).max(2)
+                } else {
+                    self.params.tm_horizonte_max as u64
+                }
+            }
+            None => self.params.tm_mtg as u64,
+        }
+        .max(1);
+
+        // The increment is income, so most of it can be spent every move
+        // without the clock moving. Not all of it: the part held back is what
+        // slowly rebuilds a buffer over a long game.
+        // O incremento no BOLO em vez de parcela a` parte. Somado por fora, ele
+        // entra inteiro em todos os lances, incluindo aqueles em que o relogio
+        // ja' nao o comporta; dentro do bolo, e' o rendimento dos lances que
+        // faltam a ser repartido por eles.
+        let mut base = if self.features.tm_horizonte {
+            // O recurso inteiro: o que esta' no relogio, mais os incrementos que
+            // ainda se vao receber dentro do horizonte, menos a sobrecarga de
+            // CADA lance futuro. Descontava-se a sobrecarga uma vez so' e ela
+            // paga-se em todos -- num horizonte de 27 isso e' quase um segundo
+            // de optimismo, e e' o que fica por pagar quando a bandeira cai.
+            (time + inc * mtg.saturating_sub(1))
+                .saturating_sub(self.move_overhead * (2 + mtg))
+                .max(1)
+                / mtg
+        } else if self.features.tm_curva || self.features.tm_relogio {
+            (usable + inc * mtg.saturating_sub(1)) / mtg
         } else {
-            debug_assert!(moves.iter().all(|m| m.is_capture() || m.promotion.is_some()));
-            moves.retain(|m| m.is_capture() || m.promotion == Some(PieceType::Queen));
-            // Poda por SEE: uma captura que perde material na troca completa
-            // (SEE negativo) quase nunca vale a pena dentro da quiescence --
-            // e' exactamente o tipo de "captura mal calculada" que antes
-            // era sempre pesquisada (MVV-LVA nao filtra nada, so' ordena).
-            // Promocoes de dama ficam sempre (mv.to nao e' captura nesse
-            // caso, is_capture()==false, so' entram aqui por causa do
-            // OR acima -- SEE nao se aplica, `is_capture()` protege isso).
-            moves.retain(|m| !m.is_capture() || see::see_ge(self.atk, board, m, 0));
-            // Delta pruning: a capture that CANNOT reach alpha even in
-            // the best case (winning the captured piece outright, a
-            // looser bound than the full SEE exchange) isn't worth
-            // trying at all -- cheaper pre-filter than SEE, applied
-            // after it since SEE already thinned the list. Skipped
-            // near mate scores (a fixed material margin isn't
-            // meaningful there) and for promotions (potential gain is
-            // much larger than a simple capture value suggests).
-            if alpha.abs() < MATE_SCORE - MAX_PLY as i32 {
-                let delta_margin = search_params().delta_margin;
-                moves.retain(|m| {
-                    if m.promotion.is_some() {
-                        return true;
-                    }
-                    let captured_value = if m.flag == MoveFlag::EnPassant {
-                        PieceType::Pawn.value()
-                    } else {
-                        board.piece_at(m.to).map(|(pt, _)| pt.value()).unwrap_or(0)
-                    };
-                    stand_pat + captured_value + delta_margin >= alpha
-                });
+            usable / mtg + inc * self.params.tm_inc_pct as u64 / 100
+        };
+
+        // What the position is worth spending on, by where the game is.
+        //
+        // The opening is played rather than calculated: the answer is either
+        // known or is one of several equally playable moves, and a quarter of
+        // a clock can disappear before the game has started. A simplified
+        // position has less left to find. The middle is where thinking pays,
+        // so that is where the money goes.
+        let ply = (board.fullmove as i32 - 1) * 2 + (side == Color::Black) as i32;
+        let pieces = board.occ_all.count_ones() as i32;
+        let phase = if ply < 12 {
+            self.params.tm_open_pct
+        } else if ply < 24 {
+            self.params.tm_early_pct
+        } else if ply < 45 {
+            self.params.tm_mid_pct
+        } else if ply < 65 {
+            self.params.tm_late_pct
+        } else if pieces <= 10 {
+            self.params.tm_simple_pct
+        } else {
+            100
+        };
+        base = base * phase as u64 / 100;
+
+        // And by the other clock, which is half of the game.
+        //
+        // A comfortable lead on the clock is an asset to spend; being behind on
+        // it is a reason not to, because the opponent can simply keep playing
+        // and let the difference do the work. Overall health rather than the
+        // pace of any one move.
+        if let Some(opp) = opp_time.filter(|t| *t > 0) {
+            let ratio = time * 10 / opp;
+            let pressure = if ratio > 15 {
+                self.params.tm_ahead_pct
+            } else if ratio < 7 {
+                self.params.tm_behind_pct
+            } else {
+                100
+            };
+            base = base * pressure as u64 / 100;
+        }
+
+        // Two ceilings on the wall, and the second is the one that matters.
+        //
+        // Twice the plan lets a critical move think a little longer. Two
+        // fifths of what is left stops that from becoming a way to spend the
+        // clock.
+        let hard = self.aperta_sem_inc(
+            (base * self.params.tm_hard_mult as u64)
+                .min(usable * self.params.tm_hard_pct as u64 / 100),
+            usable,
+            inc,
+        );
+        // A floor under both, so that a clock this low still buys a move that
+        // was looked at rather than one that was guessed. It cannot make the
+        // engine spend what it does not have: the floor is itself capped by
+        // what is actually left.
+        let floor = (self.params.tm_floor_ms as u64).min(usable);
+        // O relogio dele. O tecto acompanha a razao entre os dois -- o lance que
+        // merece seis segundos merece-os a` frente no relogio e nao os pode ter
+        // quando ele tem tres vezes o nosso e simplesmente nos sobrevive. So' o
+        // tecto: a seguranca do nosso relogio nunca depende do dele.
+        let mut hard = hard;
+        let mut piso_dele = 0u64;
+        if self.features.tm_adversario {
+            let dele = match side {
+                Color::White => limits.btime.unwrap_or(0),
+                Color::Black => limits.wtime.unwrap_or(0),
+            };
+            if dele > 0 && time > 0 {
+                // Continua e nao em degraus: em degraus, 1,49x e 1,51x eram
+                // mundos diferentes.
+                let razao = (time * 10 / dele).clamp(3, 25);
+                let ajuste = (10 + (razao as i64 - 10) / 2).clamp(5, 15) as u64;
+                hard = hard * ajuste / 10;
+            }
+            // O ritmo dele, medido: quanto o relogio dele desceu desde o nosso
+            // lance anterior, descontado o incremento que ele ganhou.
+            if self.relogio_dele > 0 && dele > 0 {
+                let inc_dele = match side {
+                    Color::White => limits.binc,
+                    Color::Black => limits.winc,
+                };
+                self.ritmo_dele = (self.relogio_dele + inc_dele).saturating_sub(dele);
+            }
+            self.relogio_dele = dele;
+            // Piso, nao tecto: nao se deixa um adversario lento pensar o dobro
+            // de nos. O tecto duro sobre o NOSSO relogio manda por cima disto.
+            // So' com relogio curto. O limiar e' o NOSSO relogio e nao a
+            // cadencia anunciada: uma partida a 3+2 que chegou aos vinte
+            // segundos esta' em regime de bullet, e e' ai' que isto serve.
+            let curto = time <= self.params.tm_predador_ate_s as u64 * 1000;
+            if self.ritmo_dele > 0 && curto {
+                piso_dele = self.ritmo_dele * self.params.tm_predador_pct as u64 / 100;
             }
         }
-        let moves = self.order_moves(board, moves, None, ply.min(MAX_PLY - 1), None);
 
-        let mut best = if in_check { -MATE_SCORE - 1 } else { alpha };
-        let mut tried = 0;
-        for mv in moves {
-            // Quiescence late move pruning: captures are already ordered
-            // best-SEE-first and filtered to SEE>=0 above, so anything
-            // past the first handful is very unlikely to be the one that
-            // matters -- cap it, same spirit as LMP in the main search.
-            // Never while in check (every legal reply must be tried
-            // there, not just captures) and never near mate scores
-            // (a fixed count isn't meaningful when the game is decided).
-            if !in_check && tried >= search_params().qs_lmp_limit as usize && alpha.abs() < MATE_SCORE - MAX_PLY as i32 {
+        let soft = base.min(hard).max(floor).max(piso_dele.min(hard));
+        let hard = hard.max(soft);
+
+        self.soft = Duration::from_millis(soft.max(1));
+        self.hard = Duration::from_millis(hard.max(1));
+    }
+
+    #[inline]
+    /// O lance com que esperamos que o adversario responda: o segundo da
+    /// variante principal. E' o que o UCI pede no campo `ponder`.
+    pub fn pv_resposta(&self) -> Option<Move> {
+        if self.pv_len[0] > 1 {
+            self.pv[0][1]
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn out_of_time(&mut self) -> bool {
+        if self.stopped {
+            return true;
+        }
+        // Checking the clock is a syscall, so it is not done every node. But
+        // the interval is a floor on how long the search can run without
+        // noticing, and it has to be small enough to fit inside the smallest
+        // allocation we will ever make. At 2048 it was not: a first iteration
+        // in a middle game position is under two thousand nodes, so in real
+        // time trouble the whole of it ran without the clock being read once,
+        // and the engine sailed past a forty millisecond wall by taking a
+        // hundred. At 512 the blind spot is a couple of milliseconds.
+        if self.nodes & 511 == 0
+            && (self.start.elapsed() >= self.hard || self.stop.load(Ordering::Relaxed))
+        {
+            self.stopped = true;
+        }
+        self.stopped
+    }
+
+    /// Would playing this move land straight back on a position already seen?
+    #[inline]
+    fn repeats_at_once(&self, board: &Board, mv: Move) -> bool {
+        let mut b = board.clone();
+        let undo = b.make_move(&mv);
+        let h = b.hash;
+        b.unmake_move(&mv, &undo);
+        self.keys.iter().rev().take(64).any(|k| *k == h)
+    }
+
+    /// Has this position already occurred? One earlier occurrence is enough to
+    /// treat it as drawn inside the search -- waiting for the third makes the
+    /// search miss the repetition it is about to walk into.
+    fn is_repetition(&self, board: &Board) -> bool {
+        let back = (board.halfmove as usize).min(self.keys.len());
+        // Walking back from the top, offset zero is this position, so the
+        // positions with the same side to move are the EVEN offsets: two plies
+        // ago, four, six. Skipping one instead of two sampled the odd ones,
+        // every one of which has the other side to move, and the side to move
+        // is part of the key -- so the test could not match and never did.
+        //
+        // Measured before the fix: three hundred and thirty four thousand
+        // calls across three positions, zero detections. The engine had no
+        // repetition detection at all. It would announce eight pawns of
+        // advantage while playing the move that made a threefold, because for
+        // the search that line was not a draw.
+        self.keys
+            .iter()
+            .rev()
+            .take(back)
+            .skip(2)
+            .step_by(2)
+            .any(|k| *k == board.hash)
+    }
+
+    pub(crate) fn is_draw(&self, board: &Board) -> bool {
+        board.halfmove >= 100 || self.is_repetition(board)
+    }
+
+    /// What a drawn position is worth, seen from the side to move at `ply`.
+    ///
+    /// The value belongs to the root, not to whoever happens to be on the move.
+    /// Returning `-contempt` at every node makes both sides reluctant, and in a
+    /// negamax that is not a preference, it is a contradiction: the root reads
+    /// its own draws as costing `contempt` and the opponent's draws as gaining
+    /// it, so the same drawn position is worth two different things depending
+    /// on the parity of the ply it was found at.
+    ///
+    /// Measured with the old version, at a contempt of twenty over 176 games:
+    /// fifty wins, forty-two draws and eighty-four losses, which is 68 Elo
+    /// worse and the whole interval below zero. The engine was declining draws
+    /// in positions it was losing, which is where it wanted them.
+    ///
+    /// Alternating with the ply is what makes the root read a draw as costing
+    /// `contempt` everywhere.
+    ///
+    /// Getting the sign right did not make the idea pay. Re-measured with the
+    /// alternation in place, at the same contempt of twenty over 183 games:
+    /// fifty-three wins, fifty draws, eighty losses, 52 Elo worse and still the
+    /// whole interval below zero. Better than the 68 it cost with both sides
+    /// reluctant, and still a loss.
+    ///
+    /// It is not that the number is too big. Twenty here is a tenth of a pawn,
+    /// half what the engine this was taken from uses. Whatever half points are
+    /// won by refusing a repetition are being paid for by refusing one that
+    /// should have been taken, and no flat number tells those apart. Scaling it
+    /// by how far ahead the search already thinks it is would, and that is a
+    /// different piece of work.
+    ///
+    /// `ContemptAtento` e' a peca de trabalho que a nota acima deixou por
+    /// fazer. O numero fixo perde porque paga as repeticoes que recusa de
+    /// menos com as que recusa de mais: numa posicao perdida o empate e' o
+    /// melhor resultado que ha' e recusa-lo e' entregar a partida. Escalado
+    /// pelo que a raiz ja' pensa, o desprezo existe onde e' barato -- de igual
+    /// para cima -- e desaparece onde custa a partida inteira.
+    ///
+    /// A rampa vai de zero a meio peao: a menos de meio peao atras nao ha'
+    /// desprezo nenhum, a zero ha'-lo por inteiro, e no meio e' proporcional,
+    /// para nao haver um degrau onde uma pontuacao a oscilar um centipeao muda
+    /// o valor de todos os empates da arvore.
+    #[inline]
+    pub(crate) fn draw_score(&self, ply: usize) -> i32 {
+        let desprezo = if self.features.contempt_atento {
+            const ATRAS: i32 = 50;
+            let r = self.raiz_aval;
+            if r <= -ATRAS {
+                0
+            } else if r < 0 {
+                self.params.contempt * (r + ATRAS) / ATRAS
+            } else {
+                self.params.contempt
+            }
+        } else {
+            self.params.contempt
+        };
+        if ply & 1 == 1 {
+            desprezo
+        } else {
+            -desprezo
+        }
+    }
+
+    pub fn go(&mut self, board: &mut Board, limits: &Limits, info: bool) -> Option<Move> {
+        // O tabuleiro deles parte de onde o nosso parte. Sem isto, os lances
+        // vao para cima de uma posicao por inicializar.
+        if crate::ponte::ligado() {
+            crate::ponte::raiz(&board.to_fen());
+        }
+        // Um lance so' nao se pensa. Medido: 350 ms gastos numa posicao com um
+        // unico lance legal, que a 1+0 e' um terco do orcamento de um lance.
+        if self.features.lance_unico && !limits.infinite {
+            let unicos = crate::movegen::generate_legal(board, &self.atk);
+            if unicos.len() == 1 {
+                let mv = unicos[0];
+                if info {
+                    // A avaliacao DEPOIS do lance forcado, negada -- e nao a de
+                    // antes.
+                    //
+                    // A de antes esta' sistematicamente errada e sempre no mesmo
+                    // sentido: um lance e' forcado tipicamente porque estamos em
+                    // xeque, e nessa posicao ainda nao recapturamos. Medido numa
+                    // recaptura forcada: a estatica de antes dava -452, a busca
+                    // dava +866. Mil trezentos e dezoito centipeoes de erro.
+                    //
+                    // Isso nao seria grave se ninguem lesse o numero, mas a
+                    // ponte do Lichess le'-o para decidir desistir e para
+                    // aceitar empates. Uma manete que so' devia poupar relogio
+                    // podia entregar partidas ganhas.
+                    //
+                    // Um make/unmake e uma avaliacao contra os 350 ms que a
+                    // manete poupa: nao se sente.
+                    let undo = board.make_move(&mv);
+                    crate::ponte::lance(&mv);
+                    let e = -evaluate(board, self.features.rule50_fade);
+                    board.unmake_move(&mv, &undo);
+                    crate::ponte::desfaz(&mv);
+                    println!(
+                        "info depth 1 seldepth 1 score cp {} nodes 1 nps 0 time 0 pv {}",
+                        e / 2,
+                        mv.to_uci()
+                    );
+                }
+                return Some(mv);
+            }
+        }
+
+        // If the tables have settled this position there is nothing to search
+        // for. They know who wins and in how many moves, and the move they give
+        // is the one that makes progress against the fifty move rule -- which a
+        // search maximising a score will not choose, because every move that
+        // keeps the win looks equally winning to it.
+        if !limits.infinite && limits.depth.is_none() {
+            if let Some((mv, wdl)) = crate::tb::melhor_jogada_raiz(board, &self.atk) {
+                if info {
+                    let cp = match wdl {
+                        crate::tb::Wdl::Ganha => MATE_IN_MAX - 1,
+                        crate::tb::Wdl::Perde => -(MATE_IN_MAX - 1),
+                        crate::tb::Wdl::Empata => 0,
+                    };
+                    println!(
+                        "info depth 1 seldepth 1 score cp {} nodes 1 nps 0 tbhits 1 time 0 pv {}",
+                        cp,
+                        mv.to_uci()
+                    );
+                }
+                return Some(mv);
+            }
+        }
+
+        self.allocate(limits, board);
+        self.nodes = 0;
+        self.tb_hits = 0;
+        self.stopped = false;
+        self.stop.store(false, Ordering::Relaxed);
+        self.tt.increase_gen();
+        self.keys.truncate(self.root_keys);
+
+        let max_depth = limits.depth.unwrap_or(MAX_PLY as u32 - 2).min(MAX_PLY as u32 - 2);
+
+        let mut best: Option<Move> = None;
+        let mut best_score = 0;
+
+        // Time management state that only makes sense across iterations.
+        let mut last_best: Option<Move> = None;
+        let mut best_move_changes = 0i32;
+        let mut iters_since_change = 0i32;
+        let mut average_score = 0i32;
+        // Consecutive iterations whose score stayed near that average.
+        // Capped: past four the position has settled and counting further
+        // says nothing more.
+        let mut eval_steady = 0u32;
+        let base_soft = self.soft;
+
+        // A nota da raiz ALISADA, para o optimism. Nao se usa a ultima: ela
+        // salta entre iteracoes e o optimism saltava com ela. Media simples com
+        // a anterior, que e' o que a referencia faz.
+        let mut media_raiz: Option<i32> = None;
+        // A ultima profundidade que este fio COMPLETOU, para pesar os votos.
+        let mut ultima_prof: u32 = 0;
+
+        // OS AJUDANTES. Com `threads == 1` nada disto acontece e o caminho
+        // fica byte a byte o que era -- e' a porta de entrada desta alteracao.
+        let mut fios = Vec::new();
+        if self.threads > 1 {
+            for _ in 1..self.threads {
+                let mut a = self.ajudante();
+                a.set_game_history(self.keys.clone());
+                let mut tab = board.clone();
+                let prof = max_depth;
+                // PILHA GRANDE, e nao a de omissao.
+                //
+                // O `Searcher` leva dentro de si a tabela de PV
+                // (`[[Option<Move>; MAX_PLY]; MAX_PLY]`), o butterfly e os
+                // killers -- sao centenas de kilobytes que viajam com o
+                // objecto para a pilha do fio novo. Com os 2 MB por omissao o
+                // fio nascia e nao voltava, e o motor ficava pendurado no `go`
+                // sem panico nenhum e sem uma linha de `info`. Nao e' margem a
+                // mais: e' o tamanho do que la' vai.
+                fios.push(
+                    std::thread::Builder::new()
+                        .stack_size(32 * 1024 * 1024)
+                        .spawn(move || a.corre_ajudante(&mut tab, prof))
+                        .expect("nao consegui lancar o fio ajudante"),
+                );
+            }
+        }
+
+        for depth in 1..=max_depth {
+            let iter_start = self.start.elapsed();
+            self.root_effort.clear();
+            self.root_scores.clear();
+            let score = self.aspiration(board, depth as i32, best_score);
+            if !self.stopped {
+                ultima_prof = depth;
+            }
+            if self.features.otimismo {
+                let m = match media_raiz {
+                    None => score,
+                    Some(a) => (score + a) / 2,
+                };
+                media_raiz = Some(m);
+                // `otimismo = F * media / (|media| + 85)`, como na referencia.
+                let o = self.params.otimismo_f * m / (m.abs() + 85);
+                crate::ponte::otimismo(o);
+            }
+
+            // An aborted iteration has searched only part of the move list, so
+            // its best move is not the best move -- it is whatever happened to
+            // come first. Keep the previous depth.
+            if self.stopped && depth > 1 {
                 break;
             }
-            // History pruning inside quiescence. The move list here is
-            // already filtered to captures that do not lose material, but
-            // "does not lose material on this square" and "is worth
-            // searching" are different questions, and the history tables
-            // have an answer to the second one that SEE cannot give. A move
-            // the tables have watched fail everywhere it has been tried is
-            // not made promising by winning an exchange.
+
+            best_score = score;
+            self.raiz_aval = score;
+            if self.pv_len[0] > 0 {
+                best = self.pv[0][0];
+            }
+
+            // Decline a repetition when something else is nearly as good.
             //
-            // Not while in check, where every reply must be tried, and not
-            // once the score is already in mate territory, where a fixed
-            // history threshold means nothing.
-            if !in_check
-                && best > -MATE_SCORE + MAX_PLY as i32
-                && alpha.abs() < MATE_SCORE - MAX_PLY as i32
-            {
-                let h = if mv.is_capture() {
-                    match (board.piece_at(mv.from), board.piece_at(mv.to)) {
-                        (Some((moving, _)), Some((captured, _))) => {
-                            self.capture_history[board.side.idx()][moving.idx()][captured.idx()]
-                        }
-                        _ => 0,
-                    }
-                } else {
-                    let ch = match board.piece_at(mv.from) {
-                        Some((pt, _)) => self.cont_hist_score(pt, mv.to, ply),
-                        None => 0,
-                    };
-                    self.history_scores[board.side.idx()][mv.from as usize][mv.to as usize] + ch
-                };
-                if h < -search_params().qs_hist_prune_margin {
-                    continue;
-                }
-            }
-            tried += 1;
-            let undo = board.make_move(&mv);
-            let score = -self.quiescence(board, -beta, -alpha, ply + 1);
-            board.unmake_move(&mv, &undo);
-            if self.stop {
-                return if in_check { best.max(alpha) } else { alpha };
-            }
-            if score > best {
-                best = score;
-            }
-            if score >= beta {
-                return beta;
-            }
-            if score > alpha {
-                alpha = score;
-            }
-        }
-        if in_check {
-            best
-        } else {
-            alpha
-        }
-    }
-
-    /// `reached_by_null`: was the move that led to THIS node a null
-    /// move (see NMP block below)? 2026-07-22: needed for the
-    /// double-null-move guard (`plies_from_null > 0`) -- consecutive
-    /// null moves in the same line are unsound (can "prove" a fail-high
-    /// via two passes that wouldn't survive a single one) and the
-    /// aggressive eval-adaptive NMP reduction genuinely relies on this
-    /// guard for safety; using the reduction formula without it caused a
-    /// severe regression (A/B: 6.7% vs a pre-change baseline) -- ~93% of
-    /// games lost, not a small/noisy signal, a real missing safety net.
-    fn negamax(
-        &mut self,
-        board: &mut Board,
-        depth: i32,
-        mut alpha: i32,
-        beta: i32,
-        ply: usize,
-        reached_by_null: bool,
-        cutnode: bool,
-    ) -> i32 {
-        self.nodes += 1;
-        if depth <= 6 {
-            self.nodes_shallow += 1;
-        }
-        if self.time_up() {
-            return 0;
-        }
-        // Ply upper bound (found in review, 2026-07-21): check
-        // extensions don't decrease depth (`depth - 1 + 1` when
-        // in_check), so an unbroken chain of in-check plies never
-        // shrinks `depth` to <=0 on its own -- ply keeps climbing on
-        // every recursive call with nothing else to stop it. Extremely
-        // unlikely in a real game (needs ~126+ consecutive checks
-        // unbroken), but static_evals[ply-2] a few lines below is an
-        // unguarded array read once ply passes MAX_PLY, so this would
-        // panic (an instant loss mid-game) rather than fail safely.
-        // quiescence_from() already has the equivalent guard; negamax
-        // didn't.
-        if ply >= MAX_PLY - 1 {
-            return crate::evaluation::amortece_rule50(
-                crate::evaluation::evaluate_fast(board),
-                board.halfmove,
-            );
-        }
-
-        let mut beta = beta;
-
-        let hash = board.hash;
-        if ply > 0 && self.is_repetition_or_fifty(board, hash) {
-            return self.valor_empate(board);
-        }
-
-        // Mate distance pruning: se um mate mais curto do que o melhor
-        // possivel a este ply ja' esta' garantido/impossivel de bater,
-        // aperta a janela -- corte trivial e sempre correcto (nao
-        // interfere com scores normais, so' com scores de mate).
-        let mating_value = MATE_SCORE - ply as i32;
-        if mating_value < beta {
-            beta = mating_value;
-            if alpha >= mating_value {
-                return mating_value;
-            }
-        }
-        let mated_value = -MATE_SCORE + ply as i32;
-        if mated_value > alpha {
-            alpha = mated_value;
-            if beta <= mated_value {
-                return mated_value;
-            }
-        }
-
-        // Singular extensions: se estamos numa re-pesquisa singular
-        // (excluded_move definido), ignorar TT probe/store por completo
-        // -- a busca a janela restrita nao deve devolver cedo por TT
-        // nem poluir a TT com scores enviesados por excluir um lance.
-        let excluded = self.excluded_move;
-
-        let orig_alpha = alpha;
-        let mut subidas_alpha: i32 = 0;
-        let mut tt_move = None;
-        // Standard PVS convention: a null/scout window (beta == alpha+1)
-        // means this is not a PV node. Used below for the extended TT
-        // cutoff.
-        let is_pv = beta - alpha > 1;
-        // Propagate the double-extension count from the PARENT ply
-        // unconditionally, every time this ply is visited -- not just
-        // when a double extension is actually granted (bug found by
-        // review 2026-07-22: `dextensions[ply]` was only ever WRITTEN
-        // inside the double-extension branch below, so on every other
-        // path through this ply -- normal/negative extension, multicut,
-        // depth<8, no tt_move -- the slot kept whatever a PREVIOUS,
-        // unrelated visit to this same ply left there during the DFS
-        // -- sibling/cousin branches, not this line's real ancestor.
-        // `ply` alone doesn't identify a line, only depth-in-tree, so
-        // without this unconditional propagation the counter is a
-        // shared watermark across unrelated branches instead of a
-        // per-line counter, defeating the whole point of the cap).
-        if ply > 0 {
-            self.dextensions[ply] = self.dextensions[ply - 1];
-        }
-        let mut tt_entry_captured: Option<crate::tt::TtEntry> = None;
-        if excluded.is_none() { if let Some(e) = self.tt.probe(hash) {
-            tt_entry_captured = Some(e);
-            tt_move = e.best;
-            // score_from_tt(): converte o score guardado (relativo ao
-            // no' onde foi escrito) para a escala deste no' -- ver nota
-            // grande junto de score_to_tt/score_from_tt.
-            let tt_score = score_from_tt(e.score, ply as i32);
-            // MultiPV: a stored root entry can point at (or bound around)
-            // a move we're deliberately excluding for this line -- skip
-            // every TT-based shortcut/adjustment at the root while an
-            // exclusion list is active, so the real move loop below
-            // (which already filters excluded_root_moves) is always
-            // reached instead of returning a cached result that ignores
-            // the exclusion.
-            let multipv_guard = ply == 0 && !self.excluded_root_moves.is_empty();
-            if e.depth >= depth && !multipv_guard {
-                match e.bound {
-                    Bound::Exact => {
-                        // 2026-07-20 (BUG REAL corrigido -- achado por
-                        // instrumentacao directa num jogo real onde o
-                        // motor jogou o "primeiro lance legal gerado" em
-                        // vez do lance realmente escolhido pela busca,
-                        // numa posicao completamente ganha): quando a TT
-                        // ja tem um bound Exact suficiente para a raiz
-                        // (ply==0), esta funcao retorna aqui SEM NUNCA
-                        // passar pelo loop de lances mais abaixo -- que e'
-                        // o unico sitio onde `self.root_best` era
-                        // definido. Em jogos longos (TT acumulada ao
-                        // longo de muitos `go`), isto podia fazer VARIAS
-                        // iteracoes da iterative deepening (todas com
-                        // `e.depth` >= profundidade pedida) devolverem
-                        // sem NUNCA definir root_best, deixando toda a
-                        // decisao do lance final refem da ULTIMA
-                        // iteracao -- e se essa tambem fosse interrompida
-                        // a meio (ver bug irmao em iterative_deepening()),
-                        // `root_best` ficava None e o motor caia no
-                        // fallback "primeiro lance legal", ignorando
-                        // completamente o que a busca sabia.
-                        if ply == 0 {
-                            if let Some(tm) = tt_move {
-                                self.root_best = Some(tm);
-                            }
-                        }
-                        return tt_score;
-                    }
-                    Bound::Lower => {
-                        if tt_score > alpha {
-                            alpha = tt_score;
-                        }
-                    }
-                    // 2026-07-20 (BUG REAL corrigido -- ver nota grande
-                    // acima do ScoreFromTT): faltava apertar "beta" aqui
-                    // -- o ramo "Upper" real de um alfa-beta com TT
-                    // sempre aperta o limite CONTRARIO ao que "Lower"
-                    // aperta (Lower sobe alpha, Upper desce beta), para
-                    // o corte combinado "alpha>=beta" logo a seguir
-                    // conseguir mesmo cortar quando aplicavel. O corpo
-                    // vazio anterior fazia este ramo nunca contribuir
-                    // para nenhum corte.
-                    Bound::Upper => {
-                        if tt_score < beta {
-                            beta = tt_score;
-                        }
-                    }
-                }
-                if alpha >= beta {
-                    if ply == 0 {
-                        if let Some(tm) = tt_move {
-                            self.root_best = Some(tm);
-                        }
-                    }
-                    return tt_score;
-                }
-            } else if !is_pv
-                && ply > 0
-                && e.depth == depth - 1
-                && e.bound == Bound::Upper
-                && tt_score + search_params().tt_extended_cutoff_margin <= alpha
-            {
-                // Extended TT cutoff: a same-position entry exactly ONE
-                // depth short of what's needed still short-circuits the
-                // search if it already looked like a clear fail-low --
-                // the entry says "this position tops out at tt_score or
-                // below" one ply shallower, and tt_score is already well
-                // under alpha even with a safety margin. A full re-search
-                // at the requested depth would almost certainly just
-                // confirm the same fail-low, so accept it now instead of
-                // paying for the confirmation. Never at PV nodes (those
-                // need the real answer, not a probable one).
-                return alpha;
-            }
-        }}
-
-        if depth <= 0 {
-            // Ponto de entrada na quiescence: usa a avaliacao COMPLETA
-            // (com os termos "Polgar") uma unica vez aqui, como stand-pat
-            // inicial -- e' aqui que a riqueza posicional realmente
-            // influencia a busca. Dentro da propria quiescence (resolucao
-            // de capturas, que pode ter varios nos), usa-se a versao
-            // rapida (ver quiescence()) para nao pagar o custo repetido.
-            // Mesma reutilizacao que o caminho de profundidade > 0 faz dez
-            // linhas abaixo: se a TT ja' tem a avaliacao completa desta
-            // posicao, calcula-la outra vez e' repetir trabalho identico.
-            // Aqui pesa mais do que la', porque a entrada da quiescencia e'
-            // onde esta' a maioria dos nos.
-            let raw_full_stand_pat = match tt_entry_captured
-                .filter(|e| e.static_eval != crate::tt::TT_EVAL_NONE)
-            {
-                Some(e) => {
-                    crate::nnue_sf::garante_camada(self.atk, board);
-                    e.static_eval as i32
-                }
-                None => evaluate(board),
-            };
-            // Scaled at THIS node's halfmove, whether the raw value came
-            // fresh or from a TT entry stored at some other node's halfmove
-            // -- see `evaluation::amortece_rule50`.
-            let full_stand_pat = crate::evaluation::amortece_rule50(raw_full_stand_pat, board.halfmove);
-            return self.quiescence_from(board, alpha, beta, ply, full_stand_pat);
-        }
-
-        let in_check = board.in_check(board.side, self.atk);
-
-        // Static eval computed once at each node (except while in check,
-        // where it is meaningless); cached in `static_evals[ply]` so
-        // the `improving` heuristic below can compare against 2 plies
-        // back. Slight cost but pays off multiple times per node.
-        //
-        // Cached in the TT too: a TT hit on this position already has
-        // the full eval computed by whichever earlier visit stored it,
-        // so reuse it instead of paying for
-        // `evaluate()` again -- this is what makes switching static
-        // eval from evaluate_fast to the full evaluate() affordable.
-        // Only the raw (uncorrected) eval is cached; corr-hist is
-        // applied fresh below every time since it can change between
-        // visits even for the same board.
-        let raw_static_eval = if in_check {
-            // Sem avaliacao, mas o acumulador tem de continuar a seguir o
-            // caminho -- senao os filhos deste no' ficam sem pai. Ver
-            // `nnue_sf::garante_camada`.
-            crate::nnue_sf::garante_camada(self.atk, board);
-            0
-        } else if let Some(e) = tt_entry_captured.filter(|e| e.static_eval != crate::tt::TT_EVAL_NONE) {
-            crate::nnue_sf::garante_camada(self.atk, board);
-            e.static_eval as i32
-        } else {
-            crate::evaluation::evaluate(board)
-        };
-        // Halfmove-scaled before correction (see `evaluation::amortece_rule50`
-        // for why this has to happen here and not inside `evaluate()`
-        // itself): `raw_static_eval` above may have come from a TT entry
-        // stored at a different node's halfmove, so the scale is applied
-        // fresh against THIS node's clock rather than baked into the cached
-        // value.
-        //
-        // Corrected version (see corr_hist) used for pruning-margin
-        // decisions below; the raw (unscaled, uncorrected) value is what
-        // improving/static_evals track, since correction is a slow-moving
-        // average and mixing it -- or the halfmove shrink -- into the
-        // improving comparison would blur a signal that's meant to be about
-        // THIS node's fast eval trend, not the learned bias or the clock.
-        let static_eval = if in_check {
-            0
-        } else {
-            let amortecido = crate::evaluation::amortece_rule50(raw_static_eval, board.halfmove);
-            self.corrected_static_eval(board, amortecido)
-        };
-        if ply < MAX_PLY {
-            self.static_evals[ply] = raw_static_eval;
-        }
-        // `improving`: at a same-side ply, are we better than 2 plies
-        // ago (last time we moved)? If so, position is trending our
-        // way -- afford tighter pruning; if not, we're stagnant/worse,
-        // be more careful. Standard heuristic in every strong engine.
-        let improving = !in_check
-            && ply >= 2
-            && raw_static_eval > self.static_evals[ply - 2];
-
-        // Reverse futility pruning -- the quadratic curve that measured a
-        // real win (+46 Elo, see the note this replaced), now with three
-        // contextual nudges added back on top of THAT curve rather than a
-        // different one.
-        //
-        // 2026-08-03: many strong engines modulate this margin by roughly
-        // this trio -- an opponent capture in the air, an opponent trend,
-        // continuation history -- and that is real evidence the idea earns
-        // its keep, not just that one engine happened to like it. The
-        // earlier attempt to test it here was not a fair test of the idea:
-        // it mixed a reference's base slope with THIS engine's old
-        // modulator constants (34/26/615), values nobody had tuned for that
-        // base, and lost. This time the modulators are reasoned from what
-        // this engine's own history actually produces (`hist_bonus_max` =
-        // 2121, `hist_malus_max` = -992), not copied from any reference:
-        // divisor 150 caps the history nudge around +/-14 at the extremes,
-        // small next to a depth-1 base of 65; the easy-capture bonus (15)
-        // and the worsening discount (12) are each roughly a fifth of that
-        // same base -- present, not dominant. A hypothesis with its own
-        // reasoning behind the numbers, to be measured on its own result.
-        if !is_pv
-            && !in_check
-            && ply > 0
-            && depth <= search_params().rfp_max_depth
-            && (search_params().rfp_skip_ttpv == 0
-                || !tt_entry_captured.map(|e| e.pv).unwrap_or(false))
-            && beta.abs() < MATE_SCORE - MAX_PLY as i32
-        {
-            let sp = search_params();
-            let mut margin = sp.rfp_step * depth * depth / 2 - sp.rfp_step * depth / 2 + sp.rfp_base * depth;
-
-            // The opponent has a piece of ours attacked by a cheaper piece.
-            // Material is about to change hands and the static evaluation
-            // says nothing about it, so raise the bar for skipping.
-            if self.opponent_has_winning_threat(board) {
-                margin += sp.rfp_opp_easy_capture * depth;
-            }
-
-            // The opponent's position got worse over the last ply. Someone
-            // losing ground is less likely to have a refutation waiting.
-            if ply > 0 && self.static_evals[ply - 1] != 0
-                && raw_static_eval > -self.static_evals[ply - 1] + 1
-            {
-                margin -= sp.rfp_opp_worsening;
-            }
-
-            // The move that led here had a good history score.
-            if let Some((pt, to)) = self.ply_last_move[ply] {
-                let prev_hist = self.cont_hist_score(pt, to, ply);
-                margin += prev_hist / sp.rfp_hist_divisor.max(1);
-            }
-
-            // Quanto menos fiavel for a eval estatica aqui, maior a barra para
-            // a dispensar. Ver `rfp_corr_divisor` e `corr_magnitude`.
-            if sp.rfp_corr_divisor > 0 {
-                margin += self.corr_magnitude(board, raw_static_eval) / sp.rfp_corr_divisor;
-            }
-
-            let margin = (margin.max(20) * eval_margin_scale()) / 100;
-            if static_eval - margin >= beta {
-                self.cut_rfp += 1;
-                // O valor devolvido nao tem de ser o mais optimista compativel
-                // com o corte. `static_eval - margem` assume a estimativa
-                // estatica certa; `beta` e' o que o corte PROVA. Misturar os
-                // dois devolve menos ficcao a` arvore sem mudar quando cortamos.
-                // Ver `rfp_return_beta` (0 = comportamento antigo).
-                let w = search_params().rfp_return_beta.clamp(0, 1024);
-                let val = static_eval - margin;
-                return if w == 0 { val } else { (beta * w + val * (1024 - w)) / 1024 };
-            }
-        }
-        // Null-move pruning: se mesmo passando a vez ao adversario ainda
-        // ficamos >= beta numa busca reduzida, a posicao e' tao boa que
-        // podemos cortar ja'. Condicoes de seguranca:
-        //  - nao em xeque (passar a vez em xeque e' ilegal/absurdo)
-        //  - profundidade suficiente para a busca reduzida ter significado
-        //  - lado a jogar tem pelo menos uma peca maior que peao (evita
-        //    zugzwang, tipico de finais de peoes)
-        //  - beta longe de scores de mate (nao mascarar mates)
-        //  - nunca na raiz (ply > 0), para root_best ser sempre definido
-        //
-        // 2026-07-22: reducao "R" agora e' eval-adaptive, nao o antigo
-        // `depth>6?3:2` fixo que ignorava completamente a avaliacao
-        // estatica -- mecanismo genuinamente mais informado (quanto
-        // mais a posicao excede beta, mais funda a reducao), nao so'
-        // constantes recalibradas. A reducao usa `static_eval`, o valor
-        // corrigido; os dois gates usam valores diferentes, e a razao
-        // esta' explicada onde eles estao.
-        // 2026-07-23: tentei uma busca de verificacao completa (R sem
-        // cap + `nmp_min_ply` + re-busca real quando depth>15 e beta e'
-        // quase decisivo) -- A/B isolado (300 jogos) deu 41.5%,
-        // negativo e claro. Revertido para esta versao (formula do R,
-        // `.max(1)` simples, sem cap artificial nem busca de
-        // verificacao) -- e' a versao que já
-        // tinha validado 50/50 (neutro) contra o estado anterior
-        // (R fixo=4 por bug), que por sua vez já era +57.5% sobre o
-        // baseline pre-NMP. Ver NOTAS_PROXIMA_SESSAO para o historico
-        // completo.
-        let sp_nmp = search_params();
-        // Whole-node pruning belongs OUTSIDE the principal variation.
-        // RFP, razoring, ProbCut and the null move all decide a node without
-        // searching it properly, which is a trade the principal variation
-        // cannot make: a wrong cut there does not lose a side branch, it
-        // corrupts the line the engine is going to play and sends the search
-        // back to redo it. Measured before this guard existed, the null move
-        // was attempted in PV nodes and failed 100% of the time.
-        if !is_pv
-            && depth >= sp_nmp.nmp_min_depth
-            && !in_check
-            && ply > 0
-            && (ply as i32) >= self.nmp_min_ply
-            && !reached_by_null
-            && excluded.is_none()
-            && beta.abs() < MATE_SCORE - MAX_PLY as i32
-            && self.has_non_pawn_material(board)
-            // The two gates deliberately read different evaluations. The
-            // narrow one (margin ~29) is the fine judgement of whether this
-            // node is comfortably above beta, and it wants the CORRECTED
-            // eval, which is what the search actually believes. The wide one
-            // (margin ~193, relaxing with depth) is a floor: it exists to stop
-            // us handing away a move in a position that only looks good
-            // because correction history says so, and a floor built on the
-            // corrected value cannot do that job. A 2026-07-23 review saw the
-            // raw value here, read it as a copy-paste slip, and made both
-            // gates corrected. It was not a slip.
-            && static_eval >= beta + (sp_nmp.nmp_eval_margin * eval_margin_scale()) / 100
-            && raw_static_eval
-                >= beta
-                    + (sp_nmp.nmp_static_eval_base_margin * eval_margin_scale()) / 100
-                    - sp_nmp.nmp_static_eval_depth_margin * depth
-        {
-            let r = ((sp_nmp.nmp_base_reduction + depth * sp_nmp.nmp_depth_reduction_scale) / 256
-                + ((static_eval - beta) / sp_nmp.nmp_eval_reduction_scale).min(sp_nmp.nmp_max_eval_reduction))
-                .max(1);
-            self.nmp_tried += 1;
-            if is_pv {
-                self.nmp_tried_pv += 1;
-            }
-            let undo = board.make_null_move();
-            let score = -self.negamax(board, depth - r, -beta, -beta + 1, ply + 1, true, !cutnode);
-            board.unmake_null_move(&undo);
-            if self.stop {
-                return 0;
-            }
-            if score < beta {
-                self.nmp_failed_low += 1;
-                if is_pv {
-                    self.nmp_failed_pv += 1;
-                }
-            }
-            if score >= beta {
-                self.nmp_cutoff_raw += 1;
-                // Verification, where skipping a move is not safe to trust.
-                //
-                // The null move assumes there is always something useful to
-                // do. In zugzwang there is not, and the deeper the search and
-                // the closer beta is to decisive, the more a wrong cut costs.
-                // Below that, and inside a verification already running, the
-                // cut is taken as before.
-                //
-                // The verification is a real search of the same reduced
-                // depth, in a null window at beta, with the null move
-                // disabled beneath it -- otherwise it would verify itself by
-                // skipping a move again, which is what it exists to check.
-                //
-                // This engine had this, measured 41.5% in one 300-game A/B,
-                // and removed it. That is a mechanism every strong engine
-                // carries, deleted on a single measurement of one integration
-                // of it.
-                if (depth <= 15 && beta.abs() < MATE_SCORE - MAX_PLY as i32) || self.nmp_min_ply > 0 {
-                    self.nmp_cut_taken += 1;
-                    return beta;
-                }
-                self.nmp_verify_tried += 1;
-                let saved = self.nmp_min_ply;
-                self.nmp_min_ply = ply as i32 + (depth - r) * 3 / 4;
-                let verify = self.negamax(board, depth - r, beta - 1, beta, ply, false, true);
-                self.nmp_min_ply = saved;
-                if self.stop {
-                    return 0;
-                }
-                if verify >= beta {
-                    self.nmp_verify_ok += 1;
-                    return verify;
-                }
-                self.nmp_verify_failed += 1;
-            }
-        }
-
-        // Razoring: a profundidade muito baixa, se a avaliacao estatica
-        // mais uma margem generosa ainda fica abaixo de alfa, e' muito
-        // improvavel que exista um lance tranquilo que recupere a
-        // diferenca -- verifica-se com uma chamada real a quiescence
-        // (nao um corte cego) e so' se aceita o resultado se confirmar
-        // o fail-low, para nunca perder uma tactica real.
-        if !is_pv && !in_check && ply > 0 && depth <= 3 {
-            let sp = search_params();
-            let margin = ((sp.razor_base + sp.razor_per_depth * (depth - 1)) * eval_margin_scale()) / 100;
-            if static_eval + margin <= alpha {
-                // `raw_static_eval` already IS `evaluate(board)` here (we are
-                // under `!in_check`, so it was computed as the full eval on
-                // entry, or reused from the TT's cached full eval of THIS same
-                // position). Recomputing it would just repeat the now-expensive
-                // full eval for an identical value -- reuse it instead. Exact:
-                // node counts are unchanged, only the redundant eval is saved.
-                let full_stand_pat = raw_static_eval;
-                let q = self.quiescence_from(board, alpha, beta, ply, full_stand_pat);
-                if q <= alpha {
-                    self.cut_razor += 1;
-                    return q;
-                }
-            }
-        }
-
-        // Internal Iterative Reduction (IIR): if there is no TT move at
-        // a node that would otherwise search deep, drop the depth by 1
-        // instead of running a full nested IID search (which costs a
-        // sub-tree). The idea: without a TT hint the move ordering is
-        // weaker, so an extra ply won't help much anyway -- better to
-        // spend the time on the fully-ordered later iterations. Cheap
-        // to implement, well-tested pattern.
-        let mut depth = depth;
-        if tt_move.is_none() && depth >= 4 && !in_check {
-            depth -= 1;
-        }
-
-        let mut moves = generate_legal(board, self.atk);
-        if moves.is_empty() {
-            return if in_check { -MATE_SCORE + ply as i32 } else { 0 };
-        }
-        // MultiPV support (simple exclusion method): at the root only,
-        // drop moves already reported by a previous MultiPV line so the
-        // next call finds the next-best line instead of repeating the
-        // same move. No effect on normal single-PV search (the list is
-        // empty then).
-        if ply == 0 && !self.excluded_root_moves.is_empty() {
-            moves.retain(|m| !self.excluded_root_moves.contains(m));
-            if moves.is_empty() {
-                return if in_check { -MATE_SCORE + ply as i32 } else { 0 };
-            }
-        }
-
-        // ProbCut: at reasonable depth, a capture that already beats a
-        // margin ABOVE the real beta in a cheap verification search is
-        // very likely to also beat the real beta with a full search --
-        // cut immediately instead of paying for it. Guards: not in
-        // check, not root (ply > 0, keeps root_best always defined),
-        // not during a singular re-search (keeps TT semantics simple),
-        // far from mate scores (never risk masking a real mate). The
-        // `depth >= 5` floor and the margin below (was a hardcoded 150)
-        // are the tuned parameters for this check.
-        if !is_pv
-            && depth >= 5
-            && ply > 0
-            && !in_check
-            && excluded.is_none()
-            && beta.abs() < MATE_SCORE - MAX_PLY as i32
-        {
-            let prob_beta = beta + search_params().probcut_beta_margin;
-            if prob_beta < MATE_SCORE - MAX_PLY as i32 {
-                for mv in &moves {
-                    if !mv.is_capture() && mv.promotion.is_none() {
-                        continue;
-                    }
-                    // SEE pre-filter: skip captures whose max plausible
-                    // gain can't reach prob_beta from here anyway.
-                    if !see::see_ge(self.atk, board, mv, prob_beta - static_eval) {
-                        continue;
-                    }
-                    let undo = board.make_move(mv);
-                    if ply + 1 < MAX_PLY {
-                        if let Some((moved_pt, _)) = board.piece_at(mv.to) {
-                            self.ply_last_move[ply + 1] = Some((moved_pt, mv.to));
-                        }
-                    }
-                    // Cheap verification at depth 1, then a real (but
-                    // reduced) search only if the quick probe holds up.
-                    let mut score = -self.negamax(board, 1, -prob_beta, -prob_beta + 1, ply + 1, false, !cutnode);
-                    if score >= prob_beta && !self.stop {
-                        score = -self.negamax(board, depth - 4, -prob_beta, -prob_beta + 1, ply + 1, false, !cutnode);
-                    }
-                    board.unmake_move(mv, &undo);
-                    if self.stop {
-                        return 0;
-                    }
-                    if score >= prob_beta {
-                        return score;
-                    }
-                }
-            }
-        }
-
-        // Singular extensions: se o tt_move parece dominante (a TT diz "este
-        // e' bom o suficiente" com bound Lower ou Exact e depth similar
-        // a esta), testar se e' MESMO singular fazendo uma re-pesquisa
-        // reduzida a excluir esse lance, numa janela restrita a volta
-        // de `tt.score - m*depth`. Se nenhum outro lance chega la, e'
-        // singular: estende +1 quando for a vez dele no picker.
-        // Multi-cut: se um lance de reserva bate `beta` ate' na janela
-        // restrita, corte seguro imediato.
-        //
-        // Aplicado a depth >= 8, fora da raiz, fora de re-pesquisa
-        // singular, TT entry suficientemente fiavel.
-        //
-        // Nota: revertido uma vez a meio da sessao 2026-07-20 por causa
-        // de A/B self-play de 30 jogos ter dado 50% -- decisao errada,
-        // essa amostra nao tem resolucao para +Elo real e o padrao vem
-        // do #1 em HCE puro. Restaurado. Ver
-        // feedback_kestrel_nao_reverter_por_self_play_pequeno.
-        let mut se_candidate: Option<Move> = None;
-        let mut se_extension: i32 = 0;
-        if excluded.is_none() && ply > 0 && depth >= 8 {
-            if let (Some(tm), Some(te)) = (tt_move, tt_entry_captured) {
-                let tt_score = score_from_tt(te.score, ply as i32);
-                if te.depth >= depth - 3
-                    && te.bound != Bound::Upper
-                    && tt_score.abs() < MATE_THRESHOLD
-                {
-                    let s_beta = (tt_score - 2 * depth).max(-MATE_SCORE + 1);
-                    let s_depth = (depth - 1) / 2;
-                    self.excluded_move = Some(tm);
-                    let s_score = self.negamax(board, s_depth, s_beta - 1, s_beta, ply, reached_by_null, cutnode);
-                    self.excluded_move = None;
-                    if self.stop {
-                        return 0;
-                    }
-                    // Double extension: not just singular but
-                    // singular by a WIDE margin (DOUBLE_EXT_MARGIN extra)
-                    // -- extend 2 plies instead of 1. Capped via
-                    // `dextensions` (read from the PARENT ply) so a run
-                    // of double extensions along one line can't explode
-                    // the tree; falls back to a normal +1 singular
-                    // extension once the cap is hit.
-                    let parent_dext = self.dextensions[ply.saturating_sub(1)];
-                    if s_score < s_beta - DOUBLE_EXT_MARGIN && !is_pv && parent_dext <= DOUBLE_EXT_MAX {
-                        se_candidate = Some(tm);
-                        // Third ply for a QUIET move that is singular by an
-                        // even wider margin. The restriction to quiets is the
-                        // whole point: a capture can be singular simply
-                        // because it is the only way to recapture, which says
-                        // nothing about the line being forced. A quiet move
-                        // that no alternative comes close to matching is one
-                        // the position genuinely compels, and those are worth
-                        // following further than anything else on the board.
-                        se_extension =
-                            if !tm.is_capture() && s_score < s_beta - search_params().triple_ext_margin {
-                                3
-                            } else {
-                                2
-                            };
-                        self.dextensions[ply] = parent_dext + 1;
-                    } else if s_score < s_beta {
-                        se_candidate = Some(tm);
-                        se_extension = 1;
-                    } else if s_beta >= beta {
-                        return s_beta;
-                    } else if tt_score >= beta {
-                        // Negative extension: the tt_move already looked
-                        // like it beats beta at the CURRENT depth (not
-                        // just the reduced verification depth) without
-                        // triggering the multicut condition above -- a
-                        // signal that a full-depth search here
-                        // would likely just re-confirm the same cutoff,
-                        // so shrink depth by 1 instead of granting an
-                        // extension.
-                        se_candidate = Some(tm);
-                        se_extension = -1;
-                    }
-                }
-            }
-        }
-        // Staged move picker: substitui o `order_moves` + `for mv in
-        // moves` que pontuava TUDO upfront antes de sequer tentar o
-        // primeiro lance. Ver `MovePicker` no fim deste ficheiro para as
-        // fases e a motivacao.
-        let killers = self.killers[ply.min(MAX_PLY - 1)];
-
-        // Limpar os killers do ply SEGUINTE antes de descer.
-        //
-        // Os killers de `ply+1` foram aprendidos noutra sub-arvore irma --
-        // outra posicao, outro contexto. Herda-los faz a ordenacao tentar
-        // primeiro lances que nao tem nada a ver com esta linha, gastando
-        // nos a verificar lixo. A ideia (limpar por no', nao por
-        // profundidade) nao e' nossa -- e' pratica publicada, medida noutro
-        // motor em ~+12 Elo; a implementacao e a medicao aqui sao nossas.
-        //
-        // Atras de env var ate' termos SPRT proprio -- a extensao de xeque
-        // hoje mostrou que uma medicao noutro motor pode nao transferir
-        // (la' encolhia a arvore 11%, aqui aumentava-a 4,6x).
-        if limpa_killers_filho() && ply + 1 < MAX_PLY {
-            self.killers[ply + 1] = [None, None];
-        }
-
-        let mut picker = MovePicker::new(moves, tt_move, killers);
-
-        let mut best_score = -MATE_SCORE - 1;
-        let mut best_move = None;
-        // Lances tranquilos experimentados neste no' ate' agora, para
-        // aplicar malus de history heuristic se um lance POSTERIOR causar
-        // o corte beta (ver update_history/history_scores).
-        let mut quiets_tried: Vec<Move> = Vec::new();
-        let mut captures_tried: Vec<(Move, PieceType, PieceType)> = Vec::new();
-        let mut futility_eval: Option<i32> = None;
-        self.history.push(hash);
-        let mut i: usize = 0;
-        while let Some(mv) = picker.next_move(self, board, ply.min(MAX_PLY - 1), hash) {
-            // Late Move Pruning (LMP): at low depth, after already
-            // trying enough quiet moves, skip the rest entirely
-            // (unlike LMR which only reduces depth). Threshold grows
-            // quadratically with depth; tighter when not improving.
-            // Never in check, never on capture/promotion, never near
-            // mate scores.
-            if !is_pv
-                && !in_check
-                && depth <= 5
-                && !mv.is_capture()
-                && mv.promotion.is_none()
-                && alpha.abs() < MATE_SCORE - MAX_PLY as i32
-            {
-                let lmp_threshold = if improving {
-                    3 + depth * depth
-                } else {
-                    2 + depth * depth / 2
-                };
-                if (quiets_tried.len() as i32) >= lmp_threshold {
-                    i += 1;
-                    continue;
-                }
-            }
-
-            // Futility pruning: quiet moves at low depth that cannot
-            // beat alpha even with a generous margin over static eval
-            // are usually not worth searching. Improving-aware: tighter
-            // margin when position is trending well (afford more prune).
-            if i > 0
-                && !is_pv
-                && !in_check
-                && depth <= 6
-                && !mv.is_capture()
-                && mv.promotion.is_none()
-                && alpha.abs() < MATE_SCORE - MAX_PLY as i32
-            {
-                let sp = search_params();
-                let margin = (if improving { sp.futility_improving.at(depth) } else { sp.futility_not_improving.at(depth) }
-                    * eval_margin_scale())
-                    / 100;
-                let fe = *futility_eval.get_or_insert(static_eval);
-                if fe + margin <= alpha {
-                    i += 1;
-                    self.cut_futility += 1;
-                    continue;
-                }
-            }
-
-            // Noisy (capture) futility pruning: same idea as the quiet
-            // version above, but for captures -- uses SEE (the real net
-            // material swing of the full exchange, not just the target
-            // piece's face value) as the realistic best case instead of
-            // a flat piece-value guess. If even that can't reach alpha
-            // with the margin, this capture isn't worth searching either.
-            // Wider margin than the quiet case: a capture at least wins
-            // back some material even when it's not tactically decisive,
-            // so it needs more slack before being confidently dismissed.
-            if i > 0
-                && !is_pv
-                && !in_check
-                && depth <= 6
-                && mv.is_capture()
-                && mv.promotion.is_none()
-                && alpha.abs() < MATE_SCORE - MAX_PLY as i32
-            {
-                let sp = search_params();
-                let margin = (if improving { sp.cap_futility_improving.at(depth) } else { sp.cap_futility_not_improving.at(depth) }
-                    * eval_margin_scale())
-                    / 100;
-                let fe = *futility_eval.get_or_insert(static_eval);
-                let see_val = see::see(self.atk, board, &mv);
-                if fe + see_val + margin <= alpha {
-                    i += 1;
-                    continue;
-                }
-            }
-
-            // History pruning: late quiet moves at low depth whose
-            // history score is strongly negative have consistently
-            // failed to cause a cutoff in similar contexts before --
-            // skip them outright instead of even a reduced search.
-            // Separate signal from LMP (which is pure move-count) and
-            // from LMR (which still searches, just shallower).
-            if i >= 3
-                && !is_pv
-                && !in_check
-                && depth <= search_params().hist_pruning_max_depth
-                && !mv.is_capture()
-                && mv.promotion.is_none()
-                && alpha.abs() < MATE_SCORE - MAX_PLY as i32
-            {
-                // Main history PLUS continuation history: a move that looks
-                // bad on average can still be the right reply to what was
-                // just played (and vice versa). Pruning on the context-free
-                // signal alone throws those away; summing both means a move
-                // is only skipped when it is bad generally AND bad here.
-                let ch = match board.piece_at(mv.from) {
-                    Some((pt, _)) => self.cont_hist_score(pt, mv.to, ply),
-                    None => 0,
-                };
-                let h = self.history_scores[board.side.idx()][mv.from as usize][mv.to as usize] + ch;
-                if h < -search_params().history_prune_mult * depth {
-                    i += 1;
-                    continue;
-                }
-            }
-
-            // SEE pruning: skip moves that lose material beyond a
-            // depth-scaled allowance, judged purely by Static Exchange
-            // Evaluation. Complements capture futility (which is
-            // eval-relative): this fires on the raw material swing alone,
-            // so it also catches quiets that hang a piece.
+            // Contempt already makes a repeated position score badly INSIDE
+            // the search, but only where the search reaches one. A move that
+            // repeats immediately -- straight back into a position already on
+            // the board twice -- is decided here, where the whole root list is
+            // in hand and the alternatives have scores.
+            // Recusar a repeticao imediata.
             //
-            // ONLY at non-PV nodes. A first attempt without that gate
-            // measured NEGATIVE (490 games, 48.9%): pruning on material
-            // alone inside the principal variation throws away exactly the
-            // speculative sacrifices this engine is built to find, on the
-            // one line it will actually play. Off the PV, a scout search
-            // is only trying to refute a move cheaply, so a material-losing
-            // continuation is a fair thing to dismiss.
+            // Isto ja' aqui estava, mas trancado atras de `contempt > 0` -- e o
+            // contempt esta' a zero e vai continuar, porque foi medido tres
+            // vezes e perde as tres. Resultado: o bloco nunca correu.
             //
-            // Allowance shape: quadratic in depth for captures, linear for
-            // quiets -- a losing capture at least resolves a tension and
-            // deserves more slack deeper in the tree, while a quiet that
-            // simply drops material rarely justifies itself. Margins are in
-            // OUR eval units (pawn = 125, not the 100 most published
-            // numbers assume), so they are scaled accordingly rather than
-            // copied.
-            if !is_pv
-                && i > 0
-                && depth <= 8
-                && !in_check
-                && alpha.abs() < MATE_SCORE - MAX_PLY as i32
-            {
-                let see_allowance = if mv.is_capture() {
-                    -40 * depth * depth
-                } else {
-                    -100 * depth
-                };
-                if !see::see_ge(self.atk, board, &mv, see_allowance) {
-                    i += 1;
-                    continue;
-                }
-            }
-
-            // Captures worth reducing, decided BEFORE the move: once
-            // `make_move` runs, `mv.to` holds our own piece and the
-            // captured one is gone, so this is the only point that can
-            // still ask "what did we take, and was taking it actually
-            // good". Only a losing-or-equal exchange is a candidate --
-            // reducing a capture that wins material outright throws away
-            // exactly the tactic the search exists to find.
-            let capture_lmr_info = if mv.is_capture() {
-                match (board.piece_at(mv.from), board.piece_at(mv.to)) {
-                    (Some((moving, _)), Some((captured, _))) => {
-                        let losing_or_equal = !see::see_ge(self.atk, board, &mv, 1);
-                        let ch = self.capture_history[board.side.idx()][moving.idx()][captured.idx()];
-                        Some((losing_or_equal, ch))
-                    }
-                    _ => None,
-                }
+            // Sao coisas diferentes. O contempt desconta TODOS os empates da
+            // arvore inteira, incluindo os das posicoes perdidas, onde o empate
+            // e' o melhor resultado que ha' -- foi por isso que perdeu. Isto so'
+            // olha para uma coisa: o lance que devolve a posicao ao tabuleiro
+            // pela terceira vez, na raiz, com a lista toda em mao e as
+            // alternativas ja' pontuadas. Se houver outra a menos de
+            // `RecusaMargem`, joga-se essa.
+            //
+            // E so' quando NAO estamos pior. Numa posicao ma' a repeticao e' o
+            // que nos salva, e recusa-la e' entregar a partida -- que e'
+            // exactamente o erro que o contempt fixo cometia.
+            //
+            // O bot empatou tres vezes seguidas com o MalanChess (2700) e uma
+            // com o banerot (2738), em partidas de 125 a 149 lances. Contra
+            // adversarios duzentos pontos abaixo, cada um desses empates custa
+            // cinco ou seis pontos de rating.
+            //
+            // MEDIDO a` primeira tentativa, contra um adversario 270 pontos
+            // abaixo, com limiar zero e margem 60: 242 vitorias, 32 derrotas,
+            // 43 empates, contra 205-1-112 da base. Os empates cairam de 112
+            // para 43, que era o objectivo -- mas as derrotas subiram de UMA
+            // para trinta e duas. Estando nos 270 pontos acima, converter um
+            // empate devia dar vitoria quase sempre e estava a dar cinquenta
+            // por cento: a condicao era frouxa de mais. Aceitava alternativas
+            // ate' 30 centipeoes piores e bastava a posicao nao estar negativa.
+            //
+            // Dai' o limiar: nao "nao estou pior", mas "estou claramente a
+            // ganhar". Uma posicao de +0,5 que se repete pode muito bem ser um
+            // empate justo, e trocar essa repeticao por um lance 30 centipeoes
+            // pior e' como se perde a partida.
+            let margem_recusa = if self.params.contempt > 0 {
+                Some(self.params.contempt)
+            } else if self.features.recusa_repeticao && best_score >= self.params.recusa_limiar {
+                Some(self.params.recusa_margem)
             } else {
                 None
             };
-
-            let root_nodes_before = if ply == 0 { self.nodes } else { 0 };
-            let undo = board.make_move(&mv);
-            if ply + 1 < MAX_PLY {
-                if let Some((moved_pt, _)) = board.piece_at(mv.to) {
-                    self.ply_last_move[ply + 1] = Some((moved_pt, mv.to));
+            if let Some(margem_recusa) = margem_recusa
+                .filter(|_| !(self.features.contempt_atento && best_score <= -50))
+            {
+                if let Some(b) = best {
+                    if self.repeats_at_once(board, b) {
+                        let margin = margem_recusa;
+                        let alt = self
+                            .root_scores
+                            .iter()
+                            .filter(|(m, _)| *m != b && !self.repeats_at_once(board, *m))
+                            .max_by_key(|(_, sc)| *sc);
+                        if let Some((m, sc)) = alt {
+                            if *sc >= best_score - margin {
+                                best = Some(*m);
+                            }
+                        }
+                    }
                 }
             }
-            // Check extension + singular extension: se este e' o
-            // tt_move provado singular acima, estende +1.
+
+            if info {
+                self.print_info(depth, score);
+            }
+
+            if limits.nodes.map_or(false, |n| self.nodes >= n) {
+                break;
+            }
+
+            // What the position is telling us about how long to keep going.
             //
-            // A extensao incondicional de xeque (estender 1 ply em TODO o
-            // xeque, a qualquer profundidade) e' das tecnicas mais antigas e
-            // ha' muito abandonada pelos motores fortes -- so' as extensoes
-            // singulares sobrevivem. Um projecto proximo mediu **+8,0 +- 8,1
-            // Elo (1654 jogos, 30+0.3) so' por a REMOVER**: a arvore encolhe
-            // ~11,5% a depth 18 no livro de aberturas, mais em finais
-            // patologicos. E' binario -- limitar por profundidade e' pior
-            // que qualquer dos extremos.
-            //
-            // Removida por omissao desde 2026-08-16. O nosso teste com a rede
-            // do Stockfish confirmou o mesmo sinal: 8 s na posicao inicial dao
-            // profundidade 21 sem extensao contra 19 com ela. `KESTREL_EXT_XEQUE=1`
-            // repoe o comportamento antigo para efeitos de comparacao.
-            let extend = if in_check && ext_xeque() {
-                1
-            } else if Some(mv) == se_candidate {
-                se_extension
+            // Three signals, and they answer different questions. A score that
+            // is falling means the move we have is worse than we thought and
+            // the alternatives deserve another look. A best move that has
+            // stopped changing means the answer has settled and more time buys
+            // nothing. And a move that took most of the tree to itself and
+            // still came out on top was never a close call.
+            if depth == 1 {
+                average_score = score;
             } else {
-                0
-            };
-            let score = if i == 0 {
-                -self.negamax(board, depth - 1 + extend, -beta, -alpha, ply + 1, false, if is_pv { false } else { !cutnode })
-            } else {
-                // LMR: late quiet moves are usually not the best -- search
-                // them at a reduced depth first, verify with full depth
-                // only if promising. Logarithmic reduction (standard
-                // shape) instead of hard tiers: smooth growth with depth
-                // and move index. Never reduce captures/promotions/
-                // checks/while escaping check. History-adjusted: a move
-                // with strongly positive history gets less reduction
-                // (it's usually been good here before), strongly
-                // negative gets more.
-                let gives_check = board.in_check(board.side, self.atk);
-                // 2026-07-22: min-move-count gate now uses a per-node-type
-                // split (PV min 4 moves, non-PV min 3, min depth 3)
-                // instead of a single `i>=2, depth>=2`
-                // threshold for every node type -- PV nodes get one
-                // extra move of "trust" before LMR kicks in, since a PV
-                // node's move ordering has already earned more
-                // confidence than a non-PV scout node's. Pure integer
-                // threshold, no fixed-point/scale conversion involved
-                // (unlike the NMP/corr-hist calibrations above), so
-                // applied directly without the caution those needed.
-                let min_moves = if is_pv { 4 } else { 3 };
-                // Which condition is granting immunity to quiet moves. The
-                // reductions we DO apply almost never need a re-search (1.5%),
-                // which is not a healthy sign -- it says we only reduce what
-                // was obviously bad already. So the question is not how hard
-                // we reduce, it is how much never reaches the reduction at
-                // all, and which test is letting it past.
-                if !mv.is_capture() && mv.promotion.is_none() {
-                    self.lmr_quiet_total += 1;
-                    if gives_check {
-                        self.lmr_skip_check += 1;
-                    } else if depth < 3 {
-                        self.lmr_skip_depth += 1;
-                    } else if extend != 0 {
-                        self.lmr_skip_extend += 1;
-                    } else if i < min_moves {
-                        self.lmr_skip_early += 1;
-                    }
-                }
-                let capture_ok_for_lmr = lmr_captures_enabled()
-                    && matches!(capture_lmr_info, Some((losing_or_equal, _)) if losing_or_equal);
-                let r = if i >= min_moves
-                    && depth >= 3
-                    && extend == 0
-                    && (!mv.is_capture() || capture_ok_for_lmr)
-                    && mv.promotion.is_none()
-                    && !gives_check
-                    && !peao_avancado(board, &mv)
-                {
-                    let sp_lmr = search_params();
-                    let base = lmr_table()[(depth as usize).min(63)][(i + 1).min(63)];
-                    // BUG FIX (2026-07-25): this runs AFTER make_move, so
-                    // `board.side` is already the OPPONENT -- indexing the
-                    // history table with it read the wrong side's stats
-                    // entirely (history is written with the mover's index,
-                    // see update_history at the cutoff below). Use the side
-                    // that actually played `mv`.
-                    let mover = board.side.opp().idx();
-                    let h = self.history_scores[mover][mv.from as usize][mv.to as usize];
-                    // 2026-07-23: divisor was a hand-set guess (4000);
-                    // retuned to 8846, our HISTORY_MAX being 16000. Same
-                    // divisor as before -- now applied in milli-plies, so
-                    // it stops being all-or-nothing: h=8845 used to ask for
-                    // -1.000 ply and get 0.
-                    let hist_adj = -(h * LMR_ESCALA / 8846);
-                    // TTPV: this position was reached by a real PV search
-                    // before (full window, not a scout probe) -- reduce
-                    // one ply less here. A position that earned
-                    // full-window search once is less likely to be a
-                    // safe-to-skip wasteland.
-                    let ttpv_adj = if tt_entry_captured.map(|e| e.pv).unwrap_or(false) { -LMR_ESCALA } else { 0 };
-                    // Continuation history as its OWN reduction term, with
-                    // its own divisor -- deliberately NOT folded into `h`
-                    // above. It sums two lags, so its range is ~2x the main
-                    // history's; adding it into `h` and reusing the 8846
-                    // divisor silently tripled the reduction swing and
-                    // measured neutral (1247 games, 50.4%). Capped at ~1 ply
-                    // on its own, as before -- the cap is unchanged, only
-                    // the values inside it are now continuous instead of
-                    // snapping to -1/0/+1. The piece already sits on
-                    // `mv.to` at this point (post-make_move).
-                    let cont_adj = match board.piece_at(mv.to) {
-                        Some((pt, _)) => {
-                            let ch = self.cont_hist_score(pt, mv.to, ply);
-                            (-(ch * LMR_ESCALA / search_params().lmr_hist_divisor.max(1)))
-                                .clamp(-LMR_ESCALA, LMR_ESCALA)
-                        }
-                        None => 0,
-                    };
-                    // Corrplexity: reduce ~one ply less when
-                    // |eval-staticEval| > 89 --
-                    // i.e. when the correction-history signal
-                    // says this position's static eval is trending far
-                    // from what raw material/PST said (a "complex"
-                    // position where blind reduction is riskier).
-                    // A threshold term: either the position is complex or it
-                    // is not, so this one is genuinely a whole ply -- it just
-                    // says so in milli-plies now, like the rest.
-                    let corrplexity = (static_eval - raw_static_eval).abs();
-                    let corrplexity_adj = if corrplexity > 89 { -LMR_ESCALA } else { 0 };
-                    // Reduce MORE (one whole ply) when !improving -- the same
-                    // `improving` signal RFP/futility already use. Also a
-                    // threshold, also exactly one ply.
-                    let non_imp_adj = if !improving { LMR_ESCALA } else { 0 };
-                    // The two compile-time terms. Both 0 unless their build
-                    // variable was set, so the default binary is unchanged.
-                    let cutnode_adj = if cutnode { sp_lmr.lmr_cutnode } else { 0 };
-                    let move_linear_adj = -sp_lmr.lmr_move_linear * (i as i32 + 1);
-
-                    // Three more signals the fine-grained shape wants, and that
-                    // we did not have. The point of milli-plies is to fuse many
-                    // weak signals; with only a handful of terms the resolution
-                    // buys nothing, which is why our own instrumentation showed
-                    // reductions that essentially never come back (0.4%
-                    // re-search rate) -- we were cutting uniformly instead of
-                    // cutting hard where it is safe.
-                    //
-                    // All default to 0, so the binary is unchanged until an
-                    // SPRT says otherwise.
-
-                    // The TT move being a capture says the position is sharp
-                    // and the quiet alternatives are likelier to be noise.
-                    let ttcap_adj = if sp_lmr.lmr_ttcapture != 0
-                        && tt_entry_captured.and_then(|e| e.best).map(|m| m.is_capture()).unwrap_or(false)
-                    {
-                        sp_lmr.lmr_ttcapture
-                    } else {
-                        0
-                    };
-
-                    // A PV node has earned more trust than a scout node: cut it
-                    // less. We already do this for ttPv; this is the node type
-                    // itself.
-                    let pv_adj = if is_pv { -sp_lmr.lmr_pvnode } else { 0 };
-
-                    // Killer: refutou um irmao, portanto nao e' um lance tardio
-                    // em espirito, diga o indice o que disser.
-                    let killer_adj = if Some(mv) == killers[0] || Some(mv) == killers[1] {
-                        -sp_lmr.lmr_killer
-                    } else {
-                        0
-                    };
-                    let alpha_raise_adj = subidas_alpha * sp_lmr.lmr_alpha_raise;
-                    // Xeque: reduzir MENOS em vez de isentar. So' tem efeito se
-                    // `lmr_check` estiver ligado -- com 0 mantem-se a isencao.
-                    let check_adj = if gives_check { -sp_lmr.lmr_check } else { 0 };
-
-                    // ALL-node scaling, and it is MULTIPLICATIVE rather than a
-                    // flat term: at an all-node every move is expected to fail
-                    // low, so the deeper the search the more the whole reduction
-                    // can grow. Additive terms cannot express that.
-                    let all_node = !is_pv && !cutnode;
-                    // Captures reduced under `capture_ok_for_lmr` never
-                    // touch `hist_adj` above -- that table is keyed by
-                    // (from, to) and only ever written for quiets, so
-                    // reading it for a capture would score noise. Its own
-                    // table (moving, captured) and its own base offset
-                    // replace it here; `hist_adj` itself is forced to 0 so
-                    // the two never both apply to the same move.
-                    let (hist_adj, capture_adj) = match capture_lmr_info {
-                        Some((_, ch)) if capture_ok_for_lmr => (
-                            0,
-                            sp_lmr.lmr_capture_base
-                                - (ch * LMR_ESCALA / sp_lmr.lmr_capture_hist_divisor.max(1))
-                                    .clamp(-LMR_ESCALA, LMR_ESCALA),
-                        ),
-                        _ => (hist_adj, 0),
-                    };
-                    let mut r_milli = base
-                        + hist_adj
-                        + cont_adj
-                        + ttpv_adj
-                        + corrplexity_adj
-                        + non_imp_adj
-                        + cutnode_adj
-                        + move_linear_adj
-                        + capture_adj
-                        + ttcap_adj
-                        + pv_adj
-                        + killer_adj
-                        + alpha_raise_adj
-                        + check_adj;
-                    if all_node && sp_lmr.lmr_allnode != 0 {
-                        r_milli += r_milli * sp_lmr.lmr_allnode / (256 * depth + 285);
-                    }
-                    // ONE division, at the end. Clamped in milli-plies first so
-                    // the ceiling means the same thing it did before.
-                    //
-                    // MEASURED AND REJECTED (2026-08-16): letting the floor go
-                    // negative -- a reduction that becomes a small extension for
-                    // very well-ordered moves, as the reference does -- read
-                    // 50.2% over 555 games at 5+0.05. Dead. Worth recording
-                    // because the case for it looked strong on paper: we reduce
-                    // 165k moves by 2.70 plies on average and only 0.4% ever
-                    // come back above alpha, which reads like blind pruning. It
-                    // is not; the ordering is simply good enough that what gets
-                    // reduced deserved it. Do not retry without new evidence.
-                    //
-                    r_milli.clamp(0, (depth - 1) * LMR_ESCALA) / LMR_ESCALA
+                // Against the average before it swallows this score:
+                // comparing with one that already has is an easier question and
+                // makes the window mean half what it says.
+                let ediff = (score - average_score).abs();
+                eval_steady = if ediff <= self.params.tm_trend_window {
+                    (eval_steady + 1).min(4)
                 } else {
                     0
                 };
-                // PVS: janela nula primeiro (reduzida se LMR), re-pesquisa se prometedor.
-                // doDeeper/doShallower: depois de a re-pesquisa reduzida
-                // bater alpha, ajusta a profundidade da re-pesquisa
-                // +/-1 conforme bateu alpha por muito (1 ply mais fundo,
-                // lance invulgarmente forte) ou por pouco (1 ply mais
-                // raso, poupa tempo). 2026-07-23: a PRIMEIRA versão usou
-                // margens RAW (36/141/8) vindas de uma escala de eval
-                // ~1.92x mais pequena que a nossa (peão 65 vs 125) e a
-                // bisecção localizou-a como o maior culpado da regressão
-                // do dia (-6.2%) -- as margens comparam com SCORES na
-                // escala de eval do Kestrel, por isso os valores raw
-                // disparavam "mais fundo" ~2x mais depressa do que
-                // deviam. Recalibradas pela razão do peão (69/271/15) --
-                // mecanismo mantido, valores corrigidos (ponto do
-                // utilizador: "não são as funções que estão mal, mas a
-                // calibração dos valores").
-                let new_depth = depth - 1 + extend;
-                let mut research_depth = new_depth;
-                // Floor the reduced DEPTH at 1 (never 0 = plain quiescence),
-                // exactly as the reference does: max(newDepth - reduction, 1).
-                let reduced_depth = (new_depth - r).max(1);
-                let probe_cutnode = if r > 0 { true } else { !cutnode };
-                let mut s = -self.negamax(board, reduced_depth, -alpha - 1, -alpha, ply + 1, false, probe_cutnode);
-                if r > 0 {
-                    self.lmr_tried += 1;
-                    self.lmr_sum += r as u64;
-                }
-                if r > 0 && s > alpha && !self.stop {
-                    // A reduced search that beats alpha has to be redone at
-                    // full depth, so this branch cost MORE than not reducing
-                    // it. The share of reductions that end up here is what
-                    // decides whether LMR is saving nodes or buying them --
-                    // a healthy engine re-searches a small minority.
-                    self.lmr_research += 1;
-                    let sp = search_params();
-                    let do_deeper = (s > best_score + sp.do_deeper_margin_base + sp.do_deeper_margin_depth * new_depth / 64) as i32;
-                    let do_shallower = (s < best_score + sp.do_shallower_margin) as i32;
-                    research_depth = (new_depth + do_deeper - do_shallower).max(1);
-                    s = -self.negamax(board, research_depth, -alpha - 1, -alpha, ply + 1, false, !cutnode);
-                }
-                if s > alpha && s < beta && !self.stop {
-                    s = -self.negamax(board, research_depth, -beta, -alpha, ply + 1, false, false)
-                }
-                s
-            };
-            board.unmake_move(&mv, &undo);
-            if !mv.is_capture() {
-                quiets_tried.push(mv);
-            } else if let Some((moving_pt, _)) = board.piece_at(mv.from) {
-                // Post-unmake board has the captured piece restored at
-                // mv.to (except en passant, where it's a pawn beside
-                // mv.to, not on it -- handled by the flag check instead
-                // of relying on board state for that one case).
-                let captured_pt = if mv.flag == MoveFlag::EnPassant {
-                    PieceType::Pawn
-                } else {
-                    board.piece_at(mv.to).map(|(pt, _)| pt).unwrap_or(PieceType::Pawn)
-                };
-                captures_tried.push((mv, moving_pt, captured_pt));
+                average_score = (score + 9 * average_score) / 10;
             }
-            if ply == 0 {
-                let delta = self.nodes.saturating_sub(root_nodes_before);
-                if let Some(entry) = self.root_move_nodes.iter_mut().find(|(m, _)| *m == mv) {
-                    entry.1 += delta;
-                } else {
-                    self.root_move_nodes.push((mv, delta));
-                }
+            if best != last_best {
+                last_best = best;
+                iters_since_change = 0;
+                best_move_changes += 1;
+            } else {
+                iters_since_change += 1;
             }
 
-            // BUG corrigido (2026-07-20, achado num jogo real na Arena --
-            // "bestmove 0000" a meio de uma posicao completamente ganha):
-            // a busca do 1o lance-filho pode terminar e devolver um
-            // resultado valido no EXATO momento em que o relogio esgota
-            // (self.stop passa a true dentro da recursao). O codigo antigo
-            // verificava self.stop ANTES de guardar o resultado, deitando
-            // fora um lance perfeitamente valido -- se isto acontecesse em
-            // TODAS as profundidades (incl. profundidade 1), root_best
-            // nunca chegava a ser definido e o motor devolvia lance nulo.
-            // Agora guarda-se sempre o resultado do lance que JA terminou;
-            // so' se para de explorar MAIS lances depois disso.
-            // Root trace: what every root move actually scored, in what
-            // window, at what depth. Set KESTREL_ROOT_TRACE to switch on.
+            let spent: u64 = self.root_effort.iter().map(|(_, n)| *n).sum();
+            let on_best = best
+                .and_then(|b| self.root_effort.iter().find(|(m, _)| *m == b))
+                .map(|(_, n)| *n)
+                .unwrap_or(0);
+            // With nothing measured yet, claim the middle rather than either
+            // end: an unknown share should neither buy time nor spend it.
+            let effort_frac = if spent > 0 && self.features.tm_node_effort {
+                on_best as f64 / spent as f64
+            } else {
+                0.4
+            };
+            let drop = if self.features.tm_stability {
+                (average_score - score).max(0)
+            } else {
+                0
+            };
+            let settle = if self.features.tm_stability {
+                iters_since_change as u32
+            } else {
+                0
+            };
+            let changes = if self.features.tm_stability {
+                best_move_changes.max(0) as u32
+            } else {
+                0
+            };
+            let steady = if self.features.tm_trend {
+                Some(eval_steady)
+            } else {
+                None
+            };
+            // Com a `TmPawn`, o elastico tambem e' o dele. Portar a alocacao
+            // sem portar o elastico foi meia correccao: os nossos factores
+            // chegam a 3,40 e o motor estica quase todos os lances ao maximo
+            // -- medido, factores de 1,91 a 3,38 em lances seguidos, com
+            // base=3439ms a virar soft=6778ms.
             //
-            // This exists because "the engine played the wrong move" is not
-            // a debuggable statement -- the interesting question is what the
-            // search believed about each alternative at the moment it chose,
-            // and no other output shows that. It was this trace that showed
-            // the losing pattern: the first move fixes alpha, every later
-            // move is then searched with a null window, and a quiet move
-            // whose value only appears deeper fails low there and is never
-            // re-searched wide enough to reveal it.
-            if ply == 0 && root_trace() {
+            // O do pawn:
+            //   avaliacao a cair  clamp(1 + (media - melhor)/100, 1.00, 1.75)
+            //   estabilidade      clamp(1 - iters_sem_mudar/(2*prof), 0.75, 1.00)
+            //   instabilidade     clamp(0.9 + mudancas/(2*prof),     1.00, 1.50)
+            //
+            // Duas diferencas fazem-no funcionar: a estabilidade ENCOLHE ate'
+            // 0,75 -- posicao facil gasta menos, e e' dai' que vem a poupanca
+            // que sustenta o resto da partida; e os factores sao relativos a`
+            // PROFUNDIDADE, portanto uma mudanca de lance pesa metade a
+            // profundidade 20 do que pesa a 10.
+            let factor = if self.features.tm_pawn {
+                let prof = (depth.max(1)) as f64;
+                let cair = (1.0 + drop as f64 / 100.0).clamp(1.0, 1.75);
+                let estab = (1.0 - settle as f64 / (2.0 * prof)).clamp(0.75, 1.0);
+                let instab = (0.9 + changes as f64 / (2.0 * prof)).clamp(1.0, 1.5);
+                cair * estab * instab
+            } else {
+                time_scale(effort_frac, settle, drop, changes, steady,
+                           self.params.tm_escala_max, self.params.tm_escala_min)
+            };
+
+            // The scaling moves the plan, never the wall. Whatever the position
+            // says, a move cannot spend more than the clock allows.
+            let soft = base_soft.mul_f64(factor).min(self.hard);
+            self.soft = soft;
+            // Diagnostico: o orcamento que o motor se da' a si proprio, lance a
+            // lance. Sem isto so' se ve' o tempo GASTO, e nao da' para saber se
+            // ele gastou o que pediu ou se passou do que pediu.
+            if tempo_debug() {
                 eprintln!(
-                    "ROOT d={} i={} mv={} score={} alpha={} beta={} best={}",
-                    depth, i, mv.to_uci(), score, alpha, beta, best_score
+                    "ORC base={}ms factor={:.2} soft={}ms hard={}ms gasto={}ms",
+                    base_soft.as_millis(), factor, soft.as_millis(),
+                    self.hard.as_millis(), self.start.elapsed().as_millis()
                 );
             }
-            if ply == 0 {
-                // Bookkeeping per root move, adapted from how a stronger
-                // engine does it -- the details matter and each one was
-                // learned by getting it wrong first.
-                //
-                // The previous score is saved on EVERY visit, before anything
-                // else: it is the tiebreak that stops a score which merely
-                // wobbles from changing the decision.
-                //
-                // The current score is written only for the first move, whose
-                // full window makes it a value, and for moves that raise
-                // alpha, which get the full-window re-search. Anything else
-                // is INVALIDATED rather than left alone. That last part is
-                // the one that matters: leaving a stale score behind lets a
-                // move measured two iterations ago at a shallower depth
-                // compete against one measured now, and it made this engine
-                // open 1.d3 instead of 1.d4.
-                let idx = match self.root_scores.iter().position(|(m, _, _)| *m == mv) {
-                    Some(i) => i,
-                    None => {
-                        self.root_scores.push((mv, NO_SCORE, NO_SCORE));
-                        self.root_scores.len() - 1
-                    }
-                };
-                self.root_scores[idx].2 = self.root_scores[idx].1;
-                // A move whose own search was cut by the clock has no score to
-                // record. The return value of an aborted search is whatever
-                // the partial window held -- in practice 0 -- and because the
-                // first move is stored unconditionally, that 0 went in as if
-                // it were measured. It then became the reported evaluation:
-                // a position worth -12 published as 0.00, and 0.00 fed to the
-                // next move's aspiration window. Unmeasured is the truth here,
-                // and the previous iteration's value in .2 is what answers.
-                self.root_scores[idx].1 = if self.stop {
-                    NO_SCORE
-                } else if i == 0 || score > alpha {
-                    score
-                } else {
-                    NO_SCORE
-                };
+
+            // Is there room for another iteration, not is there room for the
+            // one just finished.
+            //
+            // Each depth costs roughly twice the one before, so stopping only
+            // once the plan is already spent means routinely starting an
+            // iteration that cannot fit and letting the wall end it. The spend
+            // then settles at about twice the plan, which is enough to break
+            // even against the increment: measured over a fifty-nine move game
+            // at 8+0.08, the engine used 12.69 seconds of a 12.72 second
+            // budget and flagged. Nothing looked wrong move by move -- the
+            // longest was 0.72 seconds -- because nothing was wrong move by
+            // move.
+            //
+            // Predicting the next one instead leaves the margin the increment
+            // is supposed to build.
+            let elapsed = self.start.elapsed();
+            let last = elapsed.saturating_sub(iter_start);
+            if elapsed + last * 2 >= self.soft {
+                break;
             }
-            // Um lance cuja propria busca o relogio cortou nao tem score, e
-            // isso ja' foi dito dez linhas acima ao gravar NO_SCORE em
-            // root_scores: "Unmeasured is the truth here". Deixa-lo competir
-            // aqui era usar exactamente o numero que acabamos de declarar
-            // invalido -- o valor de uma busca abortada e' o que a janela
-            // parcial tinha, na pratica 0.
-            //
-            // Num posicao perdida TODOS os lances reais pontuam negativo,
-            // portanto esse 0 ganha-lhes a todos e o lance jogado passa a ser
-            // aquele em que o relogio calhou de cortar. Medido: a mesma
-            // posicao, 1 thread, mesmo relogio, cinco corridas -- tres lances
-            // diferentes (518k-604k nos, todos a -95cp). Um motor de
-            // referencia nas mesmas condicoes devolveu o mesmo lance e o mesmo
-            // numero de nos as cinco vezes. A instabilidade era nossa, e era
-            // aqui.
-            //
-            // O jogo IZt573pD perdeu-se assim: 27.Rh3 num posicao que a busca
-            // completa avalia a -705.
-            let medido = !(ply == 0 && self.stop);
-            if medido && score > best_score {
-                best_score = score;
-                best_move = Some(mv);
-                if ply == 0 {
-                    self.root_best = Some(mv);
+        }
+
+        // Os ajudantes so' param pelo sinal partilhado: o relogio e' deste
+        // fio. Sem este `store` ficavam a procurar para sempre.
+        if !fios.is_empty() {
+            self.stop.store(true, Ordering::Relaxed);
+            let mut cand: Vec<(Move, i32)> = Vec::with_capacity(fios.len() + 1);
+            // A profundidade que o fio principal completou. Um ajudante que
+            // tenha ficado dois plies atras ja' nao esta' a ver a mesma coisa e
+            // nao vota: o proposito do Lazy SMP e' divergir no caminho, nao
+            // decidir com menos informacao.
+            let prof_principal = ultima_prof;
+            if let (Some(b), true) = (best, best_score > -MATE) {
+                cand.push((b, best_score));
+            }
+            for f in fios {
+                if let Ok(Some((m, sc, d))) = f.join() {
+                    if d + 2 >= prof_principal {
+                        cand.push((m, sc));
+                    }
                 }
             }
-            if self.stop {
-                self.history.pop();
-                return best_score;
-            }
-            if score > alpha {
-                alpha = score;
-                // Cada subida de alpha levanta a fasquia para os lances que
-                // faltam: os seguintes tem menos hipoteses de importar. E' um
-                // sinal que a nossa LMR nao tinha.
-                subidas_alpha += 1;
-            }
-            if alpha >= beta {
-                // Move-ordering telemetry. The share of beta cutoffs produced
-                // by the FIRST move tried is the number that decides how wide
-                // this tree is: every cutoff that takes until the fifth move
-                // has paid for four subtrees nobody needed. Measured against
-                // a reference at the same depth we visit 2.76 nodes per node
-                // where it visits 2.48, and that gap is where it lives.
-                self.cut_nodes += 1;
-                if i == 0 {
-                    self.cut_first += 1;
+            if cand.len() > 1 {
+                if let Some(v) = Searcher::vota(&cand) {
+                    best = Some(v);
                 }
-                // How much a cutoff is worth to the history tables is not the
-                // same as how deep the search was. A move that beats beta by a
-                // wide margin refuted the node outright; one that scrapes past
-                // it by a centipawn may not survive one more ply. Crediting
-                // both identically teaches the ordering that a marginal move
-                // is as trustworthy as a decisive one. A comfortable cutoff is
-                // scored as if the search had been a ply deeper.
-                let hist_depth =
-                    depth + (best_score > beta + search_params().hist_beta_margin) as i32;
-                if !mv.is_capture() && ply < MAX_PLY {
-                    let k = &mut self.killers[ply];
-                    if k[0] != Some(mv) {
-                        k[1] = k[0];
-                        k[0] = Some(mv);
+            }
+        }
+
+        // Never return nothing: if even depth one was cut short, play the first
+        // legal move rather than forfeit.
+        if est_ligado() {
+            self.relata_forma();
+            self.relata_saidas();
+        }
+        best.or_else(|| generate_legal(board, &self.atk).into_iter().next())
+    }
+
+    /// De que e' feita a arvore que acabamos de construir.
+    ///
+    /// A pergunta que isto responde: chegar a` profundidade 14 custa-nos 2,67s
+    /// contra 0,88s do Triumviratus nas mesmas cinco posicoes, com nos por
+    /// segundo equivalentes -- portanto o excesso e' arvore, nao velocidade. O
+    /// racio e' CONSTANTE nas profundidades 10, 12 e 14 (2,6x, 2,9x, 2,6x) e o
+    /// factor de ramificacao e' igual ao deles, 1,62 contra 1,63. Um excesso
+    /// uniforme, e nao um que cresce, nao aponta para a forma da reducao --
+    /// essa composedagia-se com a profundidade. Aponta para alguma coisa que se
+    /// paga em todos os nos.
+    fn relata_saidas(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let n: Vec<u64> = SAIDA.iter().map(|a| a.load(Relaxed)).collect();
+        let ent = n[0].max(1) as f64;
+        let nomes = ["entrou", "quiescencia", "empate/limite", "CORTOU pela tabela",
+                     "tablebases", "futilidade inv.", "sondas a` tabela",
+                     "encontrou entrada", "entrada com limite", "GEROU LANCES",
+                     "entrada funda o bastante", "chegou ao teste final",
+                     "barrado: limite nao serve", "barrado: regra dos 50"];
+        let mut s = String::new();
+        let nomes: Vec<&str> = nomes.to_vec();
+        for (i, nome) in nomes.iter().enumerate() {
+            if i == 0 { continue; }
+            s.push_str(&format!(" {}={} ({:.1}%)", nome, n[i], n[i] as f64 * 100.0 / ent));
+        }
+        println!("info string SAIDAS entrou={}{}", n[0], s);
+    }
+
+    fn relata_forma(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let p = FORMA[0].load(Relaxed);
+        let q = FORMA[1].load(Relaxed);
+        let l = FORMA[2].load(Relaxed);
+        let c1 = FORMA[3].load(Relaxed);
+        let rl = FORMA[4].load(Relaxed);
+        let rj = FORMA[5].load(Relaxed);
+        let tot = (p + q).max(1);
+        println!(
+            "info string FORMA principal={} ({:.1}%) quiescencia={} ({:.1}%) \
+lances_procurados/no={:.2} corte1={:.1}% rebusca_lmr={} ({:.1}% dos nos) rebusca_janela={} ({:.1}%)",
+            p, p as f64 * 100.0 / tot as f64,
+            q, q as f64 * 100.0 / tot as f64,
+            l as f64 / p.max(1) as f64,
+            c1 as f64 * 100.0 / p.max(1) as f64,
+            rl, rl as f64 * 100.0 / p.max(1) as f64,
+            rj, rj as f64 * 100.0 / p.max(1) as f64,
+        );
+    }
+
+    fn print_info(&self, depth: u32, score: i32) {
+        let ms = self.start.elapsed().as_millis().max(1) as u64;
+        let nps = self.nodes * 1000 / ms;
+        let score_str = if is_mate(score) {
+            let plies = MATE - score.abs();
+            let moves = (plies + 1) / 2;
+            format!("mate {}", if score > 0 { moves } else { -moves })
+        } else {
+            // Two internal units to the centipawn, from the training
+            // quantisation. The win/draw/loss figures below are NOT converted:
+            // that model was fitted against the internal units and its offset
+            // and scaling are in them, so handing it centipawns would quietly
+            // halve every probability it reports.
+            format!("cp {}", score / 2)
+        };
+        let (w, d, l) = nnue::wdl(score);
+        let mut pv = String::new();
+        for i in 0..self.pv_len[0] {
+            if let Some(m) = self.pv[0][i] {
+                pv.push(' ');
+                pv.push_str(&m.to_uci());
+            }
+        }
+        println!(
+            "info depth {} score {} wdl {} {} {} nodes {} nps {} time {} pv{}",
+            depth, score_str, w, d, l, self.nodes, nps, ms, pv
+        );
+    }
+
+    /// Search the root with a window around the last score, widening on a
+    /// failure rather than starting wide every time.
+    fn aspiration(&mut self, board: &mut Board, depth: i32, prev: i32) -> i32 {
+        // Wider at low depth, where the previous score is a poor guide, and
+        // narrowing as it becomes a good one.
+        let mut delta = 5 + self.params.asp_delta * 8 / depth.max(1);
+        let (mut alpha, mut beta) = if depth <= self.params.asp_depth || is_mate(prev) {
+            (-INF, INF)
+        } else {
+            (prev - delta, prev + delta)
+        };
+
+        // Quantas falhas por cima seguidas. Cada uma tira um ply a` busca de
+        // repeticao: uma posicao que ja' decidiu vai falhar na mesma direccao,
+        // e confirma-la a` profundidade cheia e' pagar a arvore toda para saber
+        // o que ja' se sabia.
+        let mut falhas = 0i32;
+        loop {
+            self.root_delta = (beta - alpha).max(1);
+            // Once a bound is this far from level, the window has stopped being
+            // a guess worth narrowing and has become an obstacle: a position
+            // that decided is going to keep failing in the same direction, and
+            // each failure costs a whole re-search to widen by a step.
+            if alpha < -1000 {
+                alpha = -INF;
+            }
+            if beta > 1000 {
+                beta = INF;
+            }
+
+            let d = if self.features.asp_baixa {
+                (depth - falhas).max(1)
+            } else {
+                depth
+            };
+            let score = self.negamax(board, d, alpha, beta, 0, true, false);
+            if self.stopped {
+                return score;
+            }
+            if score <= alpha {
+                // Failing low means the position is worse than believed, and
+                // the upper bound has to move with the lower one or the next
+                // attempt fails low again at once.
+                beta = (alpha + beta) / 2;
+                alpha = (score - delta).max(-INF);
+                // Uma janela que ja' oscilou nos dois sentidos nao decidiu
+                // nada, e a profundidade volta ao que era.
+                falhas = 0;
+            } else if score >= beta {
+                if self.features.asp_baixa {
+                    // O limite de baixo sobe com o de cima: sem isso a
+                    // repeticao volta a percorrer terreno ja' coberto.
+                    alpha = (beta - delta).max(alpha);
+                }
+                beta = (score + delta).min(INF);
+                falhas += 1;
+            } else {
+                return score;
+            }
+            delta += delta / 2;
+        }
+    }
+
+    /// `cut_node` says this node is expected to fail high.
+    ///
+    /// It is not a guess made here: it is handed down. The first child of a
+    /// principal variation node is another one; every later child of a
+    /// principal variation node is expected to fail high; the children of a
+    /// node expected to fail high are expected to fail low, and the other way
+    /// round. Knowing which kind of node you are in is worth something, because
+    /// a node that is expected to fail high will do it on one of the first
+    /// moves or not at all, so the late ones there can be reduced harder than
+    /// the same moves somewhere else.
+    #[inline]
+    fn killer_fresco_on(&self) -> bool {
+        self.features.killer_fresco
+    }
+
+    fn negamax(
+        &mut self,
+        board: &mut Board,
+        mut depth: i32,
+        mut alpha: i32,
+        beta: i32,
+        ply: usize,
+        pv_node: bool,
+        cut_node: bool,
+    ) -> i32 {
+        self.pv_len[ply] = 0;
+
+        // Os killers do ply abaixo ficaram la' da ultima sub-arvore, que nao
+        // tem nada a ver com esta. Herda-los e' promover lances a` frente da
+        // lista por razao nenhuma, e a classe acerta 66% onde as capturas
+        // acertam 83-87%. O motor da nossa arquitectura limpa-os e mede +12,15
+        // Elo nisso.
+        if self.killer_fresco_on() && ply + 1 < MAX_PLY {
+            self.killers[ply + 1] = [None; NUM_KILLERS];
+        }
+
+        // Repoe-se DOIS plies a` frente: o contador do ply SEGUINTE tem de
+        // sobreviver a esta visita para a reducao o poder ler.
+        if ply + 2 < MAX_PLY + 8 {
+            self.cut_cnt[ply + 2] = 0;
+        }
+
+        if depth <= 0 {
+            marca(1);
+            return self.quiescence(board, alpha, beta, ply);
+        }
+
+        self.nodes += 1;
+        marca(0);
+        if est_ligado() { FORMA[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+        if self.out_of_time() {
+            return 0;
+        }
+
+        let root = ply == 0;
+        let in_check = board.in_check(board.side, &self.atk);
+
+        if !root {
+            if self.is_draw(board) {
+                marca(2);
+                return self.draw_score(ply);
+            }
+            if ply >= MAX_PLY - 1 {
+                return evaluate(board, self.features.rule50_fade);
+            }
+
+            // Below the size the tables cover, the result is not an estimate.
+            // Returning it ends the subtree at once, and ends it with the right
+            // answer -- which is worth more than the nodes saved, because the
+            // endings the tables cover are the ones a network reads worst.
+            //
+            // The score is placed just inside the mate range so it outranks any
+            // evaluation without ever being mistaken for a real mate, and the
+            // distance to the root keeps a shorter win preferred to a longer
+            // one even though the tables here cannot say how long either is.
+            if let Some(w) = crate::tb::sondar(board) {
+                match w {
+                    // A drawn table position is settled and can be returned
+                    // whatever else is loaded: there is no progress to measure
+                    // in a draw, so nothing is lost by not knowing the distance.
+                    crate::tb::Wdl::Empata => {
+                        self.tb_hits += 1;
+                        return self.draw_score(ply);
                     }
-                    // History heuristic: bonus para o lance que cortou,
-                    // malus para os lances tranquilos anteriores neste
-                    // no' que NAO cortaram (quiets_tried inclui `mv` como
-                    // ultimo elemento, ja' que foi empurrado logo acima --
-                    // excluido do malus).
-                    let bonus = history_bonus(hist_depth);
-                    let malus = history_malus(hist_depth);
-                    let side = board.side.idx();
-                    self.update_history(side, &mv, bonus);
-                    let n = quiets_tried.len().saturating_sub(1);
-                    for qm in &quiets_tried[..n] {
-                        self.update_history(side, qm, -malus);
+                    // A won one is only useful when the set can say how long
+                    // the win takes. Told merely that it is won, every move
+                    // that keeps it scores the same, the search has nothing to
+                    // choose between them, and a rook up becomes a draw by the
+                    // fifty move rule. Measured: king and rook against king
+                    // went from a1a6, which restricts the king, to e1e2, which
+                    // does nothing at all.
+                    _ if crate::tb::tem_dtz() => {
+                        self.tb_hits += 1;
+                        let v = if w == crate::tb::Wdl::Ganha {
+                            MATE_IN_MAX - 2 - ply as i32
+                        } else {
+                            -(MATE_IN_MAX - 2 - ply as i32)
+                        };
+                        return v;
                     }
-                    // Countermove heuristic (binario) mantido para
-                    // compatibilidade; cont_hist e' o sinal principal.
-                    if let Some((ctx_pt, ctx_to)) = self.ply_last_move[ply] {
-                        self.countermoves[ctx_pt.idx()][ctx_to as usize] = Some(mv);
+                    _ => {}
+                }
+            }
+            // REPETICAO A` DISTANCIA DE UM LANCE. O teste acima so' sabe que repetiu DEPOIS de
+            // repetir; se quem joga pode forcar a repeticao daqui, ha' um empate garantido e o
+            // alpha nao pode ficar abaixo dele. Padrao do Stockfish; ver `cuckoo.rs`.
+            if self.features.cuckoo {
+                let empate = self.draw_score(ply);
+                if alpha < empate {
+                    let cuc = CUCKOO.get_or_init(|| {
+                        crate::cuckoo::Cuckoo::novo(crate::zobrist::tabelas(), &self.atk)
+                    });
+                    if cuc.repeticao_a_vista(board, &self.keys, self.root_keys, &self.atk) {
+                        alpha = empate;
+                        if alpha >= beta {
+                            return alpha;
+                        }
                     }
-                    // Continuation history: actualiza (prev_move -> mv)
-                    // com +bonus para mv que cortou, -bonus para os
-                    // quiets tentados antes. Feito a 1-ply e 2-ply back
-                    // (multi-lag, ver `cont_hist`). Precisamos da peca
-                    // que fez mv -- board ja' fez unmake, portanto o
-                    // piece_at do mailbox devolve o estado ANTES do mv,
-                    // que e' exactamente o que queremos.
-                    if let Some((curr_pt, _)) = board.piece_at(mv.from) {
-                        let prev1 = if ply >= 1 { self.ply_last_move.get(ply).and_then(|x| *x) } else { None };
-                        let prev2 = if ply >= 2 { self.ply_last_move.get(ply - 1).and_then(|x| *x) } else { None };
-                        // The lag-4 entry has to be written as well as read,
-                        // or the accessor sums a table nothing ever fills.
-                        let prev4 = if ply >= 4 { self.ply_last_move.get(ply - 3).and_then(|x| *x) } else { None };
-                        if let Some((p4_pt, p4_to)) = prev4 {
-                            self.update_cont_hist(p4_pt, p4_to, curr_pt, mv.to, bonus);
-                        }
-                        if let Some((p1_pt, p1_to)) = prev1 {
-                            self.update_cont_hist(p1_pt, p1_to, curr_pt, mv.to, bonus);
-                        }
-                        if let Some((p2_pt, p2_to)) = prev2 {
-                            self.update_cont_hist(p2_pt, p2_to, curr_pt, mv.to, bonus);
-                        }
-                        for qm in &quiets_tried[..n] {
-                            if let Some((q_pt, _)) = board.piece_at(qm.from) {
-                                if let Some((p4_pt, p4_to)) = prev4 {
-                                    self.update_cont_hist(p4_pt, p4_to, q_pt, qm.to, -malus);
-                                }
-                                if let Some((p1_pt, p1_to)) = prev1 {
-                                    self.update_cont_hist(p1_pt, p1_to, q_pt, qm.to, -malus);
-                                }
-                                if let Some((p2_pt, p2_to)) = prev2 {
-                                    self.update_cont_hist(p2_pt, p2_to, q_pt, qm.to, -malus);
+                }
+            }
+            // Mate distance pruning: no line from here can beat a mate already
+            // found closer to the root.
+            let a = alpha.max(mate_score(ply));
+            let b = beta.min(-mate_score(ply + 1));
+            if a >= b {
+                marca(4);
+                return a;
+            }
+            alpha = a;
+        }
+
+        // A node searching with a move excluded is asking a different question
+        // from the one the table answered, so it must not take the answer --
+        // nor leave its own answer behind for a node that is asking the
+        // ordinary question.
+        let excluded = self.excluded[ply];
+        let entry = self.tt.probe(board.hash);
+        if est_ligado() {
+            marca(6); // sondas
+            if entry.is_some() { marca(7); }         // encontrou entrada
+        }
+        let mut tt_move = None;
+        let mut tt_bound = Bound::NoBound;
+        let mut tt_pv = pv_node;
+        if let Some(e) = entry {
+            tt_move = e.best;
+            tt_bound = e.bound;
+            tt_pv |= e.pv;
+            if est_ligado() {
+                marca(8);
+                if e.depth >= depth { marca(10); }
+            }
+            if excluded.is_none() && !pv_node && e.depth >= depth && e.has_bound() {
+                let s = score_from_tt(e.score, ply);
+                let usable = match e.bound {
+                    Bound::Exact => true,
+                    Bound::Lower => s >= beta,
+                    Bound::Upper => s <= alpha,
+                    Bound::NoBound => false,
+                };
+                // Not near the fifty move wall: there the same position is
+                // worth different things depending on how much counter is left,
+                // and the table does not know which one it stored.
+                if est_ligado() {
+                    marca(11);                                   // chegou ao teste final
+                    if !usable { marca(12); }                    // o limite nao serve
+                    if usable && board.halfmove >= 90 { marca(13); } // barrado pela regra dos 50
+                }
+                if usable && board.halfmove < 90 {
+                    // Credit the stored move on the way out. It just caused a
+                    // cutoff, which is the same evidence a searched move would
+                    // have produced, and returning without recording it lets
+                    // the tables go cold in exactly the positions that come
+                    // back most often -- the ones the table keeps answering.
+                    if self.features.tt_cut_credit && s >= beta {
+                        if let Some(m) = tt_move {
+                            // As close to a legality test as is affordable here:
+                            // one of ours on the origin square, and nothing of
+                            // ours on the destination. It does not prove the
+                            // move is legal, which is why this is off.
+                            let ours = board
+                                .piece_at(m.from)
+                                .is_some_and(|(_, c)| c == board.side);
+                            let free = board
+                                .piece_at(m.to)
+                                .is_none_or(|(_, c)| c != board.side);
+                            if ours && free && !m.is_capture() && m.promotion.is_none() {
+                                let side = board.side.idx();
+                                let slots = self.cont_slots(ply);
+                                self.credit(board, m, side, &slots, hist_bonus(depth));
+                                if !self.killers[ply].iter().any(|k| *k == Some(m)) {
+                                    for j in (1..NUM_KILLERS).rev() {
+                                        self.killers[ply][j] = self.killers[ply][j - 1];
+                                    }
+                                    self.killers[ply][0] = Some(m);
                                 }
                             }
                         }
                     }
-                } else if mv.is_capture() {
-                    // Capture history: same bonus/malus shape as the
-                    // quiet-move history above, keyed by (moving,
-                    // captured) piece type instead of (from, to).
-                    // Complements SEE in ordering (see MovePicker) --
-                    // never touches SEE itself.
-                    let bonus = history_bonus(hist_depth);
-                    let malus = history_malus(hist_depth);
-                    let side = board.side.idx();
-                    let n = captures_tried.len().saturating_sub(1);
-                    if let Some(&(_, moving_pt, captured_pt)) = captures_tried.last() {
-                        self.update_capture_history(side, moving_pt, captured_pt, bonus);
-                    }
-                    for &(_, moving_pt, captured_pt) in &captures_tried[..n] {
-                        self.update_capture_history(side, moving_pt, captured_pt, -malus);
+                    marca(3);
+                    return s;
+                }
+            }
+        }
+
+        // The raw number is kept separately, because it is what goes back into
+        // the table at the bottom of this node.
+        //
+        // Storing the corrected value there instead is a quiet disaster: the
+        // next visit reads it, applies the correction a second time, stores
+        // that, and the error compounds every time the position is reached.
+        // Nothing about it looks wrong from outside -- the evaluation stays
+        // plausible while drifting.
+        let raw_static_eval = if in_check {
+            TT_EVAL_NONE as i32
+        } else {
+            match entry {
+                Some(e) if e.static_eval != TT_EVAL_NONE => e.static_eval as i32,
+                _ => {
+                    let e = evaluate(board, self.features.rule50_fade);
+                    self.tt.store_eval_only(board.hash, e as i16);
+                    e
+                }
+            }
+        };
+        let static_eval = raw_static_eval;
+        // The table keeps the raw number, the search uses the corrected one.
+        // Deliberately different: the table is shared, and whoever reads it
+        // later applies their own correction.
+        let static_eval = if in_check || !self.features.corr_hist {
+            static_eval
+        } else {
+            self.corrected(board, static_eval, ply)
+        };
+
+        self.eval_stack[ply] = static_eval;
+        // Is the side to move better off than it was two plies ago?
+        //
+        // A ply spent in check has no static evaluation and its slot holds a
+        // sentinel, not a score. Comparing against the sentinel made every
+        // position for two plies after any check look like it was improving,
+        // because anything beats minus thirty two thousand -- so reverse
+        // futility pruned harder and late move pruning cut later, both on a
+        // fact that was not one. Step back four plies when two are not usable,
+        // and claim nothing when neither is.
+        let usable = |v: i32| v != TT_EVAL_NONE as i32;
+        let improving = if in_check {
+            false
+        } else if ply >= 2 && usable(self.eval_stack[ply - 2]) {
+            static_eval > self.eval_stack[ply - 2]
+        } else if ply >= 4 && usable(self.eval_stack[ply - 4]) {
+            static_eval > self.eval_stack[ply - 4]
+        } else {
+            false
+        };
+
+        // Two evaluations from here on, and they are not the same number.
+        //
+        // `static_eval` is what the network says, corrected, and it is what
+        // `improving` and the forward futility margin compare against -- both
+        // want a value that means the same thing at every ply, which a score
+        // borrowed from a search does not.
+        //
+        // `pruning_eval` is that value improved by what the table already
+        // knows. A stored lower bound above the static score, or an upper
+        // bound below it, is a better estimate than the static score by
+        // definition: a search went and found out. Whole-node pruning should
+        // use the better one, and it was using the worse one.
+        let mut pruning_eval = static_eval;
+        if !in_check {
+            if let Some(e) = entry {
+                if e.has_bound() {
+                    let ts = score_from_tt(e.score, ply);
+                    let better = match e.bound {
+                        Bound::Exact => true,
+                        Bound::Lower => ts > static_eval,
+                        Bound::Upper => ts < static_eval,
+                        Bound::NoBound => false,
+                    };
+                    if better {
+                        pruning_eval = ts;
                     }
                 }
+            }
+        }
+
+        if !pv_node && !in_check {
+            // Reverse futility: so far ahead that giving away the margin still
+            // beats beta, and the opponent has no way to take it all back in
+            // the remaining depth. A ply that is improving can afford a
+            // narrower margin, since the trend is evidence in the same
+            // direction as the score.
+            let margin = self.params.rfp_margin * depth
+                - self.params.rfp_improving * improving as i32;
+            // `rfp_tt_capt`: sem lance na tabela, ou com uma captura la' guardada, a entrada
+            // nao promete um plano tranquilo bom e cortar pela estatica nao descarta um.
+            if depth < self.params.rfp_depth
+                && pruning_eval - margin >= beta
+                && pruning_eval.abs() < MATE_IN_MAX
+                && (!self.features.rfp_tt_capt || tt_move.map_or(true, |m| m.is_capture()))
+            {
+                // Part of the way to the estimate rather than all of it. The
+                // margin establishes that the node is above beta, not by how
+                // much, and returning the whole distance passes upwards a
+                // confidence that was never earned.
+                marca(5);
+                return if self.features.rfp_damp {
+                    beta + (pruning_eval - beta) / 3
+                } else {
+                    pruning_eval
+                };
+            }
+
+            // Razoring: so far behind that even the quiescence search is
+            // unlikely to find enough, so ask it directly instead of spending
+            // a full width on the answer. If it turns out to be wrong the
+            // score comes back above alpha and the node is searched properly.
+            // The plain static score here, not the one the table improved.
+            // Razoring asks whether the position is so far behind that only a
+            // capture sequence could save it; a bound borrowed from a search
+            // has already priced those in, and asking with it is asking a
+            // question that has been answered.
+            //
+            // And not when alpha is already decisive -- a margin has nothing to
+            // say about a position that is being mated.
+            if self.features.razoring
+                && depth <= self.params.razor_depth
+                && alpha.abs() < 2000
+                && static_eval + self.params.razor_margin * depth <= alpha
+            {
+                let q = self.quiescence(board, alpha, alpha + 1, ply);
+                if q < alpha {
+                    marca(6);
+                    return q;
+                }
+            }
+
+            // Null move: hand the opponent a free move and see whether the
+            // position still holds. Not with only pawns left, where passing is
+            // often the best move there is and the conclusion would be wrong.
+            // The reduction grows with how far above beta we already are,
+            // rather than with depth: the question null move asks is whether
+            // the position is so good it survives giving away a move, and how
+            // good it is answers that better than how deep we are.
+            //
+            // The extra conditions matter: the
+            // raw static score has to be at least as good as the uncorrected
+            // one, and the uncorrected one has to be within reach of beta. A
+            // position that only looks good because the table said so is not
+            // one to hand a free move away in.
+            // Only where the node is expected to fail high. Elsewhere the
+            // question null move asks -- is this so good it survives giving a
+            // move away -- is not the question the node is there to answer.
+            if (!self.features.nmp_cut_node || cut_node)
+                && depth >= 3
+                && pruning_eval >= beta
+                && pruning_eval >= self.eval_stack[ply]
+                && self.eval_stack[ply]
+                    >= beta - 20 * depth - 40 * improving as i32 + 100
+                && has_pieces(board, board.side)
+                && !(ply > 0 && self.null_at[ply - 1])
+            {
+                // A reducao do lance nulo, a crescer com a profundidade.
+                //
+                // Sem o termo da profundidade -- que e' como estava -- reduz-se
+                // quatro plies a` profundidade 3 e os MESMOS quatro a`
+                // profundidade 14. A pergunta do lance nulo e' sempre a mesma
+                // ("isto e' tao bom que sobrevive a dar um lance de borla?"),
+                // mas o custo de a fazer cresce com a profundidade, e a
+                // confianca na resposta tambem: quanto mais fundo se esta',
+                // mais barata sai a verificacao em proporcao ao que ela poupa.
+                // O motor de referencia soma profundidade/3 por isso mesmo.
+                //
+                // Medido a` profundidade 14, nas mesmas tres posicoes: o
+                // Triumviratus chega la' com 2,6 vezes menos nos do que nos, com
+                // nos por segundo equivalentes. A diferenca e' toda arvore, e
+                // uma reducao que nao cresce e' uma das razoes por que ela nao
+                // encolhe onde devia.
+                let mut r = self.params.nmp_base
+                    + ((pruning_eval - beta) / 200).min(self.params.nmp_div);
+                if self.features.nmp_profundidade {
+                    r += depth / self.params.nmp_prof_div;
+                }
+                let undo = board.make_null_move();
+                crate::ponte::nulo();
+                self.keys.push(board.hash);
+                self.null_at[ply] = true;
+                // Passing the position over expects the opposite of whatever
+                // this node expects.
+                let score =
+                    -self.negamax(board, depth - r, -beta, -beta + 1, ply + 1, false, !cut_node);
+                self.null_at[ply] = false;
+                self.keys.pop();
+                board.unmake_null_move(&undo);
+                crate::ponte::desfaz_nulo();
+                if score >= beta {
+                    // A mate score from a null move search is an artefact of
+                    // the free move; report the bound instead.
+                    marca(7);
+                    return if is_mate(score) { beta } else { score };
+                }
+            }
+        }
+
+        // Nothing in the table for a node this deep means no move worth
+        // trying first, and searching at full depth to discover one costs more
+        // than finding it a ply shallower and coming back.
+        // `iir_no_all`: um no' ALL (nem PV nem de corte) vai procurar tudo de
+        // qualquer maneira; encolher-lhe a profundidade so' lhe tira qualidade.
+        if self.features.iir
+            && depth >= 4
+            && tt_move.is_none()
+            && (!self.features.iir_no_all || pv_node || cut_node)
+        {
+            depth -= 1;
+        }
+
+        // A stored lower bound far enough above beta already answers the
+        // question this node was about to ask, even at a depth we would not
+        // normally trust. It cost a search once; there is no reason to pay
+        // again to be told the same thing by a smaller margin.
+        if self.features.probcut && !pv_node && !in_check && excluded.is_none() {
+            if let Some(e) = entry {
+                if matches!(e.bound, Bound::Lower | Bound::Exact)
+                    && e.depth >= depth - 2
+                    && beta.abs() < MATE_IN_MAX
+                {
+                    let ts = score_from_tt(e.score, ply);
+                    if !is_mate(ts) && ts >= beta + self.params.probcut_margin {
+                        marca(8);
+                        return ts;
+                    }
+                }
+            }
+        }
+
+        marca(9);
+        // Geracao por etapas.
+        //
+        // Um em cada quatro nos chega aqui, e desses 92% cortam sem precisar de
+        // um unico lance tranquilo. Gerar a lista toda, filtrar-lhe a
+        // legalidade e pontuar cada tranquilo com o historico e as tabelas de
+        // continuacao e' trabalho feito e deitado fora em massa -- e' por isso
+        // que `score_moves` mais `pick` somam 12,8% do tempo, tanto como o
+        // proprio `negamax`.
+        //
+        // Aqui geram-se so' as capturas. Os tranquilos entram mais tarde, e so'
+        // se a busca la' chegar: o gatilho e' o `pick` deixar de encontrar
+        // alguma coisa acima da banda dos killers, que e' exactamente o momento
+        // em que a tabela, as capturas boas e as promocoes se esgotaram.
+        //
+        // Em xeque nao ha' etapas: as fugas incluem lances tranquilos e a lista
+        // tem de vir inteira.
+        let etapas = self.features.gera_etapas && !in_check;
+        let mut faltam_tranquilos = etapas;
+        let mut moves = if etapas {
+            crate::movegen::generate_legal_caps(board, &self.atk)
+        } else {
+            generate_legal(board, &self.atk)
+        };
+        if moves.is_empty() && !faltam_tranquilos {
+            return if in_check { mate_score(ply) } else { 0 };
+        }
+        let (mut scores, mut hist) = self.score_moves(board, &moves, tt_move, tt_bound, ply, depth);
+        if est_ligado() {
+            use std::sync::atomic::Ordering::Relaxed;
+            EST[0].fetch_add(1, Relaxed);
+            EST[1].fetch_add(moves.len() as u64, Relaxed);
+        }
+
+        let mut best_score = -INF;
+        let mut best_move = None;
+        let alpha_orig = alpha;
+        let mut searched_quiets: Vec<Move> = Vec::new();
+        let mut tipo_primeiro = 3usize;
+        let mut slot_primeiro: Option<usize> = None;
+        let mut searched_captures: Vec<Move> = Vec::new();
+        // Com geracao por etapas, uma posicao AFOGADA deixa de ser apanhada pela
+        // verificacao de antes do ciclo: a lista das capturas nasce vazia, os
+        // tranquilos sao gerados la' dentro e tambem nao ha' nenhum. Sem isto o
+        // no' caia no `return alpha` la' em baixo e um empate por afogamento
+        // passava a valer o que a janela dissesse.
+        let mut algum_lance = false;
+
+        let tt_score_for_singular = entry
+            .filter(|e| e.has_bound())
+            .map(|e| score_from_tt(e.score, ply));
+
+        // Once the quiet moves are done with, the captures behind them are not.
+        let mut skip_quiets = false;
+
+        let mut tranquilos_pontuados = false;
+        // O indice avanca no TOPO, nao no fim: o corpo tem `continue`s, e num
+        // `while` eles saltariam o incremento e prendiam o ciclo. Foi o que
+        // aconteceu a` primeira -- o motor deixou de devolver lance nenhum.
+        let mut proximo = 0usize;
+        loop {
+            // Os tranquilos entram em dois casos: quando a lista das capturas se
+            // esgota, e quando o melhor que resta ja' esta' abaixo da banda dos
+            // killers -- que e' o momento em que a tabela, as capturas boas e as
+            // promocoes acabaram.
+            //
+            // O primeiro caso faltava-me a` primeira tentativa: numa posicao sem
+            // capturas nenhumas a lista nasce vazia, o ciclo nunca corria, os
+            // tranquilos nunca eram gerados e o no' devolvia lixo. A arvore
+            // encolhia para um terco e parecia um ganho enorme.
+            if faltam_tranquilos
+                && (proximo >= moves.len()
+                    || scores[proximo..].iter().copied().max().unwrap_or(i32::MIN) < 400_000)
+            {
+                let tranquilos = crate::movegen::generate_legal_quiets(board, &self.atk);
+                if !tranquilos.is_empty() {
+                    let (o2, h2) =
+                        self.score_moves(board, &tranquilos, tt_move, tt_bound, ply, depth);
+                    moves.extend_from_slice(&tranquilos);
+                    scores.extend_from_slice(&o2);
+                    hist.extend_from_slice(&h2);
+                }
+                faltam_tranquilos = false;
+            }
+            if proximo >= moves.len() {
                 break;
             }
-            i += 1;
-        }
-        self.history.pop();
-
-        let bound = if best_score <= orig_alpha {
-            Bound::Upper
-        } else if best_score >= beta {
-            Bound::Lower
-        } else {
-            Bound::Exact
-        };
-        // score_to_tt(): guarda relativo a ESTE no' (nao a raiz) -- ver
-        // nota grande junto de score_to_tt/score_from_tt. Nao guardar
-        // durante uma re-pesquisa singular -- score enviesado por
-        // janela restrita e excluded_move.
-        if excluded.is_none() {
-            // TTPV: OR with whatever the entry already had, not just
-            // this node's own window -- fix from code review
-            // (2026-07-22): with always-replace storage, a PV-written
-            // entry gets overwritten by the next (far more common)
-            // scout-window visit to the same position, erasing the
-            // flag almost immediately. Once true, stays true across
-            // subsequent non-PV writes to the same slot
-            // (`store_pv = is_pv || (hit && old.pv)`).
-            let store_pv = is_pv || tt_entry_captured.map(|e| e.pv).unwrap_or(false);
-            let tt_static_eval = if in_check {
-                crate::tt::TT_EVAL_NONE
-            } else {
-                raw_static_eval.clamp(i16::MIN as i32, i16::MAX as i32) as i16
-            };
-            self.tt.store(hash, depth, score_to_tt(best_score, ply as i32), bound, best_move, store_pv, tt_static_eval);
-            // Correction history update: only on a genuine Exact result
-            // (fail-high/fail-low bounds are one-sided, not a real
-            // estimate of the true value) and never in check (tactics
-            // dominate there, not the slow eval-bias signal we want).
-            if !self.stop && !in_check && bound == Bound::Exact {
-                self.update_corr_hist(board, raw_static_eval, best_score, depth);
+            let i = proximo;
+            proximo += 1;
+            algum_lance = true;
+            if est_ligado() {
+                EST[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
+            if self.features.pick_cpp {
+                Self::pick_cpp(&mut moves, &mut scores, &mut hist, i);
+            } else {
+                Self::pick(&mut moves, &mut scores, &mut hist, i);
+            }
+            // Chegamos ao fim dos nao-tranquilos: agora sim vale a pena saber o
+            // que as tabelas acham dos que sobram.
+            //
+            // A pergunta e' feita DEPOIS do `pick` e sobre o lance escolhido.
+            // Com o sentinela na banda certa, o primeiro tranquilo por pontuar
+            // a ser escolhido e' exactamente o momento em que a tabela, as
+            // capturas boas e os killers se esgotaram -- e ainda antes das
+            // capturas mas. Perguntar antes obrigava a uma varredura da lista
+            // por cada lance, que e' o que o `pick` ja' faz.
+            if self.features.pontua_tarde
+                && !tranquilos_pontuados
+                && scores[i] == TRANQUILO_POR_PONTUAR
+            {
+                self.pontua_tranquilos(board, &moves, &mut scores, &mut hist, i, ply);
+                tranquilos_pontuados = true;
+                Self::pick(&mut moves, &mut scores, &mut hist, i);
+            }
+            let mv = moves[i];
+            if Some(mv) == excluded {
+                continue;
+            }
+            if est_ligado() {
+                FORMA[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            let is_quiet = !mv.is_capture() && mv.promotion.is_none();
+            // Categoria, para o instrumento: 0 tabela, 1 captura, 2 killer,
+            // 3 tranquilo. A ordem importa -- o lance da tabela pode tambem
+            // ser captura, e conta como o primeiro por ser essa a razao de
+            // estar a` frente.
+            if ttb_ligado() && i == 0 && Some(mv) == tt_move {
+                use std::sync::atomic::Ordering::Relaxed;
+                let b = match tt_bound {
+                    Bound::Exact => 0,
+                    Bound::Lower => 2,
+                    Bound::Upper => 4,
+                    Bound::NoBound => 9,
+                };
+                if b < 6 {
+                    TTB[b].fetch_add(1, Relaxed);
+                }
+            }
+            let tipo_mv = if Some(mv) == tt_move {
+                0usize
+            } else if !is_quiet {
+                1
+            } else if self.killers[ply].iter().any(|k| *k == Some(mv)) {
+                2
+            } else {
+                3
+            };
+            if i == 0 {
+                tipo_primeiro = tipo_mv;
+                slot_primeiro = self.killers[ply].iter().position(|k| *k == Some(mv));
+            }
+            if skip_quiets && is_quiet {
+                continue;
+            }
+            let mut extension = 0;
+
+            // The order below is not ours to choose. Late move count, then the
+            // exchange test on captures, then history, then the static margin,
+            // then the exchange test on quiets -- the sequence the engines that
+            // measured it settled on, cheapest question first so the expensive
+            // ones are never asked about a move that is already gone.
+            //
+            // Everything here needs a score already in hand: without one, the
+            // node has nothing to compare a margin against and skipping moves
+            // risks reporting a mate that is not there.
+            if !root
+                && !pv_node
+                && !in_check
+                && best_score > -MATE_IN_MAX
+                && has_pieces(board, board.side)
+            {
+                // A PROFUNDIDADE REDUZIDA, e nao a nominal.
+                //
+                // Antes de decidir podar, calcula-se a que profundidade o lance
+                // VAI mesmo ser procurado -- a nominal menos a reducao -- e e'
+                // com essa que se julga. Um lance que vai levar tres plies de
+                // corte e' julgado com as margens de um no' tres plies mais
+                // raso, que sao muito mais apertadas, e cai. Antes julgavamos
+                // como se fosse procurado a` profundidade toda, e sobrevivia.
+                //
+                // Dois motores independentes fazem-no, e e' a diferenca que
+                // explica os quatro para um: a` profundidade 12, com a MESMA
+                // rede dos dois lados, eles chegam la' com 77.897 nos e nos com
+                // 388.850.
+                //
+                // A estimativa sai da tabela de reducao, que e' o termo
+                // dominante e o unico disponivel neste ponto -- os ajustes
+                // finais so' aparecem depois das extensoes.
+                let prof_poda = if self.features.poda_reduzida {
+                    let r_est = if depth >= 3 && is_quiet && !in_check {
+                        (self.lmr[(depth as usize).min(63)][i.min(63)] / 1024)
+                            .clamp(0, (depth - 1).max(0))
+                    } else {
+                        0
+                    };
+                    // O historico DEVOLVE profundidade. Sem isto podamos os
+                    // lances que o historico prefere com o mesmo rigor que os
+                    // que ele despreza, e sao justamente esses que mais custa
+                    // deitar fora -- o que explica bem os 30 a 52 Elo que as
+                    // quatro doses anteriores perderam.
+                    //
+                    // A forma e' a deles (`lmrDepth += history / divisor`), a
+                    // escala e' nossa: o divisor fica em parametro porque o
+                    // nosso historico nao tem de ter a mesma amplitude que o
+                    // deles, e supor que tem ja' nos custou uma vez.
+                    let base = depth - 1 - r_est;
+                    let p = if self.features.poda_hist {
+                        base + hist[i] / self.params.poda_hist_div.max(1)
+                    } else {
+                        base
+                    };
+                    p.max(0)
+                } else {
+                    depth
+                };
+
+                // ================= A PODA DELES, INTEIRA =================
+                //
+                // Sete tentativas anteriores falharam todas pela mesma razao:
+                // levavam PECAS. A profundidade reduzida sem o resto (-38,7 a
+                // -52), a margem escalada sem mexer no `r` (-30 a -33), e a
+                // linha do historico transplantada sozinha (-54 a -63). A
+                // conclusao que tirei foi que uma peca solta nao reconstroi o
+                // conjunto; a resposta e' levar o conjunto.
+                //
+                // Aqui esta' o Step 15 deles tal como e', com a mesma ordem, os
+                // mesmos ramos e as mesmas FORMAS -- linear na futilidade dos
+                // tranquilos, linear com valor da vitima nas capturas,
+                // QUADRATICA no SEE. E, sobretudo, com a mesma moeda comum: um
+                // `lmr_depth` unico que nasce da reducao a serio e que os tres
+                // testes leem.
+                //
+                // O que NAO se importa sao as escalas de historia. As
+                // constantes deles (-4136, o divisor ~3000) sao para somas que
+                // vao a ~105000; as nossas tabelas topam em 15000 principal,
+                // 30000 continuacao. Ja' nos custou um teste morto -- uma
+                // condicao que nunca disparou e devolveu contagens de nos
+                // identicas ao byte. Por isso ficam em parametro.
+                if self.features.poda_sf {
+                    // A moeda comum. O `r` deles ja' inclui o termo do ttPv
+                    // ANTES da poda; o nosso vinha so' da tabela crua.
+                    let mut r1024 = self.lmr[(depth as usize).min(63)][i.min(63)];
+                    // Sem o `ttpv_lmr` por cima: dentro do `poda_sf` o termo do
+                    // ttPv nao e' uma ideia em prova, e' parte da forma que
+                    // fomos buscar. Com a guarda anterior nunca disparava --
+                    // `ttpv_lmr` esta' a false por omissao e o `TtpvLmr` nem
+                    // esta' na EXTRA, logo nem e' anunciado no `uci`. Medido:
+                    // `PodaSfTtpv` no minimo e no maximo davam os MESMOS 148635
+                    // nos. Quem quiser o `r` sem este termo poe `PodaSfTtpv=0`,
+                    // que e' para isso que ele e' parametro.
+                    if tt_pv {
+                        r1024 += self.params.poda_sf_ttpv;
+                    }
+                    let new_depth = depth - 1;
+                    let mut lmr_depth = new_depth - r1024 / 1024;
+                    // Uma vez por lance, como eles. Um xeque vai pelo ramo das
+                    // capturas mesmo sendo tranquilo: e' forcante, e julga-lo
+                    // com as margens dos tranquilos deita fora linhas.
+                    let gives_check = self.da_xeque(board, &mv);
+                    // O `hist[i]` e' ZERO para toda a captura por construcao
+                    // (ver o `return 0` no ramo `is_capture()` de onde ele sai),
+                    // portanto os dois termos de historia deste bloco eram
+                    // estruturalmente nulos: `PodaSfCaptHist` no minimo e no
+                    // maximo davam os mesmos 148635 nos, e o `* 34 / 1024` da
+                    // margem do SEE tambem nunca somou nada. O SF le' aqui o
+                    // historico DE CAPTURAS, que ja' existe na arvore.
+                    //
+                    // NOTA: so' tem valores com `CaptureHist=true` -- e' esse
+                    // interruptor que alimenta a tabela (`credit_capture` sai
+                    // cedo sem ele). Testar o `PodaSF` sem ele volta a medir a
+                    // forma incompleta.
+                    let capt_h = if !is_quiet { self.capt_score(board, &mv) } else { 0 };
+
+                    if !is_quiet || gives_check {
+                        // --- capturas e xeques ---
+                        if !gives_check && lmr_depth < 8 {
+                            let vitima = if mv.flag == MoveFlag::EnPassant {
+                                PieceType::Pawn.value()
+                            } else {
+                                board.piece_at(mv.to).map(|(pt, _)| pt.value()).unwrap_or(0)
+                            };
+                            if static_eval
+                                + self.params.poda_sf_capt_base
+                                + self.params.poda_sf_capt_slope * lmr_depth
+                                + vitima
+                                + self.params.poda_sf_capt_hist * capt_h / 1024
+                                <= alpha
+                            {
+                                continue;
+                            }
+                        }
+                        // SEE das capturas, com a margem a crescer com a
+                        // profundidade NOMINAL -- nao com a reduzida.
+                        let margem = self.params.poda_sf_capt_see * depth
+                            + capt_h * 34 / 1024;
+                        if !see::see_ge(&self.atk, board, &mv, -margem) {
+                            continue;
+                        }
+                    } else if !pv_node {
+                        // `!pv_node`: nao se poda tranquilo nenhum num no' de
+                        // PV. E' a linha principal, a que a busca esta' a
+                        // defender, e uma margem que falha ali deita fora a
+                        // variante em vez de uma sub-arvore lateral.
+                        //
+                        // Mal se ve' na contagem de nos -- os nos de PV sao
+                        // poucos -- mas muda o que a busca guarda, que e' onde
+                        // isto se paga.
+                        // --- tranquilos ---
+                        // Poda pelo historico de continuacao, ANTES de tudo o
+                        // resto: um lance que as tabelas desprezam ha' muito
+                        // nao merece o no'.
+                        if hist[i] < -self.params.poda_sf_cont_prune * depth {
+                            continue;
+                        }
+                        // O historico DEVOLVE profundidade. Sozinha esta linha
+                        // deu -54 Elo; aqui vem com o resto do conjunto.
+                        let devolucao = hist[i] / self.params.poda_sf_div.max(1);
+                        lmr_depth += devolucao;
+                        conta_lmrd(lmr_depth, devolucao);
+
+                        if !in_check
+                            && lmr_depth < 12
+                            && static_eval
+                                + self.params.poda_sf_fut_slope * lmr_depth
+                                + if static_eval > alpha { 90 } else { 0 }
+                                + self.params.poda_sf_fut_base
+                                <= alpha
+                        {
+                            // `continue` e mais nada: poda ESTE lance e nao
+                            // os que vem a seguir.
+                            //
+                            // Aqui estava `skip_quiets = true`, que parava
+                            // todos os tranquilos que faltavam no no' a`
+                            // PRIMEIRA margem que falhasse. A ordem nao e'
+                            // monotona na futilidade -- um lance que falha a
+                            // margem nao diz nada sobre o seguinte -- por isso
+                            // isso deitava fora lances por associacao.
+                            //
+                            // MEDIDO em partidas, mesmas condicoes (8+0.08,
+                            // UHO, aberturas iguais, o remendo em primeiro):
+                            //
+                            //     com `skip_quiets`   563 partidas  -17,4 Elo
+                            //     com `continue`      605 partidas   -4,1 Elo
+                            //
+                            // Treze Elo por uma palavra. Parar por contagem de
+                            // lances e' outra coisa e tem o seu proprio sitio;
+                            // parar por uma margem falhada nao se justifica.
+                            continue;
+                        }
+
+                        lmr_depth = lmr_depth.max(0);
+
+                        // QUADRATICA. Um multiplicador unico sobre a nossa
+                        // margem linear nao imita isto, e era isso que as
+                        // tentativas anteriores faziam.
+                        if !see::see_ge(
+                            &self.atk,
+                            board,
+                            &mv,
+                            -self.params.poda_sf_see * lmr_depth * lmr_depth,
+                        ) {
+                            continue;
+                        }
+                    }
+                } else {
+                    if is_quiet {
+                        // Late move pruning: past a certain count at low depth,
+                        // the ordering has been wrong often enough that the rest
+                        // are not worth the nodes.
+                        //
+                        // It stops the QUIETS, not the loop. Losing captures score
+                        // below every quiet move and are therefore last in the
+                        // list, so breaking here threw all of them away as well --
+                        // a rule about quiet moves silently deleting captures.
+                        let full = self.params.lmp_base + depth * depth;
+                        let count = if !self.features.lmp_improving || improving {
+                            full
+                        } else {
+                            full / 2
+                        };
+                        // O lance da tabela vindo de um limite superior nao
+                        // gasta um lugar: ele foi posto a` frente sem o ter
+                        // ganho, e sem isto empurra para fora da poda um lance
+                        // que estava na fronteira.
+                        let indice = if self.features.tt_sem_lmp
+                            && tt_bound == Bound::Upper
+                            && tt_move.is_some()
+                            && i > 0
+                        {
+                            i - 1
+                        } else {
+                            i
+                        };
+                        if depth <= self.params.lmp_depth && indice >= count as usize {
+                            skip_quiets = true;
+                            continue;
+                        }
+
+                        // History pruning. A quiet move the tables have disliked
+                        // this consistently, at a depth this shallow, is not worth
+                        // the node. The threshold grows with the square of the
+                        // depth so that it only bites where being wrong is cheap.
+                        //
+                        // The constant is in OUR history units and had to be. Taken
+                        // straight from a design whose tables run to about
+                        // 105000, against ours that cap near 24500, it never once
+                        // fired -- the two runs came back with byte-identical node
+                        // counts, which is what a dead branch looks like from
+                        // outside.
+
+                        if self.features.history_prune
+                            && prof_poda <= 4
+                            && hist[i] < -self.params.hist_prune * prof_poda * prof_poda
+                        {
+                            continue;
+                        }
+
+                        // Futility: even handed the margin, this move does not
+                        // reach alpha, and a quiet move does not change the
+                        // material to make up the difference. The history term
+                        // belongs here: a move the tables like is worth trying even
+                        // when the margin says otherwise, and one they dislike is
+                        // worth less than the margin suggests. Its divisor is in
+                        // OUR history units, which run about five and a half times
+                        // smaller.
+                        //
+                        // This one stopped the loop too. Quiets are ordered by
+                        // history, so a later quiet does fail the same test -- but
+                        // the captures behind them do not, and were going with it.
+                        let hist_term = hist[i] / self.params.fut_hist_div.max(1);
+                        // A inclinacao sobe quando a profundidade desce.
+                        //
+                        // O erro da primeira tentativa: troquei `depth` por
+                        // `prof_poda` e deixei os coeficientes como estavam. As
+                        // margens deles sao feitas PARA a profundidade reduzida --
+                        // 119 por ply nos tranquilos, 234 + 247 por ply nas capturas
+                        // -- e as nossas foram afinadas para a nominal. Meter um
+                        // numero menor na mesma formula encolhe a margem, e a poda
+                        // passou a cortar o que nao devia: -38,7 Elo em 892
+                        // partidas.
+                        //
+                        // `FutSlopeRed` em percentagem: 100 deixa como esta', 200
+                        // duplica a inclinacao para compensar uma profundidade que
+                        // fica tipicamente a metade.
+                        let inclin = if self.features.poda_reduzida {
+                            self.params.fut_slope * self.params.fut_slope_red / 100
+                        } else {
+                            self.params.fut_slope
+                        };
+                        if prof_poda <= self.params.fut_depth
+                            && static_eval
+                                + self.params.fut_base
+                                + inclin * prof_poda
+                                + hist_term
+                                <= alpha
+                        {
+                            skip_quiets = true;
+                            continue;
+                        }
+
+                        // A quiet move can still lose material -- walking a piece
+                        // onto a square where it is taken for nothing. Static
+                        // exchange says so before the search has to find out, and
+                        // it is asked last because it is the dearest question here.
+                        if prof_poda <= 8
+                            && !see::see_ge(
+                                &self.atk,
+                                board,
+                                &mv,
+                                -(self.params.see_prune_quiet * self.params.see_quiet_red / 100)
+                                    * (prof_poda + prof_poda * prof_poda),
+                            )
+                        {
+                            continue;
+                        }
+                    } else {
+                        // FUTILIDADE PARA CAPTURAS.
+                        //
+                        // Nao a tinhamos de todo: a futilidade so' se aplicava a
+                        // lances tranquilos, e uma captura que nao chega perto de
+                        // alpha era procurada na mesma.
+                        //
+                        // Os dois motores que li fazem-no, e o cinder de forma
+                        // elegante: em vez de escrever um caso a` parte para
+                        // capturas, ele aplica UM teste a todos os lances e desconta
+                        // o que o lance GANHA -- `!pos.gaining(m, margem)`. Uma
+                        // captura que traz material suficiente sobrevive; uma que
+                        // nao traz cai como qualquer tranquilo.
+                        //
+                        // Aqui o ganho e' o valor da peca comida, que e' o limite
+                        // superior do que a captura pode trazer.
+                        if self.features.fut_capturas && !in_check && prof_poda < 8 {
+                            let vitima = if mv.flag == MoveFlag::EnPassant {
+                                PieceType::Pawn.value()
+                            } else {
+                                board.piece_at(mv.to).map(|(pt, _)| pt.value()).unwrap_or(0)
+                            };
+                            let ganho = vitima
+                                + mv.promotion
+                                    .map(|p| p.value() - PieceType::Pawn.value())
+                                    .unwrap_or(0);
+                            if static_eval
+                                + self.params.fut_capt_base
+                                + self.params.fut_slope * prof_poda
+                                + ganho
+                                <= alpha
+                            {
+                                continue;
+                            }
+                        }
+                        if depth <= 8
+                            && !see::see_ge(&self.atk, board, &mv, -self.params.see_prune * depth)
+                        {
+                            // A capture that loses more than the depth could plausibly
+                            // win back.
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            // Singular extension. If the table says this move is good enough to
+            // fail high, search every OTHER move against a window just below
+            // that. If they all fall short, this move is the only one holding
+            // the position up, and a line that hangs on one move deserves
+            // another ply to be sure of it.
+            if !root
+                && excluded.is_none()
+                && Some(mv) == tt_move
+                && depth >= self.params.sing_depth
+                && ply < MAX_PLY - 8
+            {
+                if let Some(ts) = tt_score_for_singular {
+                    let e = entry.unwrap();
+                    if e.depth >= depth - 3
+                        // A referencia so' testa BOUND_LOWER; nos aceitamos
+                        // tambem os exactos, o que abre um conjunto muito maior
+                        // de sondagens. Do KestrelStrike, recuperado a 20-09.
+                        && (matches!(e.bound, Bound::Lower)
+                            || (!self.features.sing_so_inferior
+                                && matches!(e.bound, Bound::Exact)))
+                        && !is_mate(ts)
+                    {
+                        let target = ts - self.params.sing_margin * depth;
+                        self.excluded[ply] = Some(mv);
+                        let s = self.negamax(
+                            board,
+                            (depth - 1) / 2,
+                            target - 1,
+                            target,
+                            ply,
+                            false,
+                            cut_node,
+                        );
+                        self.excluded[ply] = None;
+                        if self.stopped {
+                            return 0;
+                        }
+                        if s < target {
+                            extension = 1;
+                            // Not merely singular but singular by a distance:
+                            // every alternative fell a long way short, so the
+                            // line is even narrower than one ply of extension
+                            // says. Outside the principal variation only, where
+                            // being wrong costs a subtree rather than the move
+                            // we play.
+                            if !pv_node && s < target - self.params.double_ext {
+                                extension = 2;
+                            }
+                        } else if target >= beta {
+                            // Every other move also beats beta, so the position
+                            // is winning for reasons that do not depend on this
+                            // one and the whole subtree can go.
+                            return target;
+                        } else if !pv_node && !is_mate(s) && s >= beta {
+                            return s;
+                        } else if ts >= beta {
+                            // The table says this move fails high, and the
+                            // search just said it is not the only one that
+                            // does. A node with several good answers is the
+                            // opposite of the case worth extending, so take a
+                            // ply off rather than adding one.
+                            extension = -1;
+                        }
+                    }
+                }
+            }
+
+            let nodes_before = self.nodes;
+            self.played[ply] = board
+                .piece_at(mv.from)
+                .map(|(pt, _)| (pt.idx(), mv.to as usize));
+            let undo = board.make_move(&mv);
+            crate::ponte::lance(&mv);
+            // Ask for the child's entry now. The probe happens a function call
+            // and a check detection later, which is enough to cover part of the
+            // trip to memory -- and that trip was a fifth of the whole search.
+            self.tt.prefetch(board.hash);
+            self.keys.push(board.hash);
+
+            // A move that gives check is forcing: the reply is constrained and
+            // the line is worth another ply. Only while the score says the game
+            // is still a contest, since a check in a decided position extends
+            // something that changes nothing.
+            if self.features.check_ext
+                && board.in_check(board.side, &self.atk)
+                && static_eval != TT_EVAL_NONE as i32
+                && static_eval.abs() > self.params.check_ext_eval
+            {
+                extension = extension.max(1);
+            }
+
+            let new_depth = depth - 1 + extension;
+
+            let mut did_lmr = false;
+            let mut searched_again = false;
+            let mut score;
+            if i == 0 {
+                // The first move of a principal variation node leads to another
+                // one; anywhere else the child expects the opposite of us.
+                let child_cut = if pv_node { false } else { !cut_node };
+                score =
+                    -self.negamax(board, new_depth, -beta, -alpha, ply + 1, pv_node, child_cut);
+            } else {
+                // Late move reductions: the ordering has already put the moves
+                // most likely to be best first, so the ones at the back are
+                // searched shallower until one of them proves otherwise.
+                // Late captures are reduced too, outside the principal
+                // variation. A capture is not automatically worth a full look
+                // just for being a capture -- the ones that were worth it are
+                // already at the front of the list, and the ones down here have
+                // been sorted below quiet moves by static exchange for a
+                // reason.
+                // Nothing is reduced once the board is nearly empty.
+                //
+                // Off by default, and the reason is worth writing down because
+                // the idea sounded right and the measurement said otherwise.
+                // It was put in to fix a real fault: king and rook against
+                // king, four seconds, and the engine reports five and a half
+                // pawns rather than the mate. Switching reductions off in that
+                // position took the depth from nineteen to thirteen and left
+                // the score where it was.
+                //
+                // Which located the fault somewhere else. That mate is up to
+                // sixteen moves away -- thirty-two plies -- and no depth this
+                // search reaches can prove it. The engine would have to be
+                // driven there by the evaluation, and the network gives it the
+                // value of a rook without distinguishing a king pinned to the
+                // edge from one standing in the middle. It is an evaluation
+                // that cannot restrict a king, not a search that reduces the
+                // move which would. Tablebases are the answer to that, which is
+                // why every strong engine carries them for these endings.
+                let poucas_pecas =
+                    board.occ_all.count_ones() <= self.params.lmr_endgame_pieces as u32;
+                let reducible = !poucas_pecas
+                    && (is_quiet
+                        || (self.features.lmr_captures && !pv_node && depth >= 3));
+
+                did_lmr = true;
+                let mut r = 0;
+                if self.features.log_lmr {
+                    // The other shape, whole. Integer logarithms of the
+                    // move number and the depth, a ply back for anything
+                    // tactical or on the principal variation, the history
+                    // divided by the ceiling one table reaches, two plies at a
+                    // node expected to fail high, and one always.
+                    //
+                    // Our history tables were rebuilt to its scale earlier, so
+                    // the divisor transfers without conversion.
+                    if depth > 2 && i >= 1 + 2 * root as usize && (!pv_node || is_quiet) {
+                        let n = i as i32 + 1;
+                        r = ilog2i(n) / 2 + ilog2i(depth) / 2
+                            - (!is_quiet || pv_node) as i32
+                            - (hist[i] + 15000) / 30000
+                            + 2 * cut_node as i32
+                            + 1;
+                        r = r.clamp(0, (new_depth - 1).max(0));
+                    }
+                } else if depth >= 3 && reducible && !in_check {
+                    // Accumulated in 1024ths and divided at the end, so a term
+                    // can be worth a third of a ply instead of all or nothing.
+                    // The first version added whole plies, and the cut node term
+                    // alone was two of them where a third of one is the right
+                    // size. Five times too much, which is exactly why measuring
+                    // it found it doing no good.
+                    // A tabela ja' vem em milesimos.
+                    // A MESMA grandeza que as podas leem. Ver `r_partilhado`.
+                    let r1024 = self.r_partilhado(
+                        depth, i, alpha, beta, improving, is_quiet, cut_node,
+                        pv_node, tt_pv, tt_move, hist[i],
+                        self.cut_cnt[ply + 1], true,
+                    );
+                    r = (r1024 / 1024).clamp(0, (new_depth - 1).max(0));
+                }
+                // A reduced scout search is looking for a reason to stop, so
+                // the child is treated as expecting to fail high.
+                conta_reb(0, 1);
+                score =
+                    -self.negamax(board, new_depth - r, -alpha - 1, -alpha, ply + 1, false, true);
+                if score > alpha && r > 0 {
+                    if est_ligado() { FORMA[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+                    // A reducao estava errada: o lance merecia a profundidade
+                    // inteira e o trabalho reduzido foi deitado fora.
+                    searched_again = true;
+                    let antes = self.nodes;
+                    conta_reb(1, 1);
+                    score = -self.negamax(
+                        board,
+                        new_depth,
+                        -alpha - 1,
+                        -alpha,
+                        ply + 1,
+                        false,
+                        !cut_node,
+                    );
+                    conta_reb(3, self.nodes - antes);
+                }
+                if score > alpha && score < beta {
+                    if est_ligado() { FORMA[5].fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+                    // A janela nula nao chegou: e' preciso o valor exacto, e a
+                    // busca anterior so' deu um limite.
+                    let antes = self.nodes;
+                    conta_reb(2, 1);
+                    score = -self.negamax(board, new_depth, -beta, -alpha, ply + 1, true, false);
+                    conta_reb(3, self.nodes - antes);
+                }
+            }
+
+            self.keys.pop();
+            board.unmake_move(&mv, &undo);
+            crate::ponte::desfaz(&mv);
+
+            if root {
+                self.root_effort.push((mv, self.nodes - nodes_before));
+                // A move searched with a null window that failed low has no
+                // real score, only a bound. Recorded anyway: it is still
+                // evidence of the ordering, and the fallback below only ever
+                // looks at moves close to the best, which fail-lows are not.
+                self.root_scores.push((mv, score));
+            }
+
+            // A quiet move that was reduced and then had to be searched again
+            // has told us something either way: it was worth the second look,
+            // or it was not. Both are worth recording, and neither shows up in
+            // the cutoff update, which only ever sees the move that ended the
+            // node.
+            if did_lmr && searched_again && is_quiet {
+                let credit = if score > best_score {
+                    hist_bonus(depth)
+                } else {
+                    -hist_bonus(depth)
+                };
+                let side = board.side.idx();
+                let slots = self.cont_slots(ply);
+                self.credit(board, mv, side, &slots, credit);
+            }
+
+            if self.stopped {
+                return 0;
+            }
+
+            // At the root, and only there, give up on an iteration that has
+            // already gone well past what was planned for the whole move. The
+            // soft limit is otherwise consulted only between iterations, so a
+            // single long one sails past it and the wall is all that catches
+            // it -- much later, and much more expensively.
+            //
+            // Safe to stop here because a root move that has finished has a
+            // real score: the best so far is a genuine best-so-far, not
+            // whatever happened to be first.
+            if root && i > 0 && self.start.elapsed() >= self.soft * 2 {
+                self.stopped = true;
+            }
+
+            if score > best_score {
+                best_score = score;
+                best_move = Some(mv);
+
+                if score > alpha {
+                    alpha = score;
+                    self.update_pv(ply, mv);
+
+                    // DESCONTO DE PROFUNDIDADE DEPOIS DE O ALPHA SUBIR.
+                    //
+                    // Do KestrelStrike, recuperado a 20-09. Assim que um lance
+                    // sobe o alpha, este no' ja' tem um melhor a serio. Os
+                    // lances que vem a seguir nao tem de provar que sao bons em
+                    // absoluto -- so' tem de bater ESSE. Procura-los a`
+                    // profundidade inteira e' pagar por uma prova que ja' nao e'
+                    // precisa.
+                    //
+                    // A janela existe para o desconto so' agir onde paga: em
+                    // cima a nota ainda salta e descontar cega a raiz; em baixo
+                    // ja' nao ha' profundidade que valha a pena descontar. E
+                    // nunca em cima de um mate, onde a nota nao e' uma medida
+                    // de quanto.
+                    if ply > 0
+                        && self.params.alpha_desc > 0
+                        && depth > self.params.ad_min
+                        && depth < self.params.ad_max
+                        && !is_mate(score)
+                    {
+                        depth -= self.params.alpha_desc;
+                    }
+
+                    if alpha >= beta {
+                        // Actualizacoes pequenas e pouco frequentes escalam
+                        // bem: so' conta quando NAO houve extensao dupla, ou em
+                        // no' de PV.
+                        if extension < 2 || pv_node {
+                            self.cut_cnt[ply] += 1;
+                        }
+                        if is_quiet {
+                            self.on_beta_cutoff(board, mv, ply, depth, &searched_quiets);
+                        } else {
+                            self.credit_capture(board, mv, capt_bonus(depth));
+                        }
+                        // Captures tried and passed over were wrong here
+                        // whatever ended the node, quiet or not.
+                        for c in &searched_captures {
+                            if *c != mv {
+                                self.credit_capture(board, *c, -capt_bonus(depth));
+                            }
+                        }
+                        // Em que lance o corte aconteceu. E' aqui que a
+                        // ordenacao se mede: cada corte abaixo do primeiro e'
+                        // uma sub-arvore percorrida para nada.
+                        conta_corte(i);
+                        if ttb_ligado() && i == 0 && Some(mv) == tt_move {
+                            use std::sync::atomic::Ordering::Relaxed;
+                            let b = match tt_bound {
+                                Bound::Exact => 1,
+                                Bound::Lower => 3,
+                                Bound::Upper => 5,
+                                Bound::NoBound => 9,
+                            };
+                            if b < 6 {
+                                TTB[b].fetch_add(1, Relaxed);
+                            }
+                        }
+                        conta_tipos(i, tipo_mv, tipo_primeiro);
+                        conta_cauda(i, tipo_primeiro, tt_move.is_some());
+                        if est_ligado() && i == 0 {
+                            FORMA[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        if let Some(k) = slot_primeiro {
+                            conta_killer(k, i == 0);
+                        }
+                        break;
+                    }
+                }
+            }
+
+            if is_quiet {
+                searched_quiets.push(mv);
+            } else {
+                searched_captures.push(mv);
+            }
+        }
+
+        if best_score == -INF {
+            if !algum_lance {
+                return if in_check { mate_score(ply) } else { 0 };
+            }
+            return alpha;
+        }
+
+        // Learn the correction from what the search ended up saying, but only
+        // where it contradicts the static score in a direction worth trusting:
+        // below it and below beta, so there is an upper bound proving the
+        // static score was optimistic, or above it with a move to show why.
+        // Anywhere else the number is the product of a cutoff, not a reading of
+        // the position. Captures are excluded: there the jump comes from
+        // material rather than from misreading, and it would teach the table
+        // the wrong thing.
+        if self.features.corr_hist
+            && !in_check
+            && best_score.abs() < MATE_IN_MAX
+            && !best_move.map_or(false, |m| m.is_capture())
+            && ((best_score < static_eval && best_score < beta)
+                || (best_score > static_eval && best_move.is_some()))
+        {
+            self.learn_correction(board, best_score - static_eval, depth, ply);
+        }
+
+        let bound = if best_score >= beta {
+            Bound::Lower
+        } else if best_score > alpha_orig {
+            Bound::Exact
+        } else {
+            Bound::Upper
+        };
+        let se = if in_check {
+            TT_EVAL_NONE
+        } else {
+            raw_static_eval as i16
+        };
+        if excluded.is_none() {
+            self.tt.store(
+                board.hash,
+                depth,
+                score_to_tt(best_score, ply),
+                bound,
+                best_move,
+                tt_pv,
+                se,
+            );
         }
 
         best_score
     }
 
-    /// Busca na raiz com aspiration windows: profundidade 1 usa sempre
-    /// janela total (referencia inicial). Profundidades seguintes tentam
-    /// primeiro uma janela estreita centrada no score da iteracao
-    /// anterior -- corta muito mais no resto da arvore -- e alarga
-    /// (dobra o delta) e repete se falhar por baixo ou por cima, ate'
-    /// obter um score dentro da janela ou o tempo esgotar.
-    ///
-    /// 2026-07-23: tentei substituir por uma formula mais elaborada
-    /// (delta escalado por prev_score^2, janela total abaixo de
-    /// profundidade 6, alargamento ~1.18x em vez de 2x, fail-high com
-    /// profundidade reduzida) -- A/B isolado (300 jogos)
-    /// deu 39% negativo, claro e fora do ruido. Combinado com o
-    /// terceiro dado negativo ja' existente para esta area (versao
-    /// antiga isolada: 33%), tres sinais independentes na mesma
-    /// direccao -- revertido para esta versao (delta fixo=25, janela
-    /// estreita desde profundidade 2, dobra sempre), que E' a versao
-    /// que os testes em lote (futility/RFP/razoring/mate-distance)
-    /// validaram como positiva em conjunto. Ver NOTAS_PROXIMA_SESSAO
-    /// para o historico completo.
-    fn search_root(
-        &mut self,
-        board: &mut Board,
-        depth: i32,
-        prev_score: i32,
-        _root_average: &mut Option<i32>,
-    ) -> i32 {
-        if depth <= 1 {
-            return self.negamax(board, depth, -MATE_SCORE - 1, MATE_SCORE + 1, 0, false, false);
+    fn quiescence(&mut self, board: &mut Board, mut alpha: i32, beta: i32, ply: usize) -> i32 {
+        self.nodes += 1;
+        if est_ligado() { FORMA[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+        if self.out_of_time() {
+            return 0;
         }
-        // A sliding-average variant was tried here -- centre the window on a
-        // running average of the root score instead of on prev_score, and
-        // widen asymmetrically. It measured WORSE than the plain version
-        // below, on top of an already-documented history of three independent
-        // negative signals for touching this function at all. Reverted; not
-        // worth the added surface for an unproven gain. `_root_average` is
-        // kept as a parameter so the call site does not have to change again
-        // if this is revisited with better evidence.
-        // Adopted whole, rather than assembled a piece at a time.
-        //
-        // Every part of this had a reason behind it in the engine it comes
-        // from, and the parts work together: the starting width, what happens
-        // on each kind of failure, and how the width grows are one mechanism,
-        // not four options. Taking them singly and vetoing each against our
-        // own baseline is how a package that works ends up rejected in
-        // fragments -- which is what happened here before.
-        //
-        // Four things this does that a plain "widen the failing side and
-        // double" does not:
-        //
-        //  * the starting width scales with the previous score, because a
-        //    position already far from equal moves in bigger steps than one
-        //    near it;
-        //  * a full window below a minimum depth, where the previous score is
-        //    too unreliable to aim at;
-        //  * on a fail-low, beta comes DOWN to the midpoint as alpha goes
-        //    out. The score is below the window, so the top of it was never
-        //    the question, and leaving it high keeps searching a range we
-        //    already know is empty;
-        //  * on a fail-high, the re-search goes one ply SHALLOWER, floored
-        //    five below. A move that beats the window will beat it at less
-        //    depth too, and paying full depth to confirm it is what makes
-        //    fail-highs expensive.
-        let sp = search_params();
-        // A janela e' o que separa as threads umas das outras agora. Cada uma
-        // parte de uma largura propria, portanto falha alto/baixo em pontos
-        // diferentes e explora ordens diferentes -- mesma ideia do
-        // `5 + threadIdx % 8` do Stockfish, escrita nas nossas unidades.
-        let mut delta: i32 = sp.asp_init_delta
-            + (self.thread_idx as i32 % 8)
-            + prev_score * prev_score / 16384;
-        let (mut alpha, mut beta) = if depth >= sp.min_asp_depth {
-            (
-                (prev_score - delta).max(-MATE_SCORE - 1),
-                (prev_score + delta).min(MATE_SCORE + 1),
-            )
+        if ply >= MAX_PLY - 1 {
+            return evaluate(board, self.features.rule50_fade);
+        }
+        if self.is_draw(board) {
+            return self.draw_score(ply);
+        }
+
+        let in_check = board.in_check(board.side, &self.atk);
+        let alpha_orig = alpha;
+
+        // The table is worth reading here too. Quiescence is most of the tree,
+        // the same capture sequences transpose constantly, and every hit that
+        // returns saves not just a node but the whole tail behind it.
+        let entry = self.tt.probe(board.hash);
+        let mut tt_move = None;
+        if let Some(e) = entry {
+            tt_move = e.best;
+            if e.has_bound() {
+                let sc = score_from_tt(e.score, ply);
+                let usable = match e.bound {
+                    Bound::Exact => true,
+                    Bound::Lower => sc >= beta,
+                    Bound::Upper => sc <= alpha,
+                    Bound::NoBound => false,
+                };
+                if usable {
+                    return sc;
+                }
+            }
+        }
+
+        // Standing pat: the side to move is not obliged to capture, so the
+        // static score is a floor. Not while in check, where every move is
+        // forced and there is nothing to stand on.
+        let mut static_eval = TT_EVAL_NONE as i32;
+        let mut stand = TT_EVAL_NONE as i32;
+        if !in_check {
+            static_eval = match entry {
+                Some(e) if e.static_eval != TT_EVAL_NONE => e.static_eval as i32,
+                _ => evaluate(board, self.features.rule50_fade),
+            };
+
+            // The floor to stand on is the better of the static score and
+            // whatever the table already established, for the same reason the
+            // full search prefers it: a stored bound on the right side of the
+            // static score came from a search that went and found out. Standing
+            // on the worse number means searching captures to reach a value
+            // already in hand.
+            let mut floor = static_eval;
+            if let Some(e) = entry {
+                if e.has_bound() {
+                    let ts = score_from_tt(e.score, ply);
+                    let better = match e.bound {
+                        Bound::Exact => true,
+                        Bound::Lower => ts > static_eval,
+                        Bound::Upper => ts < static_eval,
+                        Bound::NoBound => false,
+                    };
+                    if better {
+                        floor = ts;
+                    }
+                }
+            }
+            if floor >= beta {
+                return floor;
+            }
+            if floor > alpha {
+                alpha = floor;
+            }
+            stand = floor;
+
+        }
+
+        let mut moves = if in_check {
+            generate_legal(board, &self.atk)
         } else {
-            (-MATE_SCORE - 1, MATE_SCORE + 1)
+            generate_legal_caps(board, &self.atk)
         };
-        let mut asp_depth = depth;
-        let nos_antes = self.nodes;
-        loop {
-            let score = self.negamax(board, asp_depth.max(1), alpha, beta, 0, false, false);
-            if self.stop {
-                return score;
-            }
-            self.asp_re += 1;
-            self.asp_nos = self.asp_nos.saturating_add(self.nodes - nos_antes);
-            if score <= alpha {
-                beta = (alpha + beta) / 2;
-                alpha = (alpha - delta).max(-MATE_SCORE - 1);
-                asp_depth = depth;
-            } else if score >= beta {
-                beta = (beta + delta).min(MATE_SCORE + 1);
-                asp_depth = (asp_depth - 1).max(depth - 5);
-            } else {
-                return score;
-            }
-            delta += delta * sp.asp_widening_factor / 256;
+        if in_check && moves.is_empty() {
+            return mate_score(ply);
         }
-    }
+        let (mut scores, _) = self.score_moves(board, &moves, tt_move, Bound::NoBound, ply, 1);
 
-    pub fn iterative_deepening(&mut self, board: &mut Board) -> (Option<Move>, i32, i32, u64) {
-        let search_start = std::time::Instant::now();
+        let mut best = if in_check { -INF } else { stand };
         let mut best_move = None;
-        let mut best_score = 0;
-        let mut last_depth = 0;
-        let mut prev_score = 0;
-        // Sliding average of the root score across iterations. Currently
-        // unread -- see `search_root`, where the variant that would have used
-        // it measured worse and was reverted.
-        let mut root_average: Option<i32> = None;
-        let mut stable_count: u32 = 0;
-        // How often the search has changed its mind about the best move.
-        // Stability says "nothing has moved lately"; this says "this position
-        // has been argued over", and the two are not the same signal -- a move
-        // that flipped four times and then held for two iterations reads as
-        // settled to one and as contested to the other. Measured on a real
-        // loss: the move that lost the game was played in 1.04s with 29.7s
-        // still on the clock, and 3s of thought finds a different move.
-        let mut move_changes: u32 = 0;
-        // Score of the previous completed iteration, for the falling-eval
-        // signal: a position whose score is dropping is one the search has not
-        // finished solving.
-        let mut prev_iter_score: Option<i32> = None;
-        let mut quiet_iters: u32 = 0;
-        // Are we still inside our own opening book? The book already holds a
-        // curated answer for this position, and until now it was used only to
-        // ORDER moves -- so the engine spent a full slice of clock rederiving
-        // a choice it had been handed. Measured from the starting position at
-        // 60+0, the first ten moves cost 24-30% of the clock, which is the
-        // part of the game where that time buys least.
-        //
-        // Not played instantly: a book this size (a few thousand positions)
-        // can end anywhere, and walking out of it without having searched is
-        // how an engine gets a lost position for free. It searches, at a
-        // fraction of the allowance, and the fraction stops applying the
-        // moment the position is no longer in the book.
-        let in_book = self
-            .style_book
-            .map(|b| !b.lookup(board.hash).is_empty())
-            .unwrap_or(false);
-        let opening_move = board.fullmove <= TM_OPENING_MOVES;
 
-        self.killers = [[None; 2]; MAX_PLY];
-        self.root_move_nodes.clear();
-        self.root_scores.clear();
-        // Diversificacao das threads ajudantes.
-        //
-        // Antes disto a UNICA diferenca entre as N threads era qual delas
-        // narrava: mesmo tabuleiro, mesma busca, mesmos parametros. No
-        // meio-jogo safava-se, porque com trinta lances legais os historicos
-        // separam-se e cada thread acaba noutro ramo. Num final de rei e
-        // peoes ha seis lances: todas percorriam a MESMA arvore, escreviam
-        // nas mesmas linhas de cache da TT e atropelavam-se. Medido em
-        // Lasker-Reichhelm a profundidade 29: uma thread 825 mil nos em
-        // 376ms, quatro threads 11,2 MILHOES em 7527ms -- vinte vezes mais
-        // lento, com o ritmo a cair para um quinto ao mesmo tempo que os nos
-        // explodiam. As duas coisas juntas sao a assinatura de threads a
-        // lutar pelo mesmo trabalho, nao de sobrecarga de paralelismo.
-        //
-        // Cada ajudante salta um padrao proprio de profundidades, portanto
-        // chega a cada uma com a TT noutro estado e explora outra ordem. A
-        // thread 0 nunca salta nada: e ela que decide o lance.
-        // SEM SALTOS. As threads passam a divergir pela LARGURA DA JANELA DE
-        // ASPIRACAO (ver `asp_init_delta` em search_root), que e' como o
-        // Stockfish actual o faz -- `delta = 5 + threadIdx % 8 + ...`.
-        //
-        // Os saltos de profundidade vinham de uma versao antiga do Stockfish
-        // que entretanto os abandonou, e o efeito medido aqui foi patologico:
-        // na MESMA posicao e com o MESMO tempo, um fio escolhia sempre o mesmo
-        // lance e seis fios espalhavam-se por cinco lances diferentes, sem
-        // nunca escolher o do fio unico --
-        //
-        //     abertura, 10 corridas:  1 fio -> 10x a2a3
-        //                             6 fios -> 3x b1c3, 2x g1f3, 2x f1d3,
-        //                                       2x b2b4, 1x c1e3
-        //     meio-jogo, 8 corridas:  1 fio -> 8x f3e5
-        //                             6 fios -> 6x h2h3, 1x h2h4, 1x f3e5
-        //
-        // Divergir e' o proposito do Lazy SMP -- tirar a votacao custa 37,6%,
-        // medido. O que nao e' proposito e' as ajudantes estarem em
-        // profundidades DIFERENTES e a votacao pesar por profundidade: uma
-        // thread que saltou para um numero alto por um caminho raso ganha peso
-        // exactamente por isso. Com janelas em vez de saltos, todas percorrem
-        // as mesmas profundidades e divergem no caminho, que e' o que se quer.
-        for depth in 1..=self.limits.max_depth {
-            let score = self.search_root(board, depth, prev_score, &mut root_average);
-            // 2026-07-20 (BUG REAL corrigido -- irmao do bug ja' corrigido
-            // dentro do loop de lances de negamax(), "nunca descartar o
-            // resultado de um lance-filho ja' terminado so' porque o
-            // relogio esgotou a seguir"): aqui a mesma logica falhava um
-            // nivel acima -- `if self.stop && depth > 1 { break; }`
-            // acontecia ANTES de ler `self.root_best` para `best_move`,
-            // descartando uma iteracao que TINHA encontrado um lance
-            // valido (root_best ja' actualizado dentro de negamax()) so'
-            // porque o relogio esgotou a meio de um lance POSTERIOR dessa
-            // mesma iteracao. Reproduzido num jogo real: motor acabou a
-            // jogar o "primeiro lance legal gerado" (fallback de
-            // uci.rs::cmd_go) em vez do lance vencedor que a busca ja'
-            // tinha encontrado e guardado em root_best.
-            // Play the move that measured best, ties going to whichever
-            // looked better a ply ago.
-            if !self.stop {
-                if let Some(best) = self
-                    .root_scores
-                    .iter()
-                    .filter(|e| e.1 != NO_SCORE)
-                    .reduce(|a, b| if b.1 > a.1 || (b.1 == a.1 && b.2 > a.2) { b } else { a })
-                {
-                    self.root_best = Some(best.0);
+        let mut hist_unused: Vec<i32> = vec![0; moves.len()];
+        // A casa que o lance anterior acabou de ocupar. Uma captura ai' e' a
+        // outra metade de uma troca ja' comecada e nao entra na conta.
+        let casa_anterior = if ply > 0 {
+            self.played[ply - 1].map(|(_, to)| to)
+        } else {
+            None
+        };
+        let mut vulgares = 0i32;
+
+        for i in 0..moves.len() {
+            Self::pick(&mut moves, &mut scores, &mut hist_unused, i);
+            let mv = moves[i];
+
+            // O travao. Nao reduz nem testa: salta. As isencoes sao o que o
+            // torna seguro -- uma promocao muda a posicao por mais do que uma
+            // contagem sabe julgar, e uma recaptura na casa que se acabou de
+            // tomar e' a outra metade de uma troca. O que sobra e' a terceira,
+            // quarta, quinta maneira de tomar alguma coisa, e a essa altura as
+            // duas primeiras ja' disseram quanto o no' vale.
+            if self.features.travao_qs
+                && !in_check
+                && mv.promotion.is_none()
+                && Some(mv.to as usize) != casa_anterior
+            {
+                vulgares += 1;
+                if vulgares > self.params.travao_qs_n {
+                    continue;
                 }
             }
-            if let Some(rb) = self.root_best {
-                let interrupted = self.stop && Some(rb) != best_move;
-                if Some(rb) == best_move {
-                    stable_count += 1;
+
+            // The margin first, the exchange second.
+            //
+            // Both of these throw captures away and the order decides which one
+            // gets to. The margin asks whether a capture could reach alpha even
+            // if nothing were taken back; the exchange asks whether it loses
+            // material. Running the exchange first hands it every capture the
+            // margin would have dismissed for free, and static exchange is by
+            // far the more expensive question.
+            if self.features.qs_futility && !in_check && best.abs() < MATE_IN_MAX {
+                // Promotions are exempt. What this test knows how to price is a
+                // captured piece, and a promotion's value is not in what it
+                // takes -- a pawn reaching the last rank changes the position by
+                // more than the margin can express, and pruning it by material
+                // is pruning it for the wrong reason.
+                let captured = if mv.promotion.is_some() {
+                    None
+                } else if mv.flag == MoveFlag::EnPassant {
+                    Some(PieceType::Pawn)
                 } else {
-                    stable_count = 0;
-                    // Only a change that MOVED THE EVALUATION counts.
-                    //
-                    // A root move that swaps between alternatives worth the
-                    // same is not a hard position, it is a position with
-                    // several playable moves -- the opening, most of the
-                    // time. Counting those cost a real game: 73 seconds went
-                    // on moves 9 to 20, one of them 12s, and the phase that
-                    // decided the game was played at under 3s a move. This is
-                    // the exact trap `effort` and `settle` were already
-                    // documented as falling into, and the first version of
-                    // this counter walked straight into it.
-                    let real = prev_iter_score
-                        .map(|p: i32| (p - score).abs() >= TM_INSTABILITY_MIN_CP)
-                        .unwrap_or(false);
-                    if real {
-                        move_changes += 1;
-                    }
-                }
-                best_move = Some(rb);
-                // The MOVE from an interrupted iteration is kept -- it was
-                // computed and is often better than the previous depth's.
-                // The SCORE is not: an iteration cut mid-way returns whatever
-                // the partial window happened to hold, which in practice is
-                // frequently 0. Traced from a real bullet game: searches cut
-                // at 30ms and 250ms both reported score 0 on a position the
-                // full search values at -1225.
-                //
-                // Two things break when that score is kept. The engine reports
-                // a evaluation it does not believe, which is what the bridge
-                // logs and what anyone watching reads. And `prev_score` seeds
-                // the next move's aspiration window, so the following search
-                // starts centred on a number that came from nowhere -- and
-                // pays for it in fail-highs and fail-lows on a clock that, in
-                // bullet, it does not have.
-                // The score comes from the root move itself, not from the
-                // return value of an interrupted search.
-                //
-                // A search cut mid-iteration returns whatever its partial
-                // window held -- in practice often 0, which is how this engine
-                // reported "0.00" on a position it valued at -12. The root
-                // move carries a score that was actually computed for it, so
-                // it survives the interruption intact.
-                // .1 is this iteration's score, .2 the previous one's. An
-                // iteration cut before the move finished leaves .1 unmeasured,
-                // and the fallback then has to be the last depth that DID
-                // measure it -- otherwise the report falls back to the
-                // initial 0, which is exactly the "0.00" this is fixing.
-                let rb_score = self.root_scores.iter().find(|e| e.0 == rb).and_then(|e| {
-                    if e.1 != NO_SCORE {
-                        Some(e.1)
-                    } else if e.2 != NO_SCORE {
-                        Some(e.2)
-                    } else {
-                        None
-                    }
-                });
-                match rb_score {
-                    // A LOSING score from an interrupted iteration is not
-                    // trusted, and this is not caution for its own sake: with
-                    // the clock gone mid-search, the moves that would refute
-                    // the loss may simply not have been looked at yet. Keeping
-                    // it would announce a lost position that the next depth
-                    // routinely overturns, and would seed the following
-                    // aspiration window far below where the search actually
-                    // sits.
-                    Some(v) if self.stop && v < -MATE_SCORE + MAX_PLY as i32 => {}
-                    Some(v) => {
-                        best_score = v;
-                        prev_score = v;
-                    }
-                    None => {
-                        if !self.stop {
-                            best_score = score;
-                            prev_score = score;
+                    board.piece_at(mv.to).map(|(pt, _)| pt)
+                };
+
+                // And there has to be something to take. A move with nothing on
+                // the target square was being credited with a captured value of
+                // zero and pruned on that basis, which is not a bound on
+                // anything.
+                if let Some(pt) = captured {
+                    // Measured from the floor the node is standing on, which is
+                    // what the capture has to beat -- not from the raw static
+                    // score. Trying it the other way round was the first thing
+                    // I changed here and it did not help, which was the clue
+                    // that the fault was elsewhere.
+                    let futile = stand + value_in_eval_units(pt) + self.params.qs_margin;
+                    if stand != TT_EVAL_NONE as i32 && futile <= alpha {
+                        // The value it could not beat is an honest lower bound
+                        // on this node. The capture was not searched, but it was
+                        // not refuted either, and if every remaining move is
+                        // skipped the same way then this is the best the node
+                        // can show for itself. Dropping it makes the node return
+                        // less than it knows, and the underestimate travels up
+                        // the tree and into the table.
+                        if futile > best {
+                            best = futile;
                         }
+                        continue;
                     }
                 }
-                last_depth = depth;
-                // An interrupted iteration is still reported when it
-                // changed the move.
-                //
-                // The engine keeps a better move found by an iteration the
-                // clock cut short -- deliberately, and correctly: a result
-                // already computed should not be thrown away because time ran
-                // out afterwards. But the narration skipped incomplete
-                // iterations, so the last line printed belonged to the
-                // previous depth and named a different move than the one
-                // played. Reproducibly: "pv f7e6 ..." then "bestmove e8d8".
-                // The decision was right and the announcement was wrong,
-                // which is the worse of the two failures to leave in place --
-                // it misleads anyone reading the output and silently
-                // corrupts tools that follow the reported line.
-                if self.report && (!self.stop || interrupted) {
-                    // Anchored on the move actually chosen.
-                    //
-                    // extract_pv rebuilds the line from the transposition
-                    // table, and the table's entry for the root is not
-                    // necessarily the move root_best settled on -- it is
-                    // always-replace, so a later sibling can have overwritten
-                    // it. The engine then announced one move and played
-                    // another: reproducibly, "pv f7e6 ..." followed by
-                    // "bestmove e8d8". That misleads anyone reading the
-                    // output, and it quietly corrupts any tool that walks the
-                    // principal variation, since the line analysed is not the
-                    // line played.
-                    let pv = self.extract_pv_from(board, rb, depth.max(1) as usize + 4);
-                    let pv_str: Vec<String> = pv.iter().map(|m| m.to_uci()).collect();
-                    let ms = search_start.elapsed().as_millis().max(1) as u64;
-                    let nps = self.nodes.saturating_mul(1000) / ms;
-                    // Report best_score, not the raw return value: an
-                    // interrupted iteration returns whatever its partial
-                    // window held, and announcing that as the evaluation is
-                    // how a position worth -12 was published as 0.00.
-                    let rs = best_score;
-                    let score_str = if rs.abs() >= MATE_THRESHOLD {
-                        let mate_in = (MATE_SCORE - rs.abs() + 1) / 2;
-                        format!("mate {}", if rs > 0 { mate_in } else { -mate_in })
-                    } else {
-                        format!("cp {}", crate::evaluation::score_normalizado(rs))
-                    };
-                    // The same number as chances of winning, drawing, losing.
-                    //
-                    // A centipawn is not a stable unit across the game -- fitted
-                    // on 220k real results, the scale that turns evaluation into
-                    // a score runs from 433 with three pawns on the board to
-                    // 1564 with a full one. So "+2.10" means a 77% score in one
-                    // ending and 60% in an opening, and a client deciding
-                    // whether to offer a draw on centipawns is reading a ruler
-                    // whose marks move. This is what it should read instead.
-                    let (w, d, l) = crate::evaluation::win_draw_loss(rs);
-                    println!(
-                        "info depth {} multipv 1 score {} wdl {} {} {} nodes {} nps {} time {} pv {}",
-                        depth, score_str, w, d, l, self.nodes, nps, ms, pv_str.join(" ")
-                    );
-                    use std::io::Write;
-                    let _ = std::io::stdout().flush();
-                }
             }
-            if self.stop {
-                break;
+
+            // A capture that loses material cannot raise the floor we are
+            // already standing on, and following it is how quiescence chases
+            // every recapture to the horizon instead of settling.
+            if !in_check && !see::see_ge(&self.atk, board, &mv, 0) {
+                continue;
             }
-            // Spend the clock where the position asks for it.
-            //
-            // What stood here judged the two signals below as a pair of
-            // yes/no gates that could only ever END the search early: stable
-            // for 3 iterations AND 70% of nodes on the best move AND past the
-            // checkpoint -> stop, otherwise run out the full budget. Every
-            // move therefore cost the same, whether it was a forced recapture
-            // or the one move the game turned on. Measured over 25 real games
-            // at 180+0: median 3.0s a move, mean 2.84s, with a budget of
-            // ~3.5s -- an almost flat line where there should be a range.
-            //
-            // The same two signals, read as continuous quantities instead of
-            // gates, give a multiplier that moves in BOTH directions. A move
-            // that just changed with its effort still spread across rivals
-            // earns several times the budget; one that has held for
-            // iterations with nearly every node behind it gives most of it
-            // back. Only the reporting thread decides -- the others would
-            // each reach their own verdict from their own noisy statistics,
-            // and the move costs as long as the slowest of them.
-            if self.report && depth >= 5 {
-                if let Some(budget) = self.limits.soft_budget {
-                    let effort_frac = best_move
-                        .map(|bm| {
-                            let on_best = self
-                                .root_move_nodes
-                                .iter()
-                                .find(|(m, _)| *m == bm)
-                                .map(|(_, n)| *n)
-                                .unwrap_or(0);
-                            on_best as f64 / self.nodes.max(1) as f64
-                        })
-                        .unwrap_or(0.0);
-                    // Has the evaluation stopped moving? Both signals above
-                    // read "several moves are equally good" as "this position
-                    // is hard", because the root move swaps between equals
-                    // and the nodes spread across them. Traced from the
-                    // opening position: effort down at 0.08-0.13, settle
-                    // knocked back to 0 at half the depths, and the
-                    // multiplier pinned at its 2.20 ceiling -- the maximum
-                    // allowance, spent on the one position in chess that
-                    // needs it least. Measured cost in real games: 24% of the
-                    // clock gone in ten moves at 60+0, 31% at 180+0.
-                    //
-                    // The score is the signal neither of them is. When it
-                    // holds still across iterations the search is not
-                    // changing its mind, whichever of several equal moves it
-                    // happens to be naming this time -- and a value cannot be
-                    // an artefact of which thread arrived first, which is why
-                    // stability of the MOVE could never be trusted here.
-                    // Extensions stay available the moment the score does
-                    // move, which is when they are worth having.
-                    let score_delta = prev_iter_score.map(|p| (score - p).abs());
-                    // Falling eval: the DROP with its sign, not the absolute
-                    // change. It stretches the budget when the position is
-                    // getting worse -- the search has found a problem and not
-                    // yet the answer. Complementary to `quiet` below, which
-                    // shortens when the score is not moving at all: one asks
-                    // "is there still something to solve", the other "is it
-                    // already solved".
-                    let score_drop = prev_iter_score
-                        .map(|p: i32| (p - score).clamp(0, 400))
-                        .unwrap_or(0);
-                    let quiet = score_delta.map(|d| d <= TM_QUIET_CP).unwrap_or(false);
-                    quiet_iters = if quiet { quiet_iters + 1 } else { 0 };
-                    prev_iter_score = Some(score);
-                    // The opening ceiling below is there because the search's
-                    // signals are noise that early -- but a score that has
-                    // genuinely lurched is not noise, and refusing to think
-                    // about a real tactic because it happened on move eight
-                    // would be the same mistake in the other direction.
-                    let alarmed = score_delta.map(|d| d > TM_ALERT_CP).unwrap_or(false);
-                    let mut scale = time_scale(effort_frac, stable_count, score_drop, move_changes);
-                    if quiet_iters >= TM_QUIET_ITERS {
-                        scale = scale.min(1.0);
-                    }
-                    // Lance obvio: nao ha nada para decidir.
-                    //
-                    // `quiet_iters` ja' reconhece "o score parou", mas so'
-                    // trava a escala em 1.0 -- o orcamento inteiro. Numa
-                    // recaptura forcada, ou numa troca em que qualquer outra
-                    // coisa perde peca, gastar o orcamento inteiro e' deitar
-                    // relogio fora: o lance ja' esta' escolhido a' quarta
-                    // profundidade e nao volta a mudar.
-                    //
-                    // Tres condicoes ao mesmo tempo, porque cada uma sozinha
-                    // engana. O score parado sozinho acontece em posicoes
-                    // quietas com dez lances equivalentes -- e essas nao sao
-                    // obvias, sao indiferentes. O melhor lance estavel sozinho
-                    // acontece por acaso. O que nao engana e' o melhor estar
-                    // muito a' frente do SEGUNDO: aí ha' um lance e os outros
-                    // sao piores, que e' a definicao de obvio.
-                    let margem = {
-                        let mut sc: Vec<i32> = self
-                            .root_scores
-                            .iter()
-                            .filter(|e| e.1 != NO_SCORE)
-                            .map(|e| e.1)
-                            .collect();
-                        sc.sort_unstable_by(|a, b| b.cmp(a));
-                        if sc.len() >= 2 { sc[0] - sc[1] } else { i32::MAX }
-                    };
-                    if quiet_iters >= TM_QUIET_ITERS
-                        && stable_count >= TM_OBVIO_ITERS
-                        && margem >= TM_OBVIO_CP
-                    {
-                        scale = scale.min(TM_OBVIO_SCALE);
-                    }
-                    if in_book {
-                        scale = scale.min(TM_BOOK_SCALE);
-                    } else if opening_move && !alarmed {
-                        // Out of book but still in the opening. Neither signal
-                        // the multiplier is built on carries information here:
-                        // traced from the starting position, effort sits at
-                        // 0.08-0.13 and settle is knocked back to zero every
-                        // other depth, because a dozen moves are genuinely
-                        // near-equal and the root swaps between them. That
-                        // reads as "hard" and buys the ceiling, when what it
-                        // means is "it hardly matters which". A signal that
-                        // cannot inform should not be able to ask for more
-                        // time; the allowance still applies in full, it just
-                        // cannot be extended beyond it.
-                        scale = scale.min(TM_OPENING_SCALE);
-                    }
-                    let allowed = budget.mul_f64(scale);
-                    if std::env::var_os("KESTREL_TM_TRACE").is_some() {
-                        eprintln!(
-                            "tm d={:<3} elapsed={:>6}ms effort={:.2} settle={} scale={:.2} allowed={:>6}ms",
-                            depth,
-                            search_start.elapsed().as_millis(),
-                            effort_frac,
-                            stable_count,
-                            scale,
-                            allowed.as_millis()
-                        );
-                    }
-                    if search_start.elapsed() >= allowed {
-                        self.stop_flag.store(true, Ordering::Relaxed);
+
+            let undo = board.make_move(&mv);
+            crate::ponte::lance(&mv);
+            self.tt.prefetch(board.hash);
+            self.keys.push(board.hash);
+            let score = -self.quiescence(board, -beta, -alpha, ply + 1);
+            self.keys.pop();
+            board.unmake_move(&mv, &undo);
+            crate::ponte::desfaz(&mv);
+
+            if self.stopped {
+                return 0;
+            }
+            if score > best {
+                best = score;
+                if score > alpha {
+                    alpha = score;
+                    best_move = Some(mv);
+                    if alpha >= beta {
                         break;
                     }
                 }
             }
         }
-        if std::env::var_os("KESTREL_CUT_STATS").is_some() && self.report {
-            let pct = if self.cut_nodes > 0 {
-                100.0 * self.cut_first as f64 / self.cut_nodes as f64
-            } else {
-                0.0
-            };
-            eprintln!(
-                "asp: re-pesquisas={} nos-gastos-em-re-pesquisa={} ({:.0}% do total)",
-                self.asp_re, self.asp_nos,
-                100.0 * self.asp_nos as f64 / self.nodes.max(1) as f64
-            );
-            eprintln!(
-                "cut-stats: cortes={} ao-primeiro-lance={} ({:.1}%)",
-                self.cut_nodes, self.cut_first, pct
-            );
-            let rr = if self.lmr_tried > 0 {
-                100.0 * self.lmr_research as f64 / self.lmr_tried as f64
-            } else {
-                0.0
-            };
-            let avg = if self.lmr_tried > 0 {
-                self.lmr_sum as f64 / self.lmr_tried as f64
-            } else {
-                0.0
-            };
-            eprintln!(
-                "lmr-stats: reduzidos={} repesquisados={} ({:.1}%) reducao-media={:.2}",
-                self.lmr_tried, self.lmr_research, rr, avg
-            );
-            // QUEM esta a impedir a reducao, e nao so' quantas houve.
-            //
-            // Uma taxa de re-pesquisa de 1% nao diz se reduzimos de menos ou
-            // de mais -- diz que quase nada do que reduzimos volta acima de
-            // alpha. As duas explicacoes possiveis sao opostas: ou reduzimos
-            // tao fundo que a busca reduzida nunca acha nada (poda cega), ou
-            // so' chegam a' reducao lances que ja eram maus. Os contadores
-            // separam-nas, e existiam sem nunca terem sido impressos, o que
-            // e' o mesmo que nao existirem.
-            let qt = self.lmr_quiet_total.max(1);
-            eprintln!(
-                "lmr-porque: quiets={} | xeque={} ({:.1}%) profundidade={} ({:.1}%)                  extensao={} ({:.1}%) cedo-demais={} ({:.1}%) | reduzidos={} ({:.1}%)",
-                self.lmr_quiet_total,
-                self.lmr_skip_check, 100.0 * self.lmr_skip_check as f64 / qt as f64,
-                self.lmr_skip_depth, 100.0 * self.lmr_skip_depth as f64 / qt as f64,
-                self.lmr_skip_extend, 100.0 * self.lmr_skip_extend as f64 / qt as f64,
-                self.lmr_skip_early, 100.0 * self.lmr_skip_early as f64 / qt as f64,
-                self.lmr_tried, 100.0 * self.lmr_tried as f64 / qt as f64
-            );
-            // What the tables actually hold. Every consumer of history --
-            // history pruning, the LMR step, the RFP shift, the quiescence
-            // cut -- compares a raw table value against a constant, so those
-            // constants are only meaningful relative to the distribution
-            // here. Changing how the bonus is computed changes this
-            // distribution, and every one of those constants silently means
-            // something different afterwards. Printing it turns "pick a
-            // scaling factor" into a measurement.
-            {
-                let mut vals: Vec<i32> = self
-                    .history_scores
-                    .iter()
-                    .flat_map(|side| side.iter())
-                    .flat_map(|from| from.iter())
-                    .copied()
-                    .filter(|&v| v != 0)
-                    .collect();
-                if !vals.is_empty() {
-                    vals.sort_unstable();
-                    let at = |q: f64| vals[((vals.len() - 1) as f64 * q) as usize];
-                    eprintln!(
-                        "hist-dist: n={} p05={} p25={} mediana={} p75={} p95={} |max|={}",
-                        vals.len(),
-                        at(0.05),
-                        at(0.25),
-                        at(0.50),
-                        at(0.75),
-                        at(0.95),
-                        vals[0].abs().max(vals[vals.len() - 1].abs())
+
+        let bound = if best >= beta {
+            Bound::Lower
+        } else if best > alpha_orig {
+            Bound::Exact
+        } else {
+            Bound::Upper
+        };
+        self.tt.store(
+            board.hash,
+            0,
+            score_to_tt(best, ply),
+            bound,
+            best_move,
+            false,
+            if in_check { TT_EVAL_NONE } else { static_eval as i16 },
+        );
+
+        best
+    }
+
+    pub(crate) fn update_pv_pub(&mut self, ply: usize, mv: Move) {
+        self.update_pv(ply, mv);
+    }
+
+    fn update_pv(&mut self, ply: usize, mv: Move) {
+        self.pv[ply][0] = Some(mv);
+        let child = self.pv_len[ply + 1].min(MAX_PLY - ply - 2);
+        for i in 0..child {
+            self.pv[ply][i + 1] = self.pv[ply + 1][i];
+        }
+        self.pv_len[ply] = child + 1;
+    }
+
+    fn on_beta_cutoff(
+        &mut self,
+        board: &Board,
+        mv: Move,
+        ply: usize,
+        depth: i32,
+        searched: &[Move],
+    ) {
+        if !self.killers[ply].iter().any(|k| *k == Some(mv)) {
+            for i in (1..NUM_KILLERS).rev() {
+                self.killers[ply][i] = self.killers[ply][i - 1];
+            }
+            self.killers[ply][0] = Some(mv);
+        }
+        let side = board.side.idx();
+        let bonus = hist_bonus(depth);
+        let slots = self.cont_slots(ply);
+
+        self.credit(board, mv, side, &slots, bonus);
+        for q in searched {
+            if *q != mv {
+                self.credit(board, *q, side, &slots, -bonus);
+            }
+        }
+    }
+
+    /// O `r` PARTILHADO -- uma so' grandeza que a reducao e as podas leem.
+    ///
+    /// Existe por arrumacao, nao por mudanca: o calculo da reducao estava
+    /// escrito por extenso no meio do ciclo de lances e passou para aqui sem
+    /// uma virgula de diferenca.
+    ///
+    /// Verificado como se verifica uma arrumacao: a base da' **369473 nos**
+    /// antes e depois, ao no', nas quatro posicoes de referencia a`
+    /// profundidade 12. Se alguem mexer nos termos, e' esse numero que tem de
+    /// mudar de proposito e nao por acidente.
+    ///
+    /// Fica aqui tambem para o dia em que se quiser experimentar podar pela
+    /// MESMA grandeza com que se reduz -- hoje sao duas contas diferentes, e
+    /// essa e' uma experiencia por fazer, nao um defeito.
+    ///
+    /// `contar` fica falso na chamada da poda para nao poluir os contadores do
+    /// `quem`, que foram medidos com o caminho da reducao.
+    #[allow(clippy::too_many_arguments)]
+    fn r_partilhado(
+        &self,
+        depth: i32,
+        i: usize,
+        alpha: i32,
+        beta: i32,
+        improving: bool,
+        is_quiet: bool,
+        cut_node: bool,
+        pv_node: bool,
+        tt_pv: bool,
+        tt_move: Option<Move>,
+        hist_i: i32,
+        // Quantas vezes o ply SEGUINTE ja' cortou. Ver `cut_cnt_base`.
+        cortes_filho: i32,
+        contar: bool,
+    ) -> i32 {
+        let cq = |k: usize, d: i32| if contar { conta_quem(k, d) };
+        let mut r1024 = if self.features.lmr_fino {
+            self.lmr[(depth as usize).min(63)][i.min(63)]
+        } else {
+            (self.lmr[(depth as usize).min(63)][i.min(63)] / 1024) * 1024
+        };
+        cq(0, r1024);
+        // O ply SEGUINTE ja' cortou muitas vezes: no' facil, reduz-se mais.
+        //
+        // Do KestrelStrike, recuperado a 20-09. Os valores da referencia sao
+        // 264 e 1095 em 1024 avos; aqui a grandeza ja' e' a mesma, portanto
+        // entram tal e qual. Omissao 0 -- quem decide sao as partidas.
+        if cortes_filho > 1 {
+            r1024 += self.params.cut_cnt_base
+                + self.params.cut_cnt_mais * i32::from(cortes_filho > 2);
+        }
+        if self.features.lmr_janela {
+            let d = (beta - alpha).max(0).min(self.root_delta);
+            let x = d * self.params.lmr_janela_f / self.root_delta.max(1);
+            r1024 -= x;
+            cq(1, -x);
+        }
+        if self.features.lmr_piora && !improving {
+            let x = r1024 * self.params.lmr_piora_f / 512;
+            r1024 += x;
+            cq(2, x);
+        }
+        if !is_quiet {
+            let x = r1024 / 2;
+            r1024 -= x;
+            cq(3, -x);
+        }
+        if self.features.cut_node_lmr && cut_node {
+            // Reduz mais num no' de corte, e mais ainda se nem lance da tabela
+            // houver. Ver a nota do `lmr_cut_sem_tt`: medido, e nao presta.
+            let x = self.params.lmr_cut_f
+                + if tt_move.is_none() { self.params.lmr_cut_sem_tt } else { 0 };
+            r1024 += x;
+            cq(4, x);
+        }
+        if self.features.lmr_tt_captura
+            && tt_move.map_or(false, |m| m.is_capture() || m.promotion.is_some())
+        {
+            r1024 += self.params.lmr_tt_capt_f;
+            cq(8, self.params.lmr_tt_capt_f);
+        }
+        if !pv_node {
+            r1024 += self.params.lmr_nonpv_f;
+            cq(5, self.params.lmr_nonpv_f);
+        }
+        if self.features.ttpv_lmr && tt_pv {
+            r1024 -= self.params.lmr_ttpv_f;
+            cq(6, -self.params.lmr_ttpv_f);
+        }
+        let (dv, tecto) = if self.features.lmr_hist_forte {
+            (self.params.lmr_hist_div_forte.max(1), 4096)
+        } else {
+            (self.params.lmr_hist_div.max(1), 2048)
+        };
+        let x = (hist_i * 1024 / dv).clamp(-tecto, tecto);
+        r1024 -= x;
+        cq(7, -x);
+        r1024
+    }
+
+    /// What a capture is worth by past results, zero when the table is off.
+    #[inline]
+    fn capt_score(&self, board: &Board, mv: &Move) -> i32 {
+        if !self.features.capture_hist {
+            return 0;
+        }
+        let pc = match board.piece_at(mv.from) {
+            Some((pt, _)) => pt.idx(),
+            None => return 0,
+        };
+        let victim = if mv.flag == MoveFlag::EnPassant {
+            PieceType::Pawn.idx()
+        } else {
+            match board.piece_at(mv.to) {
+                Some((pt, _)) => pt.idx(),
+                None => return 0,
+            }
+        };
+        self.capthist[pc][mv.to as usize][victim]
+    }
+
+    /// Move a capture for or against by past results.
+    #[inline]
+    fn credit_capture(&mut self, board: &Board, mv: Move, bonus: i32) {
+        if !self.features.capture_hist {
+            return;
+        }
+        let pc = match board.piece_at(mv.from) {
+            Some((pt, _)) => pt.idx(),
+            None => return,
+        };
+        let victim = if mv.flag == MoveFlag::EnPassant {
+            PieceType::Pawn.idx()
+        } else {
+            match board.piece_at(mv.to) {
+                Some((pt, _)) => pt.idx(),
+                None => return,
+            }
+        };
+        hist_add(&mut self.capthist[pc][mv.to as usize][victim], bonus, HIST_MAX_CAPT);
+    }
+
+    /// Move one move for and every other move against, by the same amount.
+    #[inline]
+    fn credit(
+        &mut self,
+        board: &Board,
+        mv: Move,
+        side: usize,
+        slots: &[Option<usize>; CONT_SLOTS],
+        bonus: i32,
+    ) {
+        let b_ctx = self.balde_de(board, &mv);
+        hist_add(
+            &mut self.history[side][mv.from as usize][mv.to as usize][b_ctx],
+            bonus,
+            HIST_MAX_MAIN,
+        );
+        if let Some(pc) = board.piece_at(mv.from).map(|(pt, _)| pt.idx()) {
+            if self.features.hist_pc {
+                hist_add(&mut self.histpc[pc][mv.to as usize], bonus, HIST_MAX_PC);
+            }
+            for (k, slot) in slots.iter().enumerate() {
+                if let Some(idx) = slot {
+                    hist_add_at(
+                        &self.conthist[ich(k, *idx, pc, mv.to as usize)],
+                        bonus,
+                        HIST_MAX_CONT,
                     );
                 }
-                let mut cv: Vec<i32> = self
-                    .cont_hist
-                    .iter()
-                    .copied()
-                    .filter(|&v| v != 0)
-                    .collect();
-                if !cv.is_empty() {
-                    cv.sort_unstable();
-                    let at = |q: f64| cv[((cv.len() - 1) as f64 * q) as usize];
-                    eprintln!(
-                        "cont-dist: n={} p05={} p25={} mediana={} p75={} p95={} |max|={}",
-                        cv.len(),
-                        at(0.05),
-                        at(0.25),
-                        at(0.50),
-                        at(0.75),
-                        at(0.95),
-                        cv[0].abs().max(cv[cv.len() - 1].abs())
-                    );
+            }
+            if self.features.hist_peao {
+                let cp = self.chave_peao(board);
+                hist_add_at(
+                    &self.histpeao[ipeao(cp, pc + 6 * side, mv.to as usize)],
+                    bonus,
+                    HIST_MAX_CONT,
+                );
+            }
+        }
+    }
+
+    /// Score every move once. The caller then takes the best remaining one at
+    /// a time, because most nodes cut off after two or three and sorting the
+    /// other thirty-seven is work thrown away.
+    /// O que as tabelas acham de um lance tranquilo. E' a parte cara da
+    /// pontuacao -- quatro consultas dispersas -- e a unica que vale a pena
+    /// adiar.
+    fn hist_de(
+        &self,
+        board: &Board,
+        mv: &Move,
+        side: usize,
+        slots: &[Option<usize>; CONT_SLOTS],
+        chave_peao: usize,
+    ) -> i32 {
+        if mv.is_capture() || mv.promotion.is_some() {
+            return 0;
+        }
+        // Termo a termo igual ao caminho lento que isto substitui. Qualquer
+        // diferenca aqui muda a arvore, e da primeira vez um termo a mais
+        // custou exactamente isso.
+        let mut h = self.history[side][mv.from as usize][mv.to as usize][self.balde_de(board, mv)];
+        if let Some(pc) = board.piece_at(mv.from).map(|(pt, _)| pt.idx()) {
+            for (k, slot) in slots.iter().enumerate() {
+                if k >= 3 && !self.features.cont_longo {
+                    continue;
+                }
+                if let Some(idx) = slot {
+                    h += CONT_WEIGHT[k]
+                        * self.conthist[ich(k, *idx, pc, mv.to as usize)].load(Ordering::Relaxed);
                 }
             }
-            let t = self.nmp_tried.max(1) as f64;
-            eprintln!(
-                "nmp: tentado={} corte-cru={} ({:.0}%) aceite-sem-verificar={} verificado={} ok={} falhou={} fail-low={} ({:.0}%)",
-                self.nmp_tried,
-                self.nmp_cutoff_raw, 100.0 * self.nmp_cutoff_raw as f64 / t,
-                self.nmp_cut_taken,
-                self.nmp_verify_tried, self.nmp_verify_ok, self.nmp_verify_failed,
-                self.nmp_failed_low, 100.0 * self.nmp_failed_low as f64 / t
-            );
-            let pv = self.nmp_tried_pv.max(1) as f64;
-            let nonpv = (self.nmp_tried - self.nmp_tried_pv).max(1) as f64;
-            let nonpv_fail = self.nmp_failed_low - self.nmp_failed_pv;
-            eprintln!(
-                "nmp-pv: em-PV={} ({:.0}% do total) falha-em-PV={:.0}% | fora-de-PV={} falha={:.0}%",
-                self.nmp_tried_pv,
-                100.0 * self.nmp_tried_pv as f64 / t,
-                100.0 * self.nmp_failed_pv as f64 / pv,
-                self.nmp_tried - self.nmp_tried_pv,
-                100.0 * nonpv_fail as f64 / nonpv
-            );
-            let sh = self.nodes_shallow.max(1) as f64;
-            eprintln!(
-                "poda-rasa: nos-com-prof<=6={} | RFP={} ({:.1}%) razor={} ({:.1}%) futility={} ({:.1}%)",
-                self.nodes_shallow,
-                self.cut_rfp, 100.0 * self.cut_rfp as f64 / sh,
-                self.cut_razor, 100.0 * self.cut_razor as f64 / sh,
-                self.cut_futility, 100.0 * self.cut_futility as f64 / sh
-            );
-            eprintln!(
-                "qsearch: total={} quiescencia={} ({:.1}%) principal={} ({:.1}%)",
-                self.nodes,
-                self.qnodes,
-                100.0 * self.qnodes as f64 / self.nodes.max(1) as f64,
-                self.nodes - self.qnodes,
-                100.0 * (self.nodes - self.qnodes) as f64 / self.nodes.max(1) as f64
-            );
-            let q = self.lmr_quiet_total.max(1) as f64;
-            eprintln!(
-                "lmr-skip: quietos={} | xeque={} ({:.0}%) prof<3={} ({:.0}%) extensao={} ({:.0}%) i<min={} ({:.0}%) | reduzidos={} ({:.0}%)",
-                self.lmr_quiet_total,
-                self.lmr_skip_check, 100.0 * self.lmr_skip_check as f64 / q,
-                self.lmr_skip_depth, 100.0 * self.lmr_skip_depth as f64 / q,
-                self.lmr_skip_extend, 100.0 * self.lmr_skip_extend as f64 / q,
-                self.lmr_skip_early, 100.0 * self.lmr_skip_early as f64 / q,
-                self.lmr_tried, 100.0 * self.lmr_tried as f64 / q
-            );
+            if self.features.hist_peao {
+                // A cor conta: doze pecas, nao seis.
+                let pc12 = pc + 6 * side;
+                h += self.params.peao_f
+                    * self.histpeao[ipeao(chave_peao, pc12, mv.to as usize)]
+                        .load(Ordering::Relaxed)
+                    / 32;
+            }
         }
-        (best_move, best_score, last_depth, self.nodes)
+        h
     }
-}
 
-/// Staged move picker. Ideia: em vez de pontuar TODOS os lances legais upfront
-/// (SEE em todas as capturas, history+livro+countermove em todos os
-/// quietos) antes de sequer tentar o primeiro, devolver os lances por
-/// fases e pontuar SO' o subconjunto que a fase actual precisa. Se um
-/// corte beta acontece no TT-move (muito comum quando a TT tem info),
-/// nao pagamos NENHUM SEE nem lookup de history. Se um good-noisy corta,
-/// nao pagamos NENHUM history nem lookup de livro.
-///
-/// Correccao preservada: gera todos os lances LEGAIS uma vez a
-/// construcao (mesmo `generate_legal` de antes), so' muda a ordem/
-/// timing de pontuacao. `MovePicker::next` devolve `None` quando todos
-/// os lances foram devolvidos -- o chamador so' precisa de saber quantos
-/// devolveu para distinguir mate/stalemate de fim de loop normal.
-#[derive(Copy, Clone, PartialEq, Eq)]
-enum PickerStage {
-    TtMove,
-    ScoreNoisy,
-    GoodNoisy,
-    Killer1,
-    Killer2,
-    ScoreQuiet,
-    Quiet,
-    BadNoisy,
-    Done,
-}
+    /// Aperta o tecto quando NAO ha' incremento. Ver `tm_sem_inc_tecto`.
+    ///
+    /// So' quando o incremento e' zero: com incremento o gasto e' reposto e a
+    /// regra nao se aplica. Devolve o tecto tal e qual quando esta' desligada,
+    /// para a omissao nao mudar nada.
+    #[inline]
+    fn aperta_sem_inc(&self, tecto: u64, relogio: u64, inc: u64) -> u64 {
+        let pct = self.params.tm_sem_inc_tecto;
+        if pct <= 0 || inc > 0 {
+            return tecto;
+        }
+        tecto.min(relogio * pct as u64 / 100).max(1)
+    }
 
-pub struct MovePicker {
-    stage: PickerStage,
-    tt_move: Option<Move>,
-    killer1: Option<Move>,
-    killer2: Option<Move>,
-    /// noisy = capturas + promocoes. Pontuado com SEE (ver `score_noisy`)
-    /// so' quando entramos em `ScoreNoisy`. Cada entrada guarda o lance
-    /// e o SEE score correspondente; SEE>=0 vao primeiro (GoodNoisy),
-    /// SEE<0 vao no fim (BadNoisy).
-    noisy: Vec<(Move, i32, i32)>,
-    noisy_idx: usize,
-    /// Marca onde acabam os good noisy (SEE>=0) e comecam os bad noisy
-    /// (SEE<0). Definido quando `ScoreNoisy` termina.
-    good_noisy_end: usize,
-    /// quiet = tudo o que nao e' captura nem promocao. Pontuado com
-    /// history + livro + countermove (ver `score_quiet`) so' quando
-    /// entramos em `ScoreQuiet`.
-    quiet: Vec<(Move, i32)>,
-    quiet_idx: usize,
-}
+    /// A chave da estrutura de peoes, reduzida ao tamanho da tabela.
+    ///
+    /// Uma vez por no', e nao por lance: e' a mesma para todos os lances da
+    /// mesma posicao.
+    #[inline]
+    fn chave_peao(&self, board: &Board) -> usize {
+        use Color::{Black, White};
+        use PieceType::Pawn;
+        (subset_key(board, &[White, Black], &[Pawn]) as usize) & (TAM_PEAO - 1)
+    }
 
-impl MovePicker {
-    /// `excluded` (usado no MultiPV, ver `excluded_root_moves`) tem de ser
-    /// filtrado ANTES da construcao do picker -- basta o chamador passar
-    /// `moves` ja' filtrado; o picker nao conhece MultiPV.
-    pub fn new(moves: Vec<Move>, tt_move: Option<Move>, killers: [Option<Move>; 2]) -> Self {
-        // Separa capturas/promocoes de quietos numa unica passagem.
-        // MoveFlag::EnPassant e captura; promocoes contam sempre como
-        // noisy (mesmo sem captura -- a promocao propria e "material").
-        let mut noisy: Vec<(Move, i32, i32)> = Vec::with_capacity(moves.len() / 4);
-        let mut quiet: Vec<(Move, i32)> = Vec::with_capacity(moves.len());
-        for m in moves {
-            if m.is_capture() || m.promotion.is_some() {
-                noisy.push((m, 0, 0));
+    /// Este lance da' xeque directo?
+    ///
+    /// O termo que o outro motor tem e nos nao. Directo apenas -- a peca que
+    /// se move a atacar o rei da sua casa de destino -- que e' o que ele
+    /// tambem faz (`gives_direct_check`). Xeques a` descoberta ficam de fora:
+    /// apanha-los exigia refazer os raios todos e o termo deixaria de ser
+    /// barato, que e' a unica razao para caber na ordenacao.
+    #[inline]
+    fn da_xeque(&self, board: &Board, mv: &Move) -> bool {
+        let them = board.side.opp();
+        let ksq = board.king_sq(them);
+        let alvo = crate::bitboard::bb(ksq);
+        let occ = (board.occ_all & !crate::bitboard::bb(mv.from))
+            | crate::bitboard::bb(mv.to);
+        let pt = match mv.promotion {
+            Some(p) => p,
+            None => match board.piece_at(mv.from) {
+                Some((p, _)) => p,
+                None => return false,
+            },
+        };
+        match pt {
+            PieceType::Pawn => {
+                self.atk.pawn[board.side.idx()][mv.to as usize] & alvo != 0
+            }
+            PieceType::Knight => self.atk.knight[mv.to as usize] & alvo != 0,
+            PieceType::Bishop => {
+                crate::attacks::bishop_attacks(mv.to, occ) & alvo != 0
+            }
+            PieceType::Rook => crate::attacks::rook_attacks(mv.to, occ) & alvo != 0,
+            PieceType::Queen => {
+                (crate::attacks::bishop_attacks(mv.to, occ)
+                    | crate::attacks::rook_attacks(mv.to, occ))
+                    & alvo
+                    != 0
+            }
+            PieceType::King => false,
+        }
+    }
+
+    /// Em que balde do historico este lance cai, nesta posicao.
+    #[inline]
+    fn balde_de(&self, board: &Board, mv: &Move) -> usize {
+        if !self.features.hist_contexto {
+            return 0;
+        }
+        let i = self.keys.len().min(self.cache_ameacas.len() - 1);
+        let (chave, mapa) = self.cache_ameacas[i].get();
+        let mapa = if chave == board.hash && chave != 0 {
+            mapa
+        } else {
+            let novo = todas_ameacas(board, board.side.opp(), &self.atk);
+            self.cache_ameacas[i].set((board.hash, novo));
+            novo
+        };
+        balde(mapa, mv)
+    }
+
+    fn score_moves(
+        &self,
+        board: &Board,
+        moves: &[Move],
+        tt_move: Option<Move>,
+        tt_bound: Bound,
+        ply: usize,
+        depth: i32,
+    ) -> (Vec<i32>, Vec<i32>) {
+        let side = board.side.idx();
+        // Hoisted: the continuation slots depend on the ply, not on the move,
+        // and looking them up per move turned a couple of array reads into a
+        // couple per move in the hottest loop there is.
+        let slots = self.cont_slots(ply);
+        // A chave da estrutura de peoes, uma vez por no'. Zero quando a manete
+        // esta' desligada, e ai' nem se calcula.
+        let cp_no = if self.features.hist_peao { self.chave_peao(board) } else { 0 };
+        // What the tables actually think of each move, kept apart from where it
+        // goes in the list.
+        //
+        // These were the same number, and it was wrong. Ordering uses large
+        // sentinels -- a million for the table move, four hundred thousand for
+        // a killer, plus or minus six hundred thousand for a capture -- so any
+        // reduction scaled by "the score" saturated on the sentinel and had
+        // nothing to do with history at all. Every killer and table move was
+        // being reduced two plies less, and every losing capture two plies
+        // more, on the strength of a tag rather than a fact.
+        // So' para a ordem. Nao entra no `hist`: esse alimenta a reducao, e um
+        // termo grande la' dentro satura o clamp e poda a busca em vez de a
+        // ordenar -- foi o que custou 301 Elo a' primeira tentativa.
+        let pcb: Vec<i32> = if self.features.hist_pc {
+            moves
+                .iter()
+                .map(|mv| {
+                    if mv.is_capture() || mv.promotion.is_some() {
+                        return 0;
+                    }
+                    match board.piece_at(mv.from) {
+                        Some((pt, _)) => {
+                            self.params.hist_pc_f * self.histpc[pt.idx()][mv.to as usize] / 100
+                        }
+                        None => 0,
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        // TRIAGEM.
+        //
+        // Cada tranquilo custa aqui um acesso ao historico principal MAIS tres
+        // acessos dispersos a`s tabelas de continuacao -- e sao os dispersos que
+        // custam, porque cada um e' uma ida a` memoria que nao esta' na cache.
+        // Pagamos esse exame a toda a gente na fila e depois usamos dois ou
+        // tres lances.
+        //
+        // A triagem faz o que uma urgencia faz: um olhar barato ordena a fila --
+        // aqui, o historico principal sozinho, um acesso -- e o exame caro vai
+        // so' aos que esse olhar poe a` frente. Quem fica no fundo mantem a nota
+        // grosseira, e como 92% dos nos cortam antes de la' chegar, ninguem da'
+        // pela diferenca.
+        //
+        // O erro que se aceita e' ordenar mal quem estava no fundo da fila. E'
+        // o mesmo erro que a triagem aceita, e pela mesma razao.
+        let triagem = self.features.triagem;
+        let baratos: Vec<i32> = if triagem {
+            moves
+                .iter()
+                .map(|mv| {
+                    if mv.is_capture() || mv.promotion.is_some() {
+                        i32::MIN
+                    } else {
+                        self.history[side][mv.from as usize][mv.to as usize]
+                            [self.balde_de(board, mv)]
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        // O corte da fila: a nota do enesimo melhor pelo olhar barato.
+        let corte = if triagem {
+            let mut v: Vec<i32> = baratos.iter().copied().filter(|x| *x != i32::MIN).collect();
+            let n = (self.params.triagem_n as usize).min(v.len());
+            if n == 0 {
+                i32::MAX
             } else {
-                quiet.push((m, 0));
+                // Seleccao do enesimo, nao ordenacao completa.
+                //
+                // A primeira versao ordenava o vector inteiro para ler UM
+                // valor. Medido: custava mais do que os acessos a`s tabelas de
+                // continuacao que evitava -- 13.365 ciclos por no' contra 12.702
+                // da base. A triagem tem de ser mais barata do que o exame que
+                // dispensa, senao e' so' mais uma fila.
+                let (_, k, _) = v.select_nth_unstable_by(n - 1, |a, b| b.cmp(a));
+                *k
             }
-        }
-        MovePicker {
-            stage: PickerStage::TtMove,
-            tt_move,
-            killer1: killers[0],
-            killer2: killers[1],
-            noisy,
-            noisy_idx: 0,
-            good_noisy_end: 0,
-            quiet,
-            quiet_idx: 0,
-        }
-    }
+        } else {
+            i32::MIN
+        };
 
-    /// Devolve o proximo lance ou `None` quando nao ha mais nada.
-    /// `searcher` e usado para SEE (na fase ScoreNoisy) e para
-    /// history/livro/countermove (na fase ScoreQuiet). `ply`/`hash` sao
-    /// os do no' actual (para lookup de livro por posicao, igual ao
-    /// order_moves antigo).
-    /// Wrapper que salta o `excluded_move` do Searcher (usado por
-    /// singular extensions). Delega para `next_move_raw` e re-chama-se
-    /// se o lance devolvido for o excluido.
-    pub fn next_move(
-        &mut self,
-        searcher: &Searcher,
-        board: &Board,
-        ply: usize,
-        hash: u64,
-    ) -> Option<Move> {
-        loop {
-            let mv = self.next_move_raw(searcher, board, ply, hash)?;
-            if searcher.excluded_move == Some(mv) {
-                continue;
-            }
-            return Some(mv);
-        }
-    }
-
-    fn next_move_raw(
-        &mut self,
-        searcher: &Searcher,
-        board: &Board,
-        ply: usize,
-        hash: u64,
-    ) -> Option<Move> {
-        loop {
-            match self.stage {
-                PickerStage::TtMove => {
-                    self.stage = PickerStage::ScoreNoisy;
-                    if let Some(tm) = self.tt_move {
-                        // TT-move so' e valido se estiver na lista real
-                        // de lances legais (a TT pode conter lixo por
-                        // colisao de hash). Procura em noisy+quiet.
-                        if self.contains_move(tm) {
-                            return Some(tm);
+        let hist: Vec<i32> = moves
+            .iter()
+            .enumerate()
+            .map(|(n_mv, mv)| {
+                if triagem && !mv.is_capture() && mv.promotion.is_none() && baratos[n_mv] < corte {
+                    // Fundo da fila: fica com a nota do olhar barato.
+                    return baratos[n_mv];
+                }
+                let mv = &*mv;
+                if mv.is_capture() || mv.promotion.is_some() {
+                    return 0;
+                }
+                // Adiado: este lance so' e' avaliado se a busca chegar a ele.
+                // Medido pelo outro agente: 92% dos nos cortam sem precisar de
+                // nenhum tranquilo.
+                if self.features.pontua_tarde
+                    && Some(*mv) != tt_move
+                    && !self.killers[ply].iter().any(|k| *k == Some(*mv))
+                {
+                    return TRANQUILO_POR_PONTUAR;
+                }
+                let mut h =
+                    self.history[side][mv.from as usize][mv.to as usize][self.balde_de(board, mv)];
+                if escala_ligada() {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    ESCALA[0].fetch_add(1, Relaxed);
+                    ESCALA[3].fetch_add((h as i64).abs(), Relaxed);
+                }
+                if let Some(pc) = board.piece_at(mv.from).map(|(pt, _)| pt.idx()) {
+                    for (k, slot) in slots.iter().enumerate() {
+                        if let Some(idx) = slot {
+                            // Os dois ultimos (plies 3 e 6) so' entram com a
+                            // opcao ligada -- assim a omissao fica identica ao
+                            // que estava.
+                            if k >= 3 && !self.features.cont_longo {
+                                continue;
+                            }
+                            let c = CONT_WEIGHT[k]
+                                * self.conthist[ich(k, *idx, pc, mv.to as usize)]
+                                    .load(Ordering::Relaxed);
+                            if escala_ligada() {
+                                ESCALA[4 + k.min(5)]
+                                    .fetch_add((c as i64).abs(), std::sync::atomic::Ordering::Relaxed);
+                            }
+                            h += c;
                         }
                     }
+                    if self.features.hist_peao {
+                        // A cor conta: doze pecas, nao seis. Um peao branco em
+                        // e4 e um preto em e5 nao dizem o mesmo da estrutura.
+                        h += self.params.peao_f
+                            * self.histpeao[ipeao(cp_no, pc + 6 * side, mv.to as usize)]
+                                .load(Ordering::Relaxed)
+                            / 32;
+                    }
                 }
-                PickerStage::ScoreNoisy => {
-                    // Pontua SEE de cada captura, uma unica vez. Nao ha
-                    // MVV-LVA em separado -- SEE ja engloba a ideia de
-                    // "captura de peca grande com peca pequena", e ainda
-                    // rejeita capturas que aparentam ganhar mas perdem no
-                    // full exchange (Bxf7 defendido).
-                    for i in 0..self.noisy.len() {
-                        let m = self.noisy[i].0;
-                        if Some(m) == self.tt_move {
-                            self.noisy[i].1 = i32::MIN; // marca para saltar depois
-                            continue;
-                        }
-                        self.noisy[i].1 = see::see(searcher.atk, board, &m);
-                        // Capture history: tie-break only (see field doc
-                        // on Searcher::capture_history) -- non-capture
-                        // promotions have no "captured piece", left at 0.
-                        self.noisy[i].2 = if m.is_capture() {
-                            let moving_pt = board.piece_at(m.from).map(|(pt, _)| pt);
-                            let captured_pt = if m.flag == MoveFlag::EnPassant {
-                                Some(PieceType::Pawn)
-                            } else {
-                                board.piece_at(m.to).map(|(pt, _)| pt)
-                            };
-                            match (moving_pt, captured_pt) {
-                                (Some(mp), Some(cp)) => searcher.capture_history[board.side.idx()][mp.idx()][cp.idx()],
-                                _ => 0,
-                            }
+                if escala_ligada() {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    ESCALA[1].fetch_add((h as i64).abs(), Relaxed);
+                    ESCALA[2].fetch_max((h as i64).abs(), Relaxed);
+                }
+                h
+            })
+            .collect();
+
+        // Uma vez por no', nao uma por lance -- e so' quando sao precisas.
+        let (menores, xeque) = if self.features.ordem_posicao {
+            (
+                ameacas_menores(board, board.side.opp(), &self.atk),
+                casas_de_xeque(board, board.side.opp(), &self.atk),
+            )
+        } else {
+            ([0u64; 6], [0u64; 6])
+        };
+
+        // O termo do xeque, somado por cima do que a ordem der.
+        //
+        // MEDIDO: com ele, 173 das 195 posicoes do Win At Chess contra 155 sem
+        // ele -- dezoito a mais, e o mesmo numero que o motor de referencia
+        // resolve com a NOSSA rede. Sem ele, 154. E' o termo inteiro que compra
+        // a visao, nao a forma da ordenacao.
+        //
+        // A questao que isto responde: dava para ter essa visao sem pagar os 38%
+        // de arvore da soma continua? Aqui as bandas ficam como estao e o xeque
+        // entra so' como parcela.
+        let order: Vec<i32> = moves
+            .iter()
+            .enumerate()
+            .map(|(n, mv)| {
+                // ORDENACAO POR SOMA CONTINUA, sem bandas.
+                //
+                // A nossa ordem por bandas -- um milhao para o lance da tabela,
+                // seiscentos mil para as capturas boas, quatrocentos mil para os
+                // killers, o historico para os tranquilos, MENOS seiscentos mil
+                // para as capturas mas -- proibe comparacoes que deviam ser
+                // possiveis. Uma captura que perde meio peao fica setecentos mil
+                // pontos abaixo do pior tranquilo, quando pode muito bem ser o
+                // melhor lance do no'; e um tranquilo com historico forte nunca
+                // passa a` frente de uma captura boa, seja qual for o historico.
+                //
+                // Aqui somam-se as parcelas em vez de as arrumar em classes: o
+                // valor REAL da troca -- o `see` devolve-o, nao apenas uma
+                // comparacao com um limiar --, a vitima como desempate, o
+                // historico das capturas, e um credito ao killer que o historico
+                // pode ultrapassar. Os pesos sao parametros para se afinarem.
+                //
+                // O lance da tabela continua em cima: procura-lo primeiro nao e'
+                // uma questao de ordenacao, e' o que da' sentido a ter tabela.
+                if self.features.ordem_continua && Some(*mv) != tt_move {
+                    let mut r = 0i32;
+                    if mv.is_capture() || mv.promotion.is_some() {
+                        let s = see::see(&self.atk, board, mv);
+                        // Escala: o historico de um tranquilo forte chega a
+                        // 135.000 (medido). Para uma captura de dama ficar
+                        // acima disso, o peso do `see` tem de por o peao nos
+                        // quinze mil -- e nao nos duzentos, que foi o erro da
+                        // primeira versao e que afundou as capturas por baixo
+                        // de todos os tranquilos, triplicando a arvore.
+                        r += self.params.ord_see * s;
+                        let victim = if mv.flag == MoveFlag::EnPassant {
+                            PieceType::Pawn.value()
                         } else {
-                            0
+                            board.piece_at(mv.to).map(|(pt, _)| pt.value()).unwrap_or(0)
                         };
-                    }
-                    // Nao ordenamos o vector agora -- selection-sort
-                    // in-place em `GoodNoisy` e `BadNoisy` extrai o
-                    // maior de cada vez, evitando O(n log n) upfront
-                    // quando muitas vezes so' precisamos do primeiro.
-                    self.stage = PickerStage::GoodNoisy;
-                }
-                PickerStage::GoodNoisy => {
-                    if let Some(m) = self.pick_best_noisy(true) {
-                        return Some(m);
-                    }
-                    // Terminou os good noisy; a partir daqui o
-                    // `noisy_idx` marca o inicio dos bad noisy (que
-                    // ficam para o fim).
-                    self.good_noisy_end = self.noisy_idx;
-                    self.stage = PickerStage::Killer1;
-                }
-                PickerStage::Killer1 => {
-                    self.stage = PickerStage::Killer2;
-                    if let Some(k) = self.killer1 {
-                        if Some(k) != self.tt_move && self.quiet_contains(k) {
-                            self.mark_quiet_used(k);
-                            return Some(k);
+                        r += self.params.ord_mvv * victim / 16;
+                        r += self.capt_score(board, mv) / 16;
+                    } else {
+                        // As proporcoes do outro motor, afinadas por SPSA sobre
+                        // milhares de partidas:
+                        //   see 443, historico 106, xeque 60, killer 54
+                        // O SEE pesa quatro vezes o historico -- ao contrario do
+                        // que eu tinha adivinhado -- e ha' um termo para "da'
+                        // xeque" que nos nao tinhamos de todo.
+                        r += hist[n] * self.params.ord_hist_n / 135;
+                        if let Some(k) = self.killers[ply].iter().position(|kk| *kk == Some(*mv)) {
+                            r += self.params.ord_killer * (NUM_KILLERS as i32 - k as i32)
+                                / NUM_KILLERS as i32;
+                        }
+                        if self.params.ord_xeque > 0 && self.da_xeque(board, mv) {
+                            r += self.params.ord_xeque;
                         }
                     }
+                    return r;
                 }
-                PickerStage::Killer2 => {
-                    self.stage = PickerStage::ScoreQuiet;
-                    if let Some(k) = self.killer2 {
-                        if Some(k) != self.tt_move
-                            && Some(k) != self.killer1
-                            && self.quiet_contains(k)
-                        {
-                            self.mark_quiet_used(k);
-                            return Some(k);
-                        }
+                if Some(*mv) == tt_move {
+                    // Um limite superior quer dizer que naquele no' todos os
+                    // lances falharam em baixo: o guardado e' o menos mau, nao
+                    // um que provou cortar. Medido: vai primeiro 21.538 vezes e
+                    // corta 13,8%, contra 66,8% de um limite inferior -- e o que
+                    // fica atras dele sao as capturas boas, que acertam 83-87%.
+                    if self.features.tt_fraco && tt_bound == Bound::Upper {
+                        self.params.tt_fraco_pont
+                    } else {
+                        1_000_000
                     }
-                }
-                PickerStage::ScoreQuiet => {
-                    // Livro e' pesquisado por posicao (nao por lance),
-                    // por isso uma unica vez aqui em vez de N vezes
-                    // no loop.
-                    let side = board.side.idx();
-                    let book_entries: Vec<(u16, u32)> = match searcher.style_book {
-                        Some(b) => b.lookup(hash),
-                        None => Vec::new(),
+                } else if mv.is_capture() {
+                    let victim = if mv.flag == MoveFlag::EnPassant {
+                        PieceType::Pawn.value()
+                    } else {
+                        board
+                            .piece_at(mv.to)
+                            .map(|(pt, _)| pt.value())
+                            .unwrap_or(0)
                     };
-                    // Countermove ainda usado como fallback binario (bonus
-                    // fixo se bater) para preservar continuidade das
-                    // iteracoes anteriores; cont_hist adiciona o sinal
-                    // numerico multi-lag por cima (somando contHist a -1
-                    // e -2 plies por agora; um lag -4 poderia entrar mais
-                    // tarde).
-                    let countermove = searcher
-                        .ply_last_move
-                        .get(ply)
-                        .and_then(|x| *x)
-                        .and_then(|(pt, to)| searcher.countermoves[pt.idx()][to as usize]);
-                    let prev1 = if ply >= 1 { searcher.ply_last_move.get(ply).and_then(|x| *x) } else { None };
-                    let prev2 = if ply >= 2 { searcher.ply_last_move.get(ply - 1).and_then(|x| *x) } else { None };
-                    for i in 0..self.quiet.len() {
-                        let m = self.quiet[i].0;
-                        if m.from == m.to {
-                            // marcador "ja usado" (killer, ver mark_quiet_used)
-                            self.quiet[i].1 = i32::MIN;
-                            continue;
-                        }
-                        if Some(m) == self.tt_move {
-                            self.quiet[i].1 = i32::MIN;
-                            continue;
-                        }
-                        let h = searcher.history_scores[side][m.from as usize][m.to as usize];
-                        let cm_bonus = if Some(m) == countermove { 2000 } else { 0 };
-                        let book = searcher.book_bonus(&book_entries, &m);
-                        // Continuation history: precisa da peca que faz o
-                        // lance actual, obtida do mailbox O(1) do board
-                        // -- ~2ns por lookup, e so' aqui, fora do hot path
-                        // de make_move.
-                        let mut ch = 0i32;
-                        if let Some((curr_pt, _)) = board.piece_at(m.from) {
-                            if let Some((p1_pt, p1_to)) = prev1 {
-                                ch += searcher.cont_hist[cont_hist_idx(p1_pt, p1_to, curr_pt, m.to)];
-                            }
-                            if let Some((p2_pt, p2_to)) = prev2 {
-                                ch += searcher.cont_hist[cont_hist_idx(p2_pt, p2_to, curr_pt, m.to)];
-                            }
-                        }
-                        self.quiet[i].1 = h + cm_bonus + book + ch;
+                    let attacker = board
+                        .piece_at(mv.from)
+                        .map(|(pt, _)| pt.value())
+                        .unwrap_or(0);
+                    let mvv = victim * 16 - attacker;
+                    // A capture that loses material is not a good move that
+                    // happens to be violent, and putting it ahead of the quiet
+                    // moves on the strength of what it takes is how a search
+                    // spends its first three tries on refuted sacrifices.
+                    // Below everything, then, but still ahead of nothing.
+                    // The bar for a capture counting as good drops with depth.
+                    // Deep in the tree there is room to find out whether a
+                    // capture that looks slightly losing actually is; near the
+                    // leaves there is not, so only the clearly good ones go
+                    // first.
+                    // A barra do SEE e o peso da historia de capturas, ambos
+                    // varriveis: as capturas sao 55,5% dos primeiros lances
+                    // tentados e cortam 77,3% das vezes -- o termo com mais
+                    // peso na taxa de corte ao primeiro lance, que esta' em
+                    // 73,0%. Um ponto ganho aqui vale meio ponto no total.
+                    let past = self.capt_score(board, mv) * 16
+                        / self.params.capt_hist_div.max(1);
+                    // O CORTE PELO MERITO DO LANCE, e nao pela profundidade.
+                    //
+                    // Item 12 do VALIDACOES.md, recuperado a 21-09: "o corte
+                    // captura boa/ma vem da PROFUNDIDADE; o deles vem do valor
+                    // do lance" -- arvore +40 a +90%. O KestrelStrike ja' o
+                    // tinha arranjado; aqui faltava.
+                    //
+                    // Com a barra vinda da profundidade, a historia mexia na
+                    // ORDEM e mais nada: uma captura que a tabela adora e outra
+                    // que ela despreza eram julgadas boas ou mas pelo MESMO
+                    // criterio. Agora uma captura que ja' provou valer leva uma
+                    // barra mais permissiva, que e' o que ela merece.
+                    //
+                    // O `capt_score` ja' estava calculado na linha de cima --
+                    // so' nao entrava aqui.
+                    let bar = if self.params.capt_bar_div > 0 {
+                        -(mvv + past) / self.params.capt_bar_div
+                    } else {
+                        (-self.params.capt_bar_f * (depth - 1))
+                            .max(-self.params.capt_bar_max)
+                    };
+                    if see::see_ge(&self.atk, board, mv, bar) {
+                        600_000 + mvv + past
+                    } else {
+                        -600_000 + mvv + past
                     }
-                    self.stage = PickerStage::Quiet;
-                }
-                PickerStage::Quiet => {
-                    if let Some(m) = self.pick_best_quiet() {
-                        return Some(m);
+                } else if mv.promotion == Some(PieceType::Queen) {
+                    500_000
+                } else if let Some(k) =
+                    self.killers[ply].iter().position(|k| *k == Some(*mv))
+                {
+                    if self.features.sem_killers {
+                            // Sem killers: vale o que o historico diz, como
+                            // qualquer outro tranquilo.
+                            //
+                            // A referencia tirou-os em tres passos, e os dois
+                            // ultimos passaram como NAO-REGRESSAO (limites
+                            // <-1.75, 0.25>): tira-los nao deu Elo, deu igual e
+                            // simplificou. Nao sao vantagem que se perde -- sao
+                            // muleta de uma ordenacao pobre. Aqui acertam 65,7%
+                            // contra 87,2% das capturas, e sao 42% de todo o
+                            // desperdicio da primeira tentativa.
+                            //
+                            // Eles precisaram de compensar a media do historico
+                            // antes do LMR (`fill(-658)`); aqui nao, porque o
+                            // `score_moves` ja' devolve `order` e `hist`
+                            // separados e so' o `order` muda.
+                            hist[n]
+                        } else if self.features.killer_compete {
+                            // MEDIDO: os tres killers acertam 67,8%, 67,7% e
+                            // 68,4% quando vao a` frente -- iguais entre si, e
+                            // muito abaixo dos 87,2% das capturas. Nao sao o
+                            // segundo e o terceiro que estragam; e' a classe.
+                            //
+                            // Com 400_000 fixo, o melhor tranquilo que o
+                            // historico conhece (120_293, medido) perde para o
+                            // terceiro killer -- nao competem, passam sempre.
+                            // Aqui somam-se: o killer entra com credito, mas um
+                            // tranquilo com historico forte pode ultrapassa-lo.
+                            hist[n] + self.params.killer_bonus - 10_000 * k as i32
+                        } else {
+                            400_000 - 10_000 * k as i32
+                        }
+                } else if self.features.hist_pc {
+                    hist[n] + pcb[n]
+                } else if self.features.ordem_posicao {
+                    let mut v = hist[n];
+                    if let Some((pt, _)) = board.piece_at(mv.from) {
+                        let t = pt.idx();
+                        // Fugir de quem lhe chega, e nao ir para onde lhe
+                        // chegam. O historico nunca aprende isto: e' uma
+                        // propriedade DESTA posicao, nao do lance.
+                        let de = (menores[t] >> mv.from & 1) as i32;
+                        let para = (menores[t] >> mv.to & 1) as i32;
+                        v += pt.value() * self.params.ordem_ameaca_f * (de - para) / 100;
+                        // Xeque que nao perde material vai a` frente de tudo o
+                        // que o historico tenha a dizer.
+                        if xeque[t] >> mv.to & 1 != 0
+                            && see::see_ge(&self.atk, board, mv, -75)
+                        {
+                            v += self.params.ordem_xeque_f;
+                        }
                     }
-                    self.stage = PickerStage::BadNoisy;
+                    v
+                } else if self.features.pontua_tarde && hist[n] == TRANQUILO_POR_PONTUAR {
+                    // Fica por pontuar. Os sentinelas acima -- um milhao para o
+                    // lance da tabela, seiscentos mil para as capturas,
+                    // quatrocentos mil para os killers -- garantem que os
+                    // tranquilos so' sao olhados depois deles, e a essa altura
+                    // ja' se sabe se foram precisos.
+                    TRANQUILO_POR_PONTUAR
+                } else {
+                    hist[n]
                 }
-                PickerStage::BadNoisy => {
-                    if let Some(m) = self.pick_best_noisy(false) {
-                        return Some(m);
+            })
+            .collect();
+
+        // O termo do xeque, somado por cima do que a ordem der.
+        //
+        // MEDIDO: 173 das 195 posicoes do Win At Chess com ele, contra 155 sem --
+        // dezoito a mais, e o mesmo que o motor de referencia resolve com a NOSSA
+        // rede. E' o termo inteiro que compra a visao, nao a forma da ordenacao:
+        // a soma continua sem ele resolve 154, igual a`s bandas.
+        //
+        // Aplicado aqui, por cima, para se poder ter com as BANDAS -- e assim
+        // saber se a visao vem sem os 38% de arvore que a soma continua custa.
+        let order: Vec<i32> = if self.features.xeque_na_ordem {
+            moves
+                .iter()
+                .zip(order.into_iter())
+                .map(|(mv, o)| {
+                    if o >= 900_000 || !self.da_xeque(board, mv) {
+                        return o;
                     }
-                    self.stage = PickerStage::Done;
-                }
-                PickerStage::Done => return None,
-            }
-        }
+                    // Banda propria para o xeque, em vez de um bonus somado.
+                    //
+                    // Somado, os 60.000 nao chegam para nada: um xeque tranquilo
+                    // com historico zero fica nos 60.000, ainda abaixo dos
+                    // killers (400.000) e muito abaixo das capturas (600.000) --
+                    // ou seja, nunca sobe. Uma banda poe o xeque como CLASSE, que
+                    // e' o que as capturas ja' sao, e dentro dela os lances
+                    // continuam ordenados pelo que valiam.
+                    if self.params.xeque_banda > 0 {
+                        self.params.xeque_banda + o.clamp(-99_000, 99_000)
+                    } else {
+                        o + self.params.ord_xeque
+                    }
+                })
+                .collect()
+        } else {
+            order
+        };
+        (order, hist)
     }
 
-    /// Se `m` (o lance sugerido) ainda estiver nas listas geradas,
-    /// devolve true. Serve para validar TT-move e killers antes de os
-    /// emitir -- ambos podem ser lixo (TT colisao ou killer stale que
-    /// ja nao aplica a esta posicao).
-    fn contains_move(&self, m: Move) -> bool {
-        self.noisy.iter().any(|(x, _, _)| *x == m) || self.quiet.iter().any(|(x, _)| *x == m)
-    }
-    fn quiet_contains(&self, m: Move) -> bool {
-        self.quiet.iter().any(|(x, _)| *x == m)
-    }
-
-    /// Marca um quiet como "ja usado" (usei-o como killer, nao repetir
-    /// mais tarde no stage Quiet). Truque: guardar `from == to`, que
-    /// nunca acontece num lance real; o loop de ScoreQuiet trata como
-    /// score = MIN e o pick_best_quiet salta-o.
-    fn mark_quiet_used(&mut self, m: Move) {
-        for entry in self.quiet.iter_mut() {
-            if entry.0 == m {
-                entry.0 = Move {
-                    from: 0,
-                    to: 0,
-                    promotion: None,
-                    flag: MoveFlag::Quiet,
-                };
-                return;
-            }
-        }
-    }
-
-    /// Selection-sort in-place: encontra o de maior score a partir de
-    /// `noisy_idx`, faz swap para essa posicao, avanca. Devolve o lance;
-    /// respeita a fase (good_only=true so' devolve SEE>=0, senao so'
-    /// devolve SEE<0). Se nao ha mais na fase actual, devolve None.
-    fn pick_best_noisy(&mut self, good_only: bool) -> Option<Move> {
-        while self.noisy_idx < self.noisy.len() {
-            // Primary key SEE, tie-broken by capture history ONLY when
-            // SEE is exactly equal -- the good/bad-noisy boundary check
-            // below still looks purely at SEE, completely unaffected by
-            // the tie-break (many other pruning decisions assume that
-            // boundary is pure SEE, see search_params()-driven captures
-            // futility/SEE pruning).
-            let mut best_i = self.noisy_idx;
-            for i in (self.noisy_idx + 1)..self.noisy.len() {
-                let (_, s, h) = self.noisy[i];
-                let (_, bs, bh) = self.noisy[best_i];
-                if s > bs || (s == bs && h > bh) {
-                    best_i = i;
-                }
-            }
-            self.noisy.swap(self.noisy_idx, best_i);
-            let (m, score, _) = self.noisy[self.noisy_idx];
-            // score == i32::MIN significa "e' o TT-move, salta"
-            if score == i32::MIN {
-                self.noisy_idx += 1;
+    /// Bring the best remaining move to `at`, keeping scores in step.
+    #[inline]
+    /// Preencher a pontuacao dos tranquilos, quando a busca chega a eles.
+    fn pontua_tranquilos(
+        &self,
+        board: &Board,
+        moves: &[Move],
+        scores: &mut [i32],
+        hist: &mut [i32],
+        de: usize,
+        ply: usize,
+    ) {
+        let side = board.side.idx();
+        let slots = self.cont_slots(ply);
+        let cp = if self.features.hist_peao { self.chave_peao(board) } else { 0 };
+        for n in de..moves.len() {
+            if scores[n] != TRANQUILO_POR_PONTUAR {
                 continue;
             }
-            // Boundary entre good e bad: good tem SEE>=0.
-            if good_only {
-                if score < 0 {
-                    return None;
-                }
-            } else if score >= 0 {
-                // Nao devia acontecer (todos os good_noisy ja foram
-                // devolvidos), mas por defesa, salta -- os good ja
-                // foram devolvidos por definicao.
-                self.noisy_idx += 1;
-                continue;
-            }
-            self.noisy_idx += 1;
-            return Some(m);
+            let h = self.hist_de(board, &moves[n], side, &slots, cp);
+            hist[n] = h;
+            scores[n] = h;
         }
-        None
     }
 
-    fn pick_best_quiet(&mut self) -> Option<Move> {
-        while self.quiet_idx < self.quiet.len() {
-            let mut best_i = self.quiet_idx;
-            let mut best_score = self.quiet[best_i].1;
-            for i in (self.quiet_idx + 1)..self.quiet.len() {
-                if self.quiet[i].1 > best_score {
-                    best_score = self.quiet[i].1;
-                    best_i = i;
-                }
+    fn pick(moves: &mut [Move], scores: &mut [i32], hist: &mut [i32], at: usize) {
+        let mut best = at;
+        for j in at + 1..moves.len() {
+            if scores[j] > scores[best] {
+                best = j;
             }
-            self.quiet.swap(self.quiet_idx, best_i);
-            let (m, score) = self.quiet[self.quiet_idx];
-            if score == i32::MIN {
-                self.quiet_idx += 1;
-                continue;
-            }
-            self.quiet_idx += 1;
-            return Some(m);
         }
-        None
+        Self::troca(moves, scores, hist, at, best);
+    }
+
+    /// O mesmo, com o maximo achado em C++ por AVX2.
+    ///
+    /// Tem de devolver o MESMO indice que a versao acima, empates incluidos --
+    /// o Rust usa `>` estrito e fica com o primeiro maximo. Um argmax que
+    /// ficasse com o ultimo mudava a ordem dos lances e com ela a arvore, e
+    /// entao ja' nao estariamos a medir velocidade.
+    fn pick_cpp(moves: &mut [Move], scores: &mut [i32], hist: &mut [i32], at: usize) {
+        let best = unsafe { h2k_argmax_i32(scores.as_ptr(), scores.len(), at) };
+        Self::troca(moves, scores, hist, at, best);
+    }
+
+    #[inline]
+    fn troca(moves: &mut [Move], scores: &mut [i32], hist: &mut [i32], at: usize, best: usize) {
+        moves.swap(at, best);
+        scores.swap(at, best);
+        hist.swap(at, best);
     }
 }
 
-/// Repoe a extensao incondicional de xeque (`KESTREL_EXT_XEQUE=1`), desligada
-/// por omissao. Lido uma vez: consultas ao ambiente no caminho quente custam
-/// caro -- medido, um `env::var_os` por avaliacao valia ~25% do tempo.
-pub fn ext_xeque() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var_os("KESTREL_EXT_XEQUE").is_some())
-}
+#[cfg(test)]
+mod testes_tempo {
+    use super::faltam_lances_pct;
 
-/// Limpa os killers do ply seguinte a cada no' (`KESTREL_KILLER_RESET=1`).
-pub fn limpa_killers_filho() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var_os("KESTREL_KILLER_RESET").is_some())
+    /// A funcao antiga, para os testes que ja' existiam continuarem a dizer o
+    /// que diziam: a mediana e' o percentil 0.
+    fn faltam_lances(jogados: u32, minimo: i32) -> u64 {
+        faltam_lances_pct(jogados, minimo, 0, 0)
+    }
+
+    #[test]
+    fn curva_bate_com_a_mediana_medida() {
+        assert!(matches!(faltam_lances(0, 14), 65 | 66));
+        assert_eq!(faltam_lances(20, 14), 46);   // 45,5 arredonda para 46
+        assert_eq!(faltam_lances(60, 14), 19);
+    }
+
+    /// Os dois nos que faltavam a` tabela, e que o `minimo` tapava.
+    ///
+    /// Antes desta correccao o lance 80 dava 14 (a extrapolacao dava 10 e o
+    /// chao corrigia) quando a medida diz 15,5. Um horizonte curto de mais nas
+    /// partidas LONGAS -- que sao precisamente as que acabam a` bandeira.
+    #[test]
+    fn os_nos_de_80_e_110_vem_da_medicao_e_nao_do_chao() {
+        assert_eq!(faltam_lances(80, 14), 16);   // 15,5 arredonda para 16
+        assert_eq!(faltam_lances(110, 14), 14);
+        // e para la' do ultimo no' fica o valor da ponta, nao um declive
+        assert_eq!(faltam_lances(200, 14), 14);
+    }
+
+    /// Subir o percentil TEM de alargar o horizonte em todo o lado, senao nao
+    /// esta' a fazer o que diz.
+    #[test]
+    fn o_percentil_alarga_o_horizonte() {
+        for lance in [0u32, 20, 40, 60, 80] {
+            let mut ant = 0;
+            for pct in 0..5 {
+                let v = faltam_lances_pct(lance, 14, pct, 0);
+                assert!(v >= ant, "o percentil {} encolheu no lance {}", pct, lance);
+                ant = v;
+            }
+        }
+        // e a diferenca tem de ser real, nao arredondamento
+        assert!(faltam_lances_pct(40, 14, 3, 0) > faltam_lances_pct(40, 14, 0, 0) + 10);
+    }
+
+    /// A estimativa tem de se corrigir quando a partida a desmente.
+    #[test]
+    fn o_horizonte_cresce_depois_do_fim_da_tabela() {
+        // desligado: constante depois do lance 110, que e' o defeito
+        assert_eq!(faltam_lances_pct(110, 14, 0, 0), faltam_lances_pct(200, 14, 0, 0));
+        // ligado: cresce com o excesso
+        assert!(faltam_lances_pct(200, 14, 0, 100) > faltam_lances_pct(110, 14, 0, 100) + 50);
+        // e NAO mexe onde a tabela ainda manda
+        for l in [0u32, 40, 80, 110] {
+            assert_eq!(faltam_lances_pct(l, 14, 0, 0), faltam_lances_pct(l, 14, 0, 100),
+                       "mexeu no lance {}, onde a tabela ainda manda", l);
+        }
+    }
+    #[test]
+    fn nunca_cresce_e_respeita_o_minimo() {
+        let mut ant = u64::MAX;
+        for j in 0..200 {
+            let v = faltam_lances(j, 14);
+            assert!(v <= ant, "cresceu no lance {}", j);
+            assert!(v >= 14);
+            ant = v;
+        }
+    }
 }

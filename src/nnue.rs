@@ -1,1152 +1,775 @@
-//! The evaluation network.
-//!
-//! Architecture is `(768 -> HIDDEN)x2 -> 1`: one accumulator per side, each
-//! fed the same 768 piece-square inputs read from that side's point of view,
-//! concatenated side-to-move first, then a single output neuron.
-//!
-//! Why this shape and not something larger. The input set is the plain
-//! piece-square one -- twelve piece/colour combinations on sixty-four squares
-//! -- with no king bucketing. Bucketed inputs are worth real strength and cost
-//! a full accumulator refresh whenever a king moves, plus a much larger file
-//! for the same number of positions to train it. This shape trains to
-//! something useful on a few million positions, which is what we can generate
-//! in an evening; the bucketed version can come once the pipeline around it is
-//! proven and the data is deep enough to feed it.
-//!
-//! Quantisation follows the training side exactly: the first layer is scaled
-//! by QA and the second by QB, so an accumulator entry is a real weight times
-//! QA and the output is divided by QA*QB at the end. Doing the arithmetic in
-//! integers is not an optimisation detail here -- a float evaluation would
-//! make the search non-reproducible between machines.
+// The network: reading it, keeping it up to date, and asking it for a score.
+//
+// Shape: (768 x 32 -> 512) x 2 -> 1, plus a PSQT term that skips the hidden
+// layer, both read through four output buckets chosen by piece count. One
+// hidden layer, clipped ReLU, everything in i16.
+//
+// The file is a raw dump of the weights in declaration order with no header, so
+// the struct below IS the format. Its size is checked on load against the byte
+// count, which is the cheapest possible guard against reading a file that is
+// almost but not quite this network.
 
-use crate::board::Board;
-use crate::types::{Color, PieceType};
+use crate::bitboard::Bitboard;
+use crate::types::*;
 
-pub const HIDDEN: usize = 512;
-pub const INPUTS: usize = 768;
-const QA: i32 = 255;
-const QB: i32 = 64;
+/// King buckets. Note what this number means: the bucket is the king's own
+/// square after folding, not a coarse region, so EVERY king move changes it.
+/// That is what makes the refresh cache below load-bearing rather than an
+/// optimisation -- see the comment there.
+pub const INPUT_BUCKETS: usize = 32;
+pub const HIDDEN: usize = 1024;
 
-/// How many centipawns one unit of the network's output is worth.
+/// A cabeca. `L1H` sai da primeira camada, `L2H` da segunda, e os dezasseis
+/// viram trinta e dois na dupla activacao.
+pub const L1H: usize = 16;
+pub const L2H: usize = 32;
+
+/// O acumulador e' cortado em `[0, QA]`, e os pesos da l1 estao quantizados
+/// por `QB` -- ambos escolhidos pelo treinador, nao aqui.
+const QA: i16 = 1024;
+
+/// Pre-deslocamento do produto emparelhado. O `mulhrs` desloca 15 e queremos
+/// `(a*b) >> 12`, que e' o que faz um produto de dois valores de dez bits caber
+/// num byte.
+const DESL: i32 = 3;
+
+/// De soma inteira para unidades reais: o byte traz o produto a dividir por
+/// 256, e os pesos estao quantizados por 64.
+const DIV: f32 = 1.0 / 16384.0;
+
+/// Das unidades da rede para centipeoes -- o mesmo numero por que o PSQT foi
+/// quantizado, e por isso e' que ele se soma DEPOIS da conversao.
+const ESCALA: f32 = 400.0;
+
+/// O selo que a biblioteca de treino carimba no fim do ficheiro.
+const SELO: usize = 32;
+pub const OUT_BUCKETS: usize = 8;
+pub const NUM_PECAS: usize = INPUT_BUCKETS * 2 * 6 * 64; // 24576
+/// Pawn pairs: 96 slots (48 squares x 2 colours), every unordered pair.
 ///
-/// Tunable at runtime -- `setoption name EvalScale value <n>` -- because it is
-/// not really a property of the network. It is the exchange rate between the
-/// network's opinion and the units every pruning margin in the search is
-/// written in, and those margins were fitted against whatever this happened to
-/// be.
-///
-/// It is worth about two plies, which is why it is a knob and not a constant.
-/// Loading a network trained elsewhere, whose output is on half our scale,
-/// cost three plies of depth at a HIGHER node rate -- the signature of margins
-/// that no longer fire, so the tree widens. Rescaling that same network, one
-/// number and not one weight, gave the plies straight back.
-///
-/// Changing it detunes every margin at once, so a measured gain is the net of
-/// both effects, not the scale alone.
-/// Omissao vinda da COMPILACAO (`KESTREL_ESCALA`, ver build.rs), para a
-/// escala viajar com a rede embutida em vez de depender de quem lanca o
-/// motor. Sem a variavel fica 200, que e' a escala da rede v1.
-const ESCALA_COMPILADA: i32 = match i32::from_str_radix(env!("KESTREL_ESCALA_COMPILADA"), 10) {
-    Ok(v) => v,
-    Err(_) => 200,
-};
-static ESCALA: std::sync::atomic::AtomicI32 =
-    std::sync::atomic::AtomicI32::new(ESCALA_COMPILADA);
+/// Deliberately WITHOUT a king bucket. Bucketed, every king move would rebuild
+/// the whole block; unbucketed, only pawn moves touch it -- which is what makes
+/// this feature cheap where a threat set would not be.
+pub const PAIR_DIM: usize = 96 * 95 / 2; // 4560
+pub const PAIR_BASE: usize = NUM_PECAS;
+pub const NUM_FEATURES: usize = NUM_PECAS + PAIR_DIM; // 29136
+/// The size of a network without the pairs. It still loads: it is the same
+/// network with those rows at zero.
 
-#[inline]
-pub fn escala() -> i32 {
-    ESCALA.load(std::sync::atomic::Ordering::Relaxed)
+
+/// Weights are stored multiplied by this, and the hidden layer is clipped to
+/// it. Both facts come from the training quantisation and neither is free to
+/// change here.
+pub const SCALE: i32 = 1024;
+
+#[repr(C)]
+pub struct Network {
+    pub l0w: [[i16; HIDDEN]; NUM_FEATURES],
+    pub psqt: [[i16; OUT_BUCKETS]; NUM_FEATURES],
+    /// A primeira camada da cabeca, em int8: e' 94% do trabalho dela.
+    pub l1w: [[i8; HIDDEN]; L1H * OUT_BUCKETS],
+    pub l1b: [f32; L1H * OUT_BUCKETS],
+    /// Guardada `[saida][entrada]` pelo treinador e VIRADA ao carregar, porque
+    /// a cabeca a le' `[entrada][saida]`. As outras duas nao precisam.
+    pub l2w: [[f32; L1H * 2]; L2H * OUT_BUCKETS],
+    pub l2b: [f32; L2H * OUT_BUCKETS],
+    pub l3w: [[f32; L2H]; OUT_BUCKETS],
+    pub l3b: [f32; OUT_BUCKETS],
 }
 
-pub fn set_escala(v: i32) {
-    ESCALA.store(v.clamp(1, 4000), std::sync::atomic::Ordering::Relaxed);
+extern "C" {
+    fn cabeca_avalia(
+        largura: i32,
+        l1: i32,
+        l2: i32,
+        qa: i32,
+        desl: i32,
+        div: f32,
+        nos: *const i16,
+        eles: *const i16,
+        l1w: *const i8,
+        l1b: *const f32,
+        l2w: *const f32,
+        l2b: *const f32,
+        sw: *const f32,
+        sb: f32,
+    ) -> f32;
 }
 
-/// Per-bucket scale, measured rather than chosen.
-///
-/// One constant cannot serve both ends of the game. Fitted on 185k positions
-/// from our own archived games, the eval at which the pure-win rate reaches
-/// 50% -- Stockfish's definition of "one pawn" -- runs from 305 internal
-/// units with 2-5 pieces on the board down to 105 with 30-33. Reading all of
-/// them through a single 176 inflates the endgame roughly threefold: a drawn
-/// rook ending evaluates near zero, and near-zero times three still reads as
-/// near-zero until the margins built on it start firing, at which point the
-/// engine reports a loss in a position Stockfish calls a draw. That is not a
-/// hypothetical; it was watched happening in a live bullet game.
-///
-/// Same 8 buckets the network itself uses (`output_bucket`), so the scale and
-/// the weights that produced the number are indexed the same way.
-///
-/// Values are `176 * 100 / a`, i.e. the current scale corrected by how far
-/// each bucket's measured pawn differs from the one 176 assumes. Buckets are
-/// by piece count: 0 = 2-5 pieces, 7 = 30-33.
-const ESCALA_BALDE: [i32; 8] = [58, 95, 104, 121, 135, 160, 160, 168];
+pub const NET_BYTES: usize = std::mem::size_of::<Network>();
 
-/// Is the per-bucket scale on? Off by default -- it changes every pruning
-/// margin at once, so it goes in behind its own switch until measured.
-static ESCALA_POR_BALDE: std::sync::atomic::AtomicBool =
+/// Does the loaded network have pawn pairs at all?
+///
+/// A network in the old format has that whole block at zero, and walking the
+/// pawns to add rows of zeros costs 13.9% of the node rate for nothing. Read
+/// once when the network is loaded, so the check itself costs a load and a
+/// branch that predicts perfectly.
+pub static TEM_PARES: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-pub fn set_escala_por_balde(on: bool) {
-    ESCALA_POR_BALDE.store(on, std::sync::atomic::Ordering::Relaxed);
+#[inline]
+pub fn tem_pares() -> bool {
+    TEM_PARES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// The scale to read THIS position's evaluation with.
+/// The win-rate model the network was trained against.
 ///
-/// Falls back to the single `escala()` when the switch is off, so the default
-/// binary is unchanged.
-#[inline]
-pub fn escala_pos(board: &crate::board::Board) -> i32 {
-    if !ESCALA_POR_BALDE.load(std::sync::atomic::Ordering::Relaxed) {
-        return escala();
+/// These constants are not a choice and not a default: they are the output of a
+/// search over hundreds of validated training runs, which is why they carry
+/// sixteen digits. Changing one here without changing it in training makes the
+/// program announce probabilities the network was never taught to produce.
+///
+/// What makes them usable directly on our score, with no conversion at all, is
+/// that the quantisation stores each weight already multiplied by the training
+/// scale. Measured on ten thousand positions with known results, the fit gives
+/// k = 0.9939 for this network -- so the raw score IS this model's centipawn.
+/// For a network trained at a different scale it would not be, and this would
+/// quietly lie.
+pub const WDL_OFFSET: f64 = 285.2706341467852;
+pub const WDL_SCALING: f64 = 295.6539508488627;
+
+/// Win, draw and loss in thousandths, from the side to move's point of view.
+pub fn wdl(score: i32) -> (i32, i32, i32) {
+    let sig = |x: f64| 1.0 / (1.0 + (-x).exp());
+    let cp = score as f64;
+    let w = sig((cp - WDL_OFFSET) / WDL_SCALING);
+    let l = sig((-cp - WDL_OFFSET) / WDL_SCALING);
+    let wi = (1000.0 * w).round() as i32;
+    let li = (1000.0 * l).round() as i32;
+    (wi, 1000 - wi - li, li)
+}
+
+/// The one network, set once at startup.
+///
+/// Global rather than carried around because every path that moves a piece
+/// needs it, and threading it through the board would put a lifetime on the
+/// position itself. Set once and never replaced, so no locking is involved
+/// after startup.
+static NET: std::sync::OnceLock<Box<Network>> = std::sync::OnceLock::new();
+
+pub fn net() -> Option<&'static Network> {
+    NET.get().map(|b| &**b)
+}
+
+/// Returns false if a network was already installed.
+pub fn install(n: Box<Network>) -> bool {
+    NET.set(n).is_ok()
+}
+
+/// Pede ao nucleo paginas enormes para a tabela de pesos.
+///
+/// Sessenta megabytes, e as linhas que um lance toca estao espalhadas por eles
+/// ao acaso -- quase todo o acesso e' uma travessia da tabela de paginas numa
+/// entrada nova. Medido no outro motor nosso, no mesmo tipo de problema: 26
+/// milhoes de faltas de dTLB num bench, 14.2% da busca gasta a percorrer
+/// tabelas de paginas.
+///
+/// As DUAS chamadas sao precisas. `MADV_HUGEPAGE` marca a regiao mas so' actua
+/// em faltas futuras, e esta memoria ja' esta' escrita -- foi para la' que se
+/// leu o ficheiro. `MADV_COLLAPSE` junta as paginas que ja' la' estao.
+///
+/// Falhar nao e' erro: sem nucleo que o suporte ou sem memoria contigua para
+/// dar, o motor corre como corria.
+#[cfg(target_os = "linux")]
+fn pede_paginas_enormes(net: &Network) {
+    const MADV_HUGEPAGE: i32 = 14;
+    const MADV_COLLAPSE: i32 = 25;
+    unsafe extern "C" {
+        fn madvise(addr: *mut core::ffi::c_void, len: usize, advice: i32) -> i32;
     }
-    let n = board.occ_all.count_ones() as usize;
-    ESCALA_BALDE[(n.saturating_sub(2) / 4).min(7)]
+    if std::env::var("HALF2K_HUGE").as_deref() == Ok("0") {
+        return;
+    }
+    let base = net as *const Network as usize;
+    let fim = base + std::mem::size_of::<Network>();
+    // Alinhado a dois megabytes nas duas pontas: o `madvise` recusa um inicio
+    // desalinhado, e uma cauda a mais tocaria memoria que nao e' nossa.
+    const M: usize = 2 * 1024 * 1024;
+    let ini = base.next_multiple_of(M);
+    let f = fim - (fim % M);
+    if f <= ini {
+        return;
+    }
+    unsafe {
+        madvise(ini as *mut core::ffi::c_void, f - ini, MADV_HUGEPAGE);
+        madvise(ini as *mut core::ffi::c_void, f - ini, MADV_COLLAPSE);
+    }
 }
 
-/// Weights, in the layout `bullet` writes them.
-///
-/// `l0w` is stored input-major: all HIDDEN weights for input 0, then for
-/// input 1, and so on. That is the order the accumulator update wants -- one
-/// active input means one contiguous run of HIDDEN values to add -- so it is
-/// kept exactly as written rather than transposed on load.
-pub struct Network {
-    pub l0w: Vec<i16>, // INPUTS * HIDDEN * buckets
-    pub l0b: Vec<i16>, // HIDDEN
-    /// Output weights, laid out bucket by bucket: the 2*HIDDEN weights of
-    /// bucket 0, then bucket 1, and so on. That is what the trainer's
-    /// `.transpose()` produces, and it is the layout inference wants -- one
-    /// contiguous run per bucket instead of a stride of 8 through the whole
-    /// matrix.
-    pub l1w: Vec<i16>, // 2 * HIDDEN * output_buckets
-    /// One bias per output bucket.
-    pub l1b: Vec<i16>,
-    /// How many output buckets, by material count. A network trained without
-    /// them has one, and everything below collapses to the single-bucket case
-    /// with no special path.
-    pub output_buckets: usize,
-    /// How many king buckets this network's inputs are split into.
-    ///
-    /// Read from the file's own size rather than assumed: a network trained
-    /// without buckets and one trained with twelve differ only in the length
-    /// of the first layer, and getting it wrong reads the wrong weights for
-    /// every piece rather than failing. One means "no bucketing", and every
-    /// index below collapses to the unbucketed layout with no special case.
-    pub buckets: usize,
-}
+#[cfg(not(target_os = "linux"))]
+fn pede_paginas_enormes(_net: &Network) {}
 
-/// One piece appearing on, or disappearing from, a square.
-///
-/// Recorded instead of applied. See `Accumulator::computed` for why.
-#[derive(Clone, Copy)]
-pub struct DirtyPiece {
-    pub pt: PieceType,
-    pub c: Color,
-    pub sq: u8,
-    pub add: bool,
-}
-
-/// How many piece changes can be outstanding before we stop deferring and
-/// just apply them.
-///
-/// Not a per-move bound -- one move is at most five changes -- but a bound on
-/// how deep the search can descend WITHOUT anything asking for a score. Past
-/// this, deferring stops paying (the list costs more to walk than the columns
-/// cost to add) so `push_dirty` applies eagerly instead. Sized from measured
-/// behaviour rather than theory: with 0.65 evaluations per node the list is
-/// almost always empty or holds one move's worth.
-pub const MAX_DIRTY: usize = 32;
-
-/// The two accumulators, side to move and the other side.
-///
-/// Kept as plain arrays rather than behind a pointer: this rides on the
-/// `Board`, and an allocation per node would cost more than the evaluation it
-/// exists to speed up.
-///
-/// **Lazy.** `white`/`black` do not necessarily describe the current position:
-/// `dirty` holds piece changes that have not been folded in yet, and the
-/// values are only brought up to date when something actually asks for a
-/// score (`Board::materialise_acc`, called from `evaluate`). The reason is
-/// measured, not assumed -- profiling put `Accumulator::add` plus the `remove`
-/// inlined into `Board::remove_piece` at 34% of total search time, while the
-/// engine performs only 0.65 evaluations per node. A third of that work was
-/// being done for positions whose score was never read.
-///
-/// What makes this cheap without a per-ply stack of accumulators (which would
-/// be ~256 kB and is copied at all nine `Board::clone` sites): `push_dirty`
-/// CANCELS a change against its own inverse. The search's make/unmake is
-/// perfectly nested, so a move that is made, searched without ever being
-/// evaluated, and unmade pushes each change and then its opposite -- and the
-/// list returns to exactly where it started. Descending and coming back up
-/// costs nothing at all, which is the property a per-ply stack buys by
-/// spending memory. Order within the list never matters: the accumulator is a
-/// sum of columns, so any permutation of the same adds and removes lands on
-/// the same values.
-#[derive(Clone)]
-pub struct Accumulator {
-    pub white: [i16; HIDDEN],
-    pub black: [i16; HIDDEN],
-    /// Which king bucket each perspective is currently written for, indexed by
-    /// colour. Kept here rather than recomputed because every add and remove
-    /// needs it, and because a mismatch between the bucket the values were
-    /// built under and the one used to index new features is silent.
-    pub bucket: [usize; 2],
-    /// Whether each perspective's squares are flipped left-right, which the
-    /// mirrored input set requires whenever that side's king sits on e-h.
-    /// Kept beside `bucket` because it has the same dependency (the king
-    /// square) and must be refreshed at the same moments.
-    pub espelha: [bool; 2],
-    /// Piece changes recorded but not yet applied to `white`/`black`.
-    pub dirty: [DirtyPiece; MAX_DIRTY],
-    pub n_dirty: u8,
-}
-
-/// Feature index for a piece on a square, from one side's point of view.
-///
-/// From black's side the board is mirrored vertically and the colours are
-/// swapped, so that "my pawn on my second rank" is the same input number for
-/// both players. Without that, the network has to learn every pattern twice
-/// and half its capacity goes into the symmetry.
-#[inline]
-fn feature(perspective: Color, piece_color: Color, pt: PieceType, sq: u8) -> usize {
-    let (c, s) = if perspective == Color::White {
-        (piece_color == Color::Black, sq as usize)
-    } else {
-        (piece_color == Color::White, (sq as usize) ^ 56)
-    };
-    (c as usize) * 384 + pt.idx() * 64 + s
-}
-
-/// Feature index with the horizontal mirror applied.
-///
-/// A bucketed input set that calls itself *mirrored* does two things, and the
-/// engine was only doing one of them. Choosing the bucket by the king's file
-/// folded onto a-d is the first; the second is that when the king actually
-/// sits on e-h, EVERY square of that perspective is flipped left-right
-/// (`sq ^ 7`) so the position is presented to the network from the side it was
-/// trained on. Skipping the flip reads every feature on the wrong file for
-/// half of all positions -- a network so read does not play badly, it plays
-/// nonsense.
-///
-/// Mirrors bullet's `ChessBucketsMirrored::map_features`, which computes the
-/// flip per perspective as `if ksq % 8 > 3 { 7 } else { 0 }` and XORs it into
-/// the square after `Chess768` has produced the index.
-#[inline]
-fn feature_espelhada(
-    perspective: Color,
-    espelha: bool,
-    piece_color: Color,
-    pt: PieceType,
-    sq: u8,
-) -> usize {
-    let sq = if espelha { sq ^ 7 } else { sq };
-    feature(perspective, piece_color, pt, sq)
-}
-
-/// Does this perspective's king sit on the e-h side?
-///
-/// Read from the raw square, NOT from the vertically flipped one: the mirror
-/// is about files and the vertical flip is about ranks, and `^ 56` leaves the
-/// file untouched -- which is exactly why the trainer can test `ksq % 8 > 3`
-/// on the unflipped square for both colours.
-#[inline]
-pub fn espelha_perspectiva(board: &crate::board::Board, perspectiva: Color) -> bool {
-    board.king_sq(perspectiva) % 8 > 3
-}
-
-impl Accumulator {
-    pub fn fresh(net: &Network, board: &Board) -> Self {
-        let mut acc = Accumulator {
-            white: [0; HIDDEN],
-            black: [0; HIDDEN],
-            // Through `bucket_efectivo`, not `bucket_do_rei`: an unbucketed
-            // network has one block of weights and every king square must map
-            // to zero. Using the layout's answer regardless indexes past the
-            // end of the first layer -- which crashed here rather than reading
-            // someone else's weights, but only by luck of the bounds check.
-            bucket: [
-                bucket_efectivo(net, board, Color::White),
-                bucket_efectivo(net, board, Color::Black),
-            ],
-            espelha: if net.buckets > 1 {
-                [
-                    espelha_perspectiva(board, Color::White),
-                    espelha_perspectiva(board, Color::Black),
-                ]
-            } else {
-                [false, false]
-            },
-            dirty: [DirtyPiece { pt: PieceType::Pawn, c: Color::White, sq: 0, add: true }; MAX_DIRTY],
-            n_dirty: 0,
-        };
-        acc.white.copy_from_slice(&net.l0b);
-        acc.black.copy_from_slice(&net.l0b);
-        for color in [Color::White, Color::Black] {
-            for pt in [
-                PieceType::Pawn,
-                PieceType::Knight,
-                PieceType::Bishop,
-                PieceType::Rook,
-                PieceType::Queen,
-                PieceType::King,
-            ] {
-                let mut bb = board.pieces[color.idx()][pt.idx()];
-                while bb != 0 {
-                    let sq = bb.trailing_zeros() as u8;
-                    bb &= bb - 1;
-                    acc.add(net, color, pt, sq);
+pub fn load(path: &str) -> std::io::Result<Box<Network>> {
+    // Com a ponte ligada a avaliacao vem de la', e manter o nosso acumulador
+    // a par custava 54% do motor para um valor que ninguem le'.
+    if crate::ponte::ligado() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "ponte activa: a rede propria nao e' carregada",
+        ));
+    }
+    let bytes = std::fs::read(path)?;
+    // A network without the pairs is the same network with those rows at zero
+    // -- which is literally how the warm start for the new one was built, the
+    // old weights copied across and the rest left at zero. So both sizes load,
+    // and the engine keeps playing while the new network is still training.
+    // O treinador carimba `bullet` repetido no fim; o resto tem de bater ao
+    // byte, porque isto e' uma copia crua para uma struct `repr(C)`.
+    if bytes.len() != NET_BYTES && bytes.len() != NET_BYTES + SELO {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "network is {} bytes, expected {} (ou {} com o selo)",
+                bytes.len(),
+                NET_BYTES,
+                NET_BYTES + SELO
+            ),
+        ));
+    }
+    // SAFETY: `Network` is `repr(C)` and made entirely of `i16`, so every bit
+    // pattern is a valid value and there is no padding to leave uninitialised.
+    // The length was just checked. Little-endian is assumed, as the file was
+    // written on the same class of machine that reads it.
+    unsafe {
+        let layout = std::alloc::Layout::new::<Network>();
+        let raw = std::alloc::alloc_zeroed(layout) as *mut Network;
+        if raw.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), raw as *mut u8, NET_BYTES);
+        let net = Box::from_raw(raw);
+        // A file of the right size can still have the pair block empty -- a
+        // network trained before the feature existed and padded, say -- so it
+        // is decided by looking rather than by the length.
+        pede_paginas_enormes(&*net);
+        let vazio = net.l0w[PAIR_BASE..].iter().all(|r| r.iter().all(|&w| w == 0));
+        TEM_PARES.store(!vazio, std::sync::atomic::Ordering::Relaxed);
+        // A l2w vem `[saida][entrada]` e a cabeca le' `[entrada][saida]`.
+        // Virada aqui uma vez, e nao em cada avaliacao.
+        let mut net = net;
+        for b in 0..OUT_BUCKETS {
+            for i in 0..L2H {
+                for j in (i + 1)..(L1H * 2) {
+                    if j < L2H {
+                        let (a, c) = (net.l2w[b * L2H + i][j], net.l2w[b * L2H + j][i]);
+                        net.l2w[b * L2H + i][j] = c;
+                        net.l2w[b * L2H + j][i] = a;
+                    }
                 }
             }
         }
-        acc
-    }
-
-    #[inline]
-    pub fn add(&mut self, net: &Network, color: Color, pt: PieceType, sq: u8) {
-        let fw = feature_bucket(Color::White, self.bucket[0], self.espelha[0], color, pt, sq) * HIDDEN;
-        let fb = feature_bucket(Color::Black, self.bucket[1], self.espelha[1], color, pt, sq) * HIDDEN;
-        #[cfg(target_arch = "x86_64")]
-        if tem_avx2() {
-            unsafe {
-                simd::soma(&mut self.white, &net.l0w[fw..fw + HIDDEN]);
-                simd::soma(&mut self.black, &net.l0w[fb..fb + HIDDEN]);
-            }
-            return;
-        }
-        for i in 0..HIDDEN {
-            self.white[i] += net.l0w[fw + i];
-            self.black[i] += net.l0w[fb + i];
-        }
-    }
-
-    #[inline]
-    pub fn remove(&mut self, net: &Network, color: Color, pt: PieceType, sq: u8) {
-        let fw = feature_bucket(Color::White, self.bucket[0], self.espelha[0], color, pt, sq) * HIDDEN;
-        let fb = feature_bucket(Color::Black, self.bucket[1], self.espelha[1], color, pt, sq) * HIDDEN;
-        #[cfg(target_arch = "x86_64")]
-        if tem_avx2() {
-            unsafe {
-                simd::subtrai(&mut self.white, &net.l0w[fw..fw + HIDDEN]);
-                simd::subtrai(&mut self.black, &net.l0w[fb..fb + HIDDEN]);
-            }
-            return;
-        }
-        for i in 0..HIDDEN {
-            self.white[i] -= net.l0w[fw + i];
-            self.black[i] -= net.l0w[fb + i];
-        }
-    }
-
-    /// Record a piece change instead of applying it.
-    ///
-    /// Cancels against the tail of the list when this change is the exact
-    /// inverse of the last one recorded -- which is what `unmake_move`
-    /// produces for a move nothing evaluated under, and what makes descending
-    /// and returning free. Falls back to applying immediately once the list is
-    /// full, so the deferral can never grow unbounded or lose a change.
-    #[inline]
-    pub fn push_dirty(&mut self, net: &Network, c: Color, pt: PieceType, sq: u8, add: bool) {
-        if let Some(last) = self.n_dirty.checked_sub(1) {
-            let d = self.dirty[last as usize];
-            if d.sq == sq && d.pt == pt && d.c == c && d.add != add {
-                self.n_dirty = last;
-                return;
-            }
-        }
-        if (self.n_dirty as usize) < MAX_DIRTY {
-            self.dirty[self.n_dirty as usize] = DirtyPiece { pt, c, sq, add };
-            self.n_dirty += 1;
-            return;
-        }
-        if add {
-            self.add(net, c, pt, sq);
-        } else {
-            self.remove(net, c, pt, sq);
-        }
-    }
-
-    /// Fold every recorded change into the values, in one pass per column.
-    ///
-    /// Called from the evaluation path, and from anything that needs the
-    /// values to mean the current position -- notably a king bucket change,
-    /// which rewrites every column and must not run against a stale base.
-    pub fn materialise(&mut self, net: &Network) {
-        for i in 0..self.n_dirty as usize {
-            let d = self.dirty[i];
-            if d.add {
-                self.add(net, d.c, d.pt, d.sq);
-            } else {
-                self.remove(net, d.c, d.pt, d.sq);
-            }
-        }
-        self.n_dirty = 0;
+        Ok(net)
     }
 }
 
-/// Squared clipped ReLU, the activation the network was trained with.
+#[inline(always)]
+fn flip_rank(s: Square) -> Square {
+    s ^ 56
+}
+
+#[inline(always)]
+fn flip_file(s: Square) -> Square {
+    s ^ 7
+}
+
+/// Which king bucket, and whether this perspective reads the board mirrored.
 ///
-/// Clamp to [0, QA] and square. The square is what makes it worth using over
-/// a plain clipped ReLU -- it gives the layer a non-linearity with a gradient
-/// that keeps growing over the active range -- and it is why the output is
-/// divided by QA once more than the quantisation alone would suggest.
-#[inline]
-fn screlu(x: i16) -> i32 {
-    let v = (x as i32).clamp(0, QA);
-    v * v
-}
-
-/// Which output bucket a position falls in.
-///
-/// By piece count, which is cheap, changes slowly, and separates positions
-/// that genuinely want different judgement: a queenless six-piece ending and
-/// a full board are not the same function of the same features.
-#[inline]
-pub fn output_bucket(net: &Network, board: &crate::board::Board) -> usize {
-    if net.output_buckets <= 1 {
-        return 0;
-    }
-    // `(pieces - 2) / ceil(32 / N)`, which is what the trainer uses
-    // (`MaterialCount<N>` in bullet's game/outputs.rs). This was
-    // `(pieces - 1) / 4`, and the two disagree at 5, 9, 13, 17, 21, 25 and 29
-    // pieces -- roughly a quarter of all positions read the wrong output
-    // bucket, silently, with no error anywhere.
-    //
-    // It went unnoticed because every network the engine had ever run was
-    // trained with ONE output bucket, where the whole function short-circuits
-    // above. The first network with eight exposed it by losing 0-71-0.
-    //
-    // The divisor is derived from the bucket count rather than hardcoded to 4,
-    // for the same reason: a network trained with a different N would
-    // otherwise be read with the wrong stride and fail the same silent way.
-    let n = board.occ_all.count_ones() as usize;
-    let divisor = 32usize.div_ceil(net.output_buckets);
-    (n.saturating_sub(2) / divisor).min(net.output_buckets - 1)
-}
-
-pub fn evaluate(net: &Network, acc: &Accumulator, side: Color, ob: usize) -> i32 {
-    let (us, them) = match side {
-        Color::White => (&acc.white, &acc.black),
-        Color::Black => (&acc.black, &acc.white),
-    };
-    // The slice for this bucket. Laid out bucket by bucket, so this is one
-    // contiguous run rather than a stride.
-    let base = ob * 2 * HIDDEN;
-    let w = &net.l1w[base..base + 2 * HIDDEN];
-    let vies = net.l1b[ob] as i32;
-    let mut sum: i32 = 0;
-    #[cfg(target_arch = "x86_64")]
-    if tem_avx2() {
-        unsafe {
-            sum = simd::saida(us, &w[..HIDDEN]) + simd::saida(them, &w[HIDDEN..]);
-        }
+/// Both are functions of the king square and both have to travel together: a
+/// king on d1 and a king on e1 fold to the same bucket while needing opposite
+/// mirrors, so anything keyed on the bucket alone will hand one perspective the
+/// other's values and every square comes back flipped.
+#[inline(always)]
+pub fn bucket_and_mirror(perspective: Color, king_sq: Square) -> (usize, bool) {
+    let ks = if perspective == Color::Black {
+        flip_rank(king_sq)
     } else {
-        for i in 0..HIDDEN {
-            sum += screlu(us[i]) * w[i] as i32;
-            sum += screlu(them[i]) * w[HIDDEN + i] as i32;
-        }
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    for i in 0..HIDDEN {
-        sum += screlu(us[i]) * w[i] as i32;
-        sum += screlu(them[i]) * w[HIDDEN + i] as i32;
-    }
-    // One QA from the squaring in the activation, then the usual QA*QB from
-    // the two quantised layers.
-    (sum / QA + vies) * escala() / (QA * QB)
+        king_sq
+    };
+    let mirror = file_of(ks) >= 4;
+    let ks = if mirror { flip_file(ks) } else { ks };
+    (4 * rank_of(ks) as usize + file_of(ks) as usize, mirror)
 }
 
-/// Read the raw little-endian dump `bullet` saves.
+/// The input number for one piece, seen from one perspective.
 ///
-/// No header and no version field -- the file is exactly the four tensors in
-/// order. That means a mismatched HIDDEN produces a wrong-sized file rather
-/// than a silently wrong network, which is the one failure mode worth having:
-/// the length check below turns it into an error instead of nonsense
-/// evaluations nobody would trace back to here.
-/// A short header we write ourselves, in front of the trainer's raw dump.
-///
-/// The trainer writes four tensors and nothing else -- no version, no shape,
-/// no layout. That works right up until two networks have the same SIZE and
-/// different meanings, which is exactly what happens when a king-bucket layout
-/// is changed without changing the bucket count: every weight lands in the
-/// right place and describes the wrong king. Nothing downstream would say so;
-/// the engine would simply play slightly wrong forever.
-///
-/// So the layout goes IN the file. Sixteen bytes, and a network without them
-/// still loads -- the old files are raw dumps and are recognised by not
-/// starting with the magic.
-const MAGIC: [u8; 4] = *b"KSTR";
-const VERSAO: u16 = 1;
-
-fn cabecalho(buckets: usize, hidden: usize, layout: &[usize; 32]) -> Vec<u8> {
-    let mut v = Vec::with_capacity(16);
-    v.extend_from_slice(&MAGIC);
-    v.extend_from_slice(&VERSAO.to_le_bytes());
-    v.extend_from_slice(&(buckets as u16).to_le_bytes());
-    v.extend_from_slice(&(hidden as u16).to_le_bytes());
-    // A fingerprint of the layout, not the layout itself: what matters is
-    // detecting that it differs, and six bytes of hash does that without
-    // making the header a second place the layout is written down.
-    let mut h: u64 = 1469598103934665603;
-    for &b in layout.iter() {
-        h ^= b as u64;
-        h = h.wrapping_mul(1099511628211);
-    }
-    v.extend_from_slice(&h.to_le_bytes()[..6]);
-    v
-}
-
-/// Write a network the engine can check rather than guess about.
-pub fn escreve_com_cabecalho(cru: &[u8], buckets: usize, saida: &str) -> std::io::Result<()> {
-    let mut v = cabecalho(buckets, HIDDEN, &king_bucket_layout());
-    v.extend_from_slice(cru);
-    std::fs::write(saida, v)
-}
-
-pub fn load(bytes: &[u8]) -> Option<Network> {
-    // Our header, if present. Without it the file is a raw trainer dump and
-    // the shape has to be inferred from its length, which is what the code
-    // below still does -- but a file that HAS the header gets checked instead
-    // of guessed, and a layout mismatch is caught here rather than never.
-    if bytes.len() > 16 && bytes[..4] == MAGIC {
-        let versao = u16::from_le_bytes([bytes[4], bytes[5]]);
-        let buckets = u16::from_le_bytes([bytes[6], bytes[7]]) as usize;
-        let hidden = u16::from_le_bytes([bytes[8], bytes[9]]) as usize;
-        let esperado = cabecalho(buckets, HIDDEN, &king_bucket_layout());
-        if hidden != HIDDEN {
-            eprintln!("nnue: rede treinada com HIDDEN={}, este binario tem {}", hidden, HIDDEN);
-            return None;
-        }
-        if bytes[10..16] != esperado[10..16] {
-            eprintln!(
-                "nnue: o layout de king buckets desta rede nao e' o deste binario. \
-                 Mesmo numero de buckets, regra diferente -- a rede leria os pesos certos \
-                 para o rei errado."
-            );
-            return None;
-        }
-        if versao == 2 {
-            return carrega_leb128(bytes, buckets);
-        }
-        if versao != 1 {
-            eprintln!("nnue: versao de cabecalho {} desconhecida deste binario", versao);
-            return None;
-        }
-    }
-    load_bruto(bytes)
-}
-
-/// The v1/no-header path: raw little-endian `i16` dump, shape inferred from
-/// byte length. Untouched by the v2 (LEB128) addition below -- every file
-/// that loaded before this existed still takes the exact same branch.
-fn load_bruto(bytes: &[u8]) -> Option<Network> {
-    let bytes = if bytes.len() > 16 && bytes[..4] == MAGIC {
-        &bytes[16..]
+/// Black's perspective sees the board upside down and with the colours
+/// exchanged, so that both sides present the network with the same problem.
+/// Taking the bucket and mirror as arguments rather than recomputing them keeps
+/// this honest: the caller has already decided which bucket it is working in,
+/// and a feature computed under a different one would be silently wrong.
+#[inline(always)]
+pub fn feature(
+    perspective: Color,
+    bucket: usize,
+    mirror: bool,
+    piece_color: Color,
+    pt: PieceType,
+    s: Square,
+) -> usize {
+    let (pc, s) = if perspective == Color::Black {
+        (piece_color.opp(), flip_rank(s))
     } else {
-        bytes
+        (piece_color, s)
     };
+    let s = if mirror { flip_file(s) } else { s };
+    s as usize + pt.idx() * 64 + pc.idx() * 384 + bucket * 768
+}
 
-    // At LEAST the four tensors; the trainer pads the tail so the last one
-    // lands on an alignment boundary, and that padding is not ours to
-    // interpret. Requiring an exact length rejected a perfectly good network
-    // over 31 words of zeroes -- and worse, the engine then fell through to
-    // the old hand-written evaluation and looked like it was working.
-    // How many buckets the file implies. The tail after the first layer is
-    // fixed, so the first layer's size divided by one bucket's worth is the
-    // count -- and if it does not divide exactly the file is not ours.
-    // Two unknowns, one equation -- so try the output-bucket counts that
-    // exist and take the one that divides exactly. Guessing wrong here does
-    // not fail: it reads an eighth of the output weights and the wrong bias,
-    // which is an evaluation that looks plausible and is worth a thousand
-    // centipawns in a level position. Measured, on a real network.
-    let total = bytes.len() / 2;
-    let mut escolha = None;
-    for ob in [8usize, 1] {
-        let cauda = HIDDEN + 2 * HIDDEN * ob + ob;
-        if total < cauda {
-            continue;
-        }
-        let resto = total - cauda;
-        let n = resto / (INPUTS * HIDDEN);
-        // Sobra pequena e' o alinhamento que o treinador poe no fim; sobra
-        // grande e' uma forma que nao e' esta.
-        if n >= 1 && resto - n * (INPUTS * HIDDEN) < 64 {
-            escolha = Some((ob, n));
-            break;
-        }
+/// The squares that pair with each square: its own file and the two beside
+/// it, ranks 2 to 7, itself excluded. The same mask the trainer uses.
+const fn pp_mask_calc(sq: usize) -> u64 {
+    const FILE_A: u64 = 0x0101_0101_0101_0101;
+    let file = (sq & 7) as u32;
+    let mut mask = FILE_A << file;
+    if file > 0 {
+        mask |= FILE_A << (file - 1);
     }
-    let (output_buckets, buckets) = match escolha {
-        Some(v) => v,
-        None => {
-            eprintln!("nnue: {} valores nao correspondem a nenhuma forma conhecida", total);
-            return None;
-        }
-    };
-    let cauda = HIDDEN + 2 * HIDDEN * output_buckets + output_buckets;
-    let want = (INPUTS * HIDDEN * buckets + cauda) * 2;
-    if bytes.len() < want {
-        eprintln!(
-            "nnue: ficheiro tem {} bytes, precisa de pelo menos {} (HIDDEN={})",
-            bytes.len(),
-            want,
-            HIDDEN
-        );
-        return None;
+    if file < 7 {
+        mask |= FILE_A << (file + 1);
     }
-    let mut it = bytes
-        .chunks_exact(2)
-        .map(|c| i16::from_le_bytes([c[0], c[1]]));
-    let l0w: Vec<i16> = (&mut it).take(INPUTS * HIDDEN * buckets).collect();
-    let l0b: Vec<i16> = (&mut it).take(HIDDEN).collect();
-    let l1w: Vec<i16> = (&mut it).take(2 * HIDDEN * output_buckets).collect();
-    let l1b: Vec<i16> = (&mut it).take(output_buckets).collect();
-    eprintln!(
-        "nnue: {} bucket(s) de entrada, {} de saida",
-        buckets, output_buckets
-    );
-    Some(Network { l0w, l0b, l1w, l1b, buckets, output_buckets })
+    mask & !(0xFFu64 | (0xFFu64 << 56)) & !(1u64 << sq)
 }
 
-// --- LEB128 packing (v2 file format) --------------------------------------
-//
-// Storage only. The decoded result is the exact same `Vec<i16>` the raw (v1)
-// path produces, and every hot loop in this file and in the accumulator
-// reads that `Vec<i16>` the same way regardless of which format it came
-// from -- packing shrinks the file on disk, it does not touch a single
-// nanosecond of search. Quantised NNUE weights cluster near zero (most
-// squares are irrelevant to most positions, so most learned weights stay
-// small), which is exactly the distribution zigzag+LEB128 is small for.
-
-/// Maps a signed value to unsigned so small magnitudes -- positive OR
-/// negative -- both encode as small numbers. Without this, -1 would encode
-/// as 0xFFFF and cost the full three bytes every time.
-#[inline]
-pub(crate) fn zigzag_encode(v: i16) -> u16 {
-    ((v << 1) ^ (v >> 15)) as u16
-}
-
-#[inline]
-pub(crate) fn zigzag_decode(u: u16) -> i16 {
-    ((u >> 1) as i16) ^ -((u & 1) as i16)
-}
-
-pub(crate) fn leb128_push(mut v: u16, out: &mut Vec<u8>) {
-    loop {
-        let byte = (v & 0x7F) as u8;
-        v >>= 7;
-        if v == 0 {
-            out.push(byte);
-            return;
-        }
-        out.push(byte | 0x80);
-    }
-}
-
-/// Returns `None` on a truncated stream rather than panicking -- a corrupt or
-/// short file is a network we refuse, not a crash.
-pub(crate) fn leb128_pop(bytes: &[u8], pos: &mut usize) -> Option<u16> {
-    let mut result: u32 = 0;
-    let mut shift = 0;
-    loop {
-        let byte = *bytes.get(*pos)?;
-        *pos += 1;
-        result |= ((byte & 0x7F) as u32) << shift;
-        if byte & 0x80 == 0 {
-            return Some(result as u16);
-        }
-        shift += 7;
-        // 16-bit payloads need at most 3 groups of 7 bits. A fourth means
-        // the stream is not ours (or corrupt) -- refuse rather than loop.
-        if shift > 21 {
-            return None;
-        }
-    }
-}
-
-fn empacota_leb128(valores: &[i16]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(valores.len() * 2);
-    for &v in valores {
-        leb128_push(zigzag_encode(v), &mut out);
-    }
-    out
-}
-
-/// Returns the decoded values AND how many bytes they occupied, in one pass.
-/// The first version of this called a second helper afterward just to
-/// re-decode the same stream and count its length -- for `l0w` (393216 of
-/// this network's 394753 values) that was the whole tensor parsed twice for
-/// no reason. There is nothing structurally faster available for the decode
-/// itself -- it is scalar and byte-at-a-time either way. The fix is not to
-/// decode faster but to stop decoding twice: don't recompute what the first
-/// pass already knew.
-fn desempacota_leb128(bytes: &[u8], n: usize) -> Option<(Vec<i16>, usize)> {
-    let mut out = Vec::with_capacity(n);
-    let mut pos = 0;
-    for _ in 0..n {
-        out.push(zigzag_decode(leb128_pop(bytes, &mut pos)?));
-    }
-    Some((out, pos))
-}
-
-/// v2 header adds `output_buckets` explicitly (bytes 16..18). It has to:
-/// v1's shape inference divides the total BYTE length by a fixed 2-byte
-/// stride to recover value counts, and that trick does not exist once
-/// values are variable-width. Storing the count sidesteps guessing instead
-/// of reimplementing it against a stream that cannot be measured that way.
-fn carrega_leb128(bytes: &[u8], buckets: usize) -> Option<Network> {
-    if bytes.len() < 18 {
-        eprintln!("nnue: cabecalho v2 truncado");
-        return None;
-    }
-    let output_buckets = u16::from_le_bytes([bytes[16], bytes[17]]) as usize;
-    let payload = &bytes[18..];
-
-    let n_l0w = INPUTS * HIDDEN * buckets;
-    let n_l0b = HIDDEN;
-    let n_l1w = 2 * HIDDEN * output_buckets;
-    let n_l1b = output_buckets;
-
-    let mut pos = 0;
-    let (l0w, consumido) = desempacota_leb128(&payload[pos..], n_l0w)?;
-    pos += consumido;
-    let (l0b, consumido) = desempacota_leb128(&payload[pos..], n_l0b)?;
-    pos += consumido;
-    let (l1w, consumido) = desempacota_leb128(&payload[pos..], n_l1w)?;
-    pos += consumido;
-    let (l1b, _) = desempacota_leb128(&payload[pos..], n_l1b)?;
-
-    eprintln!(
-        "nnue: {} bucket(s) de entrada, {} de saida (LEB128, {} bytes empacotados)",
-        buckets, output_buckets, bytes.len()
-    );
-    Some(Network { l0w, l0b, l1w, l1b, buckets, output_buckets })
-}
-
-/// Repacks an already-loaded network (any input format) into the v2 LEB128
-/// file format. `escreve_com_cabecalho`'s sibling for the packed path.
-pub fn empacota_rede(net: &Network, saida: &str) -> std::io::Result<()> {
-    let mut v = cabecalho(net.buckets, HIDDEN, &king_bucket_layout());
-    v[4..6].copy_from_slice(&2u16.to_le_bytes()); // VERSAO = 2
-    v.extend_from_slice(&(net.output_buckets as u16).to_le_bytes());
-
-    let mut todos = Vec::with_capacity(net.l0w.len() + net.l0b.len() + net.l1w.len() + net.l1b.len());
-    todos.extend_from_slice(&net.l0w);
-    todos.extend_from_slice(&net.l0b);
-    todos.extend_from_slice(&net.l1w);
-    todos.extend_from_slice(&net.l1b);
-    v.extend_from_slice(&empacota_leb128(&todos));
-
-    std::fs::write(saida, v)
-}
-
-/// Evaluate a position from scratch, for callers that have no accumulator to
-/// carry. Correct but not fast -- the search should hold an accumulator and
-/// update it move by move.
-pub fn evaluate_board(net: &Network, board: &Board) -> i32 {
-    let acc = Accumulator::fresh(net, board);
-    evaluate(net, &acc, board.side, output_bucket(net, board))
-}
-
-/// The `2 * HIDDEN` post-SCReLU activations that feed the output layer, in
-/// the exact order `evaluate` reads them: our perspective first, then theirs.
-///
-/// Exists for probing, not for play. `evaluate` collapses these against one
-/// weight vector; dumping them lets an offline fit ask what a DIFFERENT
-/// readout could have done with the same features -- e.g. whether a
-/// per-king-zone weight vector fits better than the single global one, which
-/// is the cheap way to test an output-bucketing idea without training a
-/// network to find out.
-///
-/// Deliberately returns the raw `i32` squares rather than anything scaled:
-/// the caller is fitting its own weights, and any scaling here would just be
-/// a constant it has to undo.
-pub fn activacoes_saida(net: &Network, board: &Board) -> Vec<i32> {
-    let acc = Accumulator::fresh(net, board);
-    let (us, them) = match board.side {
-        crate::types::Color::White => (&acc.white, &acc.black),
-        crate::types::Color::Black => (&acc.black, &acc.white),
-    };
-    let mut v = Vec::with_capacity(2 * HIDDEN);
-    v.extend((0..HIDDEN).map(|i| screlu(us[i])));
-    v.extend((0..HIDDEN).map(|i| screlu(them[i])));
-    v
-}
-
-/// The loaded network, if any.
-///
-/// Read from the path in `KESTREL_NNUE` on first use. An env var rather than
-/// a compiled-in file while the shape is still moving: rebuilding the engine
-/// to try a checkpoint would make comparing two networks a comparison of two
-/// binaries, which is the mistake the feature flags in Cargo.toml exist to
-/// avoid. It becomes an embedded file once the architecture stops changing.
-static REDE: std::sync::OnceLock<Option<Network>> = std::sync::OnceLock::new();
-
-pub fn rede() -> Option<&'static Network> {
-    REDE.get_or_init(|| {
-        // Rede embutida em tempo de compilacao, quando existe: e' o braco de
-        // um teste que decide e nao deve poder ser trocada por uma variavel
-        // de ambiente que nao chegou ao processo filho.
-        #[cfg(v1_embutida)]
-        {
-            const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rede_v1_embutida.bin"));
-            load(BYTES)
-        }
-        #[cfg(not(v1_embutida))]
-        {
-        let path = std::env::var("KESTREL_NNUE").ok()?;
-        let bytes = match std::fs::read(&path) {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("nnue: nao consegui ler {}: {}", path, e);
-                return None;
-            }
-        };
-        let n = load(&bytes);
-        if n.is_some() {
-            eprintln!("nnue: rede carregada de {} (HIDDEN={})", path, HIDDEN);
-        }
-        n
-        }
-    })
-    .as_ref()
-}
-
-/// How many king buckets the input set uses, and which bucket a king square
-/// falls in.
-///
-/// The point of bucketing the inputs by king square is that "knight on f5" is
-/// a different fact depending on where the king it threatens is standing. The
-/// cost is that the whole accumulator must be rebuilt whenever the king moves
-/// across a bucket boundary, so the layout should be coarse exactly where king
-/// position stops mattering.
-///
-/// This layout is COMPUTED from the rule below rather than written out as a
-/// table of numbers. That is deliberate and it is not a style preference: a
-/// trained network is bound to the layout it was trained on, so a layout
-/// transcribed from elsewhere cannot be replaced later without retraining from
-/// scratch. A rule can be restated; a table of magic numbers cannot.
-///
-/// The rule, in one sentence: fine on the two home ranks where castling
-/// structure decides king safety, coarse once the king has stepped out, where
-/// what matters is which half of the board it is on rather than which file.
-///
-/// Squares are given already mirrored into files a-d, so `file` is 0..=3.
-pub const NUM_KING_BUCKETS: usize = 12;
-
-pub fn king_bucket(file: usize, rank: usize) -> usize {
-    debug_assert!(file < 4 && rank < 8);
-    match rank {
-        // Rank 1: castled or still at home. Every file is its own bucket --
-        // a king on c1 after long castling and a king on a1 in the corner
-        // want different pawn-shelter knowledge, and this is the rank where
-        // most of a game is decided.
-        0 => file,
-        // Rank 2: the same distinction, one rank up. Kept separate from rank
-        // 1 because a king that has stepped to the second rank has usually
-        // lost a shelter pawn, which changes everything in front of it.
-        1 => 4 + file,
-        // Ranks 3-4: out of the shelter but not yet active. File resolution
-        // halves -- the exact file matters much less than the side.
-        2 | 3 => 8 + file / 2,
-        // Ranks 5-8: an endgame king, or one that is already in trouble.
-        // Which half of the board it is on is the only thing still worth a
-        // separate weight set.
-        _ => 10 + file / 2,
-    }
-}
-
-/// The layout as the trainer wants it: one bucket per square of the mirrored
-/// half-board, in square order. Generated, never transcribed.
-pub fn king_bucket_layout() -> [usize; 32] {
-    let mut t = [0usize; 32];
+pub static PP_MASK: [u64; 64] = {
+    let mut t = [0u64; 64];
     let mut i = 0;
-    while i < 32 {
-        t[i] = king_bucket(i % 4, i / 4);
+    while i < 64 {
+        t[i] = pp_mask_calc(i);
         i += 1;
     }
     t
-}
+};
 
-// ---------------------------------------------------------------------------
-// Vectorised kernels
-//
-// Written from the scalar functions above and nothing else. The scalar path
-// stays as the reference and as the fallback, and `verify_simd` below checks
-// the two agree on real positions rather than trusting that they do.
-//
-// Two operations dominate: adding or subtracting a column of the first layer
-// into the accumulator (once per piece per move), and the output sum over both
-// accumulators (once per evaluation). Both are pure streaming over i16 arrays,
-// which is what AVX2 is for -- sixteen values per register instead of one.
-// ---------------------------------------------------------------------------
-
-#[cfg(target_arch = "x86_64")]
-mod simd {
-    use super::{HIDDEN, QA};
-    use std::arch::x86_64::*;
-
-    /// `dst[i] += src[i]` over HIDDEN values.
-    ///
-    /// # Safety
-    /// Caller must have checked AVX2 is available. Both slices are HIDDEN long.
-    #[target_feature(enable = "avx2")]
-    pub unsafe fn soma(dst: &mut [i16; HIDDEN], src: &[i16]) {
-        let mut i = 0;
-        while i + 16 <= HIDDEN {
-            let a = _mm256_loadu_si256(dst.as_ptr().add(i) as *const __m256i);
-            let b = _mm256_loadu_si256(src.as_ptr().add(i) as *const __m256i);
-            _mm256_storeu_si256(
-                dst.as_mut_ptr().add(i) as *mut __m256i,
-                _mm256_add_epi16(a, b),
-            );
-            i += 16;
-        }
-        while i < HIDDEN {
-            dst[i] += src[i];
-            i += 1;
-        }
-    }
-
-    /// `dst[i] -= src[i]` over HIDDEN values.
-    ///
-    /// # Safety
-    /// As `soma`.
-    #[target_feature(enable = "avx2")]
-    pub unsafe fn subtrai(dst: &mut [i16; HIDDEN], src: &[i16]) {
-        let mut i = 0;
-        while i + 16 <= HIDDEN {
-            let a = _mm256_loadu_si256(dst.as_ptr().add(i) as *const __m256i);
-            let b = _mm256_loadu_si256(src.as_ptr().add(i) as *const __m256i);
-            _mm256_storeu_si256(
-                dst.as_mut_ptr().add(i) as *mut __m256i,
-                _mm256_sub_epi16(a, b),
-            );
-            i += 16;
-        }
-        while i < HIDDEN {
-            dst[i] -= src[i];
-            i += 1;
-        }
-    }
-
-    /// `sum over i of screlu(acc[i]) * w[i]`, accumulated in i32.
-    ///
-    /// The awkward part is that squaring a clamped i16 can reach QA*QA = 65025,
-    /// which does not fit in i16. So the clamp is done in i16 -- cheap, sixteen
-    /// at a time -- and the multiply is split: `_mm256_madd_epi16` multiplies
-    /// i16 pairs and adds adjacent products into i32 lanes, which is exactly
-    /// the shape of `screlu(x) * w` if one of the factors is `x` and the other
-    /// is `x * w`. Computing `x * w` first in i16 would overflow, so it is `x`
-    /// clamped times `w` widened -- done as two madd passes over the same data.
-    ///
-    /// # Safety
-    /// Caller must have checked AVX2. `acc` is HIDDEN long, `w` at least HIDDEN.
-    #[target_feature(enable = "avx2")]
-    pub unsafe fn saida(acc: &[i16; HIDDEN], w: &[i16]) -> i32 {
-        let zero = _mm256_setzero_si256();
-        let topo = _mm256_set1_epi16(QA as i16);
-        let mut soma = _mm256_setzero_si256();
-        let mut i = 0;
-        while i + 16 <= HIDDEN {
-            let x = _mm256_loadu_si256(acc.as_ptr().add(i) as *const __m256i);
-            let wv = _mm256_loadu_si256(w.as_ptr().add(i) as *const __m256i);
-            // clamp(x, 0, QA)
-            let c = _mm256_min_epi16(_mm256_max_epi16(x, zero), topo);
-            // c * w in i16 is safe: c <= 255 and the trained weights are small,
-            // but the PRODUCT c*c*w is not -- so multiply c by w first (fits),
-            // then madd against c to get c*(c*w) summed into i32 lanes.
-            let cw = _mm256_mullo_epi16(c, wv);
-            soma = _mm256_add_epi32(soma, _mm256_madd_epi16(c, cw));
-            i += 16;
-        }
-        // Horizontal sum of the eight i32 lanes.
-        let baixo = _mm256_castsi256_si128(soma);
-        let alto = _mm256_extracti128_si256(soma, 1);
-        let mut s = _mm_add_epi32(baixo, alto);
-        s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0b01_00_11_10));
-        s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0b10_11_00_01));
-        let mut total = _mm_cvtsi128_si32(s);
-        while i < HIDDEN {
-            let v = (acc[i] as i32).clamp(0, QA);
-            total += v * v * w[i] as i32;
-            i += 1;
-        }
-        total
-    }
-}
-
-/// Whether the vector path may be used. Checked once.
-#[cfg(target_arch = "x86_64")]
-fn tem_avx2() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        // An env var to force the scalar path, so the two can be compared on
-        // the same machine without rebuilding.
-        if std::env::var_os("KESTREL_SEM_SIMD").is_some() {
-            return false;
-        }
-        std::is_x86_feature_detected!("avx2")
-    })
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-fn tem_avx2() -> bool {
-    false
-}
-
-// ---------------------------------------------------------------------------
-// Refresh cache
-//
-// When the input set is bucketed by king square, a king move that crosses a
-// bucket boundary invalidates every feature for that perspective: the same
-// piece on the same square is a different input number now. The obvious answer
-// is to rebuild from the bias and add all thirty-two pieces back.
-//
-// Measured on our own games, that answer is too expensive to live with. King
-// moves are 25% of all moves -- far more than intuition suggests -- and with a
-// twelve-bucket layout 16.5% of ALL moves cross a boundary. At thirty-two
-// piece updates each against two for an ordinary move, that is more than
-// doubling the accumulator's total cost.
-//
-// The cache turns the rebuild into a difference. Keep one accumulator per
-// (perspective, bucket) alongside the piece placement that produced it; on a
-// refresh, start from that and apply only the pieces that changed since. Same
-// measurement: 76% of refreshes find a populated entry, and those need a
-// median of SIX piece updates rather than thirty-two -- four times cheaper.
-//
-// The invariant that makes it safe: an entry always holds an accumulator that
-// exactly matches its stored placement. Update both together or neither, and
-// a stale entry becomes impossible rather than merely unlikely -- a silently
-// wrong accumulator would show up as an evaluation that is subtly off in rare
-// positions, which is the hardest kind of bug to trace back here.
-// ---------------------------------------------------------------------------
-
-/// One cached accumulator and the placement it was built from.
-#[derive(Clone)]
-pub struct EntradaCache {
-    /// Half an accumulator: this is per perspective, so only one side's values.
-    pub valores: [i16; HIDDEN],
-    /// `[color][piece_type]` bitboards as they were when `valores` was built.
-    pub pecas: [[u64; 6]; 2],
-    pub usada: bool,
-}
-
-/// Per perspective, per king bucket.
-///
-/// Boxed and owned by the searcher rather than global: two threads sharing one
-/// cache would each invalidate the other's entries on every king move, which
-/// costs more than having no cache at all.
-pub struct CacheRefresh {
-    pub entradas: Vec<EntradaCache>,
-}
-
-impl CacheRefresh {
-    pub fn nova() -> Self {
-        CacheRefresh {
-            entradas: (0..4 * NUM_KING_BUCKETS)
-                .map(|_| EntradaCache {
-                    valores: [0; HIDDEN],
-                    pecas: [[0u64; 6]; 2],
-                    usada: false,
-                })
-                .collect(),
-        }
-    }
-
-    #[inline]
-    /// Keyed by the mirror as well as the bucket, and it has to be: the
-    /// bucket is chosen from the king's file FOLDED onto a-d, so a king on d1
-    /// and a king on e1 land in the same bucket while needing opposite
-    /// mirrors. Keyed by bucket alone, an entry built for one is handed to the
-    /// other and every square comes back flipped. Caught by `verificacache`,
-    /// which went from 0 wrong to 211 of 428 the moment the mirror was
-    /// introduced -- that check earning its keep.
-    fn indice(perspectiva: Color, bucket: usize, espelha: bool) -> usize {
-        (perspectiva.idx() * 2 + espelha as usize) * NUM_KING_BUCKETS + bucket
-    }
-
-    /// Bring one perspective of `acc` up to date for `board`, using the cached
-    /// entry for `bucket` as the starting point.
-    ///
-    /// Returns the number of piece updates applied, so the caller can measure
-    /// what this is actually saving rather than assume.
-    /// Takes the piece bitboards rather than the board, so the caller can hold
-    /// a mutable borrow of the accumulator that lives inside it. Passing
-    /// `&Board` here would need the accumulator taken out and put back, which
-    /// is exactly the shape of code that ends up putting back a stale copy.
-    pub fn refresca(
-        &mut self,
-        net: &Network,
-        pecas: [[u64; 6]; 2],
-        _rei_branco: u8,
-        _rei_preto: u8,
-        perspectiva: Color,
-        bucket: usize,
-        espelha: bool,
-        destino: &mut [i16; HIDDEN],
-    ) -> usize {
-        let i = Self::indice(perspectiva, bucket, espelha);
-        let e = &mut self.entradas[i];
-        if !e.usada {
-            // Nothing cached for this bucket yet: build from the bias, and
-            // seed the entry so the next crossing is cheap.
-            e.valores.copy_from_slice(&net.l0b);
-            e.pecas = [[0u64; 6]; 2];
-            e.usada = true;
-        }
-        let mut mexidas = 0usize;
-        for cor in [Color::White, Color::Black] {
-            for pt in [
-                PieceType::Pawn,
-                PieceType::Knight,
-                PieceType::Bishop,
-                PieceType::Rook,
-                PieceType::Queen,
-                PieceType::King,
-            ] {
-                let agora = pecas[cor.idx()][pt.idx()];
-                let antes = e.pecas[cor.idx()][pt.idx()];
-                // Only the squares that differ. A piece that stayed put
-                // contributes the same feature and needs no work at all --
-                // which is the whole point.
-                let mut saiu = antes & !agora;
-                while saiu != 0 {
-                    let sq = saiu.trailing_zeros() as u8;
-                    saiu &= saiu - 1;
-                    let f = feature_bucket(perspectiva, bucket, espelha, cor, pt, sq) * HIDDEN;
-                    aplica(&mut e.valores, &net.l0w[f..f + HIDDEN], false);
-                    mexidas += 1;
-                }
-                let mut entrou = agora & !antes;
-                while entrou != 0 {
-                    let sq = entrou.trailing_zeros() as u8;
-                    entrou &= entrou - 1;
-                    let f = feature_bucket(perspectiva, bucket, espelha, cor, pt, sq) * HIDDEN;
-                    aplica(&mut e.valores, &net.l0w[f..f + HIDDEN], true);
-                    mexidas += 1;
-                }
-                e.pecas[cor.idx()][pt.idx()] = agora;
-            }
-        }
-        destino.copy_from_slice(&e.valores);
-        mexidas
-    }
-}
-
-/// Add or subtract one column, through the vector path when it is available.
+/// A pawn's slot from one perspective: 0..47 if it is ours, 48..95 if it is
+/// theirs. The `- 8` drops the first rank, where pawns cannot be.
 #[inline]
-fn aplica(dst: &mut [i16; HIDDEN], col: &[i16], somar: bool) {
-    #[cfg(target_arch = "x86_64")]
-    if tem_avx2() {
-        unsafe {
-            if somar {
-                simd::soma(dst, col);
-            } else {
-                simd::subtrai(dst, col);
-            }
-        }
+fn peao_id(casa: usize, nosso: bool, espelho: usize) -> i32 {
+    (if nosso { 0 } else { 48 }) + (casa ^ espelho) as i32 - 8
+}
+
+/// The pair's index, unordered: the same pair gives the same number either
+/// way round.
+#[inline]
+fn par_indice(a: i32, b: i32) -> usize {
+    let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+    (hi * (hi - 1) / 2 + lo) as usize
+}
+
+/// Every pawn pair on the board, added into one perspective.
+///
+/// Unlike the trainer, where the two perspectives had to be emitted paired one
+/// for one, each side sums into its own accumulator here and the order does not
+/// matter.
+fn soma_pares(
+    net: &Network,
+    peoes: &[u64; 2],
+    perspectiva: Color,
+    valores: &mut [i16; HIDDEN],
+    psqt: &mut [i32; OUT_BUCKETS],
+) {
+    if !tem_pares() {
         return;
     }
-    if somar {
+    let espelho = if perspectiva == Color::Black { 56 } else { 0 };
+    let nossos = peoes[perspectiva.idx()];
+    let todos = peoes[0] | peoes[1];
+    let mut bb = todos;
+    while bb != 0 {
+        let sq = bb.trailing_zeros() as usize;
+        bb &= bb - 1;
+        // Only the squares above, so each pair comes out once.
+        let mut m = PP_MASK[sq] & todos & !((1u64 << sq) - 1);
+        if m == 0 {
+            continue;
+        }
+        let id_a = peao_id(sq, nossos >> sq & 1 != 0, espelho);
+        while m != 0 {
+            let sq2 = m.trailing_zeros() as usize;
+            m &= m - 1;
+            let id_b = peao_id(sq2, nossos >> sq2 & 1 != 0, espelho);
+            let f = PAIR_BASE + par_indice(id_a, id_b);
+            apply(valores, &net.l0w[f], true);
+            for b in 0..OUT_BUCKETS {
+                psqt[b] += net.psqt[f][b] as i32;
+            }
+        }
+    }
+}
+
+/// One side's half of the hidden layer, plus its PSQT running total.
+#[derive(Clone)]
+pub struct Half {
+    pub values: [i16; HIDDEN],
+    pub psqt: [i32; OUT_BUCKETS],
+    pub bucket: usize,
+    pub mirror: bool,
+}
+
+impl Half {
+    fn empty() -> Self {
+        Half {
+            values: [0; HIDDEN],
+            psqt: [0; OUT_BUCKETS],
+            bucket: 0,
+            mirror: false,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct Accumulator {
+    pub half: [Half; 2], // indexed by perspective
+}
+
+/// Build one perspective from nothing.
+pub fn rebuild_half(
+    net: &Network,
+    pieces: &[[Bitboard; 6]; 2],
+    king_sq: Square,
+    perspective: Color,
+) -> Half {
+    let (bucket, mirror) = bucket_and_mirror(perspective, king_sq);
+    let mut h = Half::empty();
+    h.bucket = bucket;
+    h.mirror = mirror;
+    for c in [Color::White, Color::Black] {
+        for pt in ALL_PIECES {
+            let mut bb = pieces[c.idx()][pt.idx()];
+            while bb != 0 {
+                let s = bb.trailing_zeros() as Square;
+                bb &= bb - 1;
+                let f = feature(perspective, bucket, mirror, c, pt, s);
+                apply(&mut h.values, &net.l0w[f], true);
+                for b in 0..OUT_BUCKETS {
+                    h.psqt[b] += net.psqt[f][b] as i32;
+                }
+            }
+        }
+    }
+    // The pairs, summed like any other feature. A full recomputation is
+    // right here: rebuilding a perspective from nothing is what this is for.
+    let peoes = [
+        pieces[Color::White.idx()][PieceType::Pawn.idx()],
+        pieces[Color::Black.idx()][PieceType::Pawn.idx()],
+    ];
+    soma_pares(net, &peoes, perspective, &mut h.values, &mut h.psqt);
+    h
+}
+
+impl Accumulator {
+    pub fn empty() -> Self {
+        Accumulator {
+            half: [Half::empty(), Half::empty()],
+        }
+    }
+
+    /// Rebuild any perspective whose king has moved into a different bucket, or
+    /// across the middle where the mirror flips.
+    ///
+    /// Called after the move has been applied, so the values it finds were
+    /// updated under the OLD bucket and cannot be patched -- under a new bucket
+    /// the same piece on the same square is a different input number, so every
+    /// one of them is wrong at once. Rebuilding is the only correct answer;
+    /// making it cheap is a separate problem.
+    ///
+    /// Returns how many perspectives were rebuilt, so the cost can be measured
+    /// rather than assumed.
+    pub fn refresh(
+        &mut self,
+        net: &Network,
+        pieces: &[[Bitboard; 6]; 2],
+        kings: [Square; 2],
+    ) -> u32 {
+        let mut done = 0;
+        let peoes = [
+            pieces[Color::White.idx()][PieceType::Pawn.idx()],
+            pieces[Color::Black.idx()][PieceType::Pawn.idx()],
+        ];
+        for p in [Color::White, Color::Black] {
+            let (bucket, mirror) = bucket_and_mirror(p, kings[p.idx()]);
+            let h = &mut self.half[p.idx()];
+            if h.bucket == bucket && h.mirror == mirror {
+                continue;
+            }
+            with_cache(|c| c.refresh(net, pieces, p, bucket, mirror, h));
+            // The cache holds the PIECE contribution only -- its loop applies
+            // piece features and nothing else -- so the pairs have to go back
+            // on here. They do not belong in the cache: they carry no king
+            // bucket, so one entry per bucket would store the same block over
+            // and over and a bucket change would still have to redo it.
+            //
+            // Left out, the pairs vanished on every king move, which is a
+            // quarter of them, and the incremental updates then added onto a
+            // base that no longer had them. Measured before this line existed:
+            // 28.3% over 76 games, -161.6 Elo, against the same network
+            // without pairs.
+            soma_pares(net, &peoes, p, &mut h.values, &mut h.psqt);
+            done += 1;
+        }
+        done
+    }
+
+    /// Build both perspectives from nothing. Correct always, and slow enough
+    /// that it is only used to start a position and as the yardstick the
+    /// incremental path is checked against.
+    pub fn fresh(net: &Network, pieces: &[[Bitboard; 6]; 2], kings: [Square; 2]) -> Self {
+        Accumulator {
+            half: [
+                rebuild_half(net, pieces, kings[0], Color::White),
+                rebuild_half(net, pieces, kings[1], Color::Black),
+            ],
+        }
+    }
+
+    /// The pairs that involve ONE square, put on or taken off.
+    ///
+    /// A pawn appearing on or leaving a square changes exactly the pairs that
+    /// involve it -- about five of them -- and leaves every other pair alone.
+    /// The first version rebuilt the whole block for both perspectives and cost
+    /// 45% of the node rate on average, 69% in a middlegame with all sixteen
+    /// pawns still on.
+    ///
+    /// The board is already updated by the time this is called, which makes
+    /// both directions the same loop: after a removal the pawns that remain are
+    /// exactly the ones that were paired with the square, and after an addition
+    /// they are exactly the ones now paired with it.
+    pub fn pares_de_uma_casa(
+        &mut self,
+        net: &Network,
+        peoes: &[u64; 2],
+        cor: Color,
+        sq: Square,
+        add: bool,
+    ) {
+        if !tem_pares() {
+            return;
+        }
+        let todos = peoes[0] | peoes[1];
+        let vizinhos = PP_MASK[sq as usize] & todos;
+        if vizinhos == 0 {
+            return;
+        }
+        for p in [Color::White, Color::Black] {
+            let h = &mut self.half[p.idx()];
+            let espelho = if p == Color::Black { 56 } else { 0 };
+            let nossos = peoes[p.idx()];
+            // The colour of the pawn that moved comes in as a PARAMETER, not
+            // from the bitboard. On a removal it is no longer there, so the
+            // bitboard would say it belongs to nobody and the pair would come
+            // out with the wrong index -- nothing to signal it, just weights
+            // read from the wrong row.
+            let id_a = peao_id(sq as usize, cor == p, espelho);
+            // As linhas primeiro, todas; a travessia do acumulador depois, uma
+            // so'. Ao contrario, sao tantas travessias quantos os vizinhos.
+            let mut linhas: [&[i16; HIDDEN]; 24] = [&net.l0w[0]; 24];
+            let mut n = 0usize;
+            let sinal = if add { 1 } else { -1 };
+            let mut m = vizinhos;
+            while m != 0 && n < 24 {
+                let sq2 = m.trailing_zeros() as usize;
+                m &= m - 1;
+                let id_b = peao_id(sq2, nossos >> sq2 & 1 != 0, espelho);
+                let f = PAIR_BASE + par_indice(id_a, id_b);
+                simd::pede(&net.l0w[f]);
+                linhas[n] = &net.l0w[f];
+                n += 1;
+                for b in 0..OUT_BUCKETS {
+                    h.psqt[b] += sinal * net.psqt[f][b] as i32;
+                }
+            }
+            aplica_varias(&mut h.values, &linhas[..n], add);
+        }
+    }
+
+    /// One piece appearing on or leaving a square, for both perspectives.
+    #[inline]
+    /// Varias mudancas de peca, numa so' passagem pelo acumulador.
+    ///
+    /// O ganho nao e' aritmetico, e' de memoria: cada valor e' lido e escrito
+    /// uma vez em vez de uma por peca. Numa captura sao seis passagens de dois
+    /// kilobytes que passam a duas.
+    pub fn update_lote(&mut self, net: &Network, lote: &[(PieceType, Color, Square, bool)]) {
+        for p in [Color::White, Color::Black] {
+            let h = &mut self.half[p.idx()];
+            let mut mais = [0usize; 4];
+            let mut menos = [0usize; 4];
+            let (mut na, mut ns) = (0usize, 0usize);
+            for &(pt, c, sq, add) in lote {
+                let f = feature(p, h.bucket, h.mirror, c, pt, sq);
+                if add {
+                    mais[na] = f;
+                    na += 1;
+                } else {
+                    menos[ns] = f;
+                    ns += 1;
+                }
+                let sinal = if add { 1 } else { -1 };
+                for b in 0..OUT_BUCKETS {
+                    h.psqt[b] += sinal * net.psqt[f][b] as i32;
+                }
+            }
+            let w = &net.l0w;
+            for i in 0..na {
+                simd::pede(&w[mais[i]]);
+            }
+            for i in 0..ns {
+                simd::pede(&w[menos[i]]);
+            }
+            match (na, ns) {
+                (1, 1) => aplica_lote::<1, 1>(&mut h.values, [&w[mais[0]]], [&w[menos[0]]]),
+                (1, 2) => aplica_lote::<1, 2>(
+                    &mut h.values,
+                    [&w[mais[0]]],
+                    [&w[menos[0]], &w[menos[1]]],
+                ),
+                (2, 1) => aplica_lote::<2, 1>(
+                    &mut h.values,
+                    [&w[mais[0]], &w[mais[1]]],
+                    [&w[menos[0]]],
+                ),
+                (2, 2) => aplica_lote::<2, 2>(
+                    &mut h.values,
+                    [&w[mais[0]], &w[mais[1]]],
+                    [&w[menos[0]], &w[menos[1]]],
+                ),
+                _ => {
+                    // Qualquer outra combinacao pelo caminho antigo: sao raras
+                    // e nao vale a pena uma variante para cada uma.
+                    for i in 0..na {
+                        apply(&mut h.values, &w[mais[i]], true);
+                    }
+                    for i in 0..ns {
+                        apply(&mut h.values, &w[menos[i]], false);
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn update(&mut self, net: &Network, c: Color, pt: PieceType, s: Square, add: bool) {
+        for p in [Color::White, Color::Black] {
+            let h = &mut self.half[p.idx()];
+            let f = feature(p, h.bucket, h.mirror, c, pt, s);
+            apply(&mut h.values, &net.l0w[f], add);
+            let sign = if add { 1 } else { -1 };
+            for b in 0..OUT_BUCKETS {
+                h.psqt[b] += sign * net.psqt[f][b] as i32;
+            }
+        }
+    }
+
+    /// The score, from the side to move's point of view.
+    pub fn eval(&self, net: &Network, stm: Color, piece_count: u32) -> i32 {
+        let bucket = ((piece_count.saturating_sub(2) / 4) as usize).min(OUT_BUCKETS - 1);
+        let us = &self.half[stm.idx()];
+        let them = &self.half[stm.opp().idx()];
+
+        // So' os pesos do balde escolhido entram numa avaliacao, que e' porque
+        // ter oito baldes custa por no' o mesmo que ter quatro.
+        let saida = unsafe {
+            cabeca_avalia(
+                HIDDEN as i32,
+                L1H as i32,
+                L2H as i32,
+                QA as i32,
+                DESL,
+                DIV,
+                us.values.as_ptr(),
+                them.values.as_ptr(),
+                net.l1w[bucket * L1H].as_ptr(),
+                net.l1b[bucket * L1H..].as_ptr(),
+                net.l2w[bucket * L2H].as_ptr(),
+                net.l2b[bucket * L2H..].as_ptr(),
+                net.l3w[bucket].as_ptr(),
+                net.l3b[bucket],
+            )
+        };
+
+        // O PSQT esta' quantizado pela mesma escala por que a saida se
+        // converte, logo soma-se depois da conversao e nao antes.
+        (saida * ESCALA) as i32 + us.psqt[bucket] - them.psqt[bucket]
+    }
+}
+
+/// Add or subtract one column of weights, through the vector path if there is
+/// one.
+#[inline]
+/// Somas e subtraccoes todas numa passagem.
+///
+/// `A` e `S` sao const generics de proposito: com as contagens conhecidas em
+/// compilacao os ciclos interiores desenrolam-se e o valor fica em registo
+/// enquanto leva com tudo. Com fatias de tamanho so' conhecido em execucao o
+/// compilador tem de manter os ciclos, e volta a haver uma passagem por linha.
+/// O mesmo, para um numero de linhas que so' se sabe em execucao.
+#[inline]
+fn aplica_varias(dst: &mut [i16; HIDDEN], linhas: &[&[i16; HIDDEN]], add: bool) {
+    if linhas.is_empty() {
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if has_avx2() {
+        // SAFETY: a feature acabou de ser verificada e as fatias tem HIDDEN de
+        // comprimento pelo tipo.
+        unsafe {
+            if add {
+                simd::varias::<true>(dst, linhas);
+            } else {
+                simd::varias::<false>(dst, linhas);
+            }
+            return;
+        }
+    }
+    for i in 0..HIDDEN {
+        let mut v = dst[i];
+        for r in linhas {
+            v = if add { v.wrapping_add(r[i]) } else { v.wrapping_sub(r[i]) };
+        }
+        dst[i] = v;
+    }
+}
+
+#[inline]
+fn aplica_lote<const A: usize, const S: usize>(
+    dst: &mut [i16; HIDDEN],
+    mais: [&[i16; HIDDEN]; A],
+    menos: [&[i16; HIDDEN]; S],
+) {
+    #[cfg(target_arch = "x86_64")]
+    if has_avx2() {
+        // SAFETY: a feature acabou de ser verificada, e todas as fatias tem
+        // HIDDEN de comprimento pelo tipo.
+        unsafe {
+            simd::lote(dst, mais, menos);
+            return;
+        }
+    }
+    for i in 0..HIDDEN {
+        let mut v = dst[i];
+        for r in mais.iter() {
+            v = v.wrapping_add(r[i]);
+        }
+        for r in menos.iter() {
+            v = v.wrapping_sub(r[i]);
+        }
+        dst[i] = v;
+    }
+}
+
+fn apply(dst: &mut [i16; HIDDEN], col: &[i16; HIDDEN], add: bool) {
+    #[cfg(target_arch = "x86_64")]
+    if has_avx2() {
+        // SAFETY: the feature was just checked, and both slices are HIDDEN long
+        // by their types.
+        unsafe {
+            if add {
+                simd::add(dst, col);
+            } else {
+                simd::sub(dst, col);
+            }
+            return;
+        }
+    }
+    if add {
         for i in 0..HIDDEN {
             dst[i] += col[i];
         }
@@ -1157,138 +780,314 @@ fn aplica(dst: &mut [i16; HIDDEN], col: &[i16], somar: bool) {
     }
 }
 
-/// Feature index with the king bucket folded in.
-///
-/// The bucket multiplies the whole 768-wide block, so bucket `b` occupies
-/// inputs `[768*b, 768*(b+1))`. That is the layout the trainer writes when
-/// told to bucket the inputs, and keeping the two in step is not optional:
-/// a network is bound to the mapping it was trained under, and a mismatch
-/// here produces plausible-looking nonsense rather than an error.
+/// `sum of clamp(acc[i], 0, SCALE) * w[i]`.
 #[inline]
-pub fn feature_bucket(
-    perspectiva: Color,
-    bucket: usize,
-    espelha: bool,
-    piece_color: Color,
-    pt: PieceType,
-    sq: u8,
-) -> usize {
-    bucket * INPUTS + feature_espelhada(perspectiva, espelha, piece_color, pt, sq)
-}
-
-/// The bucket to actually use, given what the loaded network supports.
-///
-/// A network trained without bucketed inputs has one block of weights, so
-/// every king square must map to bucket zero. Deciding this from the network
-/// rather than from a build flag means the same binary runs both, which is
-/// what makes comparing them a comparison of networks and nothing else.
-#[inline]
-pub fn bucket_efectivo(net: &Network, board: &crate::board::Board, perspectiva: Color) -> usize {
-    if net.buckets <= 1 {
-        0
-    } else {
-        bucket_do_rei(board, perspectiva)
-    }
-}
-
-/// Which bucket a side's king puts it in, mirrored to files a-d.
-///
-/// Mirroring halves the input count for free: a king on g1 and a king on b1
-/// are the same shape of position seen from the other side of the board, and
-/// making them share weights means the network learns the pattern once.
-#[inline]
-pub fn bucket_do_rei_de(board: &crate::board::Board, perspectiva: Color) -> usize {
-    bucket_do_rei(board, perspectiva)
-}
-
-#[inline]
-pub fn bucket_do_rei(board: &crate::board::Board, perspectiva: Color) -> usize {
-    let ks = board.king_sq(perspectiva);
-    let mut f = (ks % 8) as usize;
-    let mut r = (ks / 8) as usize;
-    if f >= 4 {
-        f = 7 - f;
-    }
-    if perspectiva == Color::Black {
-        r = 7 - r;
-    }
-    king_bucket(f, r)
-}
-
-/// Does the cache agree with a rebuild from scratch?
-///
-/// Run over real positions, not constructed ones. A cache that is right on the
-/// first refresh and wrong on the fifth is the failure mode worth catching,
-/// and only a sequence of real king moves produces that.
-pub fn verifica_cache(net: &Network, fens: &[String]) -> (usize, usize) {
-    // A bucketed layout needs a bucketed network. Running a 768-input net
-    // through the bucketed indices reads far past the end of the weights --
-    // which Rust catches, but only because the slice bound happens to be
-    // checked. Say so plainly instead of relying on that.
-    let esperado = NUM_KING_BUCKETS * INPUTS * HIDDEN;
-    if net.l0w.len() != esperado {
-        eprintln!(
-            "cache: a rede tem {} pesos na primeira camada, o layout de {} buckets precisa de {}. \
-             Esta rede foi treinada SEM buckets de entrada.",
-            net.l0w.len(),
-            NUM_KING_BUCKETS,
-            esperado
-        );
-        return (0, 0);
-    }
-    let mut cache = CacheRefresh::nova();
-    let mut testadas = 0;
-    let mut erradas = 0;
-    for fen in fens {
-        let board = crate::board::Board::from_fen(fen);
-        for perspectiva in [Color::White, Color::Black] {
-            let bucket = bucket_do_rei(&board, perspectiva);
-            let espelha = espelha_perspectiva(&board, perspectiva);
-            let mut via_cache = [0i16; HIDDEN];
-            cache.refresca(net, board.pieces, board.king_sq(Color::White), board.king_sq(Color::Black), perspectiva, bucket, espelha, &mut via_cache);
-
-            // From scratch, same bucket, same features.
-            let mut do_zero = [0i16; HIDDEN];
-            do_zero.copy_from_slice(&net.l0b);
-            for cor in [Color::White, Color::Black] {
-                for pt in [
-                    PieceType::Pawn,
-                    PieceType::Knight,
-                    PieceType::Bishop,
-                    PieceType::Rook,
-                    PieceType::Queen,
-                    PieceType::King,
-                ] {
-                    let mut bb = board.pieces[cor.idx()][pt.idx()];
-                    while bb != 0 {
-                        let sq = bb.trailing_zeros() as u8;
-                        bb &= bb - 1;
-                        let f = feature_bucket(perspectiva, bucket, espelha, cor, pt, sq) * HIDDEN;
-                        aplica(&mut do_zero, &net.l0w[f..f + HIDDEN], true);
-                    }
-                }
-            }
-            testadas += 1;
-            if via_cache != do_zero {
-                erradas += 1;
-            }
+fn output(acc: &[i16; HIDDEN], w: &[i16]) -> i32 {
+    #[cfg(target_arch = "x86_64")]
+    if has_avx2() {
+        // SAFETY: feature checked; `acc` is HIDDEN long and so is `w`.
+        unsafe {
+            return simd::output(acc, w);
         }
     }
-    (testadas, erradas)
+    let mut total = 0i32;
+    for i in 0..HIDDEN {
+        total += (acc[i] as i32).clamp(0, SCALE) * w[i] as i32;
+    }
+    total
 }
 
+#[cfg(target_arch = "x86_64")]
+mod simd {
+    #[allow(unused_imports)]
+    use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+    use super::{HIDDEN, SCALE};
+    use std::arch::x86_64::*;
 
-/// One refresh cache per thread.
-///
-/// Per thread and not shared: two searchers sharing a cache would each
-/// invalidate the other's entries on every king move, which costs more than
-/// having no cache at all. Thread-local rather than carried through every call
-/// site because `add_piece`/`remove_piece` are Board methods and threading a
-/// cache down to them would touch every caller for no gain.
+    /// # Safety
+    /// AVX2 must be available. Both slices are HIDDEN long.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn add(dst: &mut [i16; HIDDEN], src: &[i16; HIDDEN]) {
+        let mut i = 0;
+        while i + 16 <= HIDDEN {
+            let a = _mm256_loadu_si256(dst.as_ptr().add(i) as *const __m256i);
+            let b = _mm256_loadu_si256(src.as_ptr().add(i) as *const __m256i);
+            _mm256_storeu_si256(
+                dst.as_mut_ptr().add(i) as *mut __m256i,
+                _mm256_add_epi16(a, b),
+            );
+            i += 16;
+        }
+    }
+
+    /// # Safety
+    /// As `add`.
+    #[target_feature(enable = "avx2")]
+    /// Todas as linhas numa passagem, dezasseis valores de cada vez.
+    ///
+    /// As contagens sao const generics para os ciclos interiores desaparecerem
+    /// em compilacao: o que fica e' um ciclo com quatro ou cinco instrucoes
+    /// por bloco de dezasseis, e o acumulador atravessado uma so' vez.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn lote<const A: usize, const S: usize>(
+        dst: &mut [i16; HIDDEN],
+        mais: [&[i16; HIDDEN]; A],
+        menos: [&[i16; HIDDEN]; S],
+    ) {
+        let mut i = 0;
+        while i < HIDDEN {
+            let mut v = _mm256_loadu_si256(dst.as_ptr().add(i) as *const __m256i);
+            let mut k = 0;
+            while k < A {
+                v = _mm256_add_epi16(
+                    v,
+                    _mm256_loadu_si256(mais[k].as_ptr().add(i) as *const __m256i),
+                );
+                k += 1;
+            }
+            let mut k = 0;
+            while k < S {
+                v = _mm256_sub_epi16(
+                    v,
+                    _mm256_loadu_si256(menos[k].as_ptr().add(i) as *const __m256i),
+                );
+                k += 1;
+            }
+            _mm256_storeu_si256(dst.as_mut_ptr().add(i) as *mut __m256i, v);
+            i += 16;
+        }
+    }
+
+    /// Varias linhas de uma vez, com a contagem so' conhecida em execucao.
+    ///
+    /// O ciclo interior sobre as linhas fica, mas o exterior -- o que atravessa
+    /// o acumulador -- corre uma vez. E' o segundo que custa: sao dois
+    /// kilobytes lidos e escritos por travessia.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn varias<const ADD: bool>(dst: &mut [i16; HIDDEN], linhas: &[&[i16; HIDDEN]]) {
+        let mut i = 0;
+        while i < HIDDEN {
+            let mut v = _mm256_loadu_si256(dst.as_ptr().add(i) as *const __m256i);
+            for r in linhas {
+                let b = _mm256_loadu_si256(r.as_ptr().add(i) as *const __m256i);
+                v = if ADD { _mm256_add_epi16(v, b) } else { _mm256_sub_epi16(v, b) };
+            }
+            _mm256_storeu_si256(dst.as_mut_ptr().add(i) as *mut __m256i, v);
+            i += 16;
+        }
+    }
+
+    /// Pede a linha a` memoria sem esperar por ela.
+    ///
+    /// Dois kilobytes num sitio ao acaso de uma tabela de sessenta megabytes.
+    /// Pedida assim que o indice se sabe, chega enquanto os indices seguintes
+    /// estao a ser calculados.
+    #[inline]
+    pub fn pede(linha: &[i16; HIDDEN]) {
+        // SAFETY: `_mm_prefetch` nao le' nem escreve -- e' uma sugestao, e um
+        // endereco invalido e' ignorado.
+        unsafe {
+            _mm_prefetch(linha.as_ptr() as *const i8, _MM_HINT_T0);
+            _mm_prefetch((linha.as_ptr() as *const i8).add(64), _MM_HINT_T0);
+        }
+    }
+
+    pub unsafe fn sub(dst: &mut [i16; HIDDEN], src: &[i16; HIDDEN]) {
+        let mut i = 0;
+        while i + 16 <= HIDDEN {
+            let a = _mm256_loadu_si256(dst.as_ptr().add(i) as *const __m256i);
+            let b = _mm256_loadu_si256(src.as_ptr().add(i) as *const __m256i);
+            _mm256_storeu_si256(
+                dst.as_mut_ptr().add(i) as *mut __m256i,
+                _mm256_sub_epi16(a, b),
+            );
+            i += 16;
+        }
+    }
+
+    /// Clipped ReLU and the dot product in one pass.
+    ///
+    /// `_mm256_madd_epi16` multiplies sixteen i16 pairs and adds them in pairs
+    /// into eight i32 lanes, which is exactly a dot product. Keeping eight
+    /// separate lanes also keeps overflow far away: each carries an eighth of
+    /// the total where a scalar loop puts everything in one i32.
+    ///
+    /// # Safety
+    /// AVX2 must be available. `acc` is HIDDEN long and `w` at least HIDDEN.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn output(acc: &[i16; HIDDEN], w: &[i16]) -> i32 {
+        let zero = _mm256_setzero_si256();
+        let top = _mm256_set1_epi16(SCALE as i16);
+        let mut sum = _mm256_setzero_si256();
+        let mut i = 0;
+        while i + 16 <= HIDDEN {
+            let x = _mm256_loadu_si256(acc.as_ptr().add(i) as *const __m256i);
+            let wv = _mm256_loadu_si256(w.as_ptr().add(i) as *const __m256i);
+            let c = _mm256_min_epi16(_mm256_max_epi16(x, zero), top);
+            sum = _mm256_add_epi32(sum, _mm256_madd_epi16(c, wv));
+            i += 16;
+        }
+        let lo = _mm256_castsi256_si128(sum);
+        let hi = _mm256_extracti128_si256(sum, 1);
+        let mut s = _mm_add_epi32(lo, hi);
+        s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0b01_00_11_10));
+        s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0b10_11_00_01));
+        _mm_cvtsi128_si32(s)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Refresh cache
+//
+// The bucket here is the folded king square itself, so every king move
+// invalidates one whole perspective, and king moves are around a quarter of all
+// moves. Rebuilding from nothing means adding all thirty-two pieces back, and
+// each of those reads a kilobyte from a twenty-five megabyte table, so the cost
+// is memory rather than arithmetic and no amount of vectorising touches it.
+//
+// The cache turns the rebuild into a difference. Keep one accumulator per
+// (perspective, bucket, mirror) alongside the piece placement that produced it;
+// on a refresh, start from that and apply only the pieces that have moved
+// since. A piece that stayed put contributes the same feature and needs no work
+// at all, which is the whole point.
+//
+// The invariant that makes it safe: an entry always holds an accumulator that
+// exactly matches its stored placement. Update both together or neither, and a
+// stale entry becomes impossible rather than merely unlikely -- a quietly wrong
+// accumulator shows up as an evaluation that is subtly off in rare positions,
+// which is the hardest kind of bug to trace back to here.
+//
+// Keyed by the mirror as well as the bucket, and it has to be: a king on d1 and
+// a king on e1 fold to the same bucket while needing opposite mirrors. Keyed by
+// bucket alone, an entry built for one is handed to the other and every square
+// comes back flipped.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+struct CacheEntry {
+    values: [i16; HIDDEN],
+    psqt: [i32; OUT_BUCKETS],
+    /// The placement `values` was built from.
+    pieces: [[Bitboard; 6]; 2],
+    used: bool,
+}
+
+pub struct RefreshCache {
+    entries: Vec<CacheEntry>,
+}
+
+impl RefreshCache {
+    pub fn new() -> Self {
+        RefreshCache {
+            entries: vec![
+                CacheEntry {
+                    values: [0; HIDDEN],
+                    psqt: [0; OUT_BUCKETS],
+                    pieces: [[0; 6]; 2],
+                    used: false,
+                };
+                2 * 2 * INPUT_BUCKETS
+            ],
+        }
+    }
+
+    #[inline]
+    fn index(perspective: Color, bucket: usize, mirror: bool) -> usize {
+        (perspective.idx() * 2 + mirror as usize) * INPUT_BUCKETS + bucket
+    }
+
+    /// Bring one perspective up to date, starting from whatever this bucket was
+    /// last seen holding. Returns how many piece updates it took, so what the
+    /// cache saves can be measured rather than assumed.
+    pub fn refresh(
+        &mut self,
+        net: &Network,
+        pieces: &[[Bitboard; 6]; 2],
+        perspective: Color,
+        bucket: usize,
+        mirror: bool,
+        dst: &mut Half,
+    ) -> usize {
+        let e = &mut self.entries[Self::index(perspective, bucket, mirror)];
+        if !e.used {
+            // Nothing here yet. An empty accumulator for this network is all
+            // zeros -- there is no hidden layer bias to seed it from -- so the
+            // entry starts from an empty board and the first refresh pays the
+            // full price. Every later one starts from this.
+            e.values = [0; HIDDEN];
+            e.psqt = [0; OUT_BUCKETS];
+            e.pieces = [[0; 6]; 2];
+            e.used = true;
+        }
+
+        let mut touched = 0usize;
+        for c in [Color::White, Color::Black] {
+            for pt in ALL_PIECES {
+                let now = pieces[c.idx()][pt.idx()];
+                let before = e.pieces[c.idx()][pt.idx()];
+                let mut gone = before & !now;
+                while gone != 0 {
+                    let sq = gone.trailing_zeros() as Square;
+                    gone &= gone - 1;
+                    let f = feature(perspective, bucket, mirror, c, pt, sq);
+                    apply(&mut e.values, &net.l0w[f], false);
+                    for b in 0..OUT_BUCKETS {
+                        e.psqt[b] -= net.psqt[f][b] as i32;
+                    }
+                    touched += 1;
+                }
+                let mut arrived = now & !before;
+                while arrived != 0 {
+                    let sq = arrived.trailing_zeros() as Square;
+                    arrived &= arrived - 1;
+                    let f = feature(perspective, bucket, mirror, c, pt, sq);
+                    apply(&mut e.values, &net.l0w[f], true);
+                    for b in 0..OUT_BUCKETS {
+                        e.psqt[b] += net.psqt[f][b] as i32;
+                    }
+                    touched += 1;
+                }
+                // Placement and values move together, always.
+                e.pieces[c.idx()][pt.idx()] = now;
+            }
+        }
+
+        dst.values.copy_from_slice(&e.values);
+        dst.psqt = e.psqt;
+        dst.bucket = bucket;
+        dst.mirror = mirror;
+        touched
+    }
+}
+
 thread_local! {
-    static CACHE: std::cell::RefCell<CacheRefresh> = std::cell::RefCell::new(CacheRefresh::nova());
+    /// Per thread rather than shared: two threads on one cache would each
+    /// invalidate the other on every king move, which costs more than having no
+    /// cache at all.
+    static CACHE: std::cell::RefCell<RefreshCache> =
+        std::cell::RefCell::new(RefreshCache::new());
 }
 
-pub fn com_cache<R>(f: impl FnOnce(&mut CacheRefresh) -> R) -> R {
+pub fn with_cache<R>(f: impl FnOnce(&mut RefreshCache) -> R) -> R {
     CACHE.with(|c| f(&mut c.borrow_mut()))
+}
+
+/// Whether the vector path may be used. Decided once.
+#[cfg(target_arch = "x86_64")]
+pub fn has_avx2() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        // An escape hatch so the two paths can be compared on one machine
+        // without rebuilding -- which is how you find out whether the vector
+        // path is right, not just fast.
+        if std::env::var_os("HALF2K_NO_SIMD").is_some() {
+            return false;
+        }
+        std::is_x86_feature_detected!("avx2")
+    })
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub fn has_avx2() -> bool {
+    false
 }

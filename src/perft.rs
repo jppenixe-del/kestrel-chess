@@ -19,46 +19,83 @@ pub fn perft(board: &mut Board, depth: u32, atk: &Attacks) -> u64 {
     nodes
 }
 
-/// Like perft(), but at every node it compares the network's incrementally
-/// updated accumulator against one rebuilt from scratch.
+/// Like `perft`, but at every node it compares the incrementally updated
+/// accumulator against one rebuilt from scratch.
 ///
-/// This is the test that catches a castling rook that was moved without
-/// telling the accumulator, an en-passant capture removed from the wrong
-/// square, or a promotion that added the pawn back instead of the queen. Those
-/// are exactly the bugs that never show up in a normal game until they decide
-/// one, because the evaluation stays plausible while being wrong.
+/// This is the test that catches a castling rook moved without telling the
+/// accumulator, an en passant capture removed from the wrong square, or a
+/// promotion that adds the pawn back instead of the queen. Those are exactly
+/// the bugs that never surface in a normal game until they decide one, because
+/// the evaluation stays plausible while being wrong.
 ///
-/// It replaces the same check that used to guard the hand-written
-/// evaluation's incremental score. The evaluation changed; the class of bug
-/// did not.
-pub fn verify_incremental_eval(board: &mut Board, depth: u32, atk: &Attacks) -> (u64, u64) {
-    let mut mismatches = 0u64;
-    if let (Some(net), Some(acc)) = (crate::nnue::rede(), board.acc.as_ref()) {
-        let fresco = crate::nnue::Accumulator::fresh(net, board);
-        if fresco.white != acc.white || fresco.black != acc.black {
-            mismatches += 1;
-            eprintln!("MISMATCH acumulador fen={}", board.to_fen());
+/// Returns (nodes, mismatches).
+pub fn verify_accumulator(board: &mut Board, depth: u32, atk: &Attacks) -> (u64, u64) {
+    let mut wrong = 0u64;
+    if let (Some(net), Some(acc)) = (crate::nnue::net(), board.acc.as_ref()) {
+        let kings = [
+            board.king_sq(crate::types::Color::White),
+            board.king_sq(crate::types::Color::Black),
+        ];
+        let fresh = crate::nnue::Accumulator::fresh(net, &board.pieces, kings);
+        for p in 0..2 {
+            if fresh.half[p].values != acc.half[p].values
+                || fresh.half[p].psqt != acc.half[p].psqt
+                || fresh.half[p].bucket != acc.half[p].bucket
+                || fresh.half[p].mirror != acc.half[p].mirror
+            {
+                wrong += 1;
+                if wrong <= 5 {
+                    eprintln!("MISMATCH perspective {} at {}", p, board.to_fen());
+                }
+            }
         }
     }
-    if board.phase != {
-        let mut f = board.clone();
-        f.recompute_eval_accumulators();
-        f.phase
-    } {
-        mismatches += 1;
-        eprintln!("MISMATCH fase fen={}", board.to_fen());
-    }
     if depth == 0 {
-        return (1, mismatches);
+        return (1, wrong);
     }
     let moves = generate_legal(board, atk);
     let mut nodes = 1u64;
     for mv in moves {
         let undo = board.make_move(&mv);
-        let (n, m) = verify_incremental_eval(board, depth - 1, atk);
+        let (n, w) = verify_accumulator(board, depth - 1, atk);
         nodes += n;
-        mismatches += m;
+        wrong += w;
         board.unmake_move(&mv, &undo);
     }
-    (nodes, mismatches)
+    (nodes, wrong)
+}
+
+/// Walk a tree and check that the ordered generator agrees with the one the
+/// engine has always used -- same moves, however they are arranged.
+///
+/// Order is the whole point of the other generator, so order is exactly what
+/// this must not compare. It compares the sets: anything missing is a legal
+/// move the engine would never find, anything extra is a move it would try to
+/// play and could not.
+pub fn verify_generator(board: &mut Board, depth: u32, atk: &Attacks) -> (u64, u64) {
+    let mut wrong = 0u64;
+    let a = generate_legal(board, atk);
+    let b = crate::ordered_movegen::generate(board, atk, crate::ordered_movegen::GEN_LEGAL);
+    let mut sa: Vec<String> = a.iter().map(|m| m.to_uci()).collect();
+    let mut sb: Vec<String> = b.iter().map(|m| m.to_uci()).collect();
+    sa.sort();
+    sb.sort();
+    if sa != sb {
+        wrong += 1;
+        if wrong <= 5 {
+            eprintln!("MISMATCH {}\n  antigo {:?}\n  novo   {:?}", board.to_fen(), sa, sb);
+        }
+    }
+    if depth == 0 {
+        return (1, wrong);
+    }
+    let mut nodes = 1u64;
+    for mv in a {
+        let undo = board.make_move(&mv);
+        let (n, w) = verify_generator(board, depth - 1, atk);
+        nodes += n;
+        wrong += w;
+        board.unmake_move(&mv, &undo);
+    }
+    (nodes, wrong)
 }

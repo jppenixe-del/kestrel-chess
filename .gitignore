@@ -1,43 +1,8 @@
 /target
+/bin
+*.dat
+*.antes_*
 
-# Working journal and tuning artefacts. Kept on disk, out of version control:
-# they are scratch output of a measurement run, not part of the engine, and
-# they go stale the moment the next run starts.
-#
-# They used to be ignored for a second reason -- that they named the reference
-# engines used for measurement -- and that reason is void. Those names are now
-# in NOTICES.md on purpose: naming what you read is what makes an independent
-# implementation checkable, and hiding it achieved the opposite.
-NOTAS_PROXIMA_SESSAO.md
-dataset_*.epd
-tuned_*.txt
-tune_*.log
-selfplay_*.log
-resolvequiet.log
-datagen_*.log
-
-# Redes e leitores de OUTROS motores: uso interno de diagnostico, nunca
-# comitados. Uma rede de outro projecto e' artefacto desse projecto; serve para
-# responder "a fraqueza e' a nossa busca ou a nossa rede?", nao para andar
-# neste repositorio.
-*.nnue
-src/nnue_externo*.rs
-redes_externas/
-
-# Compiled bridge library: a GPL-derived object archive, ~93MB, and
-# optional -- build.rs links it only when present and falls back to the
-# Rust path when it is not. Distributing object code would oblige us to
-# ship its corresponding source; building it locally does not.
-sfbridge/
-
-# Ours, and not published. The engine is public; the machinery that trains
-# it, tunes it and runs the bot is not, and neither are the trained weights
-# themselves. These all live on the development machines.
-treino_768/
-treino_sf16/
-patches_bullet/
-tools/
-docs/
-*.bin
-DESENHO_*.md
-w_r2long.txt
+# O aparelho de medicao. Nunca versionado: o repositorio e' publico.
+# Ligar so' para medir, com `cargo build --release --features ponte`.
+src/medidor.rs

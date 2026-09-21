@@ -363,6 +363,11 @@ fn is_pair_excluded(excluded: bool, semi_excluded: bool, attacking_sq: i32, atta
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Invólucro sobre `get_threat_feature_t`. Tinha cinco variaveis locais
+/// calculadas e NUNCA usadas (a chamada passa os parametros originais) e nao
+/// estava marcado como `inline` -- so' o salto valia 6,9% do
+/// `delta_por_lance`. Agora e' o que sempre foi: um reencaminhamento.
+#[inline(always)]
 pub fn get_threat_feature(
     pov: usize,
     attacking_piece: usize,
@@ -373,11 +378,6 @@ pub fn get_threat_feature(
     attacked_square: i32,
     mirrored: bool,
 ) -> i32 {
-    let square_flip = (if mirrored { 7 } else { 0 }) ^ (if pov == 1 { 56 } else { 0 });
-    let a_sq = attacking_square ^ square_flip;
-    let d_sq = attacked_square ^ square_flip;
-    let a_c = attacking_color ^ pov;
-    let d_c = attacked_color ^ pov;
     get_threat_feature_t(threat_tables(), pov, attacking_piece, attacking_color,
         attacked_piece, attacked_color, attacking_square, attacked_square, mirrored)
 }
@@ -1178,14 +1178,8 @@ pub fn relacoes_ameaca(
         // king moving forces a full rebuild anyway -- which is why a search
         // with no king moves matched the rebuild exactly, and one with a single
         // `Ke1-f1` diverged from that move onward.
-        let mut alvos = king_attacks(s) & occ_sem_reis;
-        while alvos != 0 {
-            let alvo = alvos.trailing_zeros() as usize;
-            alvos &= alvos - 1;
-            if let Some((tp, tc)) = pos.piece_at(alvo) {
-                empurra(add, piece, color, s, tp, tc, alvo);
-            }
-        }
+        // EXPERIENCIA: o rei nao emite ameacas directas neste conjunto de
+        // features -- medido, 1048846 de 1048846 (100%) caem fora do espaco.
         return;
     }
 
@@ -1198,33 +1192,57 @@ pub fn relacoes_ameaca(
     // thing and drops the last reason this enumeration needed a perspective.
     let peoes = [pos.pieces[0][0], pos.pieces[1][0]];
 
-    let mut ameacados = ataques_de(piece, color, s, occ, d) & occ_sem_reis;
-    let mut incoming = (knight_attacks(s) & cavalos) | (king_attacks(s) & reis);
+    // A MASCARA, nao um OR. Um peao so' ameaca cavalo e torre
+    // (`PIECE_INTERACTION_MAP[0]` = `[-1, 0, -1, 1, -1, -1]`), mas
+    // `ataques_de` devolve tudo o que ele ataca -- peoes, bispos e damas
+    // incluidos, todos mortos. Sao 1912581 de 2653570 relacoes de peao (72%)
+    // geradas e indexadas para nada.
+    let torres = pos.pieces[0][3] | pos.pieces[1][3];
+    let alvos_validos = if piece == 0 { cavalos | torres } else { !0u64 };
+    let mut ameacados = ataques_de(piece, color, s, occ, d) & occ_sem_reis & alvos_validos;
+    // O termo `king_attacks(s) & reis` sai daqui pela mesma razao que o bloco
+    // do rei acima: (rei -> peca) nao existe neste conjunto de features. Medido,
+    // 610441 de 610441 (100%) caiam fora do espaco -- geradas, indexadas e
+    // deitadas fora.
+    let mut incoming = knight_attacks(s) & cavalos;
 
+    // A pawn threatens ONLY knights and rooks: `PIECE_INTERACTION_MAP[0]` is
+    // `[-1, 0, -1, 1, -1, -1]`. Pawn->pawn relations and the push relations were
+    // dropped when the feature set went from 60720 to 59808 inputs, but the code
+    // that generated them stayed, so every one of those tuples was built,
+    // indexed, and then discarded by the `idx < THREAT_DIM` test downstream.
+    //
     if piece == 0 {
-        // pawns also threaten (and are threatened by) pushes
-        let empurroes = (1u64 << s) << 8 | (1u64 << s) >> 8;
-        ameacados |= (pawn_attacks_from(color, s) | empurroes) & (peoes[0] | peoes[1]);
-        incoming |= ((pawn_attacks_from(0, s) | empurroes) & peoes[1])
-            | ((pawn_attacks_from(1, s) | empurroes) & peoes[0]);
-    } else {
+    } else if piece == 1 || piece == 3 {
         incoming |= (pawn_attacks_from(0, s) & peoes[1]) | (pawn_attacks_from(1, s) & peoes[0]);
     }
 
-    while ameacados != 0 {
-        let alvo = ameacados.trailing_zeros() as usize;
-        ameacados &= ameacados - 1;
-        if let Some((tp, tc)) = pos.piece_at(alvo) {
+    // Por TIPO, nao por casa. O `piece_at` varre ate' 12 bitboards com ramos
+    // imprevisiveis para descobrir o que esta' numa casa; percorrendo um
+    // bitboard de cada tipo o tipo e' conhecido de graca e so' a cor precisa de
+    // um teste. O conjunto visitado e' o mesmo -- a ORDEM e' que muda, e a
+    // ordem nao importa porque estas relacoes sao somadas, nao aplicadas em
+    // sequencia (a assinatura do bench e' quem o prova).
+    for tp in 0..6 {
+        let brancas = pos.pieces[0][tp];
+        let mut b = ameacados & (brancas | pos.pieces[1][tp]);
+        while b != 0 {
+            let alvo = b.trailing_zeros() as usize;
+            b &= b - 1;
+            let tc = usize::from(brancas & (1u64 << alvo) == 0);
             empurra(add, piece, color, s, tp, tc, alvo);
         }
     }
 
     processa_sliders(sliders, true, &mut empurra);
 
-    while incoming != 0 {
-        let src = incoming.trailing_zeros() as usize;
-        incoming &= incoming - 1;
-        if let Some((sp, sc)) = pos.piece_at(src) {
+    for sp in 0..6 {
+        let brancas = pos.pieces[0][sp];
+        let mut b = incoming & (brancas | pos.pieces[1][sp]);
+        while b != 0 {
+            let src = b.trailing_zeros() as usize;
+            b &= b - 1;
+            let sc = usize::from(brancas & (1u64 << src) == 0);
             empurra(add, sp, sc, src, piece, color, s);
         }
     }

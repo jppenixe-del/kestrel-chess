@@ -1,12 +1,31 @@
 use crate::moves::{Move, MoveFlag};
 use crate::types::{PieceType, Square};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+/// Politica de escrita da TT: preservar o lance + guarda de profundidade, JUNTOS.
+/// Global e relaxed de proposito: a TT e' partilhada e `store` nao tem acesso
+/// as `Features`. Desligada por omissao.
+static TT_POLITICA: AtomicBool = AtomicBool::new(false);
+pub fn set_politica(on: bool) { TT_POLITICA.store(on, Ordering::Relaxed); }
 
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub enum Bound {
     Exact,
     Lower,
     Upper,
+    /// No bound at all: the entry carries only a cached static evaluation.
+    ///
+    /// The search computes a static eval and then has fourteen ways to leave
+    /// the node before it ever reaches the store at the bottom -- razoring,
+    /// null move, probcut and the rest. Every one of those threw away an
+    /// evaluation that now costs ~21000 instructions, and the next visit paid
+    /// for it again. Worse, the loss was invisible: it shows up as a MISSING
+    /// entry, not as an entry without an eval, so it counted as a first visit.
+    ///
+    /// Writing the eval the moment it is computed makes the work survive the
+    /// early exits. Such an entry must never produce a cutoff -- it has no
+    /// score to stand behind.
+    NoBound,
 }
 
 /// Sentinel for "no cached static eval in this entry" -- e.g. entries
@@ -54,6 +73,19 @@ pub struct TtEntry {
 /// entries for stale ones. A whole byte costs a little more memory per
 /// slot and buys a cycle of 256, which does not wrap inside any game this
 /// engine will play.
+impl TtEntry {
+    /// Is there a score behind this entry?
+    ///
+    /// `Bound::NoBound` entries carry only a cached static eval; their `score`
+    /// field is meaningless. Anything that reads `score` outside the bound
+    /// match has to ask this first -- two places did not, and a score of 0
+    /// read as a real bound cost 33% more nodes.
+    #[inline]
+    pub fn has_bound(&self) -> bool {
+        !matches!(self.bound, Bound::NoBound)
+    }
+}
+
 struct TtSlot {
     key_xor_data: AtomicU64,
     data: AtomicU64,
@@ -82,6 +114,8 @@ const BUCKET: usize = 3;
 /// here as a genuine middle value pending a real measurement, not because
 /// splitting the difference is principled on its own.
 const STALE_PENALTY: i32 = 3;
+
+const EVAL_ONLY_DEPTH: i32 = -8;
 
 pub struct TranspositionTable {
     slots: Vec<[TtSlot; BUCKET]>,
@@ -170,6 +204,7 @@ fn encode_data(depth: i32, score: i32, bound: Bound, best: Option<Move>, pv: boo
         Bound::Exact => 0,
         Bound::Lower => 1,
         Bound::Upper => 2,
+        Bound::NoBound => 3,
     };
     let pv_bit: u64 = if pv { 1 } else { 0 };
     let eval16 = (static_eval as u16) as u64;
@@ -183,7 +218,8 @@ fn decode_data(data: u64) -> (i32, i32, Bound, Option<Move>, bool, i16) {
     let bound = match (data >> 42) & 0x3 {
         0 => Bound::Exact,
         1 => Bound::Lower,
-        _ => Bound::Upper,
+        2 => Bound::Upper,
+        _ => Bound::NoBound,
     };
     let pv = (data >> 44) & 1 == 1;
     let static_eval = ((data >> 45) & 0xFFFF) as u16 as i16;
@@ -227,6 +263,28 @@ impl TranspositionTable {
     }
 
     #[inline]
+    /// Pede o balde a' memoria antes de ele ser sondado.
+    ///
+    /// A tabela e' maior do que qualquer cache -- e' esse o objectivo -- por
+    /// isso praticamente toda a sondagem e' uma ida a' DRAM, e no perfil essas
+    /// esperas apareciam com 7,8% do tempo, escondidas nas leituras atomicas
+    /// do balde. Mas o indice e' sabido assim que o lance esta' feito, muito
+    /// antes de o filho sondar: pedir ali deixa a latencia ser coberta pelo
+    /// trabalho que fica no meio.
+    ///
+    /// Duas linhas de cache: o balde sao tres entradas de 24 bytes.
+    #[inline]
+    pub fn prefetch(&self, key: u64) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+            let idx = (key as usize) & self.mask;
+            let p = self.slots.as_ptr().add(idx) as *const i8;
+            _mm_prefetch(p, _MM_HINT_T0);
+            _mm_prefetch(p.add(64), _MM_HINT_T0);
+        }
+    }
+
     pub fn probe(&self, key: u64) -> Option<TtEntry> {
         let idx = (key as usize) & self.mask;
         let bucket = &self.slots[idx];
@@ -286,12 +344,85 @@ impl TranspositionTable {
     /// later -- the same tolerance every bucketed lock-free TT accepts,
     /// and each slot's own write is still atomic and torn-read-safe.
     #[inline]
+    /// Guarda uma entrada que so' traz a avaliacao estatica, sem lance nem
+    /// limite -- e que NUNCA despeja a entrada de outra posicao.
+    ///
+    /// A `store` normal escolhe a pior ranhura do balde e escreve la'. Para
+    /// uma entrada de profundidade -8 isso e' um mau negocio: troca-se uma
+    /// entrada com lance e profundidade real de OUTRA posicao por uma
+    /// avaliacao. E acontece a cada avaliacao nova, que sao centenas de
+    /// milhares por busca.
+    ///
+    /// MEDIDO antes disto existir: a tabela so' trazia lance em 22,3% dos nos
+    /// interiores, e o lance dela -- quando existia -- produzia 18,5% de todos
+    /// os cortes. Ou seja o lance era bom e faltava; nao era mau e sobrava.
+    ///
+    /// Aqui so' se escreve numa ranhura que ja' e' desta chave, ou numa que
+    /// nao vale a pena guardar (vazia, ou ja' so'-avaliacao, ou de uma geracao
+    /// antiga). Se as tres do balde estiverem ocupadas com trabalho real,
+    /// deita-se fora a avaliacao em vez do lance -- recalcula-la custa uma
+    /// passagem pela rede, recalcular a ordenacao custa uma subarvore.
+    pub fn store_eval_only(&self, key: u64, static_eval: i16) {
+        let idx = (key as usize) & self.mask;
+        let bucket = &self.slots[idx];
+        let gen = self.current_gen.load(Ordering::Relaxed);
+        let mut alvo: Option<usize> = None;
+        for (i, slot) in bucket.iter().enumerate() {
+            let data = slot.data.load(Ordering::Relaxed);
+            let key_xor = slot.key_xor_data.load(Ordering::Relaxed);
+            if key_xor ^ data == key {
+                alvo = Some(i);
+                break;
+            }
+            if alvo.is_some() {
+                continue;
+            }
+            let depth = ((data >> 34) & 0xFF) as u8 as i8 as i32;
+            let stale = gen.wrapping_sub(slot.gen.load(Ordering::Relaxed)) as i32;
+            if data == 0 || depth <= EVAL_ONLY_DEPTH || stale >= STALE_PENALTY {
+                alvo = Some(i);
+            }
+        }
+        let Some(i) = alvo else { return };
+        let slot = &bucket[i];
+        // Preserva o que a ranhura ja' tivesse desta mesma chave: se ela e'
+        // desta posicao, o lance dela continua a valer.
+        let anterior = {
+            let data = slot.data.load(Ordering::Relaxed);
+            let key_xor = slot.key_xor_data.load(Ordering::Relaxed);
+            if key_xor ^ data == key { Some(data) } else { None }
+        };
+        let best = anterior.and_then(|d| decode_move(d & 0x3FFFF));
+        let data = encode_data(EVAL_ONLY_DEPTH, 0, Bound::NoBound, best, false, static_eval);
+        slot.data.store(data, Ordering::Relaxed);
+        slot.key_xor_data.store(key ^ data, Ordering::Relaxed);
+        slot.gen.store(gen, Ordering::Relaxed);
+    }
+
     pub fn store(&self, key: u64, depth: i32, score: i32, bound: Bound, best: Option<Move>, pv: bool, static_eval: i16) {
         let data = encode_data(depth, score, bound, best, pv, static_eval);
         let idx = (key as usize) & self.mask;
         let bucket = &self.slots[idx];
         let gen = self.current_gen.load(Ordering::Relaxed);
         let slot = &bucket[Self::replace_index(bucket, key, gen)];
+        let mut data = data;
+        if TT_POLITICA.load(Ordering::Relaxed) {
+            let antigos = slot.data.load(Ordering::Relaxed);
+            let xr = slot.key_xor_data.load(Ordering::Relaxed);
+            let mesma = antigos != 0 && (xr ^ antigos) == key;
+            if mesma {
+                // (1) a busca falhou em baixo e nao trouxe lance: fica o antigo.
+                let best = if best.is_none() { decode_move(antigos & 0x3FFFF) } else { best };
+                // (2) uma entrada rasa nao apaga uma funda da mesma chave, a nao
+                // ser que seja exacta, ou a antiga tenha envelhecido.
+                let velhice = gen.wrapping_sub(slot.gen.load(Ordering::Relaxed));
+                let prof_antiga = ((antigos >> 34) & 0xFF) as u8 as i8 as i32;
+                if !(bound == Bound::Exact || depth + 2 * (pv as i32) > prof_antiga - 4 || velhice != 0) {
+                    return;
+                }
+                data = encode_data(depth, score, bound, best, pv, static_eval);
+            }
+        }
         slot.data.store(data, Ordering::Relaxed);
         slot.key_xor_data.store(key ^ data, Ordering::Relaxed);
         slot.gen.store(gen, Ordering::Relaxed);

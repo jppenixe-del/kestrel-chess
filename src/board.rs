@@ -11,53 +11,29 @@ pub const CASTLE_BQ: u8 = 8;
 #[derive(Clone)]
 pub struct Board {
     pub pieces: [[Bitboard; 6]; 2], // [color][piece_type]
-    /// Quantos lances fundos estamos no caminho actual.
-    ///
-    /// Mantido aqui, e so' por `make_move`/`unmake_move` e pelo lance nulo,
-    /// porque e' aqui que a posicao muda. A pilha de acumuladores da rede SF
-    /// indexa-se por ele -- e a razao de nao existir um contador proprio para
-    /// isso e' que uma tentativa anterior teve dois indices (o de `make_move`
-    /// para gravar, o ply da busca para ler), discordaram, e o motor jogou
-    /// 0-58-0 com um acumulador errado que nenhum teste de posicao apanhava.
-    /// Com um so' indice, mantido junto da posicao, esse desencontro nao tem
-    /// onde acontecer.
-    pub prof_acc: usize,
     pub occ_color: [Bitboard; 2],
     pub occ_all: Bitboard,
     pub side: Color,
-    /// The network's accumulator, carried with the position.
+    /// The network accumulator, carried with the position.
     ///
-    /// Here rather than in the searcher because every path that changes a
-    /// piece already goes through `add_piece`/`remove_piece` -- putting it
-    /// anywhere else would mean finding and patching castling, en passant and
-    /// promotion separately, and one missed case is an evaluation that is
-    /// silently wrong only in rare positions. `None` until a network is
-    /// loaded, so the hand-written evaluation costs nothing for it.
+    /// Here rather than in the searcher because every path that changes a piece
+    /// already goes through `add_piece` and `remove_piece`. Anywhere else would
+    /// mean finding and patching castling, en passant and promotion separately,
+    /// and one missed case is an evaluation that is quietly wrong only in rare
+    /// positions. `None` until a network is installed, so nothing pays for it
+    /// before there is one.
+    /// Profundidade da camada do acumulador. Sobe no `make_move`, desce no
+    /// `unmake_move`. O leitor em Rust usa-a para saber de que camada herdar.
+    pub prof_acc: usize,
     pub acc: Option<Box<crate::nnue::Accumulator>>,
+    /// As mudancas de peca deste lance, por aplicar. Quatro chegam: o roque e'
+    /// o lance com mais casas a mudar, duas que saem e duas que entram.
+    pub(crate) pend: [(PieceType, Color, Square, bool); 4],
+    pub(crate) n_pend: usize,
     pub castling: u8,
     pub ep_square: Square,
     pub halfmove: u32,
     pub fullmove: u32,
-    // Acumuladores incrementais de avaliacao (material+PST, perspetiva das
-    // BRANCAS, mg/eg separados -- ver eval::piece_contribution()) --
-    // mantidos por add_piece()/remove_piece() em vez de recalculados do
-    // zero a cada chamada a evaluate(). `phase` conta so' pecas maiores
-    // (ver eval::PHASE_INC), nao inclui peoes.
-    /// O mesmo, mas com as PSQT lidas do ponto de vista de "o rei desta cor
-    /// esta' no flanco do rei". Indexado [cor][flanco].
-    ///
-    /// Quatro somas em vez de uma porque o valor de cada casa passa a depender
-    /// de onde esta' o rei DA PROPRIA COR -- e um lance de rei que atravesse a
-    /// coluna e mudaria TODAS as pecas de uma vez, o que mataria o
-    /// incremental. Mantendo as duas leituras sempre actualizadas, um lance de
-    /// rei nao custa nada: e' so' passar a ler a outra.
-    /// Um acumulador por bucket de contagem de peoes. Mantidos os oito em
-    /// paralelo: assim um lance que mude o bucket -- uma captura de peao --
-    /// nao custa nada, e' so' passar a ler outro indice.
-    ///
-    /// O ciclo de oito e' desenrolado pelo compilador e os arrays cabem na
-    /// cache L1; o custo medido esta' na nota do commit.
-    pub phase: i32,
     /// Zobrist key for this position, kept up to date move by move.
     ///
     /// Maintained here rather than recomputed by the search because the
@@ -78,13 +54,11 @@ pub struct Undo {
     pub castling: u8,
     pub ep_square: Square,
     pub halfmove: u32,
-    // Snapshot inteiro (nao deltas) -- restaurar em unmake_move() e'
-    // sempre correcto por construcao, sem precisar de reverter cada
-    // captura/promocao/roque individualmente.
-    pub phase: i32,
-    /// Same reasoning as `phase`, and it is what makes the incremental hash
-    /// cheap: undoing a move restores one u64 instead of replaying every XOR
-    /// backwards, so only `make_move` ever pays.
+    /// A whole snapshot rather than deltas: restoring it in `unmake_move` is
+    /// correct by construction, with no need to reverse each capture,
+    /// promotion and castling individually. It is also what makes the
+    /// incremental key cheap -- undoing a move restores one u64 instead of
+    /// replaying every XOR backwards, so only `make_move` ever pays.
     pub hash: u64,
 }
 
@@ -157,27 +131,28 @@ impl Board {
         let fullmove = parts.get(5).and_then(|s| s.parse().ok()).unwrap_or(1);
 
         let mut b = Board {
-            prof_acc: 0,
             pieces,
             occ_color: [0, 0],
             occ_all: 0,
+            prof_acc: 0,
             acc: None,
+            pend: [(PieceType::Pawn, Color::White, 0, false); 4],
+            n_pend: 0,
             side,
             castling,
             ep_square,
             halfmove,
             fullmove,
-            phase: 0,
             hash: 0,
             mailbox,
         };
         b.hash = crate::zobrist::tabelas().hash_completo(&b);
         b.recompute_occ();
-        b.recompute_eval_accumulators();
-        // Built once here, from the finished position. Every later change goes
-        // through add_piece/remove_piece and updates it a piece at a time.
-        if let Some(net) = crate::nnue::rede() {
-            b.acc = Some(Box::new(crate::nnue::Accumulator::fresh(net, &b)));
+        // Built once here from the finished position. Every later change goes
+        // through add_piece/remove_piece, one piece at a time.
+        if let Some(net) = crate::nnue::net() {
+            let kings = [b.king_sq(Color::White), b.king_sq(Color::Black)];
+            b.acc = Some(Box::new(crate::nnue::Accumulator::fresh(net, &b.pieces, kings)));
         }
         b
     }
@@ -208,29 +183,6 @@ impl Board {
             self.occ_color[c.idx()] = o;
         }
         self.occ_all = self.occ_color[0] | self.occ_color[1];
-    }
-
-    /// Recalcula mg_score/eg_score/phase do ZERO, percorrendo todas as
-    /// pecas -- so' usado uma vez na construcao (from_fen); depois disso
-    /// add_piece()/remove_piece() mantem os campos correctos
-    /// incrementalmente.
-    pub fn recompute_eval_accumulators(&mut self) {
-        self.phase = 0;
-        for c in [Color::White, Color::Black] {
-            for pt in ALL_PIECES {
-                let mut bbp = self.pieces[c.idx()][pt.idx()];
-                while bbp != 0 {
-                    let s = bbp.trailing_zeros() as Square;
-                    bbp &= bbp - 1;
-                    let ph = pt.phase_inc();
-                    self.phase += ph;
-                    // Os acumuladores novos tem de ser preenchidos AQUI
-                    // tambem, senao o recalculo do zero da' zeros e a
-                    // verificacao acusa uma divergencia que nao existe --
-                    // ou pior, deixa de acusar as que existem.
-                }
-            }
-        }
     }
 
     #[inline]
@@ -333,17 +285,30 @@ impl Board {
         self.occ_all &= !bb(s);
         self.mailbox[s as usize] = None;
         self.hash ^= crate::zobrist::tabelas().piece_sq[c.idx()][pt.idx()][s as usize];
-        let ph = pt.phase_inc();
-        if let (Some(a), Some(net)) = (self.acc.as_mut(), crate::nnue::rede()) {
-            a.push_dirty(net, c, pt, s, false);
+        // The pawn pairs only change when a pawn does. Read before the
+        // accumulator is borrowed: both live on `self` and cannot be held at
+        // once.
+        let peoes = if pt == PieceType::Pawn {
+            Some([
+                self.pieces[Color::White.idx()][PieceType::Pawn.idx()],
+                self.pieces[Color::Black.idx()][PieceType::Pawn.idx()],
+            ])
+        } else {
+            None
+        };
+        // This and `add_piece` are the only two places a piece ever appears on
+        // or leaves a square -- castling, en passant and promotion all route
+        // through them.
+        if self.acc.is_some() {
+            // Guardado, nao aplicado: quem fecha o lance aplica tudo de uma vez.
+            self.pend[self.n_pend] = (pt, c, s, false);
+            self.n_pend += 1;
         }
-        // Os acumuladores por flanco so' sao LIDOS com a feature `psqtmirror`
-        // ligada (ver `material_pst_white`). Sem ela isto era trabalho morto
-        // pago em cada peca colocada ou retirada, ou seja, em cada lance da
-        // busca -- duas consultas de tabela por peca para um valor que
-        // ninguem consultava. Sendo uma const de compilacao, com a feature
-        // desligada o compilador apaga o bloco por inteiro.
-        self.phase -= ph;
+        if let (Some(a), Some(net)) = (self.acc.as_mut(), crate::nnue::net()) {
+            if let Some(p) = peoes {
+                a.pares_de_uma_casa(net, &p, c, s, false);
+            }
+        }
     }
     fn add_piece(&mut self, pt: PieceType, c: Color, s: Square) {
         self.pieces[c.idx()][pt.idx()] |= bb(s);
@@ -351,17 +316,27 @@ impl Board {
         self.occ_all |= bb(s);
         self.mailbox[s as usize] = Some((pt, c));
         self.hash ^= crate::zobrist::tabelas().piece_sq[c.idx()][pt.idx()][s as usize];
-        let ph = pt.phase_inc();
-        if let (Some(a), Some(net)) = (self.acc.as_mut(), crate::nnue::rede()) {
-            a.push_dirty(net, c, pt, s, true);
+        // The pawn pairs only change when a pawn does. Read before the
+        // accumulator is borrowed: both live on `self` and cannot be held at
+        // once.
+        let peoes = if pt == PieceType::Pawn {
+            Some([
+                self.pieces[Color::White.idx()][PieceType::Pawn.idx()],
+                self.pieces[Color::Black.idx()][PieceType::Pawn.idx()],
+            ])
+        } else {
+            None
+        };
+        if self.acc.is_some() {
+            // Guardado, nao aplicado: quem fecha o lance aplica tudo de uma vez.
+            self.pend[self.n_pend] = (pt, c, s, true);
+            self.n_pend += 1;
         }
-        // Os acumuladores por flanco so' sao LIDOS com a feature `psqtmirror`
-        // ligada (ver `material_pst_white`). Sem ela isto era trabalho morto
-        // pago em cada peca colocada ou retirada, ou seja, em cada lance da
-        // busca -- duas consultas de tabela por peca para um valor que
-        // ninguem consultava. Sendo uma const de compilacao, com a feature
-        // desligada o compilador apaga o bloco por inteiro.
-        self.phase += ph;
+        if let (Some(a), Some(net)) = (self.acc.as_mut(), crate::nnue::net()) {
+            if let Some(p) = peoes {
+                a.pares_de_uma_casa(net, &p, c, s, true);
+            }
+        }
     }
 
     /// Aplica um lance PSEUDO-LEGAL (a legalidade -- nao ficar em xeque --
@@ -372,7 +347,6 @@ impl Board {
         let them = us.opp();
         let (moving_pt, _) = self.piece_at(mv.from).expect("make_move: nada em from");
         let captured = if mv.flag == MoveFlag::EnPassant {
-            let cap_sq = if us == Color::White { mv.to - 8 } else { mv.to + 8 };
             Some((PieceType::Pawn, them))
         } else {
             self.piece_at(mv.to)
@@ -383,9 +357,9 @@ impl Board {
             castling: self.castling,
             ep_square: self.ep_square,
             halfmove: self.halfmove,
-            phase: self.phase,
             hash: self.hash,
         };
+
 
         // remove captured piece (normal or en passant)
         match mv.flag {
@@ -421,8 +395,36 @@ impl Board {
         }
 
         // en passant square update
+        // Only record the en passant square when someone can actually take it.
+        //
+        // The square goes into the position key, so recording it after every
+        // double push gives two different keys to two positions that are the
+        // same in every way that matters -- same pieces, same side to move, and
+        // no capture available in either. They then miss each other in the
+        // table, and worse, a repetition between them is not recognised as one,
+        // because a repetition is a comparison of keys.
+        //
+        // A pawn of the other colour standing beside the one that just moved is
+        // the whole of the condition. No attack table needed: the two squares
+        // are the neighbours of the landing square on the same rank, and the
+        // file guard is what stops a pawn on the a-file seeing one on the h.
         self.ep_square = if mv.flag == MoveFlag::DoublePush {
-            if us == Color::White { mv.from + 8 } else { mv.from - 8 }
+            let sq = if us == Color::White { mv.from + 8 } else { mv.from - 8 };
+            let them = us.opp();
+            let their_pawns = self.pieces[them.idx()][PieceType::Pawn.idx()];
+            let f = file_of(mv.to);
+            let mut takers = 0u64;
+            if f > 0 {
+                takers |= 1u64 << (mv.to - 1);
+            }
+            if f < 7 {
+                takers |= 1u64 << (mv.to + 1);
+            }
+            if their_pawns & takers != 0 {
+                sq
+            } else {
+                NO_SQUARE
+            }
         } else {
             NO_SQUARE
         };
@@ -475,101 +477,61 @@ impl Board {
         if self.ep_square != NO_SQUARE {
             self.hash ^= z.ep_file[file_of(self.ep_square) as usize];
         }
-        // A king that crossed a bucket boundary invalidates every feature for
-        // its own perspective: the same piece on the same square is a
-        // different input number now. Everything above updated the
-        // accumulator under the OLD bucket, so that perspective has to be
-        // rebuilt -- but from the cache, not from nothing. See CacheRefresh.
-        self.corrige_bucket();
+        // Only a king move can invalidate a perspective wholesale, so only a
+        // king move needs to ask. Everything else was paying for the question.
+        self.fecha_lote();
+        if moving_pt == PieceType::King {
+            self.refresh_perspectives();
+        }
         undo
     }
 
-    /// Rebuild a perspective whose king changed bucket, through the cache.
+    /// Rebuild any perspective the last move invalidated wholesale.
     ///
-    /// Cheap to call and cheap to skip: with an unbucketed network it returns
-    /// immediately, and with a bucketed one it does nothing unless a boundary
-    /// was actually crossed -- measured at 16.5% of all moves, which is why it
-    /// goes through the cache rather than rebuilding from the bias.
+    /// Empty until a network is wired in, but called from `make_move` AND from
+    /// `unmake_move` from the start, deliberately.
+    ///
+    /// A king that crosses a bucket boundary, or the middle of the board where
+    /// the mirror flips, changes the input number of every piece for its own
+    /// perspective: the same piece on the same square is a different feature
+    /// now. Everything the move did updated the accumulator under the OLD
+    /// bucket, so that perspective has to be rebuilt rather than patched.
+    ///
+    /// The reason both call sites exist before there is anything to call: an
+    /// earlier engine of ours had this in `make_move` only. Undoing a king move
+    /// that crossed a boundary then left the accumulator describing the king on
+    /// the right square under the wrong bucket, and any evaluation asked for in
+    /// that window silently read weights for a king that is not there. Having
+    /// the call site already here means the network cannot arrive and forget
+    /// half of it.
+    /// Aplica as mudancas guardadas e limpa a lista.
     #[inline]
-    fn corrige_bucket(&mut self) {
-        // A guarda da rede SIMPLES nao pode barrar as outras.
-        //
-        // Isto era `let net = match rede() { Some(n) if n.buckets > 1 => n,
-        // _ => return }` -- um `return` no topo. Sem `KESTREL_NNUE` definido a
-        // funcao saia na primeira linha e o `fix_bucket` da v3, que vive no
-        // fim, nunca corria: os buckets de rei dela nunca se corrigiam. 2849
-        // divergencias em 3906 lances, todas a partir do primeiro rei que sai
-        // da casa inicial.
-        //
-        // Mesma familia do bug do `busy` na ponte e do `unmake_move` sem
-        // correccao de bucket: uma condicao de UM caminho a decidir por todos.
-        //
-        // Saida rapida: esta correccao so' serve as redes `nnue` (buckets
-        // de rei). A super rede `nnue_sf` (a do bot, por EvalFile) e o HCE nao
-        // precisam dela -- tem o seu proprio acumulador. Decidir uma vez e cachear
-        // evita 4 `rede()` + a copia das pecas por NO (make+unmake), ~4,3% do bench.
-        // A decisao e' estavel: as duas redes carregam por env no arranque, antes
-        // da busca real, e nao mudam (OnceLock).
-        if !precisa_corrigir_bucket() {
+    fn fecha_lote(&mut self) {
+        if self.n_pend == 0 {
             return;
         }
-        self.corrige_bucket_slow();
-    }
-
-    /// O trabalho pesado do `corrige_bucket`, fora da linha para que o fast-path
-    /// (super rede `nnue_sf` ou HCE) inline no make_move/unmake_move so' a leitura
-    /// da bandeira e o `return` -- sem custo de chamada por NO.
-    #[cold]
-    #[inline(never)]
-    fn corrige_bucket_slow(&mut self) {
-        if let Some(net) = crate::nnue::rede().filter(|n| n.buckets > 1) {
-            self.corrige_bucket_simples(net);
+        let n = self.n_pend;
+        self.n_pend = 0;
+        let lote = self.pend;
+        if let (Some(a), Some(net)) = (self.acc.as_mut(), crate::nnue::net()) {
+            a.update_lote(net, &lote[..n]);
         }
     }
 
-    fn corrige_bucket_simples(&mut self, net: &'static crate::nnue::Network) {
-        // Read everything the refresh needs BEFORE taking the accumulator,
-        // because the accumulator lives inside the same struct. Rust says so
-        // and it is right to: reading the board through a stale copy taken
-        // around a mutable borrow is how an accumulator ends up describing a
-        // position that no longer exists.
-        let pecas = self.pieces;
-        let rb = self.king_sq(Color::White);
-        let rp = self.king_sq(Color::Black);
-        let quer = [
-            crate::nnue::bucket_do_rei_de(self, Color::White),
-            crate::nnue::bucket_do_rei_de(self, Color::Black),
-        ];
-        // The mirror travels with the bucket: both are functions of the king
-        // square, and a king crossing the d/e file changes the mirror even
-        // when it stays inside the same bucket.
-        let quer_esp = [
-            crate::nnue::espelha_perspectiva(self, Color::White),
-            crate::nnue::espelha_perspectiva(self, Color::Black),
-        ];
-        let acc = match self.acc.as_mut() {
-            Some(a) => a,
+    #[inline]
+    fn refresh_perspectives(&mut self) {
+        let net = match crate::nnue::net() {
+            Some(n) => n,
             None => return,
         };
-        for cor in [Color::White, Color::Black] {
-            let quer = quer[cor.idx()];
-            let esp = quer_esp[cor.idx()];
-            if acc.bucket[cor.idx()] == quer && acc.espelha[cor.idx()] == esp {
-                continue;
-            }
-            // The refresh below rewrites every column for this perspective, so
-            // it must not run against values that are still missing recorded
-            // changes -- and the recorded changes are indexed under the OLD
-            // bucket, which is about to stop existing. Fold them in first.
-            acc.materialise(net);
-            acc.bucket[cor.idx()] = quer;
-            acc.espelha[cor.idx()] = esp;
-            let destino: &mut [i16; crate::nnue::HIDDEN] = if cor == Color::White {
-                &mut acc.white
-            } else {
-                &mut acc.black
-            };
-            crate::nnue::com_cache(|c| c.refresca(net, pecas, rb, rp, cor, quer, esp, destino));
+        // Everything the refresh needs is read BEFORE the accumulator is
+        // borrowed, because it lives inside this same struct. Reading the board
+        // through a copy taken around a mutable borrow is how an accumulator
+        // ends up describing a position that no longer exists.
+        let pieces = self.pieces;
+        let kings = [self.king_sq(Color::White), self.king_sq(Color::Black)];
+        if let Some(a) = self.acc.as_mut() {
+            a.refresh(net, &pieces, kings);
         }
     }
 
@@ -578,6 +540,11 @@ impl Board {
     /// NUNCA chamar em xeque (o rei poderia ser "capturado" na resposta).
     pub fn make_null_move(&mut self) -> NullUndo {
         self.prof_acc += 1;
+        // A null move touches no piece, but it does advance a ply. Any
+        // per-ply record a network keeps has to be written here too, as empty
+        // -- leaving the previous move's record in place at this depth makes
+        // the accumulator chain apply a move that never happened. Caught once
+        // by the verifier at 16986 wrong entries in 1.5 million, all here.
         let undo = NullUndo { ep_square: self.ep_square, hash: self.hash };
         self.side = self.side.opp();
         self.ep_square = NO_SQUARE;
@@ -590,14 +557,14 @@ impl Board {
     }
 
     pub fn unmake_null_move(&mut self, undo: &NullUndo) {
-        self.prof_acc -= 1;
+        self.prof_acc = self.prof_acc.saturating_sub(1);
         self.side = self.side.opp();
         self.ep_square = undo.ep_square;
         self.hash = undo.hash;
     }
 
     pub fn unmake_move(&mut self, mv: &Move, undo: &Undo) {
-        self.prof_acc -= 1;
+        self.prof_acc = self.prof_acc.saturating_sub(1);
         let them = self.side; // side that is about to move again = the one who just moved's opponent... wait: after make_move, self.side = opponent of mover. So "us" (who made mv) = self.side.opp()
         let us = them.opp();
         self.side = us;
@@ -636,22 +603,19 @@ impl Board {
         if us == Color::Black {
             self.fullmove -= 1;
         }
-        // Restauro explicito (nao so' confiar nos remove/add_piece acima
-        // se cancelarem exactamente): garante correccao mesmo que algum
-        // caso futuro deixe de espelhar make_move perfeitamente.
-        self.phase = undo.phase;
         // One assignment instead of replaying every XOR backwards -- and it
         // also repairs whatever the add_piece/remove_piece calls above did to
         // the key while restoring the board.
         self.hash = undo.hash;
-        // make_move ends with corrige_bucket(); unmake_move never did. After
-        // undoing a king move that crossed a bucket boundary, the accumulator
-        // described the king on the right square under the WRONG bucket, and
-        // any evaluation asked for in that window silently read weights for a
-        // king that is not there. Only actually does work when the bucket
-        // really changed -- same guard make_move relies on -- so it costs
-        // nothing on the moves that are not king moves.
-        self.corrige_bucket();
+        // Mirrors the end of `make_move` -- see `refresh_perspectives` for why
+        // leaving this out is a bug that only shows up as a quietly wrong
+        // evaluation. `moving_pt` is what was on `from` before the move, so a
+        // promotion reports a pawn and castling reports the king, which is
+        // exactly right in both cases.
+        self.fecha_lote();
+        if moving_pt == PieceType::King {
+            self.refresh_perspectives();
+        }
     }
 
     pub fn to_fen(&self) -> String {
@@ -703,19 +667,4 @@ impl Board {
         s.push_str(&self.fullmove.to_string());
         s
     }
-}
-
-/// So' as redes `nnue` (buckets de rei) precisam do `corrige_bucket`.
-/// A super rede `nnue_sf` (do bot, por EvalFile) e o HCE nao -- tem o seu proprio
-/// acumulador. Decidido UMA vez (as duas redes carregam por env no arranque, via
-/// OnceLock, e nao mudam depois) e cacheado, para o `corrige_bucket` sair cedo no
-/// caso comum. Ver o comentario no `corrige_bucket`.
-#[inline]
-fn precisa_corrigir_bucket() -> bool {
-    static DECISAO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *DECISAO.get_or_init(|| {
-        let nnue_buckets = crate::nnue::rede().map_or(false, |n| n.buckets > 1);
-        let v3 = false;
-        nnue_buckets || v3
-    })
 }

@@ -621,6 +621,7 @@ fn bandeira(nome: &'static str) -> bool {
 }
 
 pub fn evaluate(net: &RedeSf, atk: &Attacks, board: &mut Board) -> i32 {
+    count_eval();
     // `KESTREL_TROCA_POV=1` swaps the two perspectives in the forward pass.
     // A diagnostic, not an option, and it has already answered its question:
     // NO. Our trained nets score a queen up for White as WORSE than the same
@@ -758,10 +759,13 @@ pub fn evaluate(net: &RedeSf, atk: &Attacks, board: &mut Board) -> i32 {
         }
         for (pov, base) in [(stm, 0usize), (nstm, half)] {
             let (a, b) = st.acc[pov].split_at(half);
-            for (j, (&lo, &hi)) in a.iter().zip(b.iter()).enumerate() {
+            // Fatia de saida em vez de `x[base + j]`: uma verificacao de
+            // limites no `split`, e nenhuma dentro do ciclo.
+            let saida = &mut x[base..base + half];
+            for (d, (&lo, &hi)) in saida.iter_mut().zip(a.iter().zip(b.iter())) {
                 let s0 = lo.clamp(0, TETO) as u16;
                 let s1 = hi.clamp(0, TETO) as u16;
-                x[base + j] = (s0.wrapping_mul(s1) >> 9) as u8;
+                *d = (s0.wrapping_mul(s1) >> 9) as u8;
             }
         }
         st.x = x;
@@ -808,7 +812,64 @@ pub fn evaluate(net: &RedeSf, atk: &Attacks, board: &mut Board) -> i32 {
     // paralelo foi MEDIDO e ficou 40% PIOR (8,6s vs 6,1s por 300k nos) --
     // quatro linhas de pesos ao mesmo tempo enchem a cache mais do que a
     // reutilizacao de `x` poupa. Nao repetir sem medir.
+    // MEASURED AND REJECTED (2026-08-26): skipping the zero inputs.
+    //
+    // 60% of `x` is zero after the clipped ReLU -- measured with
+    // KESTREL_SATURA -- so more than half of these 32768 multiply-accumulates
+    // are against nothing. Skipping them does not pay here, and the
+    // arithmetic says why before any code is written:
+    //
+    //   dense:  32 outputs x 1024 inputs = 32768 products, 32 per vpmaddubsw
+    //           -> ~1024 multiply instructions
+    //   sparse: 32 x 410 = 13120 products -> ~410 multiplies, BUT without VNNI
+    //           each needs a vpmaddwd and an add on top -> ~1230
+    //
+    // The sparse form only wins where one instruction does multiply AND
+    // accumulate (`vpdpbusd`), and no machine this engine runs on has it.
+    //
+    // RETESTED 2026-08-28, and the retest failed too. The argument for going
+    // back was that this note counts MULTIPLIES while the engine is short of
+    // LOADS -- the input is 67% zeros (`KESTREL_SATURA=1`), so a sparse pass
+    // over input-major weights should read ~330 columns instead of 1024, 10.5
+    // KB against 32. Written properly -- weights transposed at load time, the
+    // non-zero indices extracted with `vpcmpeqb` + `movemask` rather than a
+    // scalar scan -- it measured **1.9% fewer loads and 11.4% MORE cycles**
+    // (18.70 vs 19.05 billion loads, 19.49 vs 17.50 billion cycles, mean of 8).
+    //
+    // The loads barely moved because fc0's weights are a small share of the
+    // engine's total traffic and the mask scan adds its own. The cycles moved
+    // because without VNNI each non-zero input costs a widen, a multiply and
+    // four widened adds, and three hundred of those beat 1024 fused
+    // multiply-accumulates.
+    //
+    // A first attempt that scanned the input scalar-wise (`if x[i] == 0 {
+    // continue }`) was 28% worse still, and read MORE than the dense form: it
+    // traded 1024 vector weight loads for 1024 scalar input loads.
+    //
+    // CORRECTION (2026-08-26, later the same day). The "20% slower" first
+    // written here came from a wall-clock run taken while four cores were busy
+    // with a match, so the number was worthless -- and the verdict was written
+    // as if it were a property of the idea when it is a property of the
+    // hardware. Both halves are wrong to leave standing.
+    //
+    // What actually decides it here is the arithmetic, which contention cannot
+    // touch. Without VNNI a sparse column needs the weights widened before they
+    // can be multiplied: 4 vpmovsxbd + 4 vpmulld + 4 vpaddd per non-zero input,
+    // times ~410 of them, is ~4900 instructions against ~2000 for the dense
+    // form. Accumulating narrower does not rescue it -- a product reaches 16129
+    // and two of them overflow an i16.
+    //
+    // And the reason it is not worth revisiting is the fleet, not this box: all
+    // three machines are AMD EPYC with AVX2 and nothing above it -- no VNNI, no
+    // AVX-512 -- so there is nowhere to deploy a win. Retry when that changes,
+    // and transpose the weights to input-major first (a column is L2 = 32
+    // bytes, exactly one AVX2 register).
     let mut fc0_out = [0i32; L2];
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    unsafe {
+        fc0_grupo_avx2(&x[..L1], &stack.fc0w, &stack.fc0b, &mut fc0_out, L1);
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
     for o in 0..L2 {
         let row = &stack.fc0w[o * L1..(o + 1) * L1];
         fc0_out[o] = produto_u8_i8(&x[..L1], row) + stack.fc0b[o];
@@ -817,36 +878,39 @@ pub fn evaluate(net: &RedeSf, atk: &Attacks, board: &mut Board) -> i32 {
     // ac_sqr_0 / ac_0 use WeightScaleBits+1 (SF: SqrClippedReLU<..,
     // WeightScaleBits+1> ac_sqr_0; ClippedReLU<.., WeightScaleBits+1> ac_0;).
     let wsb0 = WEIGHT_SCALE_BITS as u32 + 1;
-    let mut concat1 = [0i32; 2 * L2];
+    // u8, not i32. Both activations clamp to 0..127, so the wide type carried
+    // no information -- and it cost four times the instructions in the layer
+    // below: an i32 accumulator fits eight per AVX2 register where u8 x i8
+    // fits thirty-two. This is the same `produto_u8_i8` path fc0 already uses.
+    let mut concat1 = [0u8; 2 * L2];
     for o in 0..L2 {
-        concat1[o] = clipped_sq(fc0_out[o], wsb0);
-        concat1[L2 + o] = clipped_lin(fc0_out[o], wsb0);
+        concat1[o] = clipped_sq(fc0_out[o], wsb0) as u8;
+        concat1[L2 + o] = clipped_lin(fc0_out[o], wsb0) as u8;
     }
 
     let mut fc1_out = [0i32; L3];
     for o in 0..L3 {
-        let mut s: i64 = 0;
+        // `i32` e nao `i64`: os valores cabem, e com 64 bits o LLVM so'
+        // consegue metade dos elementos por registo. E iterador em vez de
+        // `row[i]`, que verificava limites a cada um dos 64 acessos.
         let row = &stack.fc1w[o * (2 * L2)..(o + 1) * (2 * L2)];
-        for i in 0..2 * L2 {
-            s += concat1[i] as i64 * row[i] as i64;
-        }
-        fc1_out[o] = (s as i32) + stack.fc1b[o];
+        let s: i32 = produto_u8_i8(&concat1, row);
+        fc1_out[o] = s + stack.fc1b[o];
     }
 
     // ac_sqr_1 / ac_1 use plain WeightScaleBits.
     let wsb1 = WEIGHT_SCALE_BITS as u32;
-    let mut concat2 = [0i32; 2 * L2 + 2 * L3];
+    // Same again: 0..127 values in an i32 array. 128 entries, a multiple of
+    // 32, so the whole output layer becomes one SIMD dot product instead of a
+    // scalar loop with an i64 accumulator.
+    let mut concat2 = [0u8; 2 * L2 + 2 * L3];
     concat2[..2 * L2].copy_from_slice(&concat1);
     for o in 0..L3 {
-        concat2[2 * L2 + o] = clipped_sq(fc1_out[o], wsb1);
-        concat2[2 * L2 + L3 + o] = clipped_lin(fc1_out[o], wsb1);
+        concat2[2 * L2 + o] = clipped_sq(fc1_out[o], wsb1) as u8;
+        concat2[2 * L2 + L3 + o] = clipped_lin(fc1_out[o], wsb1) as u8;
     }
 
-    let mut s: i64 = 0;
-    for i in 0..2 * L2 + 2 * L3 {
-        s += concat2[i] as i64 * stack.fc2w[i] as i64;
-    }
-    let fc2_out = (s as i32) + stack.fc2b;
+    let fc2_out = produto_u8_i8(&concat2, &stack.fc2w[..2 * L2 + 2 * L3]) + stack.fc2b;
 
     let skip_0 = fc0_out[L2 - 2] - fc0_out[L2 - 1];
     let fwd_out = (fc2_out + skip_0) as i64;
@@ -862,7 +926,7 @@ pub fn evaluate(net: &RedeSf, atk: &Attacks, board: &mut Board) -> i32 {
     let denominator: i64 = HIDDEN_ONE_VAL * (1i64 << WEIGHT_SCALE_BITS) * 2;
     let positional = fwd_out * multiplier / denominator;
 
-    let bruto = ((psqt / OUTPUT_SCALE) + (positional / OUTPUT_SCALE)) as i32;
+    let bruto = ((psqt as i64 / OUTPUT_SCALE) + (positional / OUTPUT_SCALE)) as i32;
 
     // O motor tem UMA escala de avaliacao, e nao e' a desta rede.
     //
@@ -915,13 +979,177 @@ pub fn eval_factor() -> i32 {
     d
 }
 
+/// Pedir paginas de 2 MB para as tabelas de pesos.
+///
+/// A tabela de ameacas tem THREAT_DIM * L1 = 61 MB e le'-se por linhas
+/// dispersas: uma linha de pesos por feature que muda, ~7.5 por lance. Em
+/// paginas de 4 KB sao quinze mil paginas contra um TLB de umas duas mil
+/// entradas, e medido isso da' **26.0 milhoes de faltas de dTLB** num bench,
+/// contra 10.9 milhoes com paginas enormes -- e 28.83 G ciclos contra 24.73 G,
+/// ou seja **14.2% do tempo de busca gasto a percorrer tabelas de paginas**.
+///
+/// Sao precisas as duas chamadas. `MADV_HUGEPAGE` marca a regiao mas so' actua
+/// em faltas futuras ou quando o `khugepaged` passar, e aqui a memoria ja' esta'
+/// escrita -- foi para la' que se leu o ficheiro. `MADV_COLLAPSE` (Linux 6.1+)
+/// junta as paginas ja' existentes na altura, que e' o que este caso precisa.
+///
+/// Falhar nao e' erro: em kernel antigo, sem THP, ou sem memoria contigua, o
+/// motor corre na mesma -- mais devagar, que e' onde estava antes.
+#[cfg(target_os = "linux")]
+fn pede_paginas_enormes<T>(v: &[T]) {
+    const MADV_HUGEPAGE: i32 = 14;
+    const MADV_COLLAPSE: i32 = 25;
+    const PAGINA: usize = 4096;
+    extern "C" {
+        fn madvise(addr: *mut core::ffi::c_void, len: usize, advice: i32) -> i32;
+    }
+    let ini = v.as_ptr() as usize;
+    let fim = ini + core::mem::size_of_val(v);
+    // `madvise` exige o inicio alinhado a' pagina. Encolhe-se para DENTRO da
+    // fatia nas duas pontas: crescer para fora tocaria memoria de outrem.
+    let a = (ini + PAGINA - 1) & !(PAGINA - 1);
+    let b = fim & !(PAGINA - 1);
+    if b <= a {
+        return;
+    }
+    unsafe {
+        madvise(a as *mut core::ffi::c_void, b - a, MADV_HUGEPAGE);
+        madvise(a as *mut core::ffi::c_void, b - a, MADV_COLLAPSE);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pede_paginas_enormes<T>(_v: &[T]) {}
+
+// REORDENAR AS LINHAS DE AMEACA POR FREQUENCIA -- medido e REJEITADO.
+//
+// A tabela tem THREAT_DIM * L1 = 61 MB e le'-se por linhas dispersas, ~7.5 por
+// lance. O histograma (`KESTREL_HISTO_AMEACAS=1`) diz que a distribuicao e'
+// muito enviesada: das 59808 features, 36963 chegam a ser usadas, e
+//
+//     as 64 mais usadas cobrem 15.1% dos acessos   (64 KB)
+//     as 256                    30.6%              (256 KB)
+//     as 1024                   53.8%              (1 MB, cabe em L2)
+//     as 4096                   81.7%              (4 MB, cabe em L3)
+//
+// Metade dos acessos vai a 1024 linhas espalhadas por 61 MB. Juntas cabiam em
+// L2. Implementou-se a permutacao inteira -- tabelas reordenadas ao carregar,
+// indice mapeado uma vez onde a relacao e' calculada, e o mesmo mapeamento no
+// caminho de reconstrucao para as duas vias nao divergirem. Ficou correcta:
+// assinatura 1715838 com e sem, byte a byte.
+//
+// E deu **4.3% MAIS ciclos, a 2.6 sigma, com 10% MAIS faltas de dTLB**
+// (29.08G contra 27.89G, media de 8 corridas).
+//
+// Porque: o mapeamento obriga a uma consulta numa tabela de 119 KB por cada
+// relacao, ~9.5 por chamada, e essa consulta custa mais do que a localidade que
+// compra. Nao ha' forma de a evitar -- uma ordem por frequencia nao e' uma
+// funcao calculavel, tem de ser uma tabela. E as paginas enormes ja' tinham
+// apanhado a maior parte do problema de TLB, portanto sobrava menos do que o
+// histograma fazia parecer.
+//
+// O histograma fica, porque a medicao vale e nao custa nada desligada.
+
 static REDE: OnceLock<Option<RedeSf>> = OnceLock::new();
+
+/// Caminho posto pela opcao UCI `EvalFile`.
+///
+/// Existe porque as outras duas vias -- variavel de ambiente e caminho cravado
+/// na compilacao -- servem o OpenBench e a linha de comandos, e nenhuma delas
+/// e' alcancavel a partir de uma interface grafica. Uma lista de rating instala
+/// o binario e a rede numa pasta e espera poder apontar-lhe o caminho por
+/// `setoption`; sem isto o motor arranca SEM rede e joga na mesma, que e' o
+/// pior dos desfechos -- ninguem ve' um erro, ve' so' um motor mau.
+static CAMINHO_UCI: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// `setoption name EvalFile value <caminho>`.
+///
+/// Devolve `false` se a rede ja' tiver sido carregada, porque a partir dai o
+/// caminho nao muda nada e um chamador que pense o contrario fica a jogar com
+/// outra rede sem saber. O UCI manda as opcoes antes da primeira busca, que e'
+/// exactamente quando isto funciona.
+pub fn define_evalfile(caminho: &str) -> bool {
+    if REDE.get().is_some() {
+        return false;
+    }
+    *CAMINHO_UCI.lock().unwrap() = Some(caminho.to_string());
+    true
+}
+
+/// Onde procurar a rede quando ninguem a indicou.
+///
+/// Ao lado do executavel primeiro, na pasta corrente depois. E' a convencao que
+/// as interfaces graficas assumem: instala-se o motor e a rede juntos e nao se
+/// configura nada. Sem isto, o caminho por omissao anunciado no `uci` era uma
+/// string vazia e o utilizador tinha de adivinhar.
+fn procura_ao_lado() -> Option<String> {
+    const NOMES: [&str; 2] = ["kestrel.nnue", "nn-kestrel.nnue"];
+    let mut pastas: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(d) = exe.parent() {
+            pastas.push(d.to_path_buf());
+        }
+    }
+    pastas.push(std::path::PathBuf::from("."));
+    for d in pastas {
+        for nome in NOMES {
+            let p = d.join(nome);
+            if p.is_file() {
+                return Some(p.to_string_lossy().into_owned());
+            }
+        }
+    }
+    None
+}
+
+/// O caminho que `rede()` vai usar, para o `uci` o anunciar como omissao.
+pub fn caminho_evalfile() -> String {
+    if let Some(p) = CAMINHO_UCI.lock().unwrap().clone() {
+        return p;
+    }
+    std::env::var("KESTREL_NNUE_SF")
+        .ok()
+        .or_else(|| option_env!("KESTREL_NNUE_SF_COMPILADO").map(str::to_string))
+        .filter(|p| !p.is_empty())
+        .or_else(procura_ao_lado)
+        .unwrap_or_else(|| "<nenhuma>".to_string())
+}
 
 pub fn rede() -> Option<&'static RedeSf> {
     REDE.get_or_init(|| {
-        let path = std::env::var("KESTREL_NNUE_SF").ok()?;
+        // Caminho por ambiente, com o que foi cravado na compilacao como
+        // recurso.
+        //
+        // O OpenBench passa a rede ao `make` como `EVALFILE=<caminho>` e nao
+        // define variavel de ambiente nenhuma no motor. Sem esta segunda via, o
+        // binario que ele compila corre SEM rede: cai na avaliacao nula e mede
+        // heuristicas de busca contra ruido -- foi o que aconteceu, com o bench
+        // a dar 4354449 nos em vez de 1954973.
+        //
+        // Crava-se o CAMINHO e nao os 95 MB: o cliente guarda a rede em
+        // `Networks/<sha>` e o caminho absoluto mantem-se valido nessa maquina.
+        // A opcao UCI primeiro: e' a unica via que uma interface grafica tem,
+        // e quem a usa esta' a ser explicito. Descoberta ao lado do executavel
+        // em ultimo, para o caso em que ninguem configurou nada.
+        let path = CAMINHO_UCI
+            .lock()
+            .unwrap()
+            .clone()
+            .or_else(|| std::env::var("KESTREL_NNUE_SF").ok())
+            .or_else(|| option_env!("KESTREL_NNUE_SF_COMPILADO").map(str::to_string))
+            .filter(|p| !p.is_empty())
+            .or_else(procura_ao_lado)?;
         let bytes = std::fs::read(&path).ok()?;
-        carrega(&bytes)
+        let net = carrega(&bytes)?;
+        // So' as tabelas que se leem por linhas dispersas durante a busca. As
+        // pequenas nao valem a chamada: cabem em cache e a fatia nem chega a uma
+        // pagina enorme.
+        pede_paginas_enormes(&net.ft_threat_w);
+        pede_paginas_enormes(&net.ft_piece_w);
+        pede_paginas_enormes(&net.ft_pair_w);
+        pede_paginas_enormes(&net.ft_threat_psqt);
+        pede_paginas_enormes(&net.ft_piece_psqt);
+        Some(net)
     })
     .as_ref()
 }
@@ -1096,6 +1324,120 @@ pub fn roundtrip_bullet(net: &RedeSf) -> RedeSf {
         &fc0fw, &fc0fb, &fc1fw, &fc1fb, &fc2fw, &fc2fb)
 }
 
+
+pub fn para_bullet_pesos(net: &RedeSf) -> Vec<(String, Vec<f32>)> {
+    const FACT: usize = 704;
+    const BASE: usize = FACT + 1;
+    const NIN: usize = BASE + INPUT_DIM;
+    let n2 = 2 * L2 + 2 * L3;
+
+    let mut l0w = vec![0f32; NIN * L1];
+    let mut l0b = vec![0f32; L1];
+    for k in 0..L1 {
+        l0b[k] = net.ft_bias[k] as f32 / CONV_QA;
+    }
+    for f in 0..PIECE_DIM {
+        for k in 0..L1 {
+            l0w[(BASE + f) * L1 + k] = net.ft_piece_w[f * L1 + k] as f32 / CONV_QA;
+        }
+    }
+    for f in 0..THREAT_DIM {
+        for k in 0..L1 {
+            l0w[(BASE + PIECE_DIM + f) * L1 + k] = net.ft_threat_w[f * L1 + k] as f32 / CONV_QA;
+        }
+    }
+    for f in 0..PAIR_DIM {
+        for k in 0..L1 {
+            l0w[(BASE + PIECE_DIM + THREAT_DIM + f) * L1 + k] = net.ft_pair_w[f * L1 + k] as f32 / CONV_QA;
+        }
+    }
+
+    let mut psqtw = vec![0f32; NIN * NB];
+    for f in 0..PIECE_DIM {
+        for b in 0..NB {
+            psqtw[(BASE + f) * NB + b] = net.ft_piece_psqt[f * NB + b] as f32 / CONV_PSQT;
+        }
+    }
+    for f in 0..THREAT_DIM {
+        for b in 0..NB {
+            psqtw[(BASE + PIECE_DIM + f) * NB + b] = net.ft_threat_psqt[f * NB + b] as f32 / CONV_PSQT;
+        }
+    }
+    for f in 0..PAIR_DIM {
+        for b in 0..NB {
+            psqtw[(BASE + PIECE_DIM + THREAT_DIM + f) * NB + b] =
+                net.ft_pair_psqt[f * NB + b] as f32 / CONV_PSQT;
+        }
+    }
+    let psqtb = vec![0f32; NB];
+
+    let mut fc0w = vec![0f32; L1 * L2 * NB];
+    let mut fc0b = vec![0f32; L2 * NB];
+    let mut fc1w = vec![0f32; (2 * L2) * L3 * NB];
+    let mut fc1b = vec![0f32; L3 * NB];
+    let mut fc2w = vec![0f32; n2 * NB];
+    let mut fc2b = vec![0f32; NB];
+    for b in 0..NB {
+        let st = &net.stacks[b];
+        for o in 0..L2 {
+            fc0b[b * L2 + o] = st.fc0b[o] as f32 / CONV_B_FC0;
+            for i in 0..L1 {
+                fc0w[i * (L2 * NB) + b * L2 + o] = st.fc0w[o * L1 + i] as f32 / CONV_W_FC0;
+            }
+        }
+        for o in 0..L3 {
+            fc1b[b * L3 + o] = st.fc1b[o] as f32 / CONV_B_FC1;
+            for i in 0..2 * L2 {
+                fc1w[i * (L3 * NB) + b * L3 + o] = st.fc1w[o * (2 * L2) + i] as f32 / CONV_W_FC1;
+            }
+        }
+        for i in 0..n2 {
+            fc2w[i * NB + b] = st.fc2w[i] as f32 / CONV_W_FC2;
+        }
+        fc2b[b] = st.fc2b as f32 / CONV_B_FC2;
+    }
+    let fc0fw = vec![0f32; L1 * L2];
+    let fc0fb = vec![0f32; L2];
+
+    // O carregamento do bullet mete os pesos a ~metade (a semente compensava
+    // isto com o pre-factor ~1,844). Multiplicamos TUDO por KESTREL_WARM_SCALE
+    // (default 2,0) para cancelar o corte -- o oficial e' o arbitro. Escala
+    // separada para o PSQT (KESTREL_WARM_PSQT) porque, sendo linear, pode pedir
+    // um valor ligeiramente diferente do resto.
+    let s_geral: f32 = std::env::var("KESTREL_WARM_SCALE").ok().and_then(|v| v.parse().ok()).unwrap_or(2.0);
+    let s_psqt: f32 = std::env::var("KESTREL_WARM_PSQT").ok().and_then(|v| v.parse().ok()).unwrap_or(s_geral);
+    let escala = |mut v: Vec<f32>, s: f32| { for x in v.iter_mut() { *x *= s; } v };
+
+    vec![
+        ("l0w".to_string(), escala(l0w, s_geral)),
+        ("l0b".to_string(), escala(l0b, s_geral)),
+        ("fc0w".to_string(), escala(fc0w, s_geral)),
+        ("fc0b".to_string(), escala(fc0b, s_geral)),
+        ("fc1w".to_string(), escala(fc1w, s_geral)),
+        ("fc1b".to_string(), escala(fc1b, s_geral)),
+        ("fc2w".to_string(), escala(fc2w, s_geral)),
+        ("fc2b".to_string(), escala(fc2b, s_geral)),
+        ("fc0fw".to_string(), fc0fw),
+        ("fc0fb".to_string(), fc0fb),
+        ("psqtw".to_string(), escala(psqtw, s_psqt)),
+        ("psqtb".to_string(), psqtb),
+    ]
+}
+
+/// Escreve os pesos nomeados no formato do bullet: `id\n` + u64 comprimento + f32[].
+pub fn escreve_pesos_bullet(pesos: &[(String, Vec<f32>)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (id, data) in pesos {
+        out.extend_from_slice(id.as_bytes());
+        out.push(b'\n');
+        out.extend_from_slice(&(data.len() as u64).to_le_bytes());
+        for &v in data {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    out
+}
+
 pub fn de_bullet(
     molde: &RedeSf,
     l0w: &[f32], l0b: &[f32],
@@ -1174,8 +1516,8 @@ pub fn de_bullet(
     // corpo sozinho, com o PSQT anulado dos dois lados: sem negacao
     // correlaciona 0,7172, com negacao 0,5315. O PSQT e' que a quer -- a
     // semente que o inicializa nasceu com o sinal ao contrario do que o motor
-    // espera, e o motor esta' certo, porque le' a rede oficial ao bit contra o
-    // codigo do Stockfish.
+    // espera, e o motor esta' certo, porque le' a rede oficial ao bit contra a
+    // implementacao de referencia do formato.
     //
     // Isto explica o tecto: metade da rede vinha invertida em todas as
     // conversoes que fizemos, e a metade que estava bem era a que eu negava.
@@ -1322,6 +1664,158 @@ pub fn de_bullet(
     }
 }
 
+/// Quantas relacoes de ameaca se ENUMERAM para encontrar as que mudam.
+///
+/// A pergunta: da' para construir a lista de ameacas sujas DURANTE o proprio
+/// lance, enquanto nos reconstruimos a posicao anterior e re-enumeramos com o
+/// `relacoes_ameaca`. Se enumerarmos
+/// muitas para aplicar poucas, essa e' a diferenca de custo entre as duas
+/// mecanicas -- e ate' agora foi ESTIMADA, nunca medida. `KESTREL_RELS=1`.
+static REL_ENUM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REL_APLIC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REL_CHAM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REL_TOTAL_AP: [std::sync::atomic::AtomicU64; 6] = [
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+
+/// Quantas vezes o acumulador e' MATERIALIZADO contra quantas vezes a rede e'
+/// mesmo avaliada. Sao perguntas diferentes: o `garante_camada` corre em todo o
+/// no' -- inclusive em xeque e com a avaliacao ja' na TT -- so' para que os
+/// filhos tenham pai, e paga as ~30 linhas de pesos na mesma. A alternativa e'
+/// marcar o estado sujo e so' materializar a cadeia quando alguem avalia --
+/// medida e rejeitada, ver o commit que a testou. `KESTREL_RELS=1`.
+static ACC_MATERIALISED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ACC_FROM_PARENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static EVAL_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ACC_REFRESH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// King moves that force a refresh, split into [only the pieces change, the
+/// threats change too]. The first group is what the hybrid update recovers.
+/// Quantas PECAS diferem entre a `bb` da cache do rei e a posicao a corrigir.
+///
+/// Decide se estender o hibrido as ameacas compensa: a correccao custa
+/// ~5.8 linhas de ameaca por peca diferente, contra as ~110 features que um
+/// refresh completo enumera. Poucas pecas e' barato; muitas nao.
+static DIF_PECAS: [std::sync::atomic::AtomicU64; 2] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+static HIBRIDO_OK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static HIBRIDO_CONFERE: [std::sync::atomic::AtomicU64; 2] = [
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+
+fn verifica_hibrido() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KESTREL_VERIFICA_HIBRIDO").is_some())
+}
+static REI_CLASSE: [std::sync::atomic::AtomicU64; 2] = [
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+static PARENT_HIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PARENT_MISS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DIRTY_OK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DIRTY_BAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static WALK_OK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static WALK_PLIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Porque e' que o recuo desistiu: 0=tentativas, 1=sem antepassado calculado,
+/// 2=a cadeia nao liga ao tabuleiro, 3=lance de rei pelo meio, 4=delta falhou.
+static WALK_EXIT: [std::sync::atomic::AtomicU64; 5] = [
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+#[inline(always)]
+fn walk_exit(i: usize) {
+    WALK_EXIT[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline(always)]
+fn verify_dirty() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KESTREL_VERIFICA_SUJAS").is_some())
+}
+
+/// Contar uma avaliacao completa da rede (passagem densa), para separar
+/// "actualizei o acumulador" de "avaliei mesmo".
+#[inline(always)]
+pub fn count_eval() {
+    if diag_rels() {
+        EVAL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[inline(always)]
+fn diag_rels() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KESTREL_RELS").is_some())
+}
+
+pub fn imprime_rels() {
+    if !diag_rels() {
+        return;
+    }
+    use std::sync::atomic::Ordering::Relaxed;
+    let (e, a, c) = (REL_ENUM.load(Relaxed), REL_APLIC.load(Relaxed), REL_CHAM.load(Relaxed).max(1));
+    eprintln!(
+        "ameacas: {:.1} relacoes enumeradas por chamada, {:.1} features aplicadas -- {:.1}x",
+        e as f64 / c as f64, a as f64 / c as f64,
+        if a > 0 { e as f64 / a as f64 } else { 0.0 }
+    );
+    // Os totais em bruto, e nao so' as medias: sem eles nao se sabe se o custo
+    // vem de cada actualizacao ser cara ou de haver muitas -- que sao dois
+    // problemas diferentes com solucoes diferentes.
+    eprintln!("brutos: {c} chamadas de delta, {e} relacoes, {a} features aplicadas");
+    let (m, p, ev) = (ACC_MATERIALISED.load(Relaxed), ACC_FROM_PARENT.load(Relaxed), EVAL_CALLS.load(Relaxed));
+    eprintln!(
+        "acumulador: {m} materializacoes, {p} vindas do pai; rede avaliada {ev} vezes \
+         -- {:.2} materializacoes por avaliacao",
+        if ev > 0 { m as f64 / ev as f64 } else { 0.0 }
+    );
+    let r = ACC_REFRESH.load(Relaxed);
+    eprintln!(
+        "refresh completo: {r} vezes",
+    );
+    let (ro, rp) = (WALK_OK.load(Relaxed), WALK_PLIES.load(Relaxed));
+    eprintln!(
+        "recuo pela cadeia: {ro} vezes, {:.1} plies em media; tentativas {}, \
+         sem-antepassado {}, cadeia-nao-liga {}, rei {}, delta-falhou {}",
+        if ro > 0 { rp as f64 / ro as f64 } else { 0.0 },
+        WALK_EXIT[0].load(Relaxed), WALK_EXIT[1].load(Relaxed),
+        WALK_EXIT[2].load(Relaxed), WALK_EXIT[3].load(Relaxed),
+        WALK_EXIT[4].load(Relaxed)
+    );
+    if verify_dirty() {
+        let (sb, sm) = (DIRTY_OK.load(Relaxed), DIRTY_BAD.load(Relaxed));
+        eprintln!("sujas do make_move: {sb} certas, {sm} ERRADAS");
+    }
+    eprintln!("hibrido de rei aplicado: {} vezes", HIBRIDO_OK.load(Relaxed));
+    let (dp, dn) = (DIF_PECAS[0].load(Relaxed), DIF_PECAS[1].load(Relaxed));
+    if dn > 0 {
+        eprintln!(
+            "cache do rei contra a posicao: {:.1} pecas diferentes por hibrido \
+             ({dp} em {dn}) -- refresh enumera ~110 features",
+            dp as f64 / dn as f64
+        );
+    }
+    if verifica_hibrido() {
+        eprintln!("hibrido conferido: {} certos, {} ERRADOS",
+            HIBRIDO_CONFERE[0].load(Relaxed), HIBRIDO_CONFERE[1].load(Relaxed));
+    }
+    let (so_peca, tambem_ameaca) = (REI_CLASSE[0].load(Relaxed), REI_CLASSE[1].load(Relaxed));
+    eprintln!(
+        "lances de rei que invalidam: {so_peca} so' as PECAS, {tambem_ameaca} tambem as ameacas \
+         -- {:.0}% recuperaveis por actualizacao hibrida",
+        so_peca as f64 / (so_peca + tambem_ameaca).max(1) as f64 * 100.0
+    );
+    let (ph, pm) = (PARENT_HIT.load(Relaxed), PARENT_MISS.load(Relaxed));
+    eprintln!(
+        "pilha por ply: {ph} acertos, {pm} falhas -- {:.1}% de acerto; \
+         dos que falham, {:.1}% acabam em refresh completo",
+        ph as f64 / (ph + pm).max(1) as f64 * 100.0,
+        r as f64 / ((pm + m) * 2).max(1) as f64 * 100.0
+    );
+}
+
 // ---- Incremental accumulator ----
 //
 // Measured: the reader was spending ~90% of its time reading ~290 KB of
@@ -1380,12 +1874,25 @@ fn linha_peso(net: &RedeSf, u: usize, i: usize) -> i16 {
 /// ameacas, nao a contagem de linhas.
 ///
 /// Fundir as passagens -- manter um pedaco do acumulador em registos enquanto
-/// as ~12 linhas de um lance lhe passam por cima, como o Stockfish faz -- foi
-/// escrito e MEDIDO: 98184 contra 97506 nps em cinco rondas, ou seja empate,
+/// as ~12 linhas de um lance lhe passam por cima -- foi escrito e MEDIDO: 98184 contra 97506 nps em cinco rondas, ou seja empate,
 /// com os melhores tempos tambem empatados. O acumulador sao 2 KiB e ja' fica
 /// em L1 entre as chamadas; o que custa e' percorrer as linhas de peso, e
 /// nenhuma arrumacao das passagens evita esse trafego. Nao repetir sem uma
 /// razao nova.
+/// Acumular o PSQT num array LOCAL e escrever em memoria uma so' vez no fim,
+/// em vez de somar em `st.psqt[pov][b]` por cada uma das oito casas de cada
+/// feature, foi escrito e MEDIDO: fica ~1% MAIS LENTO (mediana 20,30s contra
+/// 20,12s, minimo 19,43 contra 19,06, dez corridas alternadas de cada). O
+/// perfil parecia dar-lhe razao -- `addq %rax,(%rbx)` a 7,0% e o `subq` a 2,2%
+/// dentro de `delta_por_lance` -- e depois da alteracao essa funcao desce de
+/// 17,7% para 15,7%. Mas percentagem de perfil e' RELATIVA: uma fatia menor de
+/// um todo mais lento nao e' um ganho. So' o tempo absoluto decide.
+///
+/// Duas armadilhas de medicao que este caso mostrou, e valem para o proximo:
+/// medir os dois binarios em blocos separados deu +18% falsos (a maquina
+/// deriva; e' preciso ALTERNAR), e o NPS do bench varia ~20% entre corridas do
+/// mesmo binario, portanto nao serve -- usar tempo total, muitas corridas,
+/// comparar medianas E minimos. Nao repetir sem uma razao nova.
 /// Pedir as linhas a memoria antes de as usar (`_mm_prefetch` no inicio de cada
 /// uma, todas de uma vez antes de aplicar qualquer) foi escrito e MEDIDO:
 /// 121459 contra 121107 nps em quatro rondas, empate. As ~24 linhas estao
@@ -1393,28 +1900,466 @@ fn linha_peso(net: &RedeSf, u: usize, i: usize) -> i16 {
 /// ja' as tinha em voo ao mesmo tempo por execucao fora de ordem -- as faltas
 /// nao estavam a acontecer em serie, como eu supus. Nao repetir sem uma razao
 /// nova.
-fn aplica_linha(net: &RedeSf, acc: &mut [i16], u: usize, somar: bool) {
-    if u < U_THREAT {
-        let row = &net.ft_piece_w[u * L1..(u + 1) * L1];
-        if somar {
-            for (a, &w) in acc.iter_mut().zip(row) { *a = a.wrapping_add(w); }
-        } else {
-            for (a, &w) in acc.iter_mut().zip(row) { *a = a.wrapping_sub(w); }
+/// O nucleo, com o comprimento no TIPO e o sinal em const generic.
+///
+/// Porque isto e' diferente de `&mut [i16]` com um `bool`, e porque foi a
+/// linha mais quente do programa inteiro (7,83%):
+///
+/// - `&mut [i16; L1]` diz ao compilador que sao exactamente 1024. Com fatias
+///   o `zip` tinha de comparar os dois comprimentos em execucao e parar no
+///   menor -- e um ciclo cujo fim o compilador nao conhece nao se desenrola
+///   como deve.
+/// - `const SOMAR: bool` faz o Rust compilar DUAS funcoes, cada uma sem ramo
+///   nenhum. Com um `bool` normal era um salto por chamada dentro do ciclo
+///   mais quente que temos.
+///
+/// Nao e' micro-optimizacao: e' deixar de escrever C em Rust. O gerador de
+/// codigo sabe fazer isto sozinho, desde que lhe digamos o que sabemos.
+#[inline(always)]
+fn soma_linha_i16<const SOMAR: bool>(acc: &mut [i16; L1], row: &[i16; L1]) {
+    for (a, &w) in acc.iter_mut().zip(row.iter()) {
+        *a = if SOMAR { a.wrapping_add(w) } else { a.wrapping_sub(w) };
+    }
+}
+
+#[inline(always)]
+fn soma_linha_i8<const SOMAR: bool>(acc: &mut [i16; L1], row: &[i8; L1]) {
+    for (a, &w) in acc.iter_mut().zip(row.iter()) {
+        let w = w as i16;
+        *a = if SOMAR { a.wrapping_add(w) } else { a.wrapping_sub(w) };
+    }
+}
+
+/// Applies every changed feature in ONE pass over the accumulator, with the
+/// block held in registers.
+///
+/// WHY, with the number that motivated it: for the same bench and the SAME
+/// network, Stockfish issues 11.5 billion L1 loads and we issue 23.7. Our L1
+/// MISS RATE is the better of the two (10.4% against 16.1%) -- the data is in
+/// cache, we simply ask for it twice as often. The extra asks are here: one
+/// full 1024-element read-modify-write of the accumulator per changed feature,
+/// about ten per move, where one pass would do.
+///
+/// REGS = 8 of the 16 YMM registers, leaving the rest for the row loads and
+/// addressing. 8 registers x 16 lanes = 128 i16 per tile, 8 tiles for L1.
+/// Sixteen would hold a bigger slice but spills, which is what the compiler
+/// did when this was written as safe slices -- and that version measured 9.4%
+/// SLOWER, which is what sent me to look at the load counts in the first place.
+///
+/// Raw pointers and explicit intrinsics, not slices: the safe version paid a
+/// bounds check per tile PER FEATURE, four times more of them than the code it
+/// replaced, and left the vectorisation to the compiler.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[target_feature(enable = "avx2")]
+unsafe fn aplica_lote_avx2(net: &RedeSf, acc: *mut i16, feats: &[(u32, bool)]) {
+    use std::arch::x86_64::*;
+    const LANES: usize = 16;
+    const REGS: usize = 8;
+    const TILE: usize = LANES * REGS;
+
+    let mut base = 0usize;
+    while base < L1 {
+        let mut r = [_mm256_setzero_si256(); REGS];
+        for k in 0..REGS {
+            r[k] = _mm256_loadu_si256(acc.add(base + k * LANES) as *const __m256i);
         }
+
+        // MEDIDO E REJEITADO (2026-08-28): icar o `if somar` e o `u <
+        // U_THREAT` para fora do ciclo dos registos, duplicando-o. O `perf
+        // annotate` mostrava `test %bpl,%bpl` a 3,1% e `cmp` a 3,0% no meio das
+        // operacoes vectoriais, o que parecia dinheiro no chao -- mas medido
+        // deu 0,5% menos leituras e 1,8% MAIS ciclos. O compilador ja' os
+        // resolvia por predicacao, e duplicar o ciclo so' aumentou o codigo.
+        for &(u, somar) in feats {
+            let u = u as usize;
+            if u < U_THREAT {
+                let row = net.ft_piece_w.as_ptr().add(u * L1 + base);
+                for k in 0..REGS {
+                    let w = _mm256_loadu_si256(row.add(k * LANES) as *const __m256i);
+                    r[k] = if somar { _mm256_add_epi16(r[k], w) } else { _mm256_sub_epi16(r[k], w) };
+                }
+            } else {
+                let (tab, f) = if u < U_PAIR {
+                    (net.ft_threat_w.as_ptr(), u - U_THREAT)
+                } else {
+                    (net.ft_pair_w.as_ptr(), u - U_PAIR)
+                };
+                let row = tab.add(f * L1 + base);
+                for k in 0..REGS {
+                    // 16 pesos i8 -> 16 i16, que e' o que o acumulador guarda.
+                    let b = _mm_loadu_si128(row.add(k * LANES) as *const __m128i);
+                    let w = _mm256_cvtepi8_epi16(b);
+                    r[k] = if somar { _mm256_add_epi16(r[k], w) } else { _mm256_sub_epi16(r[k], w) };
+                }
+            }
+        }
+
+        for k in 0..REGS {
+            _mm256_storeu_si256(acc.add(base + k * LANES) as *mut __m256i, r[k]);
+        }
+        base += TILE;
+    }
+}
+
+/// LIGADO por omissao. `KESTREL_LOTE=0` volta ao caminho linha-a-linha, que
+/// so' existe agora para comparacao -- medido a -5,3% de ciclos e -14,4% de
+/// leituras L1 contra ele, com contagem de nos identica.
+/// Instrumentacao temporaria: quantas features muda um lance, mesmo.
+///
+/// A conta de guardanapo dizia 8 -- peca que sai, peca que entra, captura --
+/// e o perfil dizia 3170 leituras por no' nesta funcao, cinco vezes mais do que
+/// 8 features x 64 leituras por linha dariam. Uma das duas estava errada, e sem
+/// medir nao se sabe qual. Ligar com KESTREL_CONTA_FEATS=1.
+pub static CONTA_CHAMADAS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static CONTA_FEATS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static CONTA_I8: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static HISTO: [std::sync::atomic::AtomicU64; 12] = [const { std::sync::atomic::AtomicU64::new(0) }; 12];
+
+fn conta_activa() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("KESTREL_CONTA_FEATS").as_deref() == Ok("1"))
+}
+
+pub fn relatorio_feats() -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let c = CONTA_CHAMADAS.load(Relaxed).max(1);
+    let f = CONTA_FEATS.load(Relaxed);
+    let i8n = CONTA_I8.load(Relaxed);
+    let mut s = format!(
+        "feats: {} chamadas, {} features, media {:.2}/chamada ({:.0}% i8)\n  histograma: ",
+        c, f, f as f64 / c as f64, i8n as f64 / f.max(1) as f64 * 100.0
+    );
+    for (i, h) in HISTO.iter().enumerate() {
+        let v = h.load(Relaxed);
+        if v > 0 {
+            let et = if i == 11 { ">=44".to_string() } else { format!("{}-{}", i * 4, i * 4 + 3) };
+            s += &format!("{}:{:.1}%  ", et, v as f64 / c as f64 * 100.0);
+        }
+    }
+    s
+}
+
+/// Medicao: quanto custa o bloco de ameacas, em nps.
+///
+/// A nossa rede e' SFNNv16 -- `HalfKAv2_hm` + `Full_Threats` + `PP_3Wide`,
+/// 86896 entradas. Um motor com uma rede da linha v13 tem so' `HalfKAv2_hm`,
+/// 22528, e por isso muda ~2.2 features por lance onde nos mudamos 9.76, das
+/// quais 77% sao ameacas e pares. Mesma largura de acumulador, mesmo custo por
+/// linha -- ele carrega um quarto das linhas.
+///
+/// Com KESTREL_SEM_AMEACAS=1 os dois blocos deixam de ser calculados e
+/// aplicados. A AVALIACAO FICA ERRADA e a assinatura do bench muda: isto nao e'
+/// uma opcao de jogo, e' uma regua. Serve para saber se vale a pena treinar uma
+/// rede sem esses blocos antes de gastar dias a treina-la.
+/// Regua: desligar SO' os pares de peoes, mantendo as ameacas.
+///
+/// Existe para medir a variante "HalfKA + PP_3Wide, sem Full_Threats" sem
+/// treinar nada: o custo por lance de cada bloco e' independente do que a rede
+/// aprendeu, portanto mede-se agora e so' depois se decide se vale a pena
+/// treinar. `KESTREL_SEM_PARES=1`.
+/// Quantas ameacas estao ACTIVAS numa posicao, contra as que MUDAM num lance.
+///
+/// Decide se vale a pena calcular o bloco de ameacas de raiz so' onde se avalia
+/// (a ideia de "so' nas ultimas profundidades") em vez de o manter incremental.
+/// Se as activas forem muitas mais que as que mudam, calcular de raiz e' pior --
+/// e o acumulador incremental ja' e' a resposta certa.
+pub static ACT_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static ACT_C: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Histograma de acessos por feature de ameaca.
+///
+/// A tabela tem THREAT_DIM * L1 = 61 MB e le'-se por linhas dispersas. Se os
+/// acessos forem enviesados -- ha' ameacas comuns e ameacas que quase nunca
+/// acontecem -- reordenar as linhas por frequencia poe as quentes juntas e a
+/// cache passa a servi-las. E' uma PERMUTACAO: a rede e' a mesma, a assinatura
+/// do bench nao muda, e nao se treina nada. `KESTREL_HISTO_AMEACAS=1`.
+pub static HISTO_AM: std::sync::OnceLock<Vec<std::sync::atomic::AtomicU32>> = std::sync::OnceLock::new();
+
+fn histo_activo() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("KESTREL_HISTO_AMEACAS").as_deref() == Ok("1"))
+}
+
+fn histo_conta(idx: usize) {
+    if !histo_activo() {
+        return;
+    }
+    let h = HISTO_AM.get_or_init(|| (0..THREAT_DIM).map(|_| std::sync::atomic::AtomicU32::new(0)).collect());
+    if let Some(c) = h.get(idx) {
+        c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// A permutacao que poe as linhas mais usadas primeiro.
+///
+/// Medido no bench: as 1024 mais usadas cobrem 53.8% dos acessos e as 4096
+/// cobrem 81.7%. Hoje estao espalhadas por 61 MB; juntas cabem em L2 e L3.
+pub fn permutacao_por_uso() -> Vec<u32> {
+    let Some(h) = HISTO_AM.get() else { return Vec::new() };
+    let mut ord: Vec<(u64, u32)> = h
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.load(std::sync::atomic::Ordering::Relaxed) as u64, i as u32))
+        .collect();
+    // Decrescente por uso; empates pelo indice, para ser determinista.
+    ord.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    // `perm[antigo] = novo`
+    let mut perm = vec![0u32; THREAT_DIM];
+    for (novo, &(_, antigo)) in ord.iter().enumerate() {
+        perm[antigo as usize] = novo as u32;
+    }
+    perm
+}
+
+pub fn relatorio_histo() -> String {
+    let Some(h) = HISTO_AM.get() else {
+        return "sem histograma\n".to_string();
+    };
+    let mut v: Vec<u64> = h.iter().map(|c| c.load(std::sync::atomic::Ordering::Relaxed) as u64).collect();
+    let tot: u64 = v.iter().sum();
+    let usadas = v.iter().filter(|x| **x > 0).count();
+    v.sort_unstable_by(|a, b| b.cmp(a));
+    let mut s = format!(
+        "ameacas: {} acessos, {} das {} features usadas ({:.1}%)\n",
+        tot, usadas, THREAT_DIM, usadas as f64 / THREAT_DIM as f64 * 100.0
+    );
+    for k in [64usize, 256, 1024, 4096, 16384] {
+        let acc: u64 = v.iter().take(k).sum();
+        s += &format!(
+            "  as {k} mais usadas cobrem {:.1}% dos acessos ({} KB de pesos)\n",
+            acc as f64 / tot.max(1) as f64 * 100.0,
+            k * L1 / 1024
+        );
+    }
+    s
+}
+
+/// Manetes dos blocos importados, expostas por `setoption`.
+///
+/// Existiam como variaveis de ambiente, e isso nao chega: um torneio manda
+/// `setoption`, nao sabe por ambiente por motor. Sem elas expostas nao se pode
+/// medir o que cada bloco importado vale em jogo -- que e' a disciplina que o
+/// Triumviratus usa em 82 das suas manetes ("OFF = byte-identico").
+///
+/// -1 = segue a variavel de ambiente (comportamento antigo), 0 = ligado,
+/// 1 = desligado.
+pub static M_SEM_AMEACAS: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+pub static M_SEM_PARES: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+pub static M_SEM_HIBRIDO: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+
+fn manete(a: &std::sync::atomic::AtomicI8, ambiente: bool) -> bool {
+    match a.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => ambiente,
+    }
+}
+
+// Sem chamador desde que `SemAmeacas`/`SemPares` sairam do `setoption`.
+// Ficam porque documentam o protocolo -1/0/1 que o `set_sem_hibrido` usa.
+#[allow(dead_code)]
+pub fn set_sem_ameacas(v: bool) { M_SEM_AMEACAS.store(v as i8, std::sync::atomic::Ordering::Relaxed); }
+#[allow(dead_code)]
+pub fn set_sem_pares(v: bool) { M_SEM_PARES.store(v as i8, std::sync::atomic::Ordering::Relaxed); }
+
+/// O que dizer alto quando uma regua esta' a partir a avaliacao de proposito.
+///
+/// A regra do ESTADO.md: o binario deve dizer qual avaliacao esta' a usar, e
+/// nunca jogar as cegas em silencio. Uma regua ligada e' avaliacao errada por
+/// desenho -- os numeros de Elo que dai' saiam nao valem nada, e quem ler o log
+/// da partida tem de o saber sem ter de adivinhar.
+pub fn regua_activa() -> Option<String> {
+    let (a, p) = (sem_ameacas(), sem_pares());
+    if !a && !p {
+        return None;
+    }
+    let quais = match (a, p) {
+        (true, _) => "sem o bloco de ameacas NEM os pares de peoes",
+        (false, true) => "sem os pares de peoes",
+        _ => unreachable!(),
+    };
+    Some(format!(
+        "REGUA ACTIVA: a avaliar {quais}. A avaliacao esta' ERRADA de proposito \
+         -- isto e' uma medicao, nao um motor. Nenhum resultado de partida daqui \
+         tem significado."
+    ))
+}
+pub fn set_sem_hibrido(v: bool) { M_SEM_HIBRIDO.store(v as i8, std::sync::atomic::Ordering::Relaxed); }
+
+fn sem_pares() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    manete(&M_SEM_PARES,
+           *ON.get_or_init(|| std::env::var("KESTREL_SEM_PARES").as_deref() == Ok("1")))
+}
+
+fn sem_ameacas() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    manete(&M_SEM_AMEACAS,
+           *ON.get_or_init(|| std::env::var("KESTREL_SEM_AMEACAS").as_deref() == Ok("1")))
+}
+
+fn lote_activo() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("KESTREL_LOTE").as_deref() != Ok("0"))
+}
+
+#[inline]
+fn aplica_lote(net: &RedeSf, acc: &mut [i16], feats: &[(u32, bool)]) {
+    if feats.is_empty() {
+        return;
+    }
+    if conta_activa() {
+        use std::sync::atomic::Ordering::Relaxed;
+        CONTA_CHAMADAS.fetch_add(1, Relaxed);
+        CONTA_FEATS.fetch_add(feats.len() as u64, Relaxed);
+        CONTA_I8.fetch_add(feats.iter().filter(|(u, _)| *u as usize >= U_THREAT).count() as u64, Relaxed);
+        HISTO[(feats.len() / 4).min(11)].fetch_add(1, Relaxed);
+    }
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    unsafe {
+        aplica_lote_avx2(net, acc.as_mut_ptr(), feats);
+        return;
+    }
+    #[allow(unreachable_code)]
+    for &(u, somar) in feats {
+        aplica_linha(net, acc, u as usize, somar);
+    }
+}
+
+/// MEASURED AND REJECTED (2026-08-28): applying every changed feature in one
+/// pass over the accumulator, instead of one pass per feature.
+///
+/// The shape here is `for feature { for chunk }` -- a full 1024-element read
+/// and write of the accumulator per changed feature, ~10 of them per move.
+/// Inverting it to `for chunk { for feature }`, with a 256-element block held
+/// in registers across all features, cuts the load/add/store count from 480 to
+/// 352 per block. It measured **9.4% SLOWER** (426k -> 383k nps, idle machine,
+/// identical node count).
+///
+/// The arithmetic was right and the conclusion wrong, because the accumulator
+/// was never the cost: 2 KB of it live in L1. The cost is the weight rows --
+/// the threat table is 61 MB and every row is a trip to DRAM. Read one row at
+/// a time they are a single sequential stream the prefetcher follows; read
+/// interleaved across features they are ten streams of 512-byte pieces, and it
+/// stops following. Fewer instructions, worse locality, net loss.
+///
+/// Worth revisiting only if the weight tables ever fit in cache.
+
+/// Pede uma linha de pesos a' memoria antes de ela ser precisa.
+///
+/// A tabela das ameacas tem 59808 linhas de 1024 pesos: 61 MB, que nao cabem
+/// em cache nenhuma. Cada linha aplicada e' uma falha ate' a' DRAM, e o motor
+/// aplica ~15 por actualizacao. Mas os indices sao TODOS conhecidos no passo
+/// anterior, quando as relacoes sao convertidas em features -- ha' portanto
+/// uma volta inteira de folga entre saber a morada e precisar do conteudo.
+///
+/// Um pedido por linha de cache: a linha de pesos sao 16 delas, e o prefetcher
+/// da maquina nao as apanha sozinho porque de uma feature para a seguinte o
+/// salto nao e' sequencial.
+
+/// Salto entre pedidos, em bytes.
+///
+/// MEDIDO: 64 e 128 dao o mesmo (-2,6% e -3,0% de ciclos, dentro do ruido um
+/// do outro), 128 com metade das instrucoes -- o prefetcher de linha adjacente
+/// cobre a segunda. 256 ja' salta de mais e PIORA 1%: a linha tem 1 KB e com
+/// esse passo ficam quatro pedidos para dezasseis linhas de cache, tarde de
+/// mais para o resto.
+///
+/// E' pedido so' o primeiro QUARTO de cada linha, nao a linha toda: dentro da
+/// linha a leitura e' sequencial, portanto o prefetcher da maquina apanha o
+/// resto sozinho assim que os primeiros 256 bytes chegam. Pedir os 1024 custa
+/// quatro vezes as instrucoes para o mesmo efeito -- medido, um quarto e' 1,8%
+/// MELHOR do que a linha inteira, e metade fica igual a` inteira.
+/// 2026-08-28: passou a pedir-se a LINHA INTEIRA, nao um quarto dela.
+///
+/// O quarto foi afinado quando cada linha era aplicada de uma assentada -- o
+/// pedido do inicio chegava para o prefetcher do hardware apanhar o resto. Com
+/// o lote (ver `aplica_lote_avx2`) a linha passou a ser lida em oito pedacos,
+/// intercalados com as das outras features: entre o primeiro pedaco e o
+/// segundo passam nove linhas de outras, o prefetcher perde o rasto, e o
+/// quarto inicial deixa de cobrir o que se segue.
+///
+/// Medido em dez pares alternados: -2,2% de ciclos na media e -7,5% no minimo.
+const PASSO: usize = 128;
+
+#[inline(always)]
+fn adianta<T>(p: &[T], off: usize, n: usize) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if off + n > p.len() {
+            return;
+        }
+        unsafe {
+            use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+            let base = p.as_ptr().add(off) as *const i8;
+            let bytes = n * std::mem::size_of::<T>();
+            let mut o = 0;
+            while o < bytes {
+                _mm_prefetch(base.add(o), _MM_HINT_T0);
+                o += PASSO;
+            }
+        }
+    }
+}
+
+/// Aplica varias linhas de PECA numa so' travessia do acumulador.
+///
+/// A forma ingenua -- `aplica_linha` por peca -- le' e escreve os 1024 valores
+/// do acumulador uma vez POR PECA. No hibrido do rei sao 29,9 pecas diferentes
+/// em media, ou seja sessenta travessias onde bastavam duas. O custo nao esta'
+/// no numero de linhas; esta' no numero de vezes que se atravessa o acumulador.
+///
+/// Percorre-se em fatias que cabem nos registos: carrega-se a fatia para um
+/// buffer local, aplicam-se TODAS as adicoes e TODAS as subtraccoes sobre ele,
+/// e escreve-se uma vez. Com `target-cpu=x86-64-v3` o compilador vectoriza os
+/// ciclos internos; a fatia de 64 `i16` sao quatro registos YMM, com folga para
+/// o compilador manter os temporarios sem despejar nada para memoria.
+///
+/// So' PECAS: todos os indices vindos de `indice_peca` estao abaixo de
+/// `U_THREAT` e portanto na tabela `i16`. Ameacas e pares vivem noutras
+/// tabelas, com outra largura, e nao entram aqui.
+fn aplica_lote_pecas(net: &RedeSf, acc: &mut [i16; L1], somar: &[usize], subtrair: &[usize]) {
+    const FATIA: usize = 64;
+    let mut off = 0;
+    while off < L1 {
+        let fim = (off + FATIA).min(L1);
+        let n = fim - off;
+        let mut reg = [0i16; FATIA];
+        reg[..n].copy_from_slice(&acc[off..fim]);
+        for &u in somar {
+            let linha = &net.ft_piece_w[u * L1 + off..u * L1 + fim];
+            for i in 0..n {
+                reg[i] = reg[i].wrapping_add(linha[i]);
+            }
+        }
+        for &u in subtrair {
+            let linha = &net.ft_piece_w[u * L1 + off..u * L1 + fim];
+            for i in 0..n {
+                reg[i] = reg[i].wrapping_sub(linha[i]);
+            }
+        }
+        acc[off..fim].copy_from_slice(&reg[..n]);
+        off = fim;
+    }
+}
+
+fn aplica_linha(net: &RedeSf, acc: &mut [i16], u: usize, somar: bool) {
+    // Uma verificacao de comprimento a' entrada, e dai' para dentro o
+    // compilador ja' sabe tudo.
+    let acc: &mut [i16; L1] = acc.try_into().expect("acumulador com comprimento errado");
+    if u < U_THREAT {
+        let row: &[i16; L1] =
+            net.ft_piece_w[u * L1..(u + 1) * L1].try_into().unwrap();
+        if somar { soma_linha_i16::<true>(acc, row) } else { soma_linha_i16::<false>(acc, row) }
     } else {
-        let (f, row) = if u < U_PAIR {
+        let row: &[i8; L1] = if u < U_PAIR {
             let f = u - U_THREAT;
-            (f, &net.ft_threat_w[f * L1..(f + 1) * L1])
+            net.ft_threat_w[f * L1..(f + 1) * L1].try_into().unwrap()
         } else {
             let f = u - U_PAIR;
-            (f, &net.ft_pair_w[f * L1..(f + 1) * L1])
+            net.ft_pair_w[f * L1..(f + 1) * L1].try_into().unwrap()
         };
-        let _ = f;
-        if somar {
-            for (a, &w) in acc.iter_mut().zip(row) { *a = a.wrapping_add(w as i16); }
-        } else {
-            for (a, &w) in acc.iter_mut().zip(row) { *a = a.wrapping_sub(w as i16); }
-        }
+        if somar { soma_linha_i8::<true>(acc, row) } else { soma_linha_i8::<false>(acc, row) }
     }
 }
 
@@ -1439,20 +2384,56 @@ fn feats_unificadas(
     }
     out[ini..].sort_unstable();
 
-    add_threat_features(atk, board, pov, t);
-    let ini = out.len();
-    for &f in t.iter() {
-        out.push((U_THREAT + f) as u32);
+    // As manetes tambem valem AQUI, e nao so' no `delta_por_lance`.
+    //
+    // Estavam so' la'. Como este e' o caminho do refresh -- e o `hibrido_rei` e
+    // a cache da casa de rei partem do que ele deixa -- as ameacas voltavam a
+    // ser somadas de cada vez que o delta nao pegava, contra um delta que as
+    // tinha saltado. Com `KESTREL_SEM_DELTA=1`, que forca este caminho, o
+    // interruptor nao fazia rigorosamente nada: cp 40 / 39553 nos com e sem
+    // ele. Uma regua que mede o mesmo nos dois lados nao e' uma regua.
+    if !sem_ameacas() {
+        add_threat_features(atk, board, pov, t);
+        let ini = out.len();
+        for &f in t.iter() {
+            out.push((U_THREAT + f) as u32);
+        }
+        out[ini..].sort_unstable();
     }
-    out[ini..].sort_unstable();
 
-    add_pair_features(board, pov, pr);
-    let ini = out.len();
-    for &f in pr.iter() {
-        out.push((U_PAIR + (f - PAIR_BASE)) as u32);
+    // Os pares caem com as ameacas, como no delta (`mexeu_peao`): desligar o
+    // bloco de ameacas sem desligar os pares mediria uma terceira coisa que
+    // nao corresponde a rede nenhuma que se possa treinar.
+    if !sem_ameacas() && !sem_pares() {
+        add_pair_features(board, pov, pr);
+        let ini = out.len();
+        for &f in pr.iter() {
+            out.push((U_PAIR + (f - PAIR_BASE)) as u32);
+        }
+        out[ini..].sort_unstable();
     }
-    out[ini..].sort_unstable();
 }
+
+/// MEASURED AND REJECTED (2026-08-28): aligning the accumulator to a cache
+/// line.
+///
+/// `acc: [Vec<i16>; 2]` promises two-byte alignment and the allocator gives
+/// four, so every 256-bit load into it is unaligned and some straddle a
+/// 64-byte line. Wrapping it in `#[repr(align(64))] struct(...)` boxed, with
+/// `Deref` to `[i16]` so the call sites do not change, fixes that -- and
+/// measured **1 to 4% MORE cycles**, three pairs, never better (19.81 vs 19.63
+/// and 19.95 vs 19.25 billion). Instruction count rose 0.7% and IPC fell from
+/// 2.000 to 1.914.
+///
+/// The reason to expect a gain was real; the reason it did not appear is that
+/// modern cores split an unaligned load into the two lines for free when both
+/// are already resident, and ours are: the accumulator is 2 KB and lives in L1
+/// throughout. What the wrapper added instead was a layer of `Deref` the
+/// optimiser did not see through as cleanly.
+///
+/// Measured in CYCLES, not wall clock: the machine was serving the training
+/// feed, and three wall-clock runs of each gave 409k against 412k nps with 5%
+/// spread -- indistinguishable, and it would have been read as a small win.
 
 struct EstadoAcc {
     valido: bool,
@@ -1482,7 +2463,12 @@ struct EstadoAcc {
     conta: Vec<i8>,
     tocadas: Vec<u32>,
     x: Vec<u8>,
-    psqt: [[i64; NB]; 2],
+    /// i32, not i64: the weights on disk are i32, so the extra width bought
+    /// nothing but memory.
+    /// MEASURED: +0.08% instructions -- the compiler was already vectorising
+    /// the i64 loop. Kept for the halved footprint (32 bytes per perspective
+    /// instead of 64, and there is one of these per ply), not for speed.
+    psqt: [[i32; NB]; 2],
     /// Cache de refresh por casa de rei ("finny tables"): para cada
     /// (casa do rei, perspectiva) guarda o acumulador SO' com features de
     /// peca e os bitboards que o geraram. Reconstruir passa a ser aplicar a
@@ -1510,9 +2496,158 @@ struct EstadoAcc {
 #[derive(Clone)]
 struct Camada {
     acc: [Vec<i16>; 2],
-    psqt: [[i64; NB]; 2],
+    psqt: [[i32; NB]; 2],
     bb: [[u64; 6]; 2],
     valido: bool,
+}
+
+/// What one move touched, recorded by `make_move` at the moment it knows --
+/// rather than recovered afterwards by diffing the stored bitboards against the
+/// board, which is what `eventos_de_casa` does.
+///
+/// Five entries cover everything: a quiet move is 2 (leaves `from`, arrives at
+/// `to`), a capture or en passant 3, a castle 4 (king and rook). Every one of
+/// those goes through `remove_piece`/`add_piece` in `make_move`, so the list is
+/// exact by construction rather than inferred.
+///
+/// Without it the accumulator chain can only step back ONE ply; with it, as
+/// many as it needs.
+#[derive(Clone, Copy)]
+pub struct DirtyPieces {
+    pub n: u8,
+    /// (casa, tipo de peca, cor, entra?)
+    pub ev: [(u8, u8, u8, bool); 5],
+}
+
+impl Default for DirtyPieces {
+    fn default() -> Self {
+        DirtyPieces { n: 0, ev: [(0, 0, 0, false); 5] }
+    }
+}
+
+impl DirtyPieces {
+    #[inline(always)]
+    pub fn push_change(&mut self, sq: u8, pt: u8, cor: u8, entra: bool) {
+        if (self.n as usize) < self.ev.len() {
+            self.ev[self.n as usize] = (sq, pt, cor, entra);
+            self.n += 1;
+        }
+    }
+    #[inline(always)]
+    pub fn events(&self) -> impl Iterator<Item = (usize, usize, usize, bool)> + '_ {
+        self.ev[..self.n as usize]
+            .iter()
+            .map(|&(sq, pt, c, a)| (sq as usize, pt as usize, c as usize, a))
+    }
+}
+
+thread_local! {
+    /// The current line's move chain, indexed by `board.prof_acc`. Needs no
+    /// clearing in `unmake_move`: the next `make_move` at that depth overwrites
+    /// it, and nothing ever reads a depth above the current one.
+    static CHAIN: std::cell::RefCell<Vec<DirtyPieces>> =
+        std::cell::RefCell::new(vec![DirtyPieces::default(); MAX_CAMADAS]);
+}
+
+/// The threat relations each ply's move changed, produced by `make_move` while
+/// the board is actually being walked through the move.
+///
+/// Flat storage on purpose: one `Vec` holding every ply's relations end to end,
+/// plus a start offset per ply. A `Vec<Vec<_>>` would cost a pointer chase per
+/// access for no gain -- the same lesson the flattened weight tables taught
+/// (+9% NPS there).
+///
+/// `make_move` at depth d truncates back to `start[d]` and appends; nothing
+/// reads a depth above the current one, so no clearing is ever needed.
+pub struct ThreatChain {
+    rel: Vec<crate::sf_features::RelAmeaca>,
+    start: Vec<u32>,
+}
+
+impl ThreatChain {
+    fn new() -> Self {
+        ThreatChain { rel: Vec::with_capacity(4096), start: vec![0; MAX_CAMADAS + 1] }
+    }
+    #[inline]
+    fn begin(&mut self, d: usize) {
+        let from = self.start[d] as usize;
+        self.rel.truncate(from);
+    }
+    #[inline]
+    fn end(&mut self, d: usize) {
+        self.start[d + 1] = self.rel.len() as u32;
+    }
+    #[inline]
+    fn slice(&self, d: usize) -> &[crate::sf_features::RelAmeaca] {
+        &self.rel[self.start[d] as usize..self.start[d + 1] as usize]
+    }
+}
+
+thread_local! {
+    static THREAT_CHAIN: std::cell::RefCell<ThreatChain> =
+        std::cell::RefCell::new(ThreatChain::new());
+}
+
+/// Runs the threat enumeration for one piece appearing or disappearing, on the
+/// board as it stands right now. This is the whole point: `make_move` already
+/// walks the position through the move one piece at a time, which is exactly
+/// the sequence `delta_por_lance` reconstructs afterwards from two snapshots.
+///
+/// `sem_raios` is `noRaysContaining` in the reference, and belongs to the piece
+/// that MOVES and only to it -- passing it on a capture's removal suppresses
+/// half of a discovery and leaves a threat standing that exists in neither real
+/// position.
+pub fn threats_for_change(
+    pieces: &[[u64; 6]; 2], d: usize, add: bool, color: usize, piece: usize, sq: usize,
+    sem_raios: u64,
+) {
+    if d >= MAX_CAMADAS {
+        return;
+    }
+    let pos = crate::sf_features::PosBB { pieces: *pieces };
+    THREAT_CHAIN.with(|c| {
+        let mut c = c.borrow_mut();
+        let rel = &mut c.rel;
+        crate::sf_features::relacoes_ameaca(&pos, add, color, piece, sq, sem_raios, MAGIC, rel);
+    });
+}
+
+/// Opens/closes one ply's slice in the chain.
+pub fn threats_begin(d: usize) {
+    if d < MAX_CAMADAS {
+        THREAT_CHAIN.with(|c| c.borrow_mut().begin(d));
+    }
+}
+pub fn threats_end(d: usize) {
+    if d < MAX_CAMADAS {
+        THREAT_CHAIN.with(|c| c.borrow_mut().end(d));
+    }
+}
+
+/// Reads one ply's relations back, for the consumer and for the verification.
+pub fn threats_at<R>(d: usize, f: impl FnOnce(&[crate::sf_features::RelAmeaca]) -> R) -> Option<R> {
+    if d >= MAX_CAMADAS {
+        return None;
+    }
+    THREAT_CHAIN.with(|c| Some(f(c.borrow().slice(d))))
+}
+
+/// Called by `make_move`. Deliberately cheap: one 24-byte write into a
+/// thread-local, once per node.
+#[inline]
+pub fn record_dirty(d: usize, s: &DirtyPieces) {
+    if d >= MAX_CAMADAS {
+        return;
+    }
+    CHAIN.with(|c| c.borrow_mut()[d] = *s);
+}
+
+/// Reads back what was recorded for a given depth.
+pub fn dirty_at(d: usize) -> Option<DirtyPieces> {
+    if d >= MAX_CAMADAS {
+        return None;
+    }
+    CHAIN.with(|c| Some(c.borrow()[d]))
 }
 
 /// Fundo maximo coberto pela pilha. Acima disto o motor volta ao comportamento
@@ -1522,7 +2657,7 @@ const MAX_CAMADAS: usize = 256;
 #[derive(Clone)]
 struct EntradaCache {
     acc: Vec<i16>,
-    psqt: [i64; NB],
+    psqt: [i32; NB],
     bb: [[u64; 6]; 2],
     valido: bool,
 }
@@ -1545,7 +2680,7 @@ impl EstadoAcc {
             conta: vec![0i8; THREAT_DIM],
             tocadas: Vec::with_capacity(256),
             x: vec![0u8; L1],
-            psqt: [[0i64; NB]; 2],
+            psqt: [[0i32; NB]; 2],
             cache: vec![
                 EntradaCache { acc: Vec::new(), psqt: [0; NB], bb: [[0; 6]; 2], valido: false };
                 64 * 2
@@ -1553,7 +2688,7 @@ impl EstadoAcc {
             pilha: vec![
                 Camada {
                     acc: [vec![0i16; L1], vec![0i16; L1]],
-                    psqt: [[0i64; NB]; 2],
+                    psqt: [[0i32; NB]; 2],
                     bb: [[0u64; 6]; 2],
                     valido: false,
                 };
@@ -1573,11 +2708,20 @@ thread_local! {
 /// occupancy demands: the piece leaving is evaluated on the OLD board, the
 /// piece arriving on the NEW one. Returns false when the change is not a
 /// simple move, and the caller rebuilds instead.
+/// Recebe a posicao em BITBOARDS, nao o `Board`. A funcao so' precisava disso --
+/// usava o `board` numa unica linha, para o converter -- e a diferenca importa:
+/// com `PosBB` a entrada pode ser uma posicao INTERMEDIA reconstruida da cadeia
+/// de `DirtyPieces`, que e' o que permite ao acumulador recuar mais de um ply.
 fn delta_por_lance(
-    net: &RedeSf, board: &Board, pov: usize, st: &mut EstadoAcc,
-    ev: &[(usize, usize, usize, bool)],
+    net: &RedeSf, agora: &crate::sf_features::PosBB, pov: usize, st: &mut EstadoAcc,
+    ev: &[(usize, usize, usize, bool)], saltar_pecas: bool,
 ) -> bool {
-    let agora = board_para_posbb(board);
+    // Tudo o que este lance muda -- ameacas, pares e pecas -- junto, para UMA
+    // passagem pelo acumulador no fim. Ver `aplica_lote_avx2`.
+    let em_lote = lote_activo();
+    let mut lote: Vec<(u32, bool)> = Vec::with_capacity(32);
+
+    let agora = *agora;
     let mut antes = agora;
     // desfazer os eventos para reconstruir o tabuleiro anterior
     for &(sq, t, c, add) in ev {
@@ -1617,6 +2761,16 @@ fn delta_por_lance(
     // the king square of THIS perspective, taken from the final board and held
     // fixed while the move is walked (see `eventos_ameaca`)
     let ksq_pov = agora.king_sq(pov);
+    // As features de peca so' dependem da casa do rei e dos eventos, ambos ja'
+    // sabidos: da' para pedir as linhas agora e ter a enumeracao inteira das
+    // ameacas como folga, que e' o passo mais caro da funcao.
+    if !saltar_pecas && ksq_pov < 64 {
+        for &(sq, t, c, _) in ev {
+            let u = crate::sf_features::indice_peca(ksq_pov, pov, sq, t, c);
+            adianta(&net.ft_piece_w, u * L1, L1);
+            adianta(&net.ft_piece_psqt, u * NB, NB);
+        }
+    }
     let mut cor_que_entra = 2usize;
     for &(_, _, c, add) in ev {
         if add {
@@ -1627,7 +2781,7 @@ fn delta_por_lance(
     // chamada de `acc_incremental` chega aqui com o mesmo `antes`/`agora` --
     // `st.bb` so' avanca depois das duas -- e antes refazia todo este passeio
     // para obter a mesma lista.
-    if st.rels_chave != Some((antes.pieces, agora.pieces)) {
+    if !sem_ameacas() && st.rels_chave != Some((antes.pieces, agora.pieces)) {
     st.rels.clear();
     let mut corrente = antes;
     for capturada in [true, false] {
@@ -1666,15 +2820,41 @@ fn delta_por_lance(
     // `sort_unstable_by_key` over ~100 structs of 32 bytes, once per
     // perspective per evaluation -- was the bulk of `delta_por_lance`'s own
     // 17.5% in the profile. The reference does no sorting here either.
+    //
+    // MEASURED AND REJECTED (2026-08-25). The counter array is 59808 bytes and
+    // takes ~31 scattered touches per call, so it looks like it should thrash
+    // the 32 KB L1. Replacing it with the obvious small-data alternative --
+    // collect the (feature, sign) pairs, `sort_unstable_by_key`, `chunk_by` --
+    // gives an identical bench (1970705 nodes) and measures SLOWER by ~2%:
+    // total time over ten alternating runs each, median 13.74s against 13.45s,
+    // minimum 13.32 against 12.74, mean 13.75 against 13.47. (The first attempt
+    // read bench NPS instead and reported -4%; NPS swings ~20% between runs of
+    // the same binary, exactly as the note above this one warns. Same verdict,
+    // but the honest magnitude is half of what the noisy metric claimed.)
+    //
+    // Two reasons, both worth remembering before trying this again. The array
+    // is not cold: sibling nodes touch the same threats, so it stays L1/L2 warm
+    // and the "58 KB" is a footprint, not a working set. And nine branchy
+    // comparisons in a generic sort cost more in mispredictions than the loads
+    // they save -- the diagnostic says 9.5 relations per call, which is far too
+    // few to amortise anything. Size of the structure is not the same question
+    // as cost of touching it; only the measurement separates them.
     let rels = std::mem::take(&mut st.rels);
     let mut tocadas = std::mem::take(&mut st.tocadas);
     tocadas.clear();
-    if ksq_pov < 64 {
+    if diag_rels() {
+        REL_ENUM.fetch_add(rels.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        REL_CHAM.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    if ksq_pov < 64 && !sem_ameacas() {
         let hm = crate::sf_features::hm_de_rei(ksq_pov);
         for r in rels.iter() {
             let idx = crate::sf_features::indice_relacao(r, pov, hm);
             if idx < THREAT_DIM {
+                histo_conta(idx);
                 if st.conta[idx] == 0 {
+                    adianta(&net.ft_threat_w, idx * L1, L1);
+                    adianta(&net.ft_threat_psqt, idx * NB, NB);
                     tocadas.push(idx as u32);
                 }
                 st.conta[idx] += if r.adicionar { 1 } else { -1 };
@@ -1699,12 +2879,16 @@ fn delta_por_lance(
         st.conta[idx] = 0;
         if soma != 0 {
             let somar = soma > 0;
-            aplica_linha(net, &mut st.acc[pov], U_THREAT + idx, somar);
-            let sinal = if somar { 1i64 } else { -1 };
+            if em_lote { lote.push(((U_THREAT + idx) as u32, somar)); }
+            else { aplica_linha(net, &mut st.acc[pov], U_THREAT + idx, somar); }
+            let sinal = if somar { 1i32 } else { -1 };
             for b in 0..NB {
-                st.psqt[pov][b] += sinal * net.ft_threat_psqt[idx * NB + b] as i64;
+                st.psqt[pov][b] += sinal * net.ft_threat_psqt[idx * NB + b];
             }
         }
+    }
+    if diag_rels() {
+        REL_APLIC.fetch_add(tocadas.len() as u64, std::sync::atomic::Ordering::Relaxed);
     }
     st.tocadas = tocadas;
     // Pawn pairs. These were not handled here AT ALL: a plain `a2-a3` changes
@@ -1712,7 +2896,7 @@ fn delta_por_lance(
     // so every pawn move left the accumulator holding the previous position's
     // pairs. Cheap to redo properly -- the feature only reads the two pawn
     // bitboards, so it is skipped entirely unless a pawn actually moved.
-    let mexeu_peao = ev.iter().any(|&(_, t, _, _)| t == 0);
+    let mexeu_peao = !sem_ameacas() && !sem_pares() && ev.iter().any(|&(_, t, _, _)| t == 0);
     if mexeu_peao {
         let mut sai = std::mem::take(&mut st.par_sai);
         let mut entra = std::mem::take(&mut st.par_entra);
@@ -1722,10 +2906,11 @@ fn delta_por_lance(
         for (lista, somar) in [(&sai, false), (&entra, true)] {
             for &f in lista.iter() {
                 let u = U_PAIR + (f - PAIR_BASE);
-                aplica_linha(net, &mut st.acc[pov], u, somar);
-                let sinal = if somar { 1i64 } else { -1 };
+                if em_lote { lote.push((u as u32, somar)); }
+                else { aplica_linha(net, &mut st.acc[pov], u, somar); }
+                let sinal = if somar { 1i32 } else { -1 };
                 for b in 0..NB {
-                    st.psqt[pov][b] += sinal * net.ft_pair_psqt[(f - PAIR_BASE) * NB + b] as i64;
+                    st.psqt[pov][b] += sinal * net.ft_pair_psqt[(f - PAIR_BASE) * NB + b];
                 }
             }
         }
@@ -1735,15 +2920,24 @@ fn delta_por_lance(
 
     // features de peca: indice calculado directamente (o rei desta
     // perspectiva nao mexeu -- o chamador ja' o garantiu)
+    // Na actualizacao hibrida o bloco de pecas ja' foi trocado por inteiro
+    // (casa de rei nova contra antiga), por isso aplicar aqui os deltas de peca
+    // sobre a casa nova somaria o mesmo trabalho duas vezes.
+    if saltar_pecas {
+        if em_lote { aplica_lote(net, &mut st.acc[pov], &lote); }
+        return true;
+    }
     let ksq = agora.king_sq(pov);
     for &(sq, t, c, add) in ev {
         let u = crate::sf_features::indice_peca(ksq, pov, sq, t, c);
-        aplica_linha(net, &mut st.acc[pov], u, add);
-        let sinal = if add { 1i64 } else { -1 };
+        if em_lote { lote.push((u as u32, add)); }
+        else { aplica_linha(net, &mut st.acc[pov], u, add); }
+        let sinal = if add { 1i32 } else { -1 };
         for b in 0..NB {
-            st.psqt[pov][b] += sinal * net.ft_piece_psqt[u * NB + b] as i64;
+            st.psqt[pov][b] += sinal * net.ft_piece_psqt[u * NB + b];
         }
     }
+    if em_lote { aplica_lote(net, &mut st.acc[pov], &lote); }
     true
 }
 
@@ -1758,9 +2952,9 @@ fn delta_por_lance(
 /// Pagar aqui um delta (~12 linhas de pesos) evita aos filhos uma
 /// reconstrucao (~35 linhas mais a enumeracao das features), e um no' que
 /// chega aqui vai mesmo procurar filhos -- os cortes por TT ja' retornaram
-/// antes. E' o mesmo principio do `find_last_usable_accumulator` do
-/// Stockfish, sem precisar de guardar as pecas sujas de cada ply: em vez de
-/// remontar a cadeia quando falta, nao a deixamos partir.
+/// antes. E' o mesmo principio de procurar o ultimo acumulador utilizavel,
+/// sem precisar de guardar as pecas sujas de cada ply: em vez de remontar a
+/// cadeia quando falta, nao a deixamos partir.
 pub fn garante_camada(atk: &Attacks, board: &mut Board) {
     let net = match rede() {
         Some(n) if active() => n,
@@ -1769,7 +2963,13 @@ pub fn garante_camada(atk: &Attacks, board: &mut Board) {
     ESTADO.with(|c| {
         let mut st = c.borrow_mut();
         if carrega_do_pai(&mut st, board) {
+            if diag_rels() {
+                ACC_FROM_PARENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             return;
+        }
+        if diag_rels() {
+            ACC_MATERIALISED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         acc_incremental(net, atk, board, 0, &mut st);
         acc_incremental(net, atk, board, 1, &mut st);
@@ -1816,6 +3016,54 @@ fn produto_u8_i8(x: &[u8], w: &[i8]) -> i32 {
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[target_feature(enable = "avx2")]
+/// fc0 for a group of outputs at once, with the input tile held in registers.
+///
+/// WHY: the loop this replaces walked the whole 1024-byte input once PER
+/// OUTPUT -- 32 outputs, so the input was read 32 times, 32 KB of loads where
+/// 1 KB would do. `evaluate` accounts for 19.4% of the engine's L1 loads and
+/// this is most of it.
+///
+/// GRUPO = 8 outputs: eight i32 accumulators plus the input tile plus the
+/// weight vector fit the 16 YMM registers. Sixteen would halve the input reads
+/// again and spill, which is the mistake the first attempt at the accumulator
+/// made.
+///
+/// Same total arithmetic, a quarter of the input traffic: the input is read
+/// L2/GRUPO = 4 times instead of 32.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[target_feature(enable = "avx2")]
+unsafe fn fc0_grupo_avx2(x: &[u8], w: &[i8], bias: &[i32], out: &mut [i32], l1: usize) {
+    use std::arch::x86_64::*;
+    const GRUPO: usize = 8;
+    let uns = _mm256_set1_epi16(1);
+    let n = l1 / 32;
+
+    let mut o = 0usize;
+    while o < out.len() {
+        let g = GRUPO.min(out.len() - o);
+        let mut soma = [_mm256_setzero_si256(); GRUPO];
+        for i in 0..n {
+            // A entrada e' lida UMA vez por bloco e usada pelas `g` saidas.
+            let a = _mm256_loadu_si256(x.as_ptr().add(i * 32) as *const __m256i);
+            for j in 0..g {
+                let b = _mm256_loadu_si256(
+                    w.as_ptr().add((o + j) * l1 + i * 32) as *const __m256i);
+                let p = _mm256_maddubs_epi16(a, b);
+                soma[j] = _mm256_add_epi32(soma[j], _mm256_madd_epi16(p, uns));
+            }
+        }
+        for j in 0..g {
+            let lo = _mm256_castsi256_si128(soma[j]);
+            let hi = _mm256_extracti128_si256(soma[j], 1);
+            let mut r = _mm_add_epi32(lo, hi);
+            r = _mm_add_epi32(r, _mm_shuffle_epi32(r, 0b01_00_11_10));
+            r = _mm_add_epi32(r, _mm_shuffle_epi32(r, 0b00_01_00_01));
+            out[o + j] = _mm_cvtsi128_si32(r) + bias[o + j];
+        }
+        o += g;
+    }
+}
+
 unsafe fn produto_u8_i8_avx2(x: &[u8], w: &[i8]) -> i32 {
     use std::arch::x86_64::*;
     let uns = _mm256_set1_epi16(1);
@@ -1844,7 +3092,15 @@ unsafe fn produto_u8_i8_avx2(x: &[u8], w: &[i8]) -> i32 {
 fn carrega_do_pai(st: &mut EstadoAcc, board: &Board) -> bool {
     let d = board.prof_acc;
     if d >= MAX_CAMADAS {
+        if diag_rels() { PARENT_MISS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
         return false;
+    }
+    if diag_rels() {
+        if st.pilha[d].valido && st.pilha[d].bb == board.pieces {
+            PARENT_HIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            PARENT_MISS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
     if st.pilha[d].valido && st.pilha[d].bb == board.pieces {
         for pov in 0..2 {
@@ -1856,6 +3112,28 @@ fn carrega_do_pai(st: &mut EstadoAcc, board: &Board) -> bool {
         st.feats[0].clear();
         st.feats[1].clear();
         return true;
+    }
+    // Prova do registo do `make_move`: aplicar as `DirtyPieces` deste ply aos
+    // bitboards do PAI tem de dar exactamente o tabuleiro actual. Enquanto
+    // ninguem depende delas, isto e' so' um teste; quando o acumulador passar a
+    // recuar pela cadeia, e' a diferenca entre correcto e silenciosamente
+    // errado. `KESTREL_VERIFICA_SUJAS=1`.
+    if verify_dirty() && d > 0 && st.pilha[d - 1].valido {
+        if let Some(sj) = dirty_at(d) {
+            let mut bb = st.pilha[d - 1].bb;
+            for (sq, t, c, entra) in sj.events() {
+                if entra {
+                    bb[c][t] |= 1u64 << sq;
+                } else {
+                    bb[c][t] &= !(1u64 << sq);
+                }
+            }
+            if bb != board.pieces {
+                DIRTY_BAD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                DIRTY_OK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
     }
     if d > 0 && st.pilha[d - 1].valido {
         for pov in 0..2 {
@@ -1904,11 +3182,13 @@ fn acc_incremental(
     let verifica = *VERIFICA.get_or_init(|| std::env::var_os("KESTREL_VERIFICA_DELTA").is_some());
     if verifica && st.valido && !sem_delta {
         if let Some(ev) = eventos_de_casa(&st.bb, &board.pieces) {
-            if !rei_invalida_indices(&ev, pov, st, board) {
+            let antes_bb = crate::sf_features::PosBB { pieces: st.bb };
+            let agora_bb = board_para_posbb(board);
+            if !rei_invalida_indices(&ev, pov, &antes_bb, &agora_bb) {
                 let acc_antes = st.acc[pov].clone();
                 let psqt_antes = st.psqt[pov];
                 let bb_antes = st.bb;
-                if delta_por_lance(net, board, pov, st, &ev) {
+                if delta_por_lance(net, &board_para_posbb(board), pov, st, &ev, false) {
                     let acc_delta = st.acc[pov].clone();
                     let psqt_delta = st.psqt[pov];
                     st.acc[pov] = acc_antes;
@@ -1975,7 +3255,37 @@ fn acc_incremental(
     }
     if st.valido && !sem_delta {
         if let Some(ev) = eventos_de_casa(&st.bb, &board.pieces) {
-            if !rei_invalida_indices(&ev, pov, st, board) && delta_por_lance(net, board, pov, st, &ev) {
+            let antes_bb = crate::sf_features::PosBB { pieces: st.bb };
+            let agora_bb = board_para_posbb(board);
+            // Lance de rei que so' mexe nas features de PECA: o bloco de
+            // ameacas do acumulador continua valido e recupera-se trocando so'
+            // o bloco HalfKA, em vez de re-enumerar a posicao inteira.
+            // Piece-count gate. With few pieces a refresh is cheap -- there
+            // are few active features to enumerate -- while the hybrid always
+            // costs two full passes over 1024 accumulator entries, whatever
+            // the position holds. Below the threshold the swap does not pay.
+            //
+            // Swept, three runs each, instructions per node (they vary by ~2
+            // within a setting, so these gaps are real):
+            //   no gate 22909 | 8 -> 22795 | 12 -> 22825 | 15 -> 22881
+            //   20 -> 22980 | 24 -> 23012 | 28 -> 23106
+            // 8 it is, worth 0.50%. Above 15 it degrades monotonically, which
+            // is the gate switching the hybrid off in positions where it still
+            // pays. KESTREL_HIBRIDO_MIN tunes it; 0 disables the gate.
+            if hibrido_ligado()
+                && agora_bb.occ().count_ones() >= hibrido_min()
+                && rei_classifica(&ev, pov, &antes_bb, &agora_bb) == ReiMuda::SoPecas
+                && hibrido_rei(net, &antes_bb, &agora_bb, pov, st, &ev)
+            {
+                if verifica_hibrido() {
+                    confere_hibrido(net, atk, board, pov, st);
+                }
+                st.feats[pov].clear();
+                return;
+            }
+            if !rei_invalida_indices(&ev, pov, &antes_bb, &agora_bb)
+                && delta_por_lance(net, &agora_bb, pov, st, &ev, false)
+            {
                 // as listas ficam desactualizadas de proposito: enquanto o
                 // caminho rapido pegar, nao sao precisas (o psqt agora e'
                 // acumulado). Marca-se para o caminho lento as reconstruir.
@@ -1985,6 +3295,20 @@ fn acc_incremental(
         }
     }
 
+    // O delta de UM lance nao serviu. Antes de re-enumerar a posicao inteira,
+    // tentar a cadeia: recuar ate' ao antepassado calculado mais proximo e
+    // aplicar os deltas para a frente -- o que os dois motores de referencia
+    // fazem e nos nao faziamos.
+    if !sem_delta && walk_back_chain(net, board, pov, st) {
+        return;
+    }
+
+    // Chegar aqui e' o caminho caro: o delta de um lance nao serviu e a posicao
+    // vai ser re-enumerada de raiz. Contar quantas vezes acontece separa "cada
+    // actualizacao e' cara" de "ha' actualizacoes a mais" -- ver ACC_MATERIALISED.
+    if diag_rels() {
+        ACC_REFRESH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     let mut pecas = std::mem::take(&mut st.pecas);
     let mut novas = std::mem::take(&mut st.novas);
     let mut t = std::mem::take(&mut st.scratch_t);
@@ -2027,9 +3351,9 @@ fn acc_incremental(
                                 bb &= bb - 1;
                                 let u = crate::sf_features::indice_peca(ksq, pov, sq, t, c);
                                 aplica_linha(net, &mut base_acc, u, add);
-                                let sinal = if add { 1i64 } else { -1 };
+                                let sinal = if add { 1i32 } else { -1 };
                                 for b in 0..NB {
-                                    base_psqt[b] += sinal * net.ft_piece_psqt[u * NB + b] as i64;
+                                    base_psqt[b] += sinal * net.ft_piece_psqt[u * NB + b];
                                 }
                             }
                         }
@@ -2037,11 +3361,11 @@ fn acc_incremental(
                 }
             } else {
                 base_acc = net.ft_bias.clone();
-                base_psqt = [0i64; NB];
+                base_psqt = [0i32; NB];
                 for &(f, _) in pecas.iter() {
                     aplica_linha(net, &mut base_acc, f, true);
                     for b in 0..NB {
-                        base_psqt[b] += net.ft_piece_psqt[f * NB + b] as i64;
+                        base_psqt[b] += net.ft_piece_psqt[f * NB + b];
                     }
                 }
             }
@@ -2072,6 +3396,12 @@ fn acc_incremental(
         // Sorted merge: what is in `novas` and not in `feats` gets added,
         // what is in `feats` and not in `novas` gets subtracted. Duplicates
         // are handled by advancing both sides together.
+        // MEDIDO E REJEITADO (2026-08-28): juntar esta diferenca num lote e
+        // aplica-la de uma vez, como se faz no caminho do lance. Aqui o N e' o
+        // mais alto do motor, e mesmo assim deu 0,3% menos leituras e 1,9%
+        // MAIS ciclos -- este caminho corre 45 414 vezes em 2,9 milhoes de
+        // chamadas de delta (1,5%), e a alocacao do lote custa mais do que
+        // poupa. O ganho do lote esta' no caminho comum, nao neste.
         let velhas = &st.feats[pov];
         let (mut i, mut j) = (0usize, 0usize);
         let mut mudou = 0usize;
@@ -2113,16 +3443,16 @@ fn acc_incremental(
 
     st.feats[pov].clear();
     st.feats[pov].extend_from_slice(&novas);
-    st.psqt[pov] = [0i64; NB];
+    st.psqt[pov] = [0i32; NB];
     for &u in novas.iter() {
         let u = u as usize;
         for b in 0..NB {
             st.psqt[pov][b] += if u < U_THREAT {
-                net.ft_piece_psqt[u * NB + b] as i64
+                net.ft_piece_psqt[u * NB + b]
             } else if u < U_PAIR {
-                net.ft_threat_psqt[(u - U_THREAT) * NB + b] as i64
+                net.ft_threat_psqt[(u - U_THREAT) * NB + b]
             } else {
-                net.ft_pair_psqt[(u - U_PAIR) * NB + b] as i64
+                net.ft_pair_psqt[(u - U_PAIR) * NB + b]
             };
         }
     }
@@ -2158,6 +3488,18 @@ fn acc_incremental(
 /// So the shape is checked, not just the count: exactly one piece is put down,
 /// and it belongs to the side that just played. Anything else falls back to the
 /// full rebuild, which is always right.
+/// MEASURED AND REJECTED (2026-08-26): returning the list inline instead of in
+/// a `Vec`, to kill the allocation this makes on every call.
+///
+/// `malloc`+`free` were 1.4% of the whole engine and this is the caller, so it
+/// looked free. It measured **2.6% SLOWER**. The tuple below is
+/// `(usize, usize, usize, bool)` = **32 bytes** once padded, so seven of them
+/// inline are 224 bytes copied on every return -- more than glibc's fast path
+/// costs for a repeated same-size allocation.
+///
+/// Worth retrying only with the fields packed to `u8`, which makes the entry 4
+/// bytes; and even then the whole prize is 1%, since that is all allocation
+/// costs in total.
 fn eventos_de_casa(
     antes: &[[u64; 6]; 2], agora: &[[u64; 6]; 2],
 ) -> Option<Vec<(usize, usize, usize, bool)>> {
@@ -2286,23 +3628,380 @@ fn eventos_de_casa(
 /// in a pawn endgame -- of which ~83% kept the same orientation. Nearly half of
 /// all evaluations in an endgame were rebuilding three feature tables from
 /// scratch to arrive at the numbers they already had.
+/// Recebe as DUAS posicoes em bitboards em vez de ir buscar a antiga a
+/// `st.bb`. Num recuo de varios plies cada passo tem o seu proprio "antes", e
+/// `st.bb` so' conhece o ultimo estado avaliado.
+/// How many plies are worth walking back before giving up and re-enumerating.
+/// Walking N plies costs N deltas; a refresh costs the whole position (~26
+/// threat rows, plus pieces and pairs, plus the enumeration). Tunable for
+/// measurement: `KESTREL_RECUO=N`.
+fn max_walk_back() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("KESTREL_RECUO").ok().and_then(|v| v.parse().ok()).unwrap_or(4)
+    })
+}
+
+/// Walks the `DirtyPieces` chain back to the nearest ancestor that already has
+/// a computed accumulator, then applies each ply's delta forward.
+///
+/// Without it the accumulator can only step back ONE ply:
+/// `eventos_de_casa` compares `st.bb` (the last position
+/// evaluated, often a sibling's child rather than this node's parent) against
+/// the current board and gives up when the difference does not fit in one move.
+/// That was the route to 7.9% of all refreshes.
+///
+/// MEDIDO (2026-08-25), e a premissa estava ERRADA. Vale 34370 recuos e corta
+/// os refreshes de 224639 para 190269 (-15%), mas isso sao **0,75%** das
+/// instrucoes (23691 -> 23514 por no', bench identico a 1970705). Duas razoes,
+/// ambas dos contadores: `sem-antepassado 0` e recuo medio de **1,0 plies** --
+/// o pai esta praticamente sempre calculado, por isso nao havia cadeia partida
+/// para recuperar; e 181833 das 224537 falhas do delta sao lances de REI, que
+/// sao inerentes ao HalfKA (mudam o indice de todas as features) e que se
+/// resolvem com a cache de refresh, nao com a pilha.
+///
+/// Fica porque esta' correcto e custa pouco, e porque e' o alicerce necessario
+/// se algum dia avaliarmos menos vezes -- mas nao e' o buraco dos 2,7x.
+///
+/// ARMADILHA: o `delta_por_lance` so' aceita a forma que o `eventos_de_casa`
+/// deixa passar (UMA adicao, no maximo tres eventos). As `DirtyPieces` sao mais
+/// gerais: um roque traz quatro eventos e duas adicoes. Passa-lo por ali da' um
+/// acumulador diferente do refresh -- silenciosamente. Foi a assinatura de nos
+/// que o apanhou (2022050 em vez de 1970705); por isso a guarda abaixo.
+///
+/// Devolve `false` sem estragar nada se a cadeia nao ligar. Se falhar A MEIO,
+/// `st.acc[pov]` fica inconsistente -- mas o chamador cai no refresh, que
+/// reescreve o acumulador por inteiro, portanto e' recuperavel por construcao.
+fn walk_back_chain(
+    net: &RedeSf, board: &Board, pov: usize, st: &mut EstadoAcc,
+) -> bool {
+    let d = board.prof_acc;
+    let recuo = max_walk_back();
+    if d == 0 || d >= MAX_CAMADAS || recuo == 0 {
+        return false;
+    }
+    walk_exit(0);
+    // Antepassado calculado mais proximo, no maximo `recuo` plies atras.
+    let baixo = d.saturating_sub(recuo);
+    let k = match (baixo..d).rev().find(|&j| st.pilha[j].valido) {
+        Some(k) => k,
+        None => { walk_exit(1); return false; }
+    };
+    let n = d - k;
+
+    // Reconstruir as posicoes intermedias e PROVAR que a cadeia liga mesmo ao
+    // tabuleiro actual. Sem esta prova estariamos a confiar que `pilha[k]` e'
+    // do nosso antepassado e nao de outro ramo que passou pela mesma
+    // profundidade -- e um acumulador errado nao da sinal nenhum.
+    let mut pos = [crate::sf_features::PosBB::default(); 17];
+    if n >= pos.len() {
+        return false;
+    }
+    pos[0] = crate::sf_features::PosBB { pieces: st.pilha[k].bb };
+    for i in 0..n {
+        let sj = match dirty_at(k + 1 + i) {
+            Some(s) => s,
+            None => return false,
+        };
+        pos[i + 1] = pos[i];
+        for (sq, t, c, entra) in sj.events() {
+            if entra {
+                pos[i + 1].pieces[c][t] |= 1u64 << sq;
+            } else {
+                pos[i + 1].pieces[c][t] &= !(1u64 << sq);
+            }
+        }
+    }
+    if pos[n].pieces != board.pieces {
+        walk_exit(2);
+        return false;
+    }
+
+    // Passagem seca: se algum ply mexer o rei de forma a invalidar os indices,
+    // nao vale a pena comecar -- o refresh trata disso. Verificar ANTES de
+    // tocar no acumulador poupa o estrago a meio.
+    let mut evs: Vec<Vec<(usize, usize, usize, bool)>> = Vec::with_capacity(n);
+    for i in 0..n {
+        let sj = match dirty_at(k + 1 + i) {
+            Some(s) => s,
+            None => return false,
+        };
+        let ev: Vec<_> = sj.events().collect();
+        if ev.is_empty() {
+            // Lance nulo: nao mexe peca, logo nao mexe feature nenhuma.
+            evs.push(ev);
+            continue;
+        }
+        if rei_invalida_indices(&ev, pov, &pos[i], &pos[i + 1]) {
+            walk_exit(3);
+            return false;
+        }
+        // O `delta_por_lance` foi escrito para a forma que o `eventos_de_casa`
+        // deixa passar: UMA adicao e no maximo tres eventos. Um roque tem
+        // quatro eventos e duas adicoes -- passa-lo por ali da' um acumulador
+        // diferente do refresh, e foi o que a assinatura de nos apanhou.
+        if ev.iter().filter(|e| e.3).count() != 1 || ev.len() > 3 {
+            walk_exit(4);
+            return false;
+        }
+        evs.push(ev);
+    }
+
+    // Carregar o antepassado (so' esta perspectiva) e andar para a frente.
+    st.acc[pov].copy_from_slice(&st.pilha[k].acc[pov]);
+    st.psqt[pov] = st.pilha[k].psqt[pov];
+    for i in 0..n {
+        if evs[i].is_empty() {
+            continue;
+        }
+        if !delta_por_lance(net, &pos[i + 1], pov, st, &evs[i], false) {
+            walk_exit(4);
+            return false;
+        }
+    }
+    st.feats[pov].clear();
+    WALK_OK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    WALK_PLIES.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+    true
+}
+
+/// O que um lance de rei invalida. As tres condicoes do
+/// `rei_invalida_indices` nao sao a mesma coisa: o espelho do HalfKA e o bucket
+/// mexem so' nas features de PECA, e so' o `ORIENT_THREATS` mexe nas de ameaca
+/// e par. Medido: 308781 lances de rei mexem so' nas pecas contra 46551 que
+/// mexem em ambas -- 87% do que hoje forca um refresh e' recuperavel.
+#[derive(PartialEq, Clone, Copy)]
+enum ReiMuda {
+    Nada,
+    SoPecas,
+    Tudo,
+}
+
+/// Constroi o acumulador SO' DE PECAS para uma casa de rei e uma posicao, a
+/// partir da cache de refresh (as "finny tables"). E' o mesmo procedimento que
+/// o caminho lento ja' faz para a posicao actual; aqui e' extraido para poder
+/// correr tambem sobre a posicao ANTERIOR e a casa de rei ANTIGA, que e' o que
+/// a actualizacao hibrida precisa.
+///
+/// Nao toca na cache: le' a entrada e aplica o diff de pecas por cima de uma
+/// copia. Escrever de volta so' se faz no caminho lento, que e' quem tem o
+/// direito de a actualizar.
+fn halfka_do_cache(
+    net: &RedeSf, st: &EstadoAcc, pov: usize, ksq: usize,
+    pieces: &[[u64; 6]; 2], saida: &mut Vec<i16>, psqt: &mut [i32; NB],
+) -> bool {
+    if ksq >= 64 {
+        return false;
+    }
+    let e = &st.cache[ksq * 2 + pov];
+    if !e.valido || e.acc.len() != L1 {
+        return false;
+    }
+    saida.clear();
+    saida.extend_from_slice(&e.acc);
+    *psqt = e.psqt;
+    for c in 0..2 {
+        for t in 0..6 {
+            let saiu = e.bb[c][t] & !pieces[c][t];
+            let entrou = pieces[c][t] & !e.bb[c][t];
+            for (mut bb, add) in [(saiu, false), (entrou, true)] {
+                while bb != 0 {
+                    let sq = bb.trailing_zeros() as usize;
+                    bb &= bb - 1;
+                    let u = crate::sf_features::indice_peca(ksq, pov, sq, t, c);
+                    aplica_linha(net, saida, u, add);
+                    let sinal = if add { 1i32 } else { -1 };
+                    for b in 0..NB {
+                        psqt[b] += sinal * net.ft_piece_psqt[u * NB + b];
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Hybrid update for a king move that invalidates only the PIECE features.
+///
+///     new_acc = prev_acc - HalfKA_prev + HalfKA_new + delta(threats/pairs)
+///
+/// Neither HalfKA block is stored: both come from the refresh cache,
+/// o anterior contra a casa de rei antiga e a posicao anterior. As ameacas e os
+/// pares NAO sao tocados alem do seu proprio delta, porque os indices deles
+/// dependem do `ORIENT_THREATS`, que por hipotese nao mudou.
+fn hibrido_rei(
+    net: &RedeSf, antes: &crate::sf_features::PosBB, agora: &crate::sf_features::PosBB,
+    pov: usize, st: &mut EstadoAcc, ev: &[(usize, usize, usize, bool)],
+) -> bool {
+    let ksq_velho = antes.king_sq(pov);
+    let ksq_novo = agora.king_sq(pov);
+    if ksq_velho >= 64 || ksq_novo >= 64 {
+        return false;
+    }
+    let (iv, ino) = (ksq_velho * 2 + pov, ksq_novo * 2 + pov);
+    if !st.cache[iv].valido
+        || !st.cache[ino].valido
+        || st.cache[iv].acc.len() != L1
+        || st.cache[ino].acc.len() != L1
+    {
+        return false;
+    }
+
+    // Uma passagem fundida, sem materializar nada. A forma ingenua --
+    // construir os dois blocos em buffers e so' depois somar -- custava duas
+    // copias de 2 KiB e tres passagens onde basta uma.
+    {
+        let (velho, novo) = (&st.cache[iv], &st.cache[ino]);
+        let acc = &mut st.acc[pov];
+        for ((v, &x), &y) in acc.iter_mut().zip(velho.acc.iter()).zip(novo.acc.iter()) {
+            *v = v.wrapping_sub(x).wrapping_add(y);
+        }
+        for b in 0..NB {
+            st.psqt[pov][b] += novo.psqt[b] - velho.psqt[b];
+        }
+    }
+
+    // E agora os dois diffs de peca, aplicados DIRECTAMENTE ao acumulador: o da
+    // casa antiga com o sinal invertido (esta' a ser retirado), o da nova como
+    // esta'. `bb` da entrada da cache contra a posicao a que ela corresponde.
+    // Juntar primeiro, aplicar uma vez. Ver `aplica_lote_pecas`: eram trinta
+    // travessias do acumulador em media, e passam a ser uma.
+    let mut somar: Vec<usize> = Vec::with_capacity(48);
+    let mut subtrair: Vec<usize> = Vec::with_capacity(48);
+    for (idx, ksq, pos, inverte) in
+        [(iv, ksq_velho, antes, true), (ino, ksq_novo, agora, false)]
+    {
+        for c in 0..2 {
+            for t in 0..6 {
+                let base = st.cache[idx].bb[c][t];
+                let saiu = base & !pos.pieces[c][t];
+                let entrou = pos.pieces[c][t] & !base;
+                for (mut bb, mut add) in [(saiu, false), (entrou, true)] {
+                    if inverte {
+                        add = !add;
+                    }
+                    while bb != 0 {
+                        let sq = bb.trailing_zeros() as usize;
+                        bb &= bb - 1;
+                        if diag_rels() {
+                            DIF_PECAS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        let u = crate::sf_features::indice_peca(ksq, pov, sq, t, c);
+                        if add { somar.push(u) } else { subtrair.push(u) }
+                        let sinal = if add { 1i32 } else { -1 };
+                        for b in 0..NB {
+                            st.psqt[pov][b] += sinal * net.ft_piece_psqt[u * NB + b];
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if !somar.is_empty() || !subtrair.is_empty() {
+        let acc: &mut [i16; L1] = (&mut st.acc[pov][..])
+            .try_into()
+            .expect("acumulador com comprimento errado");
+        aplica_lote_pecas(net, acc, &somar, &subtrair);
+    }
+
+    if !delta_por_lance(net, agora, pov, st, ev, true) {
+        return false;
+    }
+    if diag_rels() {
+        DIF_PECAS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    HIBRIDO_OK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    true
+}
+
+/// Confere o resultado do hibrido contra uma reconstrucao de raiz.
+///
+/// A assinatura do bench prova as posicoes que o bench toca e mais nenhumas, e
+/// um acumulador errado nao da sinal nenhum. `KESTREL_VERIFICA_HIBRIDO=1`.
+fn confere_hibrido(net: &RedeSf, atk: &Attacks, board: &Board, pov: usize, st: &mut EstadoAcc) {
+    let acc_hibrido = st.acc[pov].clone();
+    let psqt_hibrido = st.psqt[pov];
+    let bb_guardado = st.bb;
+    st.valido = false;
+    st.feats[pov].clear();
+    acc_incremental(net, atk, board, pov, st);
+    if st.acc[pov] == acc_hibrido && st.psqt[pov] == psqt_hibrido {
+        HIBRIDO_CONFERE[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    } else {
+        HIBRIDO_CONFERE[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dif = st.acc[pov].iter().zip(acc_hibrido.iter())
+            .map(|(a, b)| (*a as i32 - *b as i32).abs()).max().unwrap_or(0);
+        eprintln!("HIBRIDO-MAU pov={pov} maxdif={dif}");
+    }
+    st.bb = bb_guardado;
+}
+
+fn rei_classifica(
+    ev: &[(usize, usize, usize, bool)], pov: usize,
+    antes: &crate::sf_features::PosBB, agora: &crate::sf_features::PosBB,
+) -> ReiMuda {
+    if !ev.iter().any(|&(_, t, c, _)| t == 5 && c == pov) {
+        return ReiMuda::Nada;
+    }
+    let novo = agora.king_sq(pov);
+    let velho = antes.pieces[pov][5].trailing_zeros() as usize;
+    if velho >= 64 || novo >= 64 {
+        return ReiMuda::Tudo;
+    }
+    if ORIENT_THREATS[velho] != ORIENT_THREATS[novo] {
+        return ReiMuda::Tudo;
+    }
+    let flip = if pov == 1 { 56 } else { 0 };
+    let peca_muda = ORIENT_HALFKA[velho] != ORIENT_HALFKA[novo]
+        || crate::sf_features::KING_BUCKETS_BASE[velho ^ flip]
+            != crate::sf_features::KING_BUCKETS_BASE[novo ^ flip];
+    if peca_muda { ReiMuda::SoPecas } else { ReiMuda::Nada }
+}
+
+/// LIGADO por omissao. Cada aplicacao foi conferida contra uma reconstrucao de
+/// raiz da posicao -- 150528 de 150528 certas, zero erradas -- e a assinatura
+/// do bench e' identica com e sem. `KESTREL_SEM_HIBRIDO=1` desliga, para
+/// medicoes A/B.
+fn hibrido_min() -> u32 {
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("KESTREL_HIBRIDO_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(8)
+    })
+}
+
+fn hibrido_ligado() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    !manete(&M_SEM_HIBRIDO,
+            !*ON.get_or_init(|| std::env::var_os("KESTREL_SEM_HIBRIDO").is_none()))
+}
+
 fn rei_invalida_indices(
-    ev: &[(usize, usize, usize, bool)], pov: usize, st: &EstadoAcc, board: &Board,
+    ev: &[(usize, usize, usize, bool)], pov: usize,
+    antes: &crate::sf_features::PosBB, agora: &crate::sf_features::PosBB,
 ) -> bool {
     if !ev.iter().any(|&(_, t, c, _)| t == 5 && c == pov) {
         return false;
     }
     if std::env::var_os("KESTREL_REI_ANTIGO").is_some() { return true; }
-    let novo = board.king_sq(if pov == 0 { Color::White } else { Color::Black }) as usize;
-    let velho = st.bb[pov][5].trailing_zeros() as usize;
+    let novo = agora.king_sq(pov);
+    let velho = antes.pieces[pov][5].trailing_zeros() as usize;
     if velho >= 64 || novo >= 64 {
         return true;
     }
     let flip = if pov == 1 { 56 } else { 0 };
-    ORIENT_HALFKA[velho] != ORIENT_HALFKA[novo]
-        || ORIENT_THREATS[velho] != ORIENT_THREATS[novo]
+    // As tres condicoes nao sao a mesma coisa. O espelho e o bucket do HalfKA
+    // mexem so' nas features de PECA; so' `ORIENT_THREATS` mexe nas de ameaca e
+    // nas de par. Quando muda o bucket e nao a orientacao das ameacas, o bloco
+    // de ameacas do acumulador continua valido e estamos a deita-lo fora.
+    let peca_muda = ORIENT_HALFKA[velho] != ORIENT_HALFKA[novo]
         || crate::sf_features::KING_BUCKETS_BASE[velho ^ flip]
-            != crate::sf_features::KING_BUCKETS_BASE[novo ^ flip]
+            != crate::sf_features::KING_BUCKETS_BASE[novo ^ flip];
+    let ameaca_muda = ORIENT_THREATS[velho] != ORIENT_THREATS[novo];
+    if diag_rels() && (peca_muda || ameaca_muda) {
+        REI_CLASSE[if ameaca_muda { 1 } else { 0 }]
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    peca_muda || ameaca_muda
 }
 
 #[cfg(test)]
