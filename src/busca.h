@@ -32,6 +32,43 @@ namespace Kestrel {
 // Everything the engine compares against a number lives here; nothing is
 // hardcoded in the middle of the search. That rule is what made it possible to
 // sweep ninety-eight parameters without recompiling once.
+// NENHUM INDICADOR QUE TEMOS PREVE ELO. Nem um.
+//
+// Contados num dia de trabalho, com partidas a fechar cada pergunta:
+//
+//   contagem de nos          apontou ao contrario do resultado DEZ vezes
+//   tempo ate' a profundidade aprovou a margem do RFP, que perdeu 20 Elo
+//   forma da arvore          o par da poda pelo historico moveu-a para junto
+//                            da referencia -- nos fundos a duplicar, rasos de
+//                            57,3% para 52,8% -- e valeu ZERO (+-7 em 1400
+//                            partidas por ponta)
+//
+// Os tres servem para escolher ONDE procurar. Nenhum diz O QUE vale. Quem
+// decide sao as partidas, e nao ha' atalho -- procurar um custou a este projecto
+// mais tempo do que qualquer outra coisa.
+//
+// E O PADRAO DE ONDE VEM O ELO, medido no mesmo dia:
+//
+//   termo da profundidade no lance nulo   NOSSO, declarado e morto      +18
+//   avaliacao completa                    NOSSA, amputada por escala    +18
+//   low_ply                               importado                     -48
+//   ProbCut pequeno                       importado                      -9
+//   par da poda pelo historico            importado e adaptado            0
+//   margem do RFP                         derivada dos nossos dados     -20
+//   IIR com os gates deles                importado             ultimo de 4
+//
+// Cinco importacoes, cinco fracassos. Duas restauracoes de codigo NOSSO que
+// estava morto, os dois unicos ganhos. E o placar recuperado do motor perdido
+// diz o mesmo com outros numeros: seis importacoes, seis fracassos; duas
+// restauracoes, +18 cada.
+//
+// A razao e' a mesma do paragrafo seguinte: um mecanismo importado aterra numa
+// paisagem calibrada SEM ele, e perde mesmo estando certo. Um mecanismo nosso
+// que nunca correu nao tem vizinhos afinados a` sua volta -- por isso e' que
+// liga-lo paga.
+//
+// Procurar codigo morto, nao ideias novas.
+
 // UM DEFEITO QUE VIVE TEMPO SUFICIENTE E' ABSORVIDO PELA AFINACAO FEITA POR
 // CIMA DELE, E CORRIGI-LO SOZINHO PODE PIORAR O MOTOR.
 //
