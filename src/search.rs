@@ -1169,7 +1169,7 @@ impl Default for Params {
             rfp_margin: 110,
             capt_bar_f: 50,
             capt_bar_max: 250,
-            capt_bar_div: 0,
+            capt_bar_div: 60,
             capt_hist_div: 256,
             rfp_improving: 150,
             lmr_piora_f: 197,
