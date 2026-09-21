@@ -5,7 +5,9 @@
 // because only the search knows when an iteration is worth reporting.
 #include <deque>
 #include <iostream>
+#include <algorithm>
 #include <sstream>
+#include <thread>
 #include <string>
 
 #include "aval.h"
@@ -30,6 +32,10 @@ std::deque<StateInfo>  g_pilha;
 Busca                  g_busca;
 Avaliador              g_aval;
 int                    g_hash_mb = 16;
+// O tecto dos fios sai da maquina e nao de um numero cravado: um `Threads` que
+// aceita mais fios do que ha' nucleos so' serve para os por a disputar cache.
+const int              FIOS_MAX = std::max(1, int(std::thread::hardware_concurrency()));
+int                    g_fios   = 1;
 
 const std::string INICIAL = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
 
@@ -106,6 +112,10 @@ void faz_go(std::istringstream& is) {
         std::cout << "bestmove 0000" << std::endl;
         return;
     }
+    // Os ajudantes nascem AQUI e nao no `setoption`: assim a rede ja' esta'
+    // carregada, e e' dela que cada um tira as suas caches. Prepara-los antes
+    // da rede dava ajudantes a avaliar tudo a zero.
+    g_busca.prepara_fios(g_fios, g_aval);
     g_busca.arranca(g_pos, lim, g_aval);
 }
 
@@ -124,18 +134,18 @@ void faz_setoption(std::istringstream& is) {
         // consegue dizer ao arbitro o que lhe falta.
         if (!g_aval.carrega(valor, erro))
             std::cout << "info string ERRO: " << erro << std::endl;
-        else
+        else {
             std::cout << "info string rede carregada: " << valor << std::endl;
+            // Os ajudantes guardam um ponteiro para a rede do dono. Trocada a
+            // rede, esse ponteiro fica a apontar para a antiga -- deitam-se
+            // fora, e o proximo `go` reconstroi-os sobre a nova.
+            g_busca.prepara_fios(1, g_aval);
+        }
     } else if (nome == "hash") {
         g_hash_mb = std::max(1, std::atoi(valor.c_str()));
         g_busca.minha_tabela()->redimensiona(std::size_t(g_hash_mb));
     } else if (nome == "threads") {
-        // Uma so', por agora: o Lazy SMP do KestrelStrike ainda nao foi
-        // recuperado. Anunciar mais do que se faz e' o defeito que ja' nos
-        // custou uma noite -- o `Threads` ficou anunciado e nunca lido, e o
-        // paralelismo estava morto sem ninguem dar por isso.
-        std::cout << "info string Threads=" << valor
-                  << " pedidas; esta versao corre a UMA." << std::endl;
+        g_fios = std::clamp(std::atoi(valor.c_str()), 1, FIOS_MAX);
     }
 }
 
@@ -173,7 +183,8 @@ int main() {
                       << "option name EvalFile type string default "
                       << Avaliador::nome_por_omissao() << "\n"
                       << "option name Hash type spin default 16 min 1 max 65536\n"
-                      << "option name Threads type spin default 1 min 1 max 1\n"
+                      << "option name Threads type spin default 1 min 1 max "
+                      << FIOS_MAX << "\n"
                       << "uciok" << std::endl;
         } else if (tok == "isready") {
             std::cout << "readyok" << std::endl;

@@ -141,6 +141,31 @@ void soma_hist(int& e, int bonus, int tecto) {
     e += bonus - e * std::abs(bonus) / tecto;
 }
 
+// A mesma formula numa entrada PARTILHADA entre fios.
+//
+// Ler, calcular e escrever, em ordem relaxada, sem travar nada. Dois fios a
+// creditar o mesmo lance ao mesmo tempo podem perder um dos creditos -- e isso
+// nao tem importancia: a tabela e' um conselho de ordenacao construido ao longo
+// de milhoes de nos, nao uma conta que tenha de fechar. O que importa e' nao
+// haver leitura e escrita simultaneas num `int` cru, que e' comportamento
+// indefinido e pode dar qualquer coisa, e nao apenas um numero desactualizado.
+void soma_hist(std::atomic<int>& e, int bonus, int tecto) {
+    bonus  = std::clamp(bonus, -tecto, tecto);
+    int v  = e.load(std::memory_order_relaxed);
+    e.store(v + bonus - v * std::abs(bonus) / tecto, std::memory_order_relaxed);
+}
+
+// Redimensiona uma tabela partilhada e poe-na a zero. `assign` nao serve: um
+// `std::atomic<int>` nao e' copiavel, portanto nao ha' como o atribuir em
+// bloco.
+void zera_partilhada(std::vector<std::atomic<int>>& v, std::size_t n) {
+    if (v.size() != n)
+        v = std::vector<std::atomic<int>>(n);   // em C++20 nasce a zero
+    else
+        for (auto& e : v)
+            e.store(0, std::memory_order_relaxed);
+}
+
 int idx_pc(PieceType pt) { return int(pt) - 1; }
 
 
@@ -281,9 +306,17 @@ void Busca::limpa() {
     capt_hist.assign(6 * 64 * 6, 0);
     // Cinco planos sempre reservados: os dois ultimos ficam a zero e por tocar
     // quando `cont_n` e' 3, e assim a manete nao mexe na memoria.
-    cont_hist.assign(5 * (6 * 64) * (6 * 64), 0);
-    hist_peao.assign(std::size_t(p.peao_chaves) * 12 * 64, 0);
-    corr.assign(CORR_FAM * 2 * CORR_TAM, 0);
+    // So' o DONO limpa as tabelas partilhadas. Um ajudante a limpar apagava, a
+    // cada busca, tudo o que a busca principal tinha aprendido -- e o sintoma
+    // seria uma busca paralela mais fraca do que a de um fio, sem nada a
+    // apontar a causa.
+    if (hist_proprio) {
+        // Cinco planos sempre reservados: os dois ultimos ficam a zero e por
+        // tocar quando `cont_n` e' 3, e assim a manete nao mexe na memoria.
+        zera_partilhada(cont_hist_meu, 5 * (6 * 64) * (6 * 64));
+        zera_partilhada(hist_peao_meu, std::size_t(p.peao_chaves) * 12 * 64);
+        zera_partilhada(corr_meu, CORR_FAM * 2 * CORR_TAM);
+    }
     low_ply.assign(LOW_PLY * 64 * 64, 102);
     p_tab->limpa();
 }
@@ -363,7 +396,8 @@ int Busca::conts(const Position& pos, Move m, int ply, int pc) const {
         }
         int ant = apc * 64 + apara;
         h += CONT_PESO[k]
-           * cont_hist[(k * (6 * 64) + ant) * (6 * 64) + pc * 64 + int(m.to_sq())];
+           * (*cont_hist)[(k * (6 * 64) + ant) * (6 * 64) + pc * 64 + int(m.to_sq())]
+                 .load(std::memory_order_relaxed);
     }
     (void) pos;
     return h;
@@ -471,13 +505,13 @@ int Busca::hist_de(const Position& pos, Move m, int ply) const {
         h += p.low_f * low_ply[(ply * 64 + int(m.from_sq())) * 64 + int(m.to_sq())] / (1 + ply);
     // O historico de peoes. Mesma casa de peso que as continuacoes: 32 = um,
     // 64 = o peso dobrado com que a referencia o soma.
-    if (p.peao_f > 0 && !hist_peao.empty()) {
+    if (p.peao_f > 0 && !hist_peao->empty()) {
         std::size_t ipeao =
           (std::size_t(pos.pawn_key() & (std::uint64_t(p.peao_chaves) - 1)) * 12
            + std::size_t(idx_pc(type_of(pos.moved_piece(m))))
            + 6 * std::size_t(int(pos.side_to_move()))) * 64
           + std::size_t(int(m.to_sq()));
-        h += p.peao_f * hist_peao[ipeao] / 32;
+        h += p.peao_f * (*hist_peao)[ipeao].load(std::memory_order_relaxed) / 32;
     }
     return h;
 }
@@ -579,7 +613,7 @@ void Busca::indices(const Position& pos, int ply, int fora[6]) const {
 }
 
 int Busca::corrigida(const Position& pos, int cru, int ply) const {
-    if (corr.empty())
+    if (corr->empty())
         return cru;
     int idx[6];
     indices(pos, ply, idx);
@@ -588,7 +622,7 @@ int Busca::corrigida(const Position& pos, int cru, int ply) const {
     for (int k = 0; k < CORR_FAM; ++k) {
         if (idx[k] < 0)
             continue;
-        soma += corr[(k * 2 + lado) * CORR_TAM + idx[k]]
+        soma += (*corr)[(k * 2 + lado) * CORR_TAM + idx[k]].load(std::memory_order_relaxed)
               * (k == 5 ? p.corr6_peso : CORR_PESO[k]);
     }
     int v = cru + soma / CORR_DIV;
@@ -596,7 +630,7 @@ int Busca::corrigida(const Position& pos, int cru, int ply) const {
 }
 
 void Busca::aprende(const Position& pos, int dif, int prof, int ply) {
-    if (corr.empty())
+    if (corr->empty())
         return;
     int idx[6];
     indices(pos, ply, idx);
@@ -605,9 +639,10 @@ void Busca::aprende(const Position& pos, int dif, int prof, int ply) {
     for (int k = 0; k < CORR_FAM; ++k) {
         if (idx[k] < 0)
             continue;
-        int& e = corr[(k * 2 + lado) * CORR_TAM + idx[k]];
-        e += bonus - e * std::abs(bonus) / CORR_TECTO;
-        e = std::clamp(e, -CORR_TECTO, CORR_TECTO);
+        std::atomic<int>& e = (*corr)[(k * 2 + lado) * CORR_TAM + idx[k]];
+        int v = e.load(std::memory_order_relaxed);
+        v += bonus - v * std::abs(bonus) / CORR_TECTO;
+        e.store(std::clamp(v, -CORR_TECTO, CORR_TECTO), std::memory_order_relaxed);
     }
 }
 
@@ -628,12 +663,12 @@ void Busca::credita(const Position& pos, Move m, int ply, int bonus) {
     // e' o unico indice que a leitura aceita. Ler uma tabela que nunca se
     // escreve e' pior do que nao a ler: a ordenacao passa a depender de uma
     // entrada que fica sempre a zero.
-    if (p.peao_f > 0 && !hist_peao.empty()) {
+    if (p.peao_f > 0 && !hist_peao->empty()) {
         std::size_t ipeao =
           (std::size_t(pos.pawn_key() & (std::uint64_t(p.peao_chaves) - 1)) * 12
            + std::size_t(idx_pc(pt)) + 6 * std::size_t(lado)) * 64
           + std::size_t(int(m.to_sq()));
-        soma_hist(hist_peao[ipeao], bonus, TECTO_PEAO);
+        soma_hist((*hist_peao)[ipeao], bonus, TECTO_PEAO);
     }
     // Escreve nas MESMAS posicoes que o `conts` le', incluindo as que ficam
     // acima da raiz. Ler uma posicao que nunca se escreve e' pior do que nao a
@@ -655,7 +690,7 @@ void Busca::credita(const Position& pos, Move m, int ply, int bonus) {
             apc = pre_pc[i]; apara = pre_para[i];
         }
         int ant = apc * 64 + apara;
-        soma_hist(cont_hist[(k * (6 * 64) + ant) * (6 * 64) + idx_pc(pt) * 64 + int(m.to_sq())],
+        soma_hist((*cont_hist)[(k * (6 * 64) + ant) * (6 * 64) + idx_pc(pt) * 64 + int(m.to_sq())],
                   bonus, TECTO_CONT);
     }
 }
@@ -1929,6 +1964,43 @@ bool Busca::repete_ja(Position& pos, Move m) {
     return r;
 }
 
+// Cria ou destroi os ajudantes do Lazy SMP.
+//
+// Faz-se quando o `Threads` muda e nao a cada lance: cada ajudante carrega uma
+// cache de acumuladores, e construi-la e' caro o bastante para se notar num
+// controlo de tempo rapido.
+//
+// O que cada ajudante recebe do dono: a tabela de transposicao, as tres
+// familias de historico, e a rede -- a MESMA rede, por ponteiro, porque sao 96
+// MB que nao mudam durante a busca. O que ele tem de seu: a pilha de
+// acumuladores, as caches, o historico de capturas, os killers e a tabela
+// peca-casa.
+void Busca::prepara_fios(int n, Avaliador& av_dono) {
+    n = std::max(1, n);
+    if (n == n_fios && int(ajudantes.size()) == n - 1)
+        return;
+    ajudantes.clear();
+    av_ajudantes.clear();
+    for (int i = 0; i < n - 1; ++i) {
+        auto a = std::make_unique<Avaliador>();
+        std::string erro;
+        if (!a->partilha_rede(av_dono, erro)) {
+            // Sem rede o ajudante nao avalia nada. Melhor menos fios do que
+            // fios a procurar com uma avaliacao a zeros.
+            saida() << "info string fio " << (i + 1) << " sem rede: " << erro << std::endl;
+            break;
+        }
+        auto b = std::make_unique<Busca>();
+        b->ajudante = true;
+        b->p        = p;
+        b->partilha_tabela(p_tab);
+        b->partilha_historico(*this);
+        av_ajudantes.push_back(std::move(a));
+        ajudantes.push_back(std::move(b));
+    }
+    n_fios = int(ajudantes.size()) + 1;
+}
+
 void Busca::arranca(Position& pos, const Limites& lim, Avaliador& avaliador) {
     // Quem joga na raiz: o optimism e' assimetrico e precisa de saber o lado.
     lado_raiz      = pos.side_to_move();
@@ -2296,9 +2368,9 @@ void Busca::arranca(Position& pos, const Limites& lim, Avaliador& avaliador) {
         MoveList<LEGAL> ml(pos);
         if (ml.size() == 1) {
             melhor_raiz = *ml.begin();
-            std::cout << "info depth 1 seldepth 1 score cp 0 nodes 1 nps 0 time 0 pv "
+            saida() << "info depth 1 seldepth 1 score cp 0 nodes 1 nps 0 time 0 pv "
                       << UCIEngine::move(melhor_raiz, false) << std::endl;
-            std::cout << "bestmove " << UCIEngine::move(melhor_raiz, false) << std::endl;
+            saida() << "bestmove " << UCIEngine::move(melhor_raiz, false) << std::endl;
             return;
         }
     }
@@ -2313,6 +2385,48 @@ void Busca::arranca(Position& pos, const Limites& lim, Avaliador& avaliador) {
     auto t0       = std::chrono::steady_clock::now();
     std::int64_t custo_anterior = 0;
     int prof_max = lim.profundidade > 0 ? lim.profundidade : MAX_PLY - 2;
+
+
+    // --- LAZY SMP: os ajudantes ---
+    //
+    // Nao procuram noutro sitio: procuram a MESMA posicao, e chegam a`s coisas
+    // por outra ordem porque a tabela de transposicao que partilham lhes vai
+    // respondendo coisas diferentes. Quem enche a tabela mais depressa faz a
+    // principal encontrar la' trabalho ja' feito, e ela desce mais.
+    //
+    // O que mudou aqui em relacao a` primeira versao e' a partilha do
+    // HISTORICO. So' com a tabela, a quatro fios fazia-se 3,17x os nos de um
+    // fio e chegava-se ao ply 21 onde uma referencia chegava ao 25 -- os nos
+    // estavam la', o que nao circulava era a aprendizagem.
+    //
+    // A posicao vai por FEN. Um `Position` nao se copia: ele aponta para uma
+    // cadeia de `StateInfo` que e' da arvore de quem o construiu. O historico
+    // de repeticoes vai a` parte, em `chaves_jogo`, que e' o que a FEN nao leva.
+    if (!ajudante && !ajudantes.empty()) {
+        const std::string fen = pos.fen();
+        Limites lim_aj  = lim;
+        lim_aj.infinito = true;   // quem manda parar e' a principal
+        lim_aj.nos      = 0;
+        lim_aj.movetime = 0;
+        lim_aj.profundidade = 0;
+        fios.clear();
+        for (std::size_t i = 0; i < ajudantes.size(); ++i) {
+            Busca&     b = *ajudantes[i];
+            Avaliador& a = *av_ajudantes[i];
+            b.p           = p;          // os mesmos parametros
+            b.chaves_jogo = chaves_jogo;
+            b.pre_n       = pre_n;
+            std::memcpy(b.pre_pc, pre_pc, sizeof(pre_pc));
+            std::memcpy(b.pre_para, pre_para, sizeof(pre_para));
+            b.parar.store(false, std::memory_order_relaxed);
+            fios.emplace_back([&b, &a, fen, lim_aj]() {
+                StateInfo st;
+                Position  pa;
+                pa.set(fen, false, &st);
+                b.arranca(pa, lim_aj, a);
+            });
+        }
+    }
 
     for (int prof = 1; prof <= prof_max; ++prof) {
         auto antes_iter = std::chrono::steady_clock::now();
@@ -2345,13 +2459,13 @@ void Busca::arranca(Position& pos, const Limites& lim, Avaliador& avaliador) {
         //
         // E os mates passam a ser anunciados como mates. Sem isto um mate ia
         // como um `cp` enorme, e nem a interface nem o arbitro o viam.
-        std::cout << "info depth " << prof << " seldepth " << sel_prof << " score ";
+        saida() << "info depth " << prof << " seldepth " << sel_prof << " score ";
         if (std::abs(nota) >= VALUE_MATE_IN_MAX_PLY) {
             int plies = VALUE_MATE - std::abs(nota);
             int mv    = (plies + 1) / 2;
-            std::cout << "mate " << (nota > 0 ? mv : -mv);
+            saida() << "mate " << (nota > 0 ? mv : -mv);
         } else {
-            std::cout << "cp " << nota / 2;
+            saida() << "cp " << nota / 2;
         }
         // WDL: vitoria, empate e derrota em milesimos, do ponto de vista de quem
         // joga.
@@ -2370,15 +2484,15 @@ void Busca::arranca(Position& pos, const Limites& lim, Avaliador& avaliador) {
             double cp = double(nota);
             int w = int(std::lround(1000.0 * sig((cp - 285.2706341467852) / 295.6539508488627)));
             int l = int(std::lround(1000.0 * sig((-cp - 285.2706341467852) / 295.6539508488627)));
-            std::cout << " wdl " << w << " " << (1000 - w - l) << " " << l;
+            saida() << " wdl " << w << " " << (1000 - w - l) << " " << l;
         }
-        std::cout << (tb_acertos ? " tbhits " + std::to_string(tb_acertos) : std::string())
-                  << " hashfull " << p_tab->cheia() << " nodes " << nos
+        saida() << (tb_acertos ? " tbhits " + std::to_string(tb_acertos) : std::string())
+                  << " hashfull " << p_tab->cheia() << " nodes " << nos_totais()
                   << " time " << passou << " nps "
-                  << (passou > 0 ? nos * 1000 / std::uint64_t(passou) : 0) << " pv";
+                  << (passou > 0 ? nos_totais() * 1000 / std::uint64_t(passou) : 0) << " pv";
         for (int j = 0; j < pv_n[0]; ++j)
-            std::cout << " " << UCIEngine::move(pv_tab[0][j], false);
-        std::cout << std::endl;
+            saida() << " " << UCIEngine::move(pv_tab[0][j], false);
+        saida() << std::endl;
 
         // --- o elastico ---
         //
@@ -2454,6 +2568,19 @@ void Busca::arranca(Position& pos, const Limites& lim, Avaliador& avaliador) {
             break;
     }
 
+    // Os ajudantes param quando a principal parou. Cada um le' a SUA bandeira,
+    // e e' esta linha que as levanta todas -- sem ela ficavam a procurar para
+    // sempre, porque correm com limites infinitos de proposito.
+    if (!fios.empty()) {
+        for (auto& b : ajudantes)
+            b->parar.store(true, std::memory_order_relaxed);
+        for (auto& f : fios)
+            if (f.joinable())
+                f.join();
+        fios.clear();
+    }
+
+
     // Recusar uma repeticao quando se esta' a ganhar.
     //
     // Guardar so' o melhor lance nao deixa nada em que cair quando ele repete:
@@ -2484,7 +2611,7 @@ void Busca::arranca(Position& pos, const Limites& lim, Avaliador& avaliador) {
         {
             extern std::uint64_t g_corr_n, g_corr_zero, g_corr_soma;
             if (g_corr_n)
-                std::cout << "info string CORR chamadas=" << g_corr_n
+                saida() << "info string CORR chamadas=" << g_corr_n
                           << " a_zero=" << (100.0 * g_corr_zero / g_corr_n) << "%"
                           << " modulo_medio=" << (double(g_corr_soma) / g_corr_n)
                           << std::endl;
@@ -2494,21 +2621,21 @@ void Busca::arranca(Position& pos, const Limites& lim, Avaliador& avaliador) {
         std::uint64_t r13 = g_forma[1] + g_forma[2] + g_forma[3];
         std::uint64_t f14 = 0;
         for (int d = 14; d < 64; ++d) f14 += g_forma[d];
-        std::cout << "info string ORDEM cortes=" << g_cortes
+        saida() << "info string ORDEM cortes=" << g_cortes
                   << " no_primeiro=" << g_cortes_1
                   << " (" << (g_cortes ? 100.0 * g_cortes_1 / g_cortes : 0) << "%)"
                   << std::endl;
-        std::cout << "info string FORMA total=" << tot
+        saida() << "info string FORMA total=" << tot
                   << " qs=" << (tot ? 100.0 * g_forma_qs / tot : 0) << "%"
                   << " prof1-3=" << (tot ? 100.0 * r13 / tot : 0) << "%"
                   << " prof>=14=" << (tot ? 100.0 * f14 / tot : 0) << "%" << std::endl;
-        std::cout << "info string FORMA por profundidade:";
+        saida() << "info string FORMA por profundidade:";
         for (int d = 1; d <= 16; ++d)
-            std::cout << " " << d << ":" << (tot ? 100.0 * g_forma[d] / tot : 0);
-        std::cout << std::endl;
+            saida() << " " << d << ":" << (tot ? 100.0 * g_forma[d] / tot : 0);
+        saida() << std::endl;
     }
     if (DIAG.margem_estudo) {
-        std::cout << "info string MARGEM  prof     n      p50      p90      p95      p99"
+        saida() << "info string MARGEM  prof     n      p50      p90      p95      p99"
                   << std::endl;
         for (int d = 1; d < EST_PROF; ++d) {
             auto& v = g_desmente[d];
@@ -2516,13 +2643,13 @@ void Busca::arranca(Position& pos, const Limites& lim, Avaliador& avaliador) {
                 continue;
             std::sort(v.begin(), v.end());
             auto q = [&](double f) { return v[std::min(v.size() - 1, size_t(v.size() * f))]; };
-            std::cout << "info string MARGEM  " << d << "  " << v.size()
+            saida() << "info string MARGEM  " << d << "  " << v.size()
                       << "  " << q(0.50) << "  " << q(0.90) << "  " << q(0.95)
                       << "  " << q(0.99) << std::endl;
         }
     }
     if (DIAG.sing_conta)
-        std::cout << "info string AVAL chamadas=" << n_aval << " nos=" << nos
+        saida() << "info string AVAL chamadas=" << n_aval << " nos=" << nos
                   << " por_no=" << (nos ? double(n_aval) / double(nos) : 0.0)
                   << " | busca: calc=" << n_aval_bs << " tabela=" << n_hit_bs
                   << " (" << (n_aval_bs + n_hit_bs ? 100.0 * n_hit_bs / (n_aval_bs + n_hit_bs) : 0) << "% poupados)"
@@ -2530,14 +2657,14 @@ void Busca::arranca(Position& pos, const Limites& lim, Avaliador& avaliador) {
                   << " (" << (n_aval_qs + n_hit_qs ? 100.0 * n_hit_qs / (n_aval_qs + n_hit_qs) : 0) << "% poupados)"
                   << std::endl;
     if (DIAG.sing_conta)
-        std::cout << "info string PC nos_entrados=" << pc_nos << " tentativas=" << pc_tentativas
+        saida() << "info string PC nos_entrados=" << pc_nos << " tentativas=" << pc_tentativas
                   << " passaram_qs=" << pc_passou_qs << " cortes=" << pc_cortes << std::endl;
     if (DIAG.sing_conta)
-        std::cout << "info string SING chamadas=" << conta_sing << " nos=" << nos_sing
+        saida() << "info string SING chamadas=" << conta_sing << " nos=" << nos_sing
                   << " (" << (nos ? 100.0 * nos_sing / nos : 0) << "% da arvore)"
                   << " ext1=" << conta_ext1 << " ext2=" << conta_ext2
                   << " ext-1=" << conta_ext_neg << std::endl;
-    std::cout << "bestmove " << UCIEngine::move(melhor_raiz, false) << std::endl;
+    saida() << "bestmove " << UCIEngine::move(melhor_raiz, false) << std::endl;
 }
 
 }  // namespace Kestrel

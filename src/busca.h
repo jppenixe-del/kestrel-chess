@@ -10,6 +10,10 @@
 #ifndef KS_BUSCA_H
 #define KS_BUSCA_H
 
+#include <iostream>
+#include <memory>
+#include <string>
+#include <thread>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -771,10 +775,51 @@ class Busca {
     /// meio.
     std::uint64_t nos_limite = 0;
     void arranca(Position& pos, const Limites& lim, Avaliador& av);
+
+    /// SOU UM AJUDANTE DO LAZY SMP?
+    ///
+    /// Um ajudante corre a mesma busca, na mesma posicao, partilhando a tabela
+    /// de transposicao e as tres familias de historico. Nao e' que ele procure
+    /// noutro sitio -- e' que chega a`s coisas por outra ordem, enche a tabela
+    /// mais depressa, e a principal encontra la' o trabalho ja' feito.
+    ///
+    /// O que ele NAO faz: escrever para a saida (havia um `bestmove` por fio),
+    /// e gerir o relogio (quem decide quando parar e' a principal, e ela
+    /// escreve em `parar`, que todos leem).
+    bool ajudante = false;
+    /// Quantos fios esta busca usa ao todo, a principal incluida.
+    int  n_fios = 1;
+    /// Cria (ou destroi) os ajudantes e liga-lhes a tabela, o historico e a
+    /// rede desta busca. Chamar quando o `Threads` muda, nao a cada lance.
+    void prepara_fios(int n, Avaliador& av_dono);
+    /// Os nos de TODOS os fios.
+    ///
+    /// A principal, a quatro fios, anda MENOS nos do que andaria sozinha --
+    /// encontra na tabela o que os outros ja' fizeram. Anunciar so' os dela
+    /// dava um motor que parece abrandar quando se lhe dao fios, e um `nps`
+    /// que nao e' o trabalho que a maquina esta' mesmo a fazer.
+    std::uint64_t nos_totais() const {
+        std::uint64_t t = nos;
+        for (const auto& b : ajudantes)
+            t += b->nos;
+        return t;
+    }
+    /// A saida desta busca. No ajudante e' um sorvedouro: um `ostream` sem
+    /// buffer deita fora tudo o que la' se escreve. Proprio de cada busca e nao
+    /// partilhado, senao os fios disputavam os bits de estado do mesmo stream.
+    std::ostream  nulo{nullptr};
+    std::ostream& saida() { return ajudante ? nulo : std::cout; }
     void limpa();
     void nova_partida();
 
     Parametros         p;
+
+    // Os ajudantes e os fios que os correm. Vivem aqui entre buscas para nao
+    // se pagar a construcao -- e sobretudo as caches de acumuladores de cada
+    // um -- a cada lance da partida.
+    std::vector<std::unique_ptr<Busca>>     ajudantes;
+    std::vector<std::unique_ptr<Avaliador>> av_ajudantes;
+    std::vector<std::thread>                fios;
     // A TABELA E' PARTILHADA, e e' por ela que as threads conversam.
     //
     // Era membro por valor: com N buscas davam N tabelas separadas, e uma busca
@@ -790,6 +835,13 @@ class Busca {
 
     /// Aponta esta busca para a tabela de outra. Chamar ANTES de arrancar.
     void partilha_tabela(TranspositionTable* t) { p_tab = t; }
+    /// Aponta o historico desta busca para o de outra. Chamar ANTES de arrancar.
+    void partilha_historico(Busca& dono) {
+        cont_hist    = &dono.cont_hist_meu;
+        hist_peao    = &dono.hist_peao_meu;
+        corr         = &dono.corr_meu;
+        hist_proprio = false;
+    }
     TranspositionTable* minha_tabela() { return &tabela_propria; }
     std::atomic<bool>  parar{false};
     std::uint64_t      nos = 0;
@@ -926,14 +978,42 @@ class Busca {
     // Dois killers por ply. Guardam-se no corte de um TRANQUILO; nao se
     // guardam capturas, que ja' tem banda propria pelo MVV e pelo SEE.
     Move killers[MAX_PLY][2]{};
-    std::vector<int> cont_hist;  // 3 * (6*64) * (6*64)
+    // AS TRES FAMILIAS QUE OS FIOS PARTILHAM.
+    //
+    // A quatro fios fazemos 3,17x os nos de um fio e mesmo assim chegamos ao
+    // ply 21 onde um motor de referencia chega ao 25. Os nos estao la'; o que
+    // nao circulava era a APRENDIZAGEM. Cada fio tinha o seu historico, e o que
+    // um descobria morria com ele.
+    //
+    // Sao tres e nao quatro: as continuacoes, a correccao e o historico de
+    // peoes. A de capturas fica por fio -- o que uma captura leva sabe-se antes
+    // de a jogar, portanto ha' menos a ganhar em partilha-la, e era assim que
+    // estava.
+    //
+    // Atomicas com ordem RELAXADA. Nao ha' ordem a garantir entre elas: sao
+    // conselhos de ordenacao, e um conselho lido a meio de uma actualizacao
+    // ainda e' um conselho. O que nao se pode e' ter leitura e escrita
+    // simultaneas em `int` cru, que e' comportamento indefinido e nao apenas um
+    // numero errado.
+    //
+    // O padrao e' o mesmo da tabela de transposicao logo acima: um vector
+    // proprio e um ponteiro que os ajudantes reapontam para o do dono.
+    std::vector<std::atomic<int>>  cont_hist_meu;   // 5 * (6*64) * (6*64)
+    std::vector<std::atomic<int>>* cont_hist = &cont_hist_meu;
     // O historico indexado pela ESTRUTURA DE PEOES: peao_chaves * 12 * 64.
-    std::vector<int> hist_peao;
+    std::vector<std::atomic<int>>  hist_peao_meu;
+    std::vector<std::atomic<int>>* hist_peao = &hist_peao_meu;
 
     // [familia][lado][chave]. Cinco familias: peoes, a forca restante de cada
     // lado, o ultimo lance por peca e destino, e o ultimo lance como mudanca da
     // chave da posicao.
-    std::vector<int> corr;  // 5 * 2 * 16384
+    std::vector<std::atomic<int>>  corr_meu;   // 6 * 2 * 16384
+    std::vector<std::atomic<int>>* corr = &corr_meu;
+    /// Sou dono destas tabelas, ou sao emprestadas de quem me lancou?
+    ///
+    /// So' o dono as limpa. Um ajudante a limpar apagaria, a cada busca, tudo
+    /// o que a busca principal tinha aprendido.
+    bool hist_proprio = true;
 
     // O que se jogou em cada ply, como (peca, destino).
     int jogado_pc[MAX_PLY]{};

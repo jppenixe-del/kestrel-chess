@@ -28,7 +28,7 @@ bool Avaliador::carrega(const std::string& caminho, std::string& erro) {
     // avaliacao constante e nada levanta erro. Custou-me uma tarde a perceber
     // que a rede nunca chegava a ser lida.
     ficheiro.current.reset();
-    rede.load(std::filesystem::path("."), std::filesystem::path(caminho), ficheiro);
+    p_rede->load(std::filesystem::path("."), std::filesystem::path(caminho), ficheiro);
     // A `load` do substrato falha CALADA: devolve sem descricao e deixa os
     // pesos a zero, e uma rede a zeros avalia tudo a zero sem levantar erro
     // nenhum. E' preciso perguntar-lhe se ela ficou mesmo la'.
@@ -36,7 +36,7 @@ bool Avaliador::carrega(const std::string& caminho, std::string& erro) {
         erro = "a rede " + caminho + " nao foi aceite (arquitectura ou ficheiro truncado)";
         return false;
     }
-    caches   = std::make_unique<Eval::NNUE::AccumulatorCaches>(rede);
+    caches   = std::make_unique<Eval::NNUE::AccumulatorCaches>(*p_rede);
     tem_rede = true;
     return true;
 }
@@ -48,14 +48,14 @@ bool Avaliador::carrega_embebida(std::string& erro) {
     // de uma tentativa anterior, o substrato salta o carregamento calado e a
     // rede fica a zeros.
     ficheiro.current.reset();
-    rede.load_internal(ficheiro);
+    p_rede->load_internal(ficheiro);
     // E a mesma verificacao: a `load` falha sem dizer nada e deixa os pesos a
     // zero. Uma rede a zeros avalia tudo a zero e nada levanta erro.
     if (ficheiro.netDescription.empty()) {
         erro = "a rede embebida nao foi aceite";
         return false;
     }
-    caches   = std::make_unique<Eval::NNUE::AccumulatorCaches>(rede);
+    caches   = std::make_unique<Eval::NNUE::AccumulatorCaches>(*p_rede);
     tem_rede = true;
     return true;
 #else
@@ -72,13 +72,29 @@ const char* Avaliador::nome_por_omissao() {
 #endif
 }
 
+bool Avaliador::partilha_rede(Avaliador& dono, std::string& erro) {
+    tem_rede = false;
+    if (!dono.tem_rede) {
+        erro = "o dono ainda nao tem rede carregada";
+        return false;
+    }
+    p_rede   = dono.p_rede;
+    ficheiro = dono.ficheiro;
+    // As caches sao construidas A PARTIR da rede mas sao deste fio: duas buscas
+    // a escrever na mesma cache de acumuladores dariam avaliacoes de posicoes
+    // que nenhuma delas esta' a ver.
+    caches   = std::make_unique<Eval::NNUE::AccumulatorCaches>(*p_rede);
+    tem_rede = true;
+    return true;
+}
+
 void Avaliador::repoe() { acumuladores.reset(); }
 
 void Avaliador::partes(const Position& pos, int& psqt, int& posicional) {
     psqt = posicional = 0;
     if (!tem_rede || pos.checkers())
         return;
-    auto [a, b] = rede.evaluate(pos, acumuladores, *caches);
+    auto [a, b] = p_rede->evaluate(pos, acumuladores, *caches);
     psqt = int(a); posicional = int(b);
 }
 
@@ -104,7 +120,7 @@ void Avaliador::partes(const Position& pos, int& psqt, int& posicional) {
 Value Avaliador::avalia_cheia(const Position& pos, int escala_x100, int otimismo) {
     if (pos.checkers() || !tem_rede)
         return VALUE_ZERO;
-    Value v = Eval::evaluate(rede, pos, acumuladores, *caches, otimismo);
+    Value v = Eval::evaluate(*p_rede, pos, acumuladores, *caches, otimismo);
     return Value(int(v) * escala_x100 / 100);
 }
 
@@ -149,7 +165,7 @@ Value Avaliador::avalia(const Position& pos) {
     // inversa, 348 no razoring, 100+150 na dos tranquilos -- foram varridas nas
     // unidades do half2k. Uma avaliacao 18% maior aperta cada uma delas em 18%
     // sem ninguem dar por isso.
-    auto [psqt, posicional] = rede.evaluate(pos, acumuladores, *caches);
+    auto [psqt, posicional] = p_rede->evaluate(pos, acumuladores, *caches);
     return Value((int(psqt) + int(posicional)) * 85 / 100);
 }
 
