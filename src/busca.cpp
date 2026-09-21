@@ -2277,6 +2277,7 @@ void Busca::arranca(Position& pos, const Limites& lim, Avaliador& avaliador) {
     if (const char* v = std::getenv("KS_TM_INSTAB")) p.tm_instab_div = std::atoi(v);
     if (const char* v = std::getenv("KS_TM_INSTAB_MAX")) p.tm_instab_max = std::atoi(v);
     if (const char* v = std::getenv("KS_TM_ESCALA_MAX")) p.tm_escala_max = std::atoi(v);
+    if (const char* v = std::getenv("KS_TM_CHAO")) p.tm_chao_ms = std::atoi(v);
     if (const char* v = std::getenv("KS_TM_ESCALA_MIN")) p.tm_escala_min = std::atoi(v);
     if (const char* v = std::getenv("KS_TM_TECTO")) p.tm_tecto_x10 = std::atoi(v);
     if (const char* v = std::getenv("KS_TM_CURVA")) p.tm_curva = std::atoi(v);
@@ -2455,8 +2456,11 @@ void Busca::arranca(Position& pos, const Limites& lim, Avaliador& avaliador) {
             tecto = std::max(std::min(tecto, t * p.tm_sem_inc_tecto / 100), std::int64_t(1));
 
         std::int64_t seguro = std::max(t - sobrecarga - t / 20, std::int64_t(1));
-        mole = std::chrono::milliseconds(std::min(optimo, seguro));
-        duro = std::chrono::milliseconds(std::min(std::max(tecto, optimo), seguro));
+        // O chao, limitado pelo que resta -- ver `tm_chao_ms`.
+        std::int64_t chao = std::min<std::int64_t>(std::max(p.tm_chao_ms, 0), seguro);
+        mole = std::chrono::milliseconds(std::max(std::min(optimo, seguro), chao));
+        duro = std::chrono::milliseconds(
+          std::max(std::min(std::max(tecto, optimo), seguro), chao));
     }
 
     p_tab->avanca_geracao();

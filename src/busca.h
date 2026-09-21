@@ -764,6 +764,22 @@ struct Parametros {
     // PROPOSITO. Foi implementado e MEDIDO: -14,29 +/- 12,22, LLR -1,08 em 905
     // partidas. Perde Elo. Fica a nota para nao voltar a ser tentado por
     // parecer boa ideia -- e parece.
+    /// O CHAO DO ORCAMENTO, em milissegundos.
+    ///
+    /// Um relogio muito baixo ainda deve comprar um lance que foi OLHADO, e nao
+    /// um que foi adivinhado. Sem isto, se a sobrecarga for maior do que o
+    /// orcamento por lance, o `optimo` fica em 1 ms e o motor responde na
+    /// profundidade tres -- que e' pior do que o pequeno risco de passar alguns
+    /// milissegundos.
+    ///
+    /// Acontece por conta certa e nao por acidente: a 5+0,05 a curva do
+    /// horizonte da' ~47 lances, portanto ~127 ms por lance. Uma sobrecarga de
+    /// 200 ms -- que e' o valor de um bot na internet -- nao cabe la' dentro.
+    ///
+    /// O chao e' ELE PROPRIO limitado pelo que resta no relogio, por isso nunca
+    /// pode fazer o motor gastar o que nao tem. Mesma forma do `TmFloorMs` do
+    /// half2k, que tambem tem 10.
+    int tm_chao_ms   = 10;
     int tm_estim     = 7;
     /// QUANTOS LANCES SE ASSUME QUE FALTAM, para repartir o relogio.
     ///
