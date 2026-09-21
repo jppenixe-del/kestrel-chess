@@ -550,10 +550,45 @@ struct Parametros {
     /// to 3, where the history tables have few samples and order badly. This
     /// term needs to learn nothing -- it is worth something on the first visit
     /// to any node. It is signal where we currently have none.
-    int ameaca_f      = 0;
+    // AVISO DE LEITURA, porque isto ja' me custou uma tarde.
+    //
+    // Os blocos `///` acima documentam manetes DIFERENTES, encostados uns aos
+    // outros, e as quatro declaracoes seguem todas em fila no fim. O texto
+    // "TRIED AND REJECTED" que aparece la' em cima e' do `sem_balde` -- de
+    // deitar fora o BALDE das ameacas -- e nao do `ameaca_f`. Quem ler de
+    // passagem conclui que as ameacas foram rejeitadas, quando a propria nota
+    // diz o contrario: a informacao de ameaca sobrevive porque vive aqui.
+
+    /// O termo das ameacas na ordenacao. 20 = o valor de producao.
+    ///
+    ///     nota += valor_da_peca * ameaca_f * (saiu_de_ameacada - foi_para_ameacada)
+    ///
+    /// Premeia SAIR de uma casa batida por peca mais barata e castiga ENTRAR
+    /// numa. Peao e rei valem zero de proposito: nada e' mais barato do que um
+    /// peao, e um rei nunca se troca.
+    ///
+    /// E' a manete que mais Elo deu a este motor: **+4,70**. A omissao foi
+    /// mudada de 0 para 20 a 18-09 e o binario que o bot corria em producao
+    /// traz 20. Esta reconstrucao tinha-a a ZERO -- nao por decisao, por
+    /// omissao: a manete mudou de nome (`ameaca` no binario, `ameaca_f` aqui)
+    /// e a comparacao por nome exacto nao a apanhava.
+    ///
+    /// O 40 ficou por decidir. Corria a +10,62 +/- 19,17 quando a maquina que
+    /// o media morreu, e e' isso -- e nao o mecanismo -- o que os registos
+    /// chamam "a retractacao do ameaca_f=40".
+    int ameaca_f      = 20;
+    /// Deitar fora o BALDE das ameacas na historia de continuacao: uma gaveta
+    /// em vez de quatro, para as amostras deixarem de ser divididas. MEDIDO EM
+    /// PARTIDAS E REJEITADO. 0 = fica o balde.
     int sem_balde     = 0;
     int usa_cuckoo    = 1;
-    int usa_tt_capt   = 0;
+    /// Futilidade inversa SO' quando nao ha' lance na tabela, ou quando o que
+    /// la' esta' e' uma captura. 1 = o valor de producao.
+    ///
+    /// Sem isto a futilidade inversa corta tambem onde a tabela ja' guardou um
+    /// tranquilo que resultou -- justamente onde ha' informacao a dizer que o
+    /// no' merece ser visto.
+    int usa_tt_capt   = 1;
     /// MEDIDO MORTO em 2026-09-13: nao muda um unico no'.
     ///
     /// Testado com divisor 198435 (o deles), 50000, 20000, 8000 e 1000, em tres
