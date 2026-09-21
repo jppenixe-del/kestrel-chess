@@ -32,6 +32,40 @@ namespace Kestrel {
 // Everything the engine compares against a number lives here; nothing is
 // hardcoded in the middle of the search. That rule is what made it possible to
 // sweep ninety-eight parameters without recompiling once.
+// NAO SAO AS CONSTANTES. Medido dos dois lados.
+//
+// A pergunta: a referencia corre com os parametros DELA e, com a NOSSA rede,
+// fica dezenas de Elo acima de nos. Serao as nossas oitenta constantes
+// simplesmente piores?
+//
+// Testou-se a serio -- todas de uma vez, nao uma a uma, porque uma a uma da'
+// sempre negativo (ver o paragrafo do defeito absorvido). `KS_PADRAO_SF` troca
+// o bloco inteiro: futilidade inversa, razoring, lance nulo, LMP, poda pelo
+// historico, futilidade dos tranquilos, tabela de reducao, IIR.
+//
+//   em partidas, 10+0,1, 200 jogos:
+//     os NOSSOS valores contra o preset:  **+45,42 +/- 19,38**
+//     33 vitorias contra 7
+//
+//   e a profundidade a 3 milhoes de nos, nesta arvore:
+//     nosso       ply 20    prof1-3 55,4%   prof>=14 0,23%
+//     padrao_sf   ply 20    prof1-3 71,3%   prof>=14 0,31%
+//     referencia  ply 23    prof1-3 40,2%   prof>=14 1,93%
+//
+// O preset nao ganha um ply aqui, e perde 45 Elo. Num motor menos reposto
+// ganhava dois plies -- e perdia na mesma.
+//
+// O QUE ISTO ELIMINA: a diferenca para a referencia nao esta' nos NUMEROS com
+// que fazemos as coisas. Esta' no que a busca dela FAZ e a nossa nao faz.
+// Estrutura, nao calibracao.
+//
+// RESSALVA, porque o teste tem um limite real: o que se mede e' uma TRANSCRICAO
+// dos valores deles, e algumas formas nao tem correspondencia -- o razoring
+// deles e' quadratico na profundidade e o nosso linear, a reducao deles tem um
+// termo `delta*577/rootDelta` que nao temos, e a tabela `2872/128*log(i)` foi
+// convertida para a nossa base/divisor por aproximacao. Conclui-se "esta
+// traducao, neste motor, perde"; nao se conclui "os valores deles sao maus".
+
 // NENHUM INDICADOR QUE TEMOS PREVE ELO. Nem um.
 //
 // Contados num dia de trabalho, com partidas a fechar cada pergunta:
