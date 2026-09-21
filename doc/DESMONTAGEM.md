@@ -162,3 +162,113 @@ fracassos**. E não transplantar as constantes deles em bloco: **−45 Elo**, e 
 O que pagou, as duas vezes, foi **restaurar coisas do nosso próprio motor que o
 porte deixou cair**: +18 Elo cada. Este documento é sobre encontrar o resto
 delas, no único sítio onde ainda existem.
+
+---
+
+# Primeira passagem já feita: `Busca::reducao`
+
+Para o documento não ser só método, o primeiro item da lista foi feito. Levou
+minutos, não horas — porque o binário tem símbolos.
+
+```
+objdump -d --start-address=0x40ade0 --stop-address=0x40afb5 ks_1.20260919
+```
+
+138 linhas de assembly. E o `parametros_19set.h` tem os **deslocamentos
+anotados**, portanto cada `mov 0xNNN(%rdi)` fica com nome sem adivinhar nada.
+
+## Os campos que a `reducao` do binário lê, por ordem de leitura
+
+| ordem | deslocamento | parâmetro | valor no binário |
+|---|---|---|---:|
+| 1 | `0x90` | `cut_cnt_base` | 0 |
+| 2 | `0x138` | `lmr_piora_f` | 197 |
+| 3 | `0x12c` | **`lmr_delta`** | **0** |
+| 4 | `0x14c` | `lmr_ttpv` | 1024 |
+| 5 | `0x150` | `lmr_ttpv_pv` | 0 |
+| 6 | `0x154` | `lmr_ttpv_alpha` | 0 |
+| 7 | `0x158` | `lmr_ttpv_fundo` | 0 |
+| 8 | `0x13c` | `lmr_nonpv_f` | 1024 |
+| 9 | `0x144` | `lmr_hist_div` | 22000 |
+| 10 | `0x164` | `lmr_ext_amort` | 100 |
+| 11 | `0x15c` | `lmr_cut_sem_tt` | 0 |
+| 12 | `0x140` | `lmr_cut_f` | 2048 |
+
+## O esqueleto, lido das instruções
+
+```
+mov  $0x3f,%ecx                 clamp do índice a 63
+mov  0x10(%rdi,%rcx,4),%ecx     a tabela lmr, que vive em 0x10
+add  0x90(%rdi),%eax            + cut_cnt_base
+mov  0x138(%rdi),%r9d           lmr_piora_f
+imul %ecx,%r9d / sar $0x9       r += r * piora / 512
+mov  0x12c(%rdi),%esi           lmr_delta
+test %esi,%esi / jle            se lmr_delta > 0
+sub  %ebx,%eax / imul %esi
+idiv %r8d / sub %eax,%ecx       r -= (X - Y) * lmr_delta / X
+test %r12b,%r12b / jne
+shr $0x1f / add / sar $1 / sub  r -= r/2   (a metade das capturas)
+```
+
+## O achado
+
+**O `lmr_delta` é o termo `delta/rootDelta`.** É o mesmo que aparece na lista de
+peças em falta como *"sim | não usamos"*, a pensar que era mecanismo da
+referência que nunca tivemos.
+
+**Tivemos.** Está no nosso próprio binário, com interruptor `KS_LMR_DELTA`, e a
+nota no `parametros_19set.h` diz **"NOVO depois de 15-09"** — foi acrescentado
+nos últimos quatro dias antes de a máquina morrer. Está a **zero** nas omissões,
+portanto inerte também lá, mas o caminho de código existe e a forma lê-se acima.
+
+A forma é `r -= (X - Y) * lmr_delta / X`, com `X` e `Y` a virem de registos
+carregados antes da chamada. Identificar `X` e `Y` é o passo seguinte, e faz-se
+olhando para quem chama a `reducao` no `negamax`.
+
+## O que a comparação com a nossa diz
+
+A nossa `reducao` lê doze campos: os mesmos onze **menos `lmr_delta`**, mais
+`cut_cnt_mais`. Ou seja, a estrutura está quase toda lá — o que falta é um termo
+que estava desligado no original de qualquer maneira.
+
+**Isso é boa notícia e má notícia.** Boa, porque a `reducao` não é onde está o
+buraco. Má, porque significa que o buraco está numa das funções grandes — o
+`negamax` de 19.534 bytes ou a `quiescencia` de 4.110 — e essas são trabalho a
+sério.
+
+---
+
+# As vinte manetes dos últimos quatro dias
+
+O `parametros_19set.h` marca **vinte** parâmetros com *"NOVO depois de 15-09"*.
+É o trabalho final do motor antes de a máquina morrer, e portanto o sítio onde a
+reconstrução tinha mais probabilidade de falhar.
+
+Verificado contra o motor de hoje:
+
+| manete | valor | no nosso motor |
+|---|---:|---|
+| `ad_min`, `ad_max` | 3, 12 | presentes, lidos |
+| `ordem_cont` → `ordem_cont_f` | 32 | presente, lido |
+| `ameaca` → `ameaca_f` | 20 | presente, lido |
+| `sem_balde` | 0 | presente |
+| `cont_n` | 3 | presente, lido |
+| `peao_ch` → `peao_chaves` | 8192 | presente, lido |
+| `otimismo` → `otimismo_f` | 114 | presente, lido |
+| `tt_sup` → `tt_sup_nota` | 1000000 | presente, lido |
+| `tm_escala_min` | 650 | presente, lido |
+| `tm_curva`, `tm_curva_min`, `tm_curva_f` | 1, 8, 100 | presentes, lidos |
+| **`lmp_melhora`** | **0** | não existe — inerte no binário |
+| **`poda_red`** | **0** | não existe — inerte no binário |
+| **`lmr_delta`** | **0** | não existe — inerte no binário, forma acima |
+| **`asp_sf`** | **0** | não existe — inerte no binário |
+| **`tm_adv_f`** | **0** | não existe — inerte no binário |
+| **`tm_adv_min`**, **`tm_adv_max`** | 70, 140 | não existem — **excluídos de propósito** |
+
+**Catorze das vinte estão presentes e são lidas.** Das seis que faltam, cinco
+estão a zero no próprio binário e as duas últimas são o relógio do adversário,
+que foi medido a **−14,29 ± 12,22 em 905 partidas** e excluído por decisão.
+
+Portanto a recuperação dos últimos quatro dias está essencialmente completa ao
+nível dos parâmetros. **O que falta é comportamento, não valores** — e é por
+isso que este documento existe.
