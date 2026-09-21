@@ -266,7 +266,26 @@ struct Parametros {
     // diz que a margem esta' baixa de mais para a NOSSA escala -- isto nao esta'
     // a distinguir posicoes, esta' a fazer uma busca rasa em toda a parte.
     //
-    // Volta quando a arvore estiver menor ou com a margem varrida a serio.
+    // A MARGEM FOI VARRIDA, e nao salva o mecanismo. Quatro posicoes, a
+    // profundidade 12, `pc_prof = 5`, contra o mesmo motor com ele desligado:
+    //
+    //     margem        600       700       800
+    //     vs desligado  -2,5%     -0,9%     +5,5%
+    //
+    // No conjunto e' ruido. E por posicao e' pior do que ruido -- e' caotico: a
+    // margem 700 poupa 9% numa posicao (83.704 -> 75.994) e quase DUPLICA outra
+    // (228.095 -> 422.266). Uma manete que faz as duas coisas com o mesmo
+    // numero nao esta' a medir o que dissemos que media.
+    //
+    // A taxa de sucesso responde como esperado -- 81% a 205, 88% a 700 com
+    // metade das tentativas, 100% a 1000 com sete -- portanto a margem FUNCIONA
+    // como filtro. O que ela nao faz e' tornar o mecanismo rentavel aqui.
+    //
+    // Fica desligado, e agora com a condicao daquela frase cumprida: ja' nao ha'
+    // "falta varrer a margem" a dever-se a ninguem. O que resta e' a outra
+    // metade -- "quando a arvore estiver menor" -- e essa e' consequencia, nao
+    // causa: se a arvore encolher por outra via, este mecanismo volta a valer a
+    // pena sozinho.
     int pc_prof     = 0;     // profundidade minima para tentar; 0 = desligado
 
     // --- a poda do no' interior, com a profundidade REDUZIDA ---
