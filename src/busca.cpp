@@ -83,6 +83,10 @@ struct Diag {
     // vale em MODULO. E' a radiografia que mostra se a reducao escolhe o lance
     // ou se reduz tudo por igual.
     bool quem;
+    // OS QUATRO GRANDES, sem interruptor ate' agora. Nao e' para os ligar ou
+    // desligar em producao -- e' para se poder perguntar o que cada um vale,
+    // que e' a unica forma de saber o que a busca esta' mesmo a fazer.
+    bool sem_lmr, sem_corr, sem_asp, sem_ext;
     // O estudo da margem: quanto e' que a busca desmente a estatica, por ply.
     bool margem_estudo;
     // A re-busca proporcional (`RebuscaFina` no half2k).
@@ -101,6 +105,10 @@ struct Diag {
           sem_nmp_prof(std::getenv("KS_SEM_NMP_PROF") != nullptr),
           forma(std::getenv("KS_FORMA") != nullptr),
           quem(std::getenv("KS_QUEM") != nullptr),
+          sem_lmr(std::getenv("KS_OFF_LMR") != nullptr),
+          sem_corr(std::getenv("KS_OFF_CORR") != nullptr),
+          sem_asp(std::getenv("KS_OFF_ASP") != nullptr),
+          sem_ext(std::getenv("KS_OFF_EXT") != nullptr),
           nmp_todos(std::getenv("KS_NMP_TODOS") != nullptr),
           margem_estudo(std::getenv("KS_MARGEM_ESTUDO") != nullptr),
           reb_fina(std::getenv("KS_REB") != nullptr),
@@ -670,6 +678,8 @@ void Busca::indices(const Position& pos, int ply, int fora[6]) const {
 }
 
 int Busca::corrigida(const Position& pos, int cru, int ply) const {
+    if (DIAG.sem_corr)
+        return cru;
     if (corr->empty())
         return cru;
     int idx[6];
@@ -687,6 +697,8 @@ int Busca::corrigida(const Position& pos, int cru, int ply) const {
 }
 
 void Busca::aprende(const Position& pos, int dif, int prof, int ply) {
+    if (DIAG.sem_corr)
+        return;
     if (corr->empty())
         return;
     int idx[6];
@@ -833,6 +845,10 @@ void Busca::pontua(const Position& pos, Lista& l, int de, Move tt_lance,
 int Busca::reducao(int prof, int i, int alpha, int beta, bool melhorando, bool tranquilo,
                    bool cut, bool pv, bool tt_pv, Move tt_lance, int hist_i,
                    bool ttpv_bate_alpha, bool ttpv_fundo, int cortes_filho) const {
+    // Sem reducao nenhuma: a arvore inteira a` profundidade nominal. E' a
+    // medida de quanto a reducao esta' a poupar, e de quanto custa em qualidade.
+    if (DIAG.sem_lmr)
+        return 0;
     int r = lmr[std::min(prof, 63)][std::min(i, 63)];
     if (DIAG.quem) conta_q(Q_TABELA, r);
 
@@ -1558,6 +1574,9 @@ int Busca::negamax(Position& pos, int prof, int alpha, int beta, int ply, bool p
         bool tranquilo = !pos.capture_stage(m) && m.type_of() != PROMOTION;
 
         int extensao = 0;
+        // Sem extensoes: nenhum ramo ganha profundidade. Mede o que as
+        // extensoes -- singular, dupla, negativa -- estao a comprar.
+        const bool ext_ligadas = !DIAG.sem_ext;
 
         // Uma vez esgotados os tranquilos, os que faltam saltam-se. As capturas
         // atras deles NAO: elas nao falham o mesmo teste, e uma regra sobre
@@ -1664,12 +1683,12 @@ int Busca::negamax(Position& pos, int prof, int alpha, int beta, int ply, bool p
                     return 0;
                 if (sc < alvo) {
                     ++conta_ext1;
-                    extensao = 1;
+                    extensao = ext_ligadas ? 1 : 0;
                     // Nao apenas singular mas singular por uma distancia. So' fora
                     // da variante principal, onde errar custa uma sub-arvore e nao
                     // o lance que se joga.
                     bool dupla_ok = p.ext_dupla_exacto || e.limite != Limite::Exacto;
-                    if (!pv && dupla_ok && sc < alvo - p.ext_dupla) { ++conta_ext2; extensao = 2; }
+                    if (!pv && dupla_ok && sc < alvo - p.ext_dupla) { ++conta_ext2; extensao = ext_ligadas ? 2 : 0; }
                 } else if (alvo >= beta && !DIAG.sing_sem_corte) {
                     // Todos os outros tambem batem o beta: a posicao esta' ganha
                     // por razoes que nao dependem deste lance.
@@ -1683,7 +1702,7 @@ int Busca::negamax(Position& pos, int prof, int alpha, int beta, int ply, bool p
                     // que nao e' o unico. Um no' com varias boas respostas e' o
                     // oposto do caso que merece extensao.
                     ++conta_ext_neg;
-                    extensao = -p.ext_neg;
+                    extensao = ext_ligadas ? -p.ext_neg : 0;
                 }
             }
         }
@@ -1985,6 +2004,11 @@ int Busca::otimismo_de(const Position& pos) const {
 
 int Busca::aspiracao(Position& pos, int prof, int anterior) {
     nota_raiz_ant = anterior;
+    // Sem janela: cada iteracao corre de -INFINITO a +INFINITO. E' a medida do
+    // que a aspiracao poupa -- e do que custa, porque cada falha da janela e'
+    // uma re-busca inteira.
+    if (DIAG.sem_asp)
+        return negamax(pos, prof, -INFINITO, INFINITO, 0, true, false);
     // A largura arranca MAIOR nas profundidades rasas e aperta a` medida que
     // desce: `5 + 25*8/prof`. Uma largura fixa e' larga de mais em cima, onde a
     // nota ainda salta, e estreita de mais em baixo, onde ja' nao devia saltar.
