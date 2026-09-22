@@ -32,10 +32,26 @@ std::uint64_t empacota(int prof, int nota, Limite limite, Move melhor, bool pv,
 
 int prof_de(std::uint64_t d) { return int(std::int8_t((d >> B_PROF) & 0xFF)); }
 
-// [ESCRITO] Profundidade com que se marca uma entrada que so' traz avaliacao, e
-// idade a partir da qual uma via se considera descartavel.
-constexpr int PROF_SO_AVAL = -128;
-constexpr int PENA_VELHA   = 4;
+// [BINARIO] Profundidade com que se marca uma entrada que so' traz avaliacao,
+// e peso da idade na escolha da via a deitar fora.
+//
+// Os tres numeros saem do `ks_1.20260919` e sao um DESENHO, nao valores
+// soltos:
+//
+//   PROF_SO_AVAL = -8   e' o que a `guarda_so_aval` grava (4205be: a mascara
+//                       0x3f800000000 tem 0xf8 = -8 nos bits 32-39)
+//   PROF_DESCART = -7   e' o limiar abaixo do qual uma via se sacrifica
+//                       (42056d: `cmp $0xf9,%r8b` seguido de `jl`)
+//   PENA_VELHA   = 3    (420378: `lea (,%r14,4)` seguido de `sub` -- x - 4x,
+//                       que e' -3x.  Escrito assim para evitar um imul, e
+//                       facil de ler como 4.)
+//
+// O -8 esta' UM PLY ABAIXO do -7 de proposito: uma entrada de so'-avaliacao
+// nasce ja' descartavel pela via seguinte.  Com os dois a -128, como estava,
+// essa relacao quebra-se e as entradas de so'-avaliacao tornam-se imortais.
+constexpr int PROF_SO_AVAL = -8;
+constexpr int PROF_DESCART = -7;
+constexpr int PENA_VELHA   = 3;
 
 }  // namespace
 
@@ -90,8 +106,11 @@ std::size_t TranspositionTable::via_a_substituir(Balde& b, std::uint64_t chave,
         if ((xr ^ dados) == chave)
             return i;
         int velhice = std::uint8_t(ger - b.via[i].ger.load(std::memory_order_relaxed));
-        if (dados == 0)
-            return i;
+        // [BINARIO] NAO ha' curto-circuito na via vazia.  O ciclo de 420348 a
+        // 42039d percorre sempre as tres e escolhe a de menor nota; uma via
+        // vazia da' `0 - PENA_VELHA*velhice` e compete como qualquer outra.
+        // Devolver a primeira vazia diverge quando ha' outra ainda pior.
+        //
         // Quanto MENOS valor, mais cedo se deita fora: uma entrada rasa ou
         // velha vale menos do que uma funda e fresca.
         int nota = prof_de(dados) - PENA_VELHA * velhice;
@@ -179,7 +198,9 @@ void TranspositionTable::guarda_so_aval(std::uint64_t chave, std::int16_t aval) 
         if (alvo >= 0)
             continue;
         int velhice = std::uint8_t(ger - b.via[i].ger.load(std::memory_order_relaxed));
-        if (dados == 0 || prof_de(dados) <= PROF_SO_AVAL || velhice >= PENA_VELHA)
+        // [BINARIO] 42056d: `cmp $0xf9,%r8b` / `jl` -> prof < -7, estrito.
+        // 420579: `cmp $0x2,%r8b` / `jbe` para RECUSAR -> serve com velhice > 2.
+        if (dados == 0 || prof_de(dados) < PROF_DESCART || velhice > 2)
             alvo = int(i);
     }
     if (alvo < 0)
