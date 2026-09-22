@@ -2753,19 +2753,37 @@ void Busca::arranca(Position& pos, const Limites& lim, Avaliador& avaliador) {
         // historico, e as respostas deles -- tres buscas inteiras -- eram
         // deitadas fora no fim.
         //
-        // Quem vota: o principal, e cada ajudante que NAO tenha ficado mais de
-        // dois plies atras dele. Um fio que o relogio apanhou na 12 nao esta' a
-        // ver o que o principal ve na 17, e deixa-lo votar e' decidir com menos
-        // informacao -- que e' o contrario do que o Lazy SMP e' para fazer. A
-        // divergencia que se quer e' no CAMINHO, nao na profundidade; e' por
-        // isso, tambem, que nenhum ajudante leva desvio de profundidade de
-        // proposito: com fios em profundidades diferentes a votacao passa a
-        // premiar quem saltou para um numero alto por um caminho raso.
+        // [BINARIO] Quem vota: o principal, e cada ajudante que tenha lance e
+        // que tenha COMPLETADO PELO MENOS UMA ITERACAO.  Nada mais.
+        //
+        // O `ks_1.20260919` testa, em 4466cf:
+        //
+        //     mov  0x2fc(%rax),%esi    ; Busca+0x274 = ultima profundidade
+        //     test %esi,%esi
+        //     jg   449b6c              ; > 0  ->  vota
+        //
+        // e NAO compara com a profundidade do principal em lado nenhum --
+        // procurei `cmp` sobre 0x274 e sobre 0x2fc em todo o binario e nao
+        // existe.
+        //
+        // O que estava aqui antes era `b->ultima_prof + 2 >= ultima_prof`, com
+        // o argumento de que um fio atrasado decide com menos informacao.  O
+        // argumento soa bem e e' uma DEDUCAO nossa: o motor perdido nao a
+        // fazia.
+        //
+        // E ha' razao para nao a fazer.  O piso de 24 da `vota()` existe
+        // precisamente para que um fio atrasado CONTINUE A CONTAR: se a nota
+        // dele for muito inferior, o peso `nota - menor + 24` da-lhe quase so'
+        // o piso, e ele entra como um voto de CONTAGEM e nao de forca.  E' a
+        // contagem que da' forca ao metodo -- o lance que varios caminhos
+        // independentes encontraram vale mais -- e o filtro dos dois plies
+        // deitava fora essa amostra por inteiro.  Com tres ajudantes, um
+        // atrasado fazia a votacao passar de quatro vozes a tres.
         std::vector<std::pair<Move, int>> cand;
         if (melhor_raiz != Move::none() && nota_raiz > -VALUE_MATE)
             cand.emplace_back(melhor_raiz, nota_raiz);
         for (auto& b : ajudantes)
-            if (b->melhor_raiz != Move::none() && b->ultima_prof + 2 >= ultima_prof)
+            if (b->melhor_raiz != Move::none() && b->ultima_prof > 0)
                 cand.emplace_back(b->melhor_raiz, b->nota_raiz);
         if (cand.size() > 1) {
             Move v = vota(cand);
