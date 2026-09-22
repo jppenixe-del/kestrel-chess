@@ -1609,6 +1609,10 @@ int Busca::negamax(Position& pos, int prof, int alpha, int beta, int ply, bool p
                 // as capturas que perdem material pontuam abaixo de todo o
                 // tranquilo e ficam no fim da lista.
                 int conta = p.lmp_base + prof * prof;
+                // Quem nao esta' a melhorar ve' o limite a meio. Do
+                // `ks_1.20260919` (`43818c`); a zero por omissao.
+                if (p.lmp_melhora && !melhorando)
+                    conta /= 2;
                 if (prof <= p.lmp_prof && int(i) >= conta) {
                     saltar_tranquilos = true;
                     continue;
@@ -2021,6 +2025,8 @@ int Busca::aspiracao(Position& pos, int prof, int anterior) {
     // nota ainda salta, e estreita de mais em baixo, onde ja' nao devia saltar.
     int delta = 5 + p.asp_delta * 8 / std::max(prof, 1);
     int alpha = -INFINITO, beta = INFINITO;
+    // So' serve com o `asp_sf`. Ver a nota nos parametros.
+    int falhas_altas = 0;
     if (prof > p.asp_prof && !e_mate(anterior)) {
         alpha = anterior - delta;
         beta  = anterior + delta;
@@ -2041,21 +2047,28 @@ int Busca::aspiracao(Position& pos, int prof, int anterior) {
         if (beta > p.asp_tecto)
             beta = INFINITO;
 
-        int nota = negamax(pos, prof, alpha, beta, 0, true, false);
+        // Com o `asp_sf`, uma iteracao que ja' falhou alto varias vezes nao
+        // merece a profundidade inteira: o lance ja' se mostrou, falta so'
+        // confirma-lo.
+        int prof_ajust = p.asp_sf ? std::max(prof - falhas_altas, 1) : prof;
+
+        int nota = negamax(pos, prof_ajust, alpha, beta, 0, true, false);
         if (parado)
             return nota;
 
         if (nota <= alpha) {
             // Falhou em baixo: o beta desce com ele, senao a re-busca fica com
             // a janela deslocada em vez de alargada.
-            beta  = (alpha + beta) / 2;
+            beta  = p.asp_sf ? alpha : (alpha + beta) / 2;
             alpha = std::max(nota - delta, -INFINITO);
+            falhas_altas = 0;
         } else if (nota >= beta) {
             beta = std::min(nota + delta, INFINITO);
+            ++falhas_altas;
         } else {
             return nota;
         }
-        delta += delta / 2;
+        delta += p.asp_sf ? delta / 3 : delta / 2;
     }
 }
 
@@ -2210,6 +2223,7 @@ void Busca::arranca(Position& pos, const Limites& lim, Avaliador& avaliador) {
     if (const char* v = std::getenv("KS_LOW_F")) p.low_f = std::atoi(v);
     if (const char* v = std::getenv("KS_PCP_M")) p.pcp_margem = std::atoi(v);
     if (const char* v = std::getenv("KS_PCP_P")) p.pcp_prof = std::atoi(v);
+    if (const char* v = std::getenv("KS_ASP_SF")) p.asp_sf = std::atoi(v);
     if (const char* v = std::getenv("KS_ASP_TECTO"))
         p.asp_tecto = std::atoi(v);
     // A LARGURA INICIAL da janela, que nunca teve interruptor.
@@ -2329,6 +2343,7 @@ void Busca::arranca(Position& pos, const Limites& lim, Avaliador& avaliador) {
     if (const char* v = std::getenv("KS_CUT_SEM_TT")) p.lmr_cut_sem_tt = std::atoi(v);
     if (const char* v = std::getenv("KS_EXT_DUPLA")) p.ext_dupla = std::atoi(v);
     if (const char* v = std::getenv("KS_LMP_PROF")) p.lmp_prof = std::atoi(v);
+    if (const char* v = std::getenv("KS_LMP_MELHORA")) p.lmp_melhora = std::atoi(v);
     if (const char* v = std::getenv("KS_LMR_BASE")) p.lmr_base = std::atoi(v);
     if (const char* v = std::getenv("KS_LMR_DIV")) p.lmr_div = std::atoi(v);
     if (const char* v = std::getenv("KS_LMR_DELTA")) p.lmr_delta = std::atoi(v);

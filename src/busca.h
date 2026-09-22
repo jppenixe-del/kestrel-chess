@@ -259,6 +259,20 @@ struct Parametros {
     // --- poda do no' interior, a` profundidade NOMINAL ---
     int lmp_base        = 3;
     int lmp_prof        = 6;
+
+    /// Nao estando a melhorar, corta-se o limite do LMP a meio. Do binario,
+    /// `negamax` em `43818c`:
+    ///
+    ///     43818c:  mov 0x30(%rbp),%r9d    ; lmp_melhora
+    ///     438190:  imul %edx,%eax         ; prof*prof
+    ///     438195:  add 0x28(%rbp),%eax    ; + lmp_base
+    ///     43819b:  je 4381b0              ; lmp_melhora == 0 -> salta
+    ///     43819d:  cmpb $0x0,0xc4(%rsp)   ; melhorando
+    ///     4381a5:  jne 4381b0             ; melhorando -> salta
+    ///     4381a7:  shr $0x1f / add / sar $1  ; conta /= 2
+    ///
+    /// A ZERO no molde do binario.
+    int lmp_melhora   = 0;
     int hist_poda       = 600;
     /// The depth cap on history pruning, and the shape of its margin. They are
     /// a pair: capping the depth only makes sense with the quadratic margin.
@@ -975,6 +989,21 @@ struct Parametros {
     int asp_tecto   = 1000;
     int asp_delta     = 25;
     int asp_prof      = 4;
+
+    /// O ciclo de aspiracao ALTERNATIVO que o `ks_1.20260919` traz. Nao e' uma
+    /// manete de um valor: liga tres coisas ao mesmo tempo, e o binario le-a
+    /// em tres sitios do `arranca` (`4400ba`, `4400d0`, `4401b3`).
+    ///
+    ///  1. a profundidade dada a` `negamax` passa a `max(prof - falhas, 1)`
+    ///     (`440153: sub %r13d,%edx` / `440170: cmove %r12d,%edx`);
+    ///  2. ao falhar em baixo, `beta = alpha` em vez de `(alpha+beta)/2`
+    ///     (`4400e3: mov %ebx,%r14d`);
+    ///  3. o delta cresce um TERCO em vez de metade
+    ///     (`4400fc: imul $0x55555556` = 2^32/3).
+    ///
+    /// O contador de falhas altas zera a cada falha baixa (`4400f3`) e sobe a
+    /// cada falha alta (`4401c0`). A ZERO no molde do binario.
+    int asp_sf        = 0;
     // Recusar a repeticao so' quando se esta' mesmo a ganhar, e aceitar um lance
     // ate' esta margem pior para a evitar.
     int recusa_limiar = 300;
