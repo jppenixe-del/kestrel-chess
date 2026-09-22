@@ -633,6 +633,24 @@ struct Parametros {
     // grandeza que realmente controla a arvore.
     int lmr_ext_amort  = 100;
 
+    /// O termo `delta/rootDelta` da reducao, que o `ks_1.20260919` tem e esta
+    /// reconstrucao nao tinha. Do binario, `Busca::reducao` em `40ae6f`:
+    ///
+    ///     40ae6f:  mov 0x12c(%rdi),%esi      ; lmr_delta
+    ///     40ae75:  test %esi,%esi / jle      ; <= 0 -> nao faz nada
+    ///     40ae84:  vmovd 0x47f20(%rdi),%xmm0 ; delta_raiz
+    ///     40ae8c:  sub %ebx,%eax             ; beta - alpha
+    ///     40ae8e:  imul %esi,%eax            ; * lmr_delta
+    ///     40ae91:  vpmaxsd %xmm1,%xmm0,%xmm2 ; max(delta_raiz, 1)
+    ///     40ae9c:  idiv %r8d
+    ///     40ae9f:  sub %eax,%ecx             ; r -= ...
+    ///
+    /// Uma janela larga a` volta deste no' em relacao a` da raiz quer dizer que
+    /// a nota ainda anda a saltar por aqui: reduz-se menos. A ZERO no molde do
+    /// binario, portanto nao muda nada enquanto nao for ligado -- entra para o
+    /// codigo existir e poder ser medido.
+    int lmr_delta      = 0;
+
     // --- re-busca proporcional ---
     // Refazer sempre a` profundidade inteira e' o mais caro dos tres casos
     // possiveis, e faziamo-lo sempre.

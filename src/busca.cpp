@@ -864,6 +864,13 @@ int Busca::reducao(int prof, int i, int alpha, int beta, bool melhorando, bool t
         r += d;
         if (DIAG.quem) conta_q(Q_PIORA, d);
     }
+    // A janela deste no' contra a da raiz. Vem do `ks_1.20260919` (`40ae6f`), e
+    // entra AQUI: depois do termo do `melhorando` e antes de partir ao meio nas
+    // capturas -- a ordem importa, porque o `!tranquilo` corta metade do que
+    // estiver acumulado ate' esse ponto.
+    if (p.lmr_delta > 0)
+        r -= (beta - alpha) * p.lmr_delta / std::max(delta_raiz, 1);
+
     if (!tranquilo) {
         int d = -(r / 2);
         r += d;
@@ -2324,6 +2331,7 @@ void Busca::arranca(Position& pos, const Limites& lim, Avaliador& avaliador) {
     if (const char* v = std::getenv("KS_LMP_PROF")) p.lmp_prof = std::atoi(v);
     if (const char* v = std::getenv("KS_LMR_BASE")) p.lmr_base = std::atoi(v);
     if (const char* v = std::getenv("KS_LMR_DIV")) p.lmr_div = std::atoi(v);
+    if (const char* v = std::getenv("KS_LMR_DELTA")) p.lmr_delta = std::atoi(v);
     if (const char* v = std::getenv("KS_LMR_EXT_MAX")) p.lmr_ext_max = std::atoi(v);
     if (const char* v = std::getenv("KS_LMR_PECAS_FIM")) p.lmr_pecas_fim = std::atoi(v);
     if (const char* v = std::getenv("KS_PCP_MARGEM")) p.pcp_margem = std::atoi(v);
