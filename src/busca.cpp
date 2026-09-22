@@ -2400,8 +2400,32 @@ void Busca::arranca(Position& pos, const Limites& lim, Avaliador& avaliador) {
             // Cinco percentis da MESMA medida. Ver `tm_curva_pct` no `busca.h`:
             // orcar pela mediana e' orcar para METADE das partidas rebentarem o
             // orcamento, e sao essas que acabam a zero.
+            // [BINARIO] A PRIMEIRA LINHA e' a do `ks_1.20260919`, lida do
+            // simbolo `Busca::arranca(...)::FALTA` em 0x5ec520.  O simbolo tem
+            // tamanho declarado 0x24 = 36 bytes = NOVE inteiros: uma linha so',
+            // nao cinco.  Os valores:
+            //
+            //     [131, 111, 91, 74, 59, 47, 38, 24, 16]
+            //
+            // Os sete primeiros batiam ja'.  Os dois ultimos nao: estavam 31 e
+            // 28, contra os 24 e 16 do original.
+            //
+            // Ao ply 220 isso da', com 10 s no relogio, 714 ms por lance em vez
+            // dos 1250 ms que o original gastava -- 57% do tempo, na fase da
+            // partida onde o calculo profundo mais decide.  E repare-se que com
+            // `faltam = 16` o `faltam/2 = 8` toca EXACTAMENTE o `tm_curva_min`:
+            // o original foi afinado para assentar no chao ao ply 220, e com 28
+            // nunca la' chegava.
+            //
+            // A escada dos plies esta' no binario como comparacoes e nao como
+            // tabela (446355: cmp $0x4f / $0x63 / $0x77 / $0x9f / $0xdb, que sao
+            // 80-1, 100-1, 120-1, 160-1, 220-1) -- por isso uma procura da
+            // tabela por bytes nao a encontra.
+            //
+            // As outras quatro linhas sao NOSSAS, posteriores ao binario, e
+            // ficam como estao.
             static const int FALTA_P[5][9] = {
-              {131, 111,  91,  74,  59,  47,  38,  31,  28},   // p50
+              {131, 111,  91,  74,  59,  47,  38,  24,  16},   // p50 — do binario
               {143, 123, 103,  86,  70,  57,  47,  41,  41},   // p60
               {156, 136, 117,  99,  83,  70,  61,  55,  54},   // p70
               {164, 144, 125, 107,  91,  79,  69,  63,  61},   // p75
