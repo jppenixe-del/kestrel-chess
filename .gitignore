@@ -12,3 +12,17 @@ kestrelstrike-sse41
 
 # Rust build output from the previous line of this project
 target/
+
+# Binarios de teste, construidos para uma medida e deitados fora a seguir.
+# Ficam com nomes proprios (`make NOME=ks_x`) para nao pisarem o alvo normal,
+# e sao de 93 MB cada porque levam a rede embebida.
+ks_*
+
+# Copias de seguranca feitas a` mao antes de um remendo. O git ja' e' isso; o
+# que estas guardam e' o estado a meio de uma sessao, que nao interessa a
+# ninguem depois de ela acabar.
+*.bak_*
+
+# O fastchess escreve isto na pasta de onde e' lancado. E' estado dele, nao
+# nosso, e muda a cada corrida.
+config.json
