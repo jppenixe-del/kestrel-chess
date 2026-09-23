@@ -737,7 +737,28 @@ void Busca::credita(const Position& pos, Move m, int ply, int bonus) {
           (std::size_t(pos.pawn_key() & (std::uint64_t(p.peao_chaves) - 1)) * 12
            + std::size_t(idx_pc(pt)) + 6 * std::size_t(lado)) * 64
           + std::size_t(int(m.to_sq()));
-        soma_hist((*hist_peao)[ipeao], bonus, TECTO_PEAO);
+        // O BONUS QUE ENTRA NA HISTORIA DOS PEOES NAO E' O BONUS CRU.
+        //
+        // O `ks_1.20260919` escala-o antes de somar, e com pesos diferentes
+        // para cima e para baixo. `credita` em `41242c`:
+        //
+        //     41242c:  cmp $0xfffffffd,%r12d    ; bonus vs -3
+        //     412430:  jl 412460                ; abaixo -> o outro peso
+        //     412432:  imul $0x450,%r12d,%edx   ; bonus * 1104
+        //     412444:  sar $0xa,%eax            ; / 1024
+        //     412460:  imul $0x1cb,%r12d,%r15d  ; bonus * 459
+        //
+        // `%r12d` e' o bonus: `412290: mov %r8d,%r12d` guarda o quinto
+        // argumento inteiro a` entrada e nada lhe toca ate' aqui. O bloco e'
+        // mesmo o dos peoes -- `4123cc` le' o `peao_f`, `4123f7` le' o
+        // `peao_chaves`, e `41249d` le' o `cont_n` para o ciclo seguinte.
+        //
+        // Sobe o premio 7,8% e corta o castigo para 45%. A tabela dos peoes e'
+        // lida pela `hist_de`, que serve a PODA, e pela `ordena`, que serve a
+        // ORDEM: isto mexe na busca em todos os nos, ao contrario de tudo o
+        // resto que esta reconstrucao repos esta noite.
+        soma_hist((*hist_peao)[ipeao], bonus * (bonus >= -3 ? 1104 : 459) / 1024,
+                  TECTO_PEAO);
     }
     // Escreve nas MESMAS posicoes que o `conts` le', incluindo as que ficam
     // acima da raiz. Ler uma posicao que nunca se escreve e' pior do que nao a
