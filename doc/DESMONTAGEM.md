@@ -8410,3 +8410,57 @@ regista a arvore a CRESCER quando se aumentava. A guarda em falta explicaria
 isso. **Testei a previsao e so' metade se confirma:** na posicao inicial,
 `alpha_desc = 1` passa de crescer para encolher (85.097 -> 43.502); na
 kiwipete cresce nas duas versoes. Fica na fila como experiencia nova.
+
+## O SMP, FECHADO: as tres perguntas que tinham ficado em aberto
+
+### 1. Os ajudantes recebem a pilha de chaves da partida? -- SIM, nos dois
+
+No binario, `arranca_ajudantes` esta' inlined na lambda do `faz_go`
+(`0x446580`). Antes de acordar cada ajudante:
+
+```
+4491dc:  rep movsq                    ; b.p = p   (os parametros)
+449203:  call vector<unsigned long>::operator=   ; b.chaves_jogo = chaves_jogo
+449213:  vmovdqu g_busca+0x350 -> 0x3d8/0x3f8     ; pre_n, pre_pc, pre_para
+```
+
+O nosso faz o mesmo (`b.chaves_jogo = chaves_jogo`, `b.pre_n = pre_n`, os
+dois `memcpy`). Sem isto os ajudantes nao veriam as repeticoes acima da raiz e
+escreveriam na TT partilhada notas de posicoes que sao empate.
+
+### 2. Como param? -- igual nos dois
+
+`para_ajudantes` (`0x421ac0`) levanta o sinalizador de paragem de TODOS
+(`movb $0x1,0x62`, desenrolado) e depois espera por cada um
+(`cv.wait` enquanto `+0x60` estiver ligado). O nosso: `parar = true` para
+todos, depois `join()`. Avisa todos, espera por todos.
+
+### 3. Os fios sao reutilizados? -- NAO no nosso. E' a unica diferenca
+
+O binario tem um POOL de fios persistentes. Cada `Ajudante` e':
+
+| offset | campo |
+|---|---|
+| `+0x08` | mutex |
+| `+0x30` | `std::condition_variable` |
+| `+0x60` | tem trabalho |
+| `+0x61` | sair |
+| `+0x62` | parar |
+| `+0x68`-`+0x80` | a tarefa, uma `std::function<void()>` |
+| `+0x88` | a `Busca` |
+
+O fio (`garante_ajudantes`, lambda em `0x422200`) dorme na
+`condition_variable`, acorda com uma tarefa, corre-a e volta a dormir --
+criado uma vez, quando o `Threads` muda.
+
+O nosso cria os `std::thread` em cada busca (`fios.clear()` / `emplace_back`)
+e junta-os no fim. Os objectos `Busca` dos ajudantes persistem nos dois -- e
+e' la' que vivem os historicos --, portanto a diferenca e' so' o custo de
+criar e juntar fios a cada lance: dezenas de microssegundos, contra lances de
+centenas de milissegundos. **Nao mexido**: efeito esperado nulo, e trocar a
+arquitectura sem medir e' risco sem ganho.
+
+### O que continua por medir no SMP
+
+O filtro de profundidade dos votantes (`95a93ac`) -- so' actua com mais de um
+fio, e nenhuma das medidas feitas ate' aqui correu com mais de um.
