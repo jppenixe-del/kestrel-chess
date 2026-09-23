@@ -588,19 +588,7 @@ struct Parametros {
     /// nao prejudicial.
     ///
     /// Duas leituras precipitadas na mesma manha, uma em cada motor.
-    // 2048 == DOIS plies, e e' o valor do `ks_1.20260919`. Esta reconstrucao
-    // tinha 1024. Do molde em `.rodata`, `Busca+0x140` (`0x615730`):
-    //
-    //     615720  4d000000 ec000000 c5000000 00040000
-    //             0x130=77  0x134=236 0x138=197  0x13c=1024
-    //     615730  00080000 f0550000 00000000 00040000
-    //             0x140=2048 0x144=22000 0x148=0  0x14c=1024
-    //
-    // O alinhamento esta' fixado por SETE valores conhecidos a` volta, que
-    // batem todos ao que esta' aqui declarado: lmr_base=77, lmr_div=236,
-    // lmr_piora_f=197, lmr_nonpv_f=1024, lmr_hist_div=22000,
-    // lmr_pecas_fim=0, lmr_ttpv=1024. So' este e' que nao batia.
-    int lmr_cut_f     = 2048;
+    int lmr_cut_f     = 1024;
     int lmr_hist_div  = 22000;
     int lmr_pecas_fim = 0;
 
