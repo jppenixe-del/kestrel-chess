@@ -954,6 +954,73 @@ struct Parametros {
     /// em vez de quatro, para as amostras deixarem de ser divididas. MEDIDO EM
     /// PARTIDAS E REJEITADO. 0 = fica o balde.
     int sem_balde     = 0;
+    /// So' se guarda como MELHOR um lance que tenha batido o alpha. 1 = liga.
+    ///
+    /// O `negamax` escrevia `melhor_lance = m` sempre que a nota subia acima da
+    /// melhor ate' ali, mesmo num no' ALL -- onde nada bate o alpha e portanto
+    /// nao ha' melhor lance nenhum, so' o menos mau. A `quiescencia` desta mesma
+    /// busca ja' fazia o contrario (a atribuicao la' esta' DENTRO do `nota >
+    /// alpha`), e e' isso que diz que aqui foi deslize e nao decisao.
+    ///
+    /// Custa duas vezes, e as duas na tabela:
+    ///
+    ///  1. guarda-se como dica de ordenacao um lance que ninguem mostrou ser
+    ///     bom. Quem o ler a seguir tenta-o primeiro e ele nao corta.
+    ///  2. pior: por nao ser `Move::none()`, a guarda de preservacao em
+    ///     `tt.cpp` -- que so' repoe o lance antigo quando o novo e' nulo --
+    ///     nunca dispara nos nos ALL. O lance bom de uma busca anterior, talvez
+    ///     mais funda, e' apagado e substituido por este.
+    ///
+    /// Bate certo com o que a auditoria de 22-09 mediu contra o SF19 com a
+    /// NOSSA rede: temos lance na tabela MAIS vezes do que eles (34-70% contra
+    /// 22-59%) e ele rende METADE (30-43% contra 52-63%). Sao os dois lados do
+    /// mesmo defeito -- guardamos mais lances porque guardamos tambem os que
+    /// nao valem nada, e cada um desses ocupa o lugar de um que valia.
+    ///
+    /// A `melhor_nota` continua a subir na mesma: o valor de retorno e o limite
+    /// que vai para a tabela nao mudam. O que muda e' so' QUE lance a acompanha.
+    /// A raiz nao depende disto -- usa `melhor_raiz`, atribuido dentro do
+    /// `nota > alpha`.
+    ///
+    /// MEDIDO EM PARTIDAS E REJEITADO, 24-09-2026: **-26,02 +/- 14,59** em 602
+    /// partidas a 5+0,05, `Hash=16`, um fio, IC95% [-40,6; -11,4]. Mesmo binario
+    /// dos dois lados, a manete por involucro. FICA A ZERO.
+    ///
+    /// O que isto ensina e' mais do que "nao da' Elo". O raciocinio acima estava
+    /// certo na mecanica -- a arvore encolheu 23,6% a profundidade 12 (295.733
+    /// -> 226.040) -- e errado na conclusao. Guardar o lance de melhor tentativa
+    /// num no' ALL VALE, neste motor, apesar de nenhum deles bater o alpha: e'
+    /// o lance mais promissor que aquela posicao tem, e quando ela voltar com
+    /// uma janela mais alta e' por ele que se deve comecar.
+    ///
+    /// O Stockfish e o Triumviratus nao o guardam -- e podem nao o guardar
+    /// porque a preservacao do lance antigo lhes tapa o buraco. Aqui a
+    /// preservacao so' actua quando a via escolhida ja' tem ESTA chave; quando
+    /// a via e' de outra posicao, guardar `Move::none()` deixa a entrada nova
+    /// sem lance nenhum, e a visita seguinte fica sem dica.
+    ///
+    /// Terceira vez que a contagem de nos aponta ao contrario do Elo. Ver
+    /// [[metricas-que-mentem]]: -23,6% de arvore e -26 Elo na mesma mudanca.
+    int lance_so_alpha = 0;
+    /// A quiescencia grava a avaliacao no momento em que a calcula. 1 = liga.
+    ///
+    /// Ela ja' a gravava -- mas so' no fim, junto com o resto da entrada. E a
+    /// saida mais frequente da quiescencia nao passa la': e' o `chao >= beta`,
+    /// o ficar quieto, que devolve mal a estatica e' conhecida. Em todos esses
+    /// nos corre-se a rede e deita-se o numero fora; a visita seguinte a` mesma
+    /// posicao paga-a outra vez.
+    ///
+    /// A busca principal ja' tem este remendo e o comentario dela explica-o:
+    /// gravar no momento do calculo faz o trabalho sobreviver a`s maneiras de
+    /// sair do no' antes do guardar la' de baixo. A quiescencia ficou de fora, e
+    /// e' nela que a perda e' maior -- MEDIDO a profundidade 14: a busca poupa
+    /// 37-47% das avaliacoes pela tabela e a quiescencia so' 8-10%, com 32.867
+    /// calculos em 145.040 nos.
+    ///
+    /// Isto pesa onde dói: a rede e' 53% dos ciclos deste motor (`apply_combined`
+    /// sozinho e' 31,9%). Uma avaliacao poupada vale mais aqui do que em
+    /// qualquer outro sitio da arvore.
+    int qs_guarda_aval = 0;
     int usa_cuckoo    = 1;
     /// Futilidade inversa SO' quando nao ha' lance na tabela, ou quando o que
     /// la' esta' e' uma captura. 1 = o valor de producao.

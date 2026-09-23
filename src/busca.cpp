@@ -1048,7 +1048,16 @@ int Busca::quiescencia(Position& pos, int alpha, int beta, int ply) {
     int estatica = TT_SEM_AVAL;
     int chao     = TT_SEM_AVAL;
     if (!em_xeque) {
-        estatica = (tem && e.aval != TT_SEM_AVAL) ? (++n_hit_qs, int(e.aval)) : (++n_aval_qs, ++n_aval, int(DIAG.eval_crua ? av->avalia(pos) : av->avalia_cheia(pos, DIAG.eval_escala, otimismo_de(pos))));
+        if (tem && e.aval != TT_SEM_AVAL) {
+            ++n_hit_qs;
+            estatica = int(e.aval);
+        } else {
+            estatica = (++n_aval_qs, ++n_aval, int(DIAG.eval_crua ? av->avalia(pos) : av->avalia_cheia(pos, DIAG.eval_escala, otimismo_de(pos))));
+            // Ver `qs_guarda_aval` nos parametros: sem isto o `chao >= beta`
+            // logo abaixo leva a rede consigo pela porta fora.
+            if (p.qs_guarda_aval)
+                p_tab->guarda_so_aval(pos.key(), std::int16_t(estatica));
+        }
         // O chao e' o melhor entre a estatica e o que a tabela ja' estabeleceu:
         // um limite guardado do lado certo da estatica veio de uma busca que foi
         // la' ver. Ficar no numero pior e' procurar capturas para chegar a um
@@ -1907,7 +1916,11 @@ int Busca::negamax(Position& pos, int prof, int alpha, int beta, int ply, bool p
 
         if (nota > melhor_nota) {
             melhor_nota  = nota;
-            melhor_lance = m;
+            // Ver `lance_so_alpha` nos parametros: num no' ALL nao ha' melhor
+            // lance, ha' o menos mau -- e guarda-lo apaga da tabela o lance bom
+            // que la' estava.
+            if (p.lance_so_alpha == 0 || nota > alpha)
+                melhor_lance = m;
             if (nota > alpha) {
                 alpha = nota;
                 // Ver a nota do `alpha_desc` nos parametros: com um melhor a
@@ -2428,6 +2441,8 @@ void Busca::arranca(Position& pos, const Limites& lim, Avaliador& avaliador) {
     if (const char* v = std::getenv("KS_LMR_BASE")) p.lmr_base = std::atoi(v);
     if (const char* v = std::getenv("KS_LMR_DIV")) p.lmr_div = std::atoi(v);
     if (const char* v = std::getenv("KS_LMR_DELTA")) p.lmr_delta = std::atoi(v);
+    if (const char* v = std::getenv("KS_LANCE_ALPHA")) p.lance_so_alpha = std::atoi(v);
+    if (const char* v = std::getenv("KS_QS_GUARDA_AVAL")) p.qs_guarda_aval = std::atoi(v);
     if (const char* v = std::getenv("KS_PODA_RED")) p.poda_red = std::atoi(v);
     if (const char* v = std::getenv("KS_LMR_EXT_MAX")) p.lmr_ext_max = std::atoi(v);
     if (const char* v = std::getenv("KS_LMR_PECAS_FIM")) p.lmr_pecas_fim = std::atoi(v);
