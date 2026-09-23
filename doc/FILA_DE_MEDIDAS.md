@@ -89,3 +89,15 @@ quando metade das partidas sao empates.
 | 2 | politica da TT (`63c8f44`) | **neutra.** +0,51 +/- 5,29 em 2025 partidas, `Hash=16`, IC95% [-9,9, +10,9]. O SPRT simetrico nunca fecha com um efeito perto de zero -- fechado pelo intervalo. Fica a do binario, por fidelidade e nao por Elo |
 | 4 | `alpha_desc = 1` | a correr no PC, limites [0, 5]. Mesmo binario dos dois lados, a manete ligada por um invólucro (`KS_ALPHA_DESC=1 exec ./ks_base`) |
 | 3 | escala dos peoes (`27c038c`) | **neutra.** +2,03 +/- 5,18 em 2220 partidas, IC95% [-8,1, +12,2]. Fica, por fidelidade |
+
+### Pendente: o teste a 4 fios (marcado para 24-09)
+
+Todas as medidas acima foram a UM fio. O filtro dos votantes (`95a93ac`) nem
+existe a um fio, e a CCRL corre a 4. Falta: **`ks_modifs` (HEAD) contra
+`ks_github` (`origin/kestrelstrike`, `6d0555c`), os dois a `Threads=4`.**
+
+- 4+4 = 8 fios por partida. O `ob1` e o `ob6` tem 6 nucleos: nao cabe sem
+  sobrecarga, e sobrecarregar distorce precisamente a escala do SMP. O unico
+  sitio onde cabe e' o PC (12 fios logicos), a uma partida de cada vez.
+- Binarios ja construidos, `ARCH=avx2`: `/root/sprt_bin/ks_modifs`
+  (`9306c468`) e `/root/sprt_bin/ks_github` (`6cc3d431`) no `ob1`.
