@@ -1602,6 +1602,13 @@ int Busca::negamax(Position& pos, int prof, int alpha, int beta, int ply, bool p
         // profundidade que julga e' a NOMINAL.
         if (!raiz && !pv && !em_xeque && melhor_nota > -VALUE_MATE_IN_MAX_PLY
             && pos.non_pawn_material(pos.side_to_move()) > 0 && usavel(estatica)) {
+            // Ver `poda_red` no `busca.h`. A zero por omissao, e entao isto e'
+            // exactamente `prof`.
+            int prof_poda = prof;
+            if (p.poda_red) {
+                int r = lmr[std::min(prof, 63)][std::min(int(i), 63)] / 1024;
+                prof_poda = std::max(prof - r, 0);
+            }
             if (tranquilo) {
                 // Poda por contagem: passado um certo numero de lances a` pouca
                 // profundidade, a ordenacao ja' errou vezes suficientes para os
@@ -1651,8 +1658,8 @@ int Busca::negamax(Position& pos, int prof, int alpha, int beta, int ply, bool p
                 // e um tranquilo nao muda o material para compensar. O termo do
                 // historico pertence aqui: um lance de que as tabelas gostam vale
                 // a tentativa mesmo quando a margem diz que nao.
-                if (prof <= p.fut_prof
-                    && estatica + p.fut_base + p.fut_decl * prof
+                if (prof_poda <= p.fut_prof
+                    && estatica + p.fut_base + p.fut_decl * prof_poda
                          + hist[i] / std::max(p.fut_hist_div, 1)
                        <= alpha) {
                     saltar_tranquilos = true;
@@ -1662,8 +1669,9 @@ int Busca::negamax(Position& pos, int prof, int alpha, int beta, int ply, bool p
                 // Um tranquilo tambem pode perder material. A troca estatica
                 // diz-o antes de a busca ter de o descobrir, e pergunta-se por
                 // ultimo porque e' a mais cara.
-                if (prof <= 8
-                    && !pos.see_ge(m, lim_see(-p.see_poda_tranq * (prof + prof * prof))))
+                if (prof_poda <= 8
+                    && !pos.see_ge(m, lim_see(-p.see_poda_tranq
+                                              * (prof_poda + prof_poda * prof_poda))))
                     continue;
             } else {
                 // Uma captura que perde mais do que a profundidade poderia
@@ -2313,6 +2321,9 @@ void Busca::arranca(Position& pos, const Limites& lim, Avaliador& avaliador) {
     if (const char* v = std::getenv("KS_TM_TECTO")) p.tm_tecto_x10 = std::atoi(v);
     if (const char* v = std::getenv("KS_TM_CURVA")) p.tm_curva = std::atoi(v);
     if (const char* v = std::getenv("KS_TM_CURVA_MIN")) p.tm_curva_min = std::atoi(v);
+    if (const char* v = std::getenv("KS_TM_ADV_F")) p.tm_adv_f = std::atoi(v);
+    if (const char* v = std::getenv("KS_TM_ADV_MIN")) p.tm_adv_min = std::atoi(v);
+    if (const char* v = std::getenv("KS_TM_ADV_MAX")) p.tm_adv_max = std::atoi(v);
     if (const char* v = std::getenv("KS_TM_CURVA_F")) p.tm_curva_f = std::atoi(v);
     if (const char* v = std::getenv("KS_TM_CURVA_PCT")) p.tm_curva_pct = std::atoi(v);
     if (const char* v = std::getenv("KS_TM_CRESCE")) p.tm_cresce = std::atoi(v);
@@ -2347,6 +2358,7 @@ void Busca::arranca(Position& pos, const Limites& lim, Avaliador& avaliador) {
     if (const char* v = std::getenv("KS_LMR_BASE")) p.lmr_base = std::atoi(v);
     if (const char* v = std::getenv("KS_LMR_DIV")) p.lmr_div = std::atoi(v);
     if (const char* v = std::getenv("KS_LMR_DELTA")) p.lmr_delta = std::atoi(v);
+    if (const char* v = std::getenv("KS_PODA_RED")) p.poda_red = std::atoi(v);
     if (const char* v = std::getenv("KS_LMR_EXT_MAX")) p.lmr_ext_max = std::atoi(v);
     if (const char* v = std::getenv("KS_LMR_PECAS_FIM")) p.lmr_pecas_fim = std::atoi(v);
     if (const char* v = std::getenv("KS_PCP_MARGEM")) p.pcp_margem = std::atoi(v);
@@ -2483,6 +2495,21 @@ void Busca::arranca(Position& pos, const Limites& lim, Avaliador& avaliador) {
             lc = std::max<std::int64_t>(lc * p.tm_curva_f / 100, 1);
             std::int64_t bolo2 = t + inc * (lc - 1);
             optimo = std::max(bolo2 / lc - sobrecarga, std::int64_t(1));
+        }
+
+        // Quem tem mais relogio do que o adversario pode gastar mais, e quem
+        // tem menos tem de poupar. Ver `tm_adv_f` no `busca.h`; a zero por
+        // omissao. Entra DEPOIS da curva, porque no binario os dois ramos do
+        // `tm_curva` juntam-se antes disto.
+        if (p.tm_adv_f != 0) {
+            std::int64_t tadv = lim.tempo[1 - lado];
+            if (tadv > 0) {
+                double razao = double(t) / double(tadv);
+                double esc   = 1.0 + (razao - 1.0) * (double(p.tm_adv_f) / 100.0);
+                esc = std::min(std::max(esc, double(p.tm_adv_min) / 100.0),
+                               double(p.tm_adv_max) / 100.0);
+                optimo = std::int64_t(double(optimo) * esc);
+            }
         }
 
         std::int64_t tecto  = std::max(

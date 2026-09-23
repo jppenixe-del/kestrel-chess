@@ -604,6 +604,25 @@ struct Parametros {
     int lmr_hist_div  = 22000;
     int lmr_pecas_fim = 0;
 
+    /// A PROFUNDIDADE REDUZIDA PARA PODAR. O comentario do ciclo de lances ja'
+    /// dizia que "o outro ramo -- o que julga o lance a` profundidade REDUZIDA
+    /// -- esta' escrito la' e DESLIGADO". Estava escrito no `ks_1.20260919`
+    /// tambem, e nunca chegou aqui. Do binario, `negamax` em `438125`:
+    ///
+    ///     438125:  mov 0x128(%rbp),%r11d      ; poda_red
+    ///     438131:  je 43817f                  ; == 0 -> prof_poda = prof
+    ///     438153:  lea 0xe8(%r9,%rsi,1),%rax  ; a MESMA tabela da reducao
+    ///     43815b:  mov 0x10(%rbp,%rax,4),%r8d ; lmr[min(prof,63)][min(i,63)]
+    ///     43816e:  sar $0xa,%r11d             ; / 1024
+    ///     438172:  sub %r11d,%edi             ; prof - r
+    ///     43817c:  cmovs %edi,%ecx            ; max(..., 0)
+    ///
+    /// SO' a futilidade dos tranquilos e o SEE dos tranquilos a usam. O LMP, a
+    /// poda pelo historico e o SEE das CAPTURAS ficam com o `prof` cru -- o
+    /// binario le' `0x4(%rsp)` nesses tres (`438188`, `4381e3`, `4394b8`).
+    /// A ZERO no molde.
+    int poda_red      = 0;
+
     // --- reduzir os maus, ESTENDER os bons ---
     //
     // A reducao nao tem de ser so' para baixo. Um no' que ja' foi importante uma
@@ -1247,6 +1266,32 @@ struct Parametros {
     /// quando e' preciso, nos pensamos medio sempre. A forma que falta esta' no
     /// optimo e nos grampos, nao no tecto.
     int tm_tecto_x10 = 55;
+
+    /// O RELOGIO DO ADVERSARIO. Nao existia nesta reconstrucao. Do binario,
+    /// `arranca` em `4461bc`, logo a seguir ao ponto onde os dois ramos do
+    /// `tm_curva` se juntam (`4463fd: jmp 4461b5`), portanto vale nos dois:
+    ///
+    ///     4461bc:  mov 0x22c(%r8),%r12d   ; tm_adv_f; se 0 -> nada
+    ///     4461dd:  mov (%r15,%rax,8),%rsi ; tempo[1 - nos]
+    ///     4461e4:  jle 446262             ; <= 0 -> nada
+    ///     446232:  vdivsd                 ; razao = tempo[nos]/tempo[eles]
+    ///     44623c:  vsubsd 1.0             ; razao - 1
+    ///     446240:  vmulsd (tm_adv_f/100)
+    ///     446244:  vaddsd 1.0
+    ///     446248:  vmaxsd (tm_adv_min/100)
+    ///     44624c:  vminsd (tm_adv_max/100)
+    ///     446251:  vmulsd orcamento
+    ///
+    /// As constantes 1.0 e 100.0 estao em `0x608ef0` e `0x608fd0`.
+    ///
+    /// O `tm_adv_f` vale ZERO no molde, portanto esta desligado -- mas o minimo
+    /// e o maximo estao em 70 e 140, que nao sao valores de quem nunca mediu
+    /// isto. Vem da cauda do molde em `0x609eb0` (e NAO de `0x609c80`, que e' a
+    /// armadilha em que este trabalho ja' caiu uma vez: e' dali que sai o
+    /// `tm_tecto = 55` acima, que confirma a leitura).
+    int tm_adv_f     = 0;
+    int tm_adv_min   = 70;
+    int tm_adv_max   = 140;
 };
 
 struct Limites {
