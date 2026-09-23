@@ -524,7 +524,37 @@ int Busca::ameaca(const Position& pos, Move m, int ply) const {
     Bitboard batido = ameacas_barato[ply][idx_pc(pt)];
     if (!batido)
         return 0;
-    int peso = p.ameaca_f * valor_de(pt) / 100;
+    // A ESCALA DESTE TERMO ESTAVA ERRADA POR 244 VEZES.
+    //
+    // Estava `p.ameaca_f * valor_de(pt) / 100`, que para um cavalo da'
+    // 20*320/100 = 64. O `ks_1.20260919` faz (`negamax`, `43899e`):
+    //
+    //     438922:  mov 0x178(%r15),%esi     ; ameaca_f
+    //     438984:  lea ...,%rcx             ; # 5fe200 <PieceValue>
+    //     43899e:  imul (%rcx,%r8,4),%esi   ; ameaca_f * PieceValue[pt]
+    //     4389a3:  imul %esi,%r10d          ; * (saiu - entrou)
+    //     4389a7:  add %r10d,%r11d          ; nota += ...
+    //
+    // sem divisao nenhuma, e com a tabela do SUBSTRATO, que esta' em
+    // `0x5fe200` e vale `0, 208, 781, 825, 1276, 2538`. Para o mesmo cavalo:
+    // 20*781 = 15.620. Duzentas e quarenta e quatro vezes mais.
+    //
+    // A referencia concorda, e e' dela que o 20 vem
+    // (`vendor/movepick.cpp:246`):
+    //
+    //     int v = 20 * (bool(threatByLesser[pt] & from) - bool(... & to));
+    //     value += PieceValue[pt] * v;
+    //
+    // E a nota do `ameaca_f` no `busca.h` ja' escrevia a formula CERTA --
+    // `nota += valor_da_peca * ameaca_f * (saiu - entrou)`, sem /100. O codigo
+    // e' que nunca bateu a` sua propria documentacao: a linha do `/100` vem do
+    // commit inicial, do port, e quando `3eb5461` pos a manete a 20 ninguem
+    // olhou para a formula por baixo. O numero estava la'; o efeito nao.
+    //
+    // Na escala em que a `ordena` trabalha -- historia ate' +-15.000 -- 64 e'
+    // ruido e 15.620 e' um termo a serio. E' a diferenca entre ter a manete e
+    // so' ter o seu nome.
+    int peso = p.ameaca_f * int(PieceValue[pt]);
     int r = 0;
     if (batido & m.from_sq()) r += peso;   // sair de uma casa batida
     if (batido & m.to_sq())   r -= peso;   // entrar numa casa batida
