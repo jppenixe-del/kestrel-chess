@@ -88,3 +88,4 @@ dos resultados (com empates), nao a de Bernoulli, que a inflaciona muito
 quando metade das partidas sao empates.
 | 2 | politica da TT (`63c8f44`) | **neutra.** +0,51 +/- 5,29 em 2025 partidas, `Hash=16`, IC95% [-9,9, +10,9]. O SPRT simetrico nunca fecha com um efeito perto de zero -- fechado pelo intervalo. Fica a do binario, por fidelidade e nao por Elo |
 | 4 | `alpha_desc = 1` | a correr no PC, limites [0, 5]. Mesmo binario dos dois lados, a manete ligada por um invólucro (`KS_ALPHA_DESC=1 exec ./ks_base`) |
+| 3 | escala dos peoes (`27c038c`) | **neutra.** +2,03 +/- 5,18 em 2220 partidas, IC95% [-8,1, +12,2]. Fica, por fidelidade |
