@@ -56,3 +56,33 @@ aquilo foi uma decisao ou um acidente, nem ve o que se aprendeu depois.
 O `lmr_cut_f` foi o caso: repus o 2048 do binario por cima de um 1024 que
 valia +19,97 +/- 10,68 em 1080 partidas, e o meu proprio SPRT deu -4,5 a andar
 sempre para baixo sem eu o ouvir.
+
+## Estado
+
+| # | termo | resultado |
+|---|---|---|
+| 0 | `ameaca_f` com a escala certa (`4a21c2f`) | **+10,14 Elo** [+3,88, +16,41], 5688 partidas, `ob1` + PC somados. FICA |
+| 1 | `lmr_cut_f` 2048 contra 1024 | **fica o 1024.** -5,34 +/- 5,40 em 2081 partidas. A interaccao existe -- a vantagem do 1024 encolheu de ~20 para ~5 com a ameaca a funcionar --, mas nao chega a inverter: o limite superior do intervalo e' +5 |
+| 2 | politica da TT (`63c8f44`) | a correr no PC. **Com `Hash=16`**: a substituicao so' actua com a tabela cheia, e a profundidade 12 a partir de uma TT vazia da' 93.464 nos com e sem ela -- nao mede nada. Em jogo real vimos `hashfull 1000` |
+| 3 | escala dos peoes (`27c038c`) | a correr no `ob1` |
+| - | `alpha_desc` | **novo na fila.** A guarda do beta que faltava foi reposta (`89ddfac`); as tres rejeicoes antigas foram medidas SEM ela |
+
+### Como construir as variantes
+
+Com worktrees, sem tocar na arvore principal:
+
+    git worktree add --detach /tmp/wt_x HEAD
+    ln -s .../ks-cf796d1f923d.nnue /tmp/wt_x/      # a rede nao esta' no git
+    cd /tmp/wt_x && git revert --no-commit <commit>
+    make ARCH=avx2 NOME=ks_x
+
+`ARCH=avx2` e nao `native`: o `ob1` e' EPYC e o PC e' Ryzen 3600, e um binario
+`native` de um pode usar instrucoes que o outro nao tem. As contagens de nos
+sao iguais entre os dois -- confirmado, 93.464 nos na kiwipete em ambos.
+
+### Como somar duas maquinas
+
+Os W/E/D somam-se; o LLR NAO -- cada instancia calcula o seu so' com as suas
+partidas. A decisao le-se pelo intervalo de 95% do total, com a variancia REAL
+dos resultados (com empates), nao a de Bernoulli, que a inflaciona muito
+quando metade das partidas sao empates.

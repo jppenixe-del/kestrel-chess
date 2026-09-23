@@ -8336,3 +8336,77 @@ Todas as funcoes da busca e da avaliacao foram comparadas contra o binario:
 
 **Duas divergencias vivas em todo o motor**: o `lmr_cut_f` e a escala do bonus
 dos peoes. Tudo o resto que faltava valia zero por omissao.
+
+## SEGUNDA PASSAGEM: AS FORMULAS, NAO SO' OS VALORES
+
+O `ameaca_f` escapou a` primeira passagem porque o VALOR batia (20 = 20) e a
+FORMULA nao foi lida. Esta passagem le' a formula de todos os mecanismos vivos
+que so' tinham sido comparados pelo valor.
+
+### Verificados, sem divergencia
+
+| mecanismo | onde no binario | o que confere |
+|---|---|---|
+| tabela LMR | `arranca`, `43fc2f`-`43fce5` | `int((lmr_base/100 + log d * log m / max(lmr_div/100, 0.01)) * 1024)`, d e m em 1..63 (`cmp $0x40`), escrita em `Busca+0x3b0 + 256d + 4m`. Constantes `0.01` (`608f88`) e `1024.0` (`608fd8`) |
+| razoring | `4370da`-`437108` | `prof <= razor_prof`, `abs(alpha) < 2000` (o `lea 0x7cf` / `cmp $0xf9e` sem sinal), `estatica + razor_margem*prof <= alpha` -- LINEAR --, quiescencia com `[alpha, alpha+1]` |
+| entrada do lance nulo | `43710e`-`43a0b0` | `!sem_null`, `cut || nmp_todos`, `prof >= 3`, `aval_poda >= max(beta, estatica)`, `estatica >= beta - 20*prof - 40*melhorando + 100` (`43a060`-`43a079`), `non_pawn > 0`, `!nulo_em[ply-1]` |
+| re-busca fina | `438dd3`-`438e0d` | `fundo = nota > melhor + reb_fundo + 2*nova_prof`, `raso = nota < melhor + reb_raso`, chao em `nova_prof - r + 1`. Atras de `DIAG.reb_fina` nos DOIS motores -- desligada por omissao nos dois |
+| otimismo | `quiescencia`, `420dff`-`420e38` | `otimismo_f * a / (abs(a) + 85)` com `a = nota_raiz_ant` (`Busca+0x28374`), sinal trocado fora do lado da raiz |
+| IIR | `4379aa`-`439778` | `!sem_iir`, `prof >= iir_prof`, sem lance na TT, `!(iir_sem_all && !pv && !cut)` |
+| `lmr_ext_max` | `438b74`-`438ba2` | `clamp(reducao/1024, -lmr_ext_max, nova_prof - 1)` |
+| `low_bonus` (`0x1c4` = 712) | `credita`, `412866` | `bonus * low_bonus / 1024`, tecto 15.000 |
+| recusa da repeticao | `arranca`, `441d4f` / `445a7f` | `nota_raiz >= recusa_limiar`, `melhor_alt >= nota_raiz - recusa_margem` |
+
+### O mapa do `DIAG`, corrigido
+
+O compilador ENCADEIA as leituras do ambiente: cada `setne DIAG+k` que aparece
+logo a seguir a um `lea <string>` grava a manete ANTERIOR, e a da string so'
+e' gravada depois da chamada seguinte. Emparelhando bem:
+
+```
++0x0 sem_pre         +0x5 sing_conta      +0xa forma
++0x1 bonus_antigo    +0x6 sem_null        +0xb margem_estudo
++0x2 sem_capt_pen    +0x7 sem_iir         +0xc reb_fina       (KS_REB)
++0x3 ordem_escalada  +0x8 sem_nmp_prof    +0xd eval_crua
++0x4 sing_sem_corte  +0x9 nmp_todos
+```
+
+Ate' `+0xa` e' igual ao nosso. O nosso inseriu cinco sinalizadores em `+0xb`
+(`quem`, `sem_lmr`, `sem_corr`, `sem_asp`, `sem_ext`), que empurram os
+outros cinco lugares. Nao muda comportamento -- os sinalizadores sao lidos
+pelo nome --, mas quem ler `DIAG+0xc` no binario tem de saber que e' o
+`reb_fina`, e nao o `sem_lmr`. Quase afirmei o contrario.
+
+### Parametros mortos nos DOIS motores
+
+Nenhum leitor no binario e zero usos no fonte:
+
+- `probcut_margem` (`0xdc`), `tt_fraco_pont` (`0x1f0`), `qs_margem` (`0x1f4`),
+  `travao_qs_n` (`0x1f8`), `ext_xeque_aval` (`0x1fc`)
+- os oito `rfpsf_*` (`0xa4`-`0xc0`), os nove `poda_*` (`0xf4`-`0x114`) e os
+  quatro `pdiv_*` (`0x118`-`0x124`)
+
+Sao parametros de ramos que existem no half2k e nunca foram compilados neste
+motor. Consistente: nada a recuperar.
+
+### Os ramos desligados pela manete
+
+| ramo | resultado |
+|---|---|
+| killers | **bate**. Notas em `pontua` (`411190`: `usa_killers + 1` para o primeiro, `usa_killers` para o segundo) e actualizacao em `negamax` (`43a2f7`-`43a32f`). A constante `0xa2e0` que nunca tinha sido explicada e' o vies do indice: `0x8 + 4*(ply + 0xa2e0)` = `Busca+0x28b88 + 4*ply` |
+| probcut | **bate** de ponta a ponta: `pc_beta = beta + pc_margem - pc_impr*melhorando`, `pc_prof = prof - (melhorando ? pc_red_impr : pc_reducao)`, e a guarda na TT com `pc_prof + 1` e `Inferior` (`4377a1`, `4377e1`) |
+| ordem_xeque | **bate**. O limiar do SEE esta CRAVADO no binario (`439782: mov $0xffffffb5` = -75); o nosso fe-lo manete (`ordem_xeque_see = -75`). Mesmo comportamento |
+| pcp | **o nosso tem uma guarda a mais.** O binario testa `pcp_margem > 0`, `tem` (`0x20(%rsp)` <- `0xc0(%rsp)`, o retorno da `sonda`) e `limite == Inferior` -- e nao testa `!pv`, nem ha' guarda envolvente (todos os saltos para `4379f1` vem de dentro do bloco). Desligado nos dois; NAO mexido. Fica registado para quem o ligar |
+| alpha_desc | **faltava a guarda do beta** -- corrigido em `89ddfac`. Ver abaixo |
+
+### `alpha_desc`: a guarda que faltava
+
+O binario so' desconta a profundidade abaixo do beta (`438583`), como o
+Stockfish. O nosso descontava antes do corte, tambem no lance que corta -- e o
+`prof` ainda e' lido depois do ciclo, na TT e na `credita`.
+
+A manete foi medida e rejeitada tres vezes (-21,37, -44,06, -74) e a nota dela
+regista a arvore a CRESCER quando se aumentava. A guarda em falta explicaria
+isso. **Testei a previsao e so' metade se confirma:** na posicao inicial,
+`alpha_desc = 1` passa de crescer para encolher (85.097 -> 43.502); na
+kiwipete cresce nas duas versoes. Fica na fila como experiencia nova.
