@@ -2815,10 +2815,18 @@ void Busca::arranca(Position& pos, const Limites& lim, Avaliador& avaliador) {
             double estab  = std::clamp(1.0 - iters_sem_mudar / (2.0 * d), 0.75, 1.0);
             double instab = std::clamp(0.9 + mudancas / (p.tm_instab_div / 10.0 * d),
                                        1.0, p.tm_instab_max / 100.0);
-            // O quarto factor -- o ESFORCO, que fraccao da arvore foi para o
-            // melhor lance -- NAO esta' aqui: precisa do `nos_por_lance` e do
-            // `raiz_marca`, que esta arvore ainda nao tem. Falta portar.
-            // O ESFORCO: que fraccao desta iteracao foi para o melhor lance.
+            // O QUARTO FACTOR: o ESFORCO, que fraccao desta iteracao foi para
+            // o melhor lance. Posicao facil -- quase tudo num lance so' -- joga
+            // mais depressa; posicao dificil -- nos espalhados -- pensa mais.
+            //
+            // Confere com o `ks_1.20260919` (`arranca`, `440c92`-`440cf4`):
+            //
+            //     440cb6:  vdivsd %xmm10,%xmm13,%xmm11  ; nm / nos_iter
+            //     440c96:  vcvtsi2sdl 0x200(%r12)       ; tm_esf_base
+            //     440cd5:  vsubsd %xmm11,%xmm5,%xmm12   ; base/100 - frac
+            //     440ccd:  vdivsd 100.0                 ; tm_esf_f/100
+            //     440cda:  vmulsd %xmm3,%xmm12,%xmm0
+            //     440ce2 / 440cf4:  grampo em [0.5, 2.0]  (608f98 / 608fa0)
             double esf = 1.0;
             if (p.tm_esf_f > 0) {
                 std::uint64_t nos_iter = nos > nos_iter_ini ? nos - nos_iter_ini : 0;
