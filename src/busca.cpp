@@ -1922,7 +1922,26 @@ int Busca::negamax(Position& pos, int prof, int alpha, int beta, int ply, bool p
                 // mesma profundidade para as notas se poderem comparar), so' com
                 // profundidade para dar, e nunca em cima de um mate, onde a nota
                 // nao e' uma medida de quanto.
-                if (!raiz && p.alpha_desc > 0 && prof > p.ad_min && prof < p.ad_max
+                // SO' ABAIXO DO BETA. O `ks_1.20260919` tem esta guarda e esta
+                // reconstrucao nao tinha (`negamax`, `43857a`):
+                //
+                //     43857a:  mov 0x74(%rbp),%r9d     ; alpha_desc > 0
+                //     438583:  cmp %r12d,0x30(%rsp)    ; nota < beta   <-- faltava
+                //     438588:  jle -> salta
+                //     43858f:  cmp %r11d,0x78(%rbp)    ; prof > ad_min
+                //     438595:  cmp %r11d,0x7c(%rbp)    ; prof < ad_max
+                //     4385a9:  cmp $0xf813 / cmovae    ; nunca sobre um mate
+                //     4385b3:  mov %edi,0x4(%rsp)      ; prof -= alpha_desc
+                //
+                // Sem ela o desconto dispara tambem no lance que CORTA -- e o
+                // `prof` ainda e' lido depois do ciclo: a TT guarda uma
+                // profundidade mais rasa do que a que foi provada, e a `credita`
+                // da' um bonus menor ao lance que cortou. Sondas piores e ordem
+                // pior: e' a explicacao mais simples para a arvore CRESCER quando
+                // se liga um mecanismo que devia encolhe-la (a nota nos
+                // parametros regista 123.557 -> 195.386 -> 235.019 nos).
+                if (!raiz && p.alpha_desc > 0 && nota < beta
+                    && prof > p.ad_min && prof < p.ad_max
                     && std::abs(nota) < VALUE_MATE_IN_MAX_PLY)
                     prof -= p.alpha_desc;
                 // A variante principal deste ply e' este lance seguido da do
