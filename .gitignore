@@ -26,3 +26,8 @@ ks_*
 # O fastchess escreve isto na pasta de onde e' lancado. E' estado dele, nao
 # nosso, e muda a cada corrida.
 config.json
+
+# As notas de trabalho -- desmontagem, fila de medidas, plano, validacoes --
+# ficam nesta maquina. O repositorio publico e' o programa: o codigo e o que
+# esta' escrito nele.
+doc/
