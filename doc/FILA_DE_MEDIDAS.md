@@ -276,6 +276,17 @@ chega cada resposta):
 **A busca nao mudou:** 295.649 nos a profundidade 12 nas quatro posicoes de
 sempre, antes e depois, ao no'.
 
+**E em partidas reais, nao regride.** 1000 partidas a 5+0,05, `Hash=16`, a
+versao com a thread (`fb0baac`) contra a de antes (`4785414`), mesma busca:
+
+    Elo -4,86 +/- 10,98   (IC95% [-15,8; +6,1])   +228 =530 -242
+    quedas 0 e 0; desconexoes 0 e 0
+    derrotas por tempo: 7 da thread (1-144 ms) e 5 da antiga (12-140 ms)
+
+O zero esta' dentro do intervalo, como tem de estar numa busca identica. As
+derrotas por tempo sao as desta maquina com cinco partidas em simultaneo -- 0,6%
+das partidas, nos dois lados, com excessos nas mesmas gamas.
+
 **Mudou uma coisa para quem mede:** o `quit` agora para a busca, como o
 protocolo manda e o Stockfish faz. Um guiao que mande `go depth N` e `quit` de
 seguida por um cano recebe uma busca cortada. Para medir a profundidade fixa,
