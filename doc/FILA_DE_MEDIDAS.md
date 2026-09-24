@@ -177,3 +177,44 @@ Quatro medidas, ~11.000 partidas, **zero Elo ganho**: uma rejeicao clara
 (`lance_so_alpha`, -26) e tres neutros (`ameaca_f` 10, politica da TT ja' de
 ontem, `asp_sf`). O valor esta nos becos fechados e no contraste arvore/Elo,
 que hoje discordaram tres vezes em tres.
+
+## Fora da fila de Elo, mas antes da CCRL: o `stop` nao funciona
+
+Encontrado a 24-09-2026 ao medir as paginas grandes. **Com uma busca a correr,
+o motor nao responde ao `stop` nem ao `quit`.** O antigo e o novo, igual:
+
+    uci / position startpos / go depth 30 / (3 s) stop / (1 s) quit
+    -> nenhum `bestmove`, o processo so' morre pelo `timeout` (rc=124)
+
+**A causa esta' no `uci_laco.cpp`:** o `faz_go` chama `g_busca.arranca(...)`
+na MESMA thread que le' o `stdin`. Enquanto a busca corre ninguem le' os
+comandos; o `stop` so' e' lido quando ela ja' acabou, e ai' nao faz nada (o
+ramo e' `if (tok == "quit") break;` e mais nada).
+
+**Nas partidas com relogio nao aparece** -- o motor para sozinho pelo tempo --,
+e por isso todos os SPRTs correram bem. Mas:
+
+- um `go infinite` fica pendurado PARA SEMPRE: a analise em qualquer interface
+  (Arena, ChessBase, Banksia) nao funciona
+- `ponder` e' impossivel
+- o `stop` e' obrigatorio no protocolo UCI
+
+**A infraestrutura ja' existe.** O `sem_tempo()` le' um `std::atomic<bool>
+parar`, e a busca principal ja' o usa para parar os ajudantes (`busca.cpp`,
+`b->parar.store(true)`). Falta so' a busca correr numa thread separada da que
+le' os comandos. Tres cuidados:
+
+1. **uma corrida no arranque**: o `arranca` faz `parar.store(false)` logo ao
+   comecar, e um `stop` que chegue antes disso perde-se. O `parar` tem de ser
+   reposto na thread dos comandos, ANTES de a busca nascer.
+2. **o `go infinite` nao pode imprimir `bestmove` antes do `stop`**, mesmo que
+   a busca acabe sozinha (profundidade maxima, mate encontrado).
+3. **a pilha**: no Windows uma `std::thread` nasce com 1 MB, e a recursao funda
+   do `negamax` -- `Lista`, `StateInfo`, os vectores de lances vistos -- pode
+   nao caber. O Stockfish cria as threads com 8 MB de proposito. Os ajudantes
+   do SMP ja' correm em `std::thread` e tem o mesmo risco no Windows.
+
+**O teste:** o `stop` tem de dar `bestmove` em milissegundos, o `quit` tem de
+terminar o processo, o `isready` durante a busca tem de responder, e a
+contagem de nos a profundidade fixa tem de ficar IDENTICA (a busca em si nao
+muda).
