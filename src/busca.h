@@ -1036,6 +1036,44 @@ struct Parametros {
     /// sozinho e' 31,9%). Uma avaliacao poupada vale mais aqui do que em
     /// qualquer outro sitio da arvore.
     int qs_guarda_aval = 0;
+    /// Os tres primeiros canais da correccao saem das chaves que a `Position`
+    /// ja' mantem, em vez de uma passagem por todas as pecas. 1 = liga.
+    ///
+    /// O `indices()` guarda em cache os canais 0-2, que so' dependem da
+    /// posicao. Quando a cache falha, recalcula-os varrendo os bitboards peca a
+    /// peca -- perto de trinta iteracoes, cada uma com um XOR contra a `ALEA`.
+    /// MEDIDO no perfil: esses lacos sao **43% do `indices()`**, que por sua vez
+    /// e' 2,52% dos ciclos do motor -- **1,08% do total**, so' a recalcular uma
+    /// coisa que o substrato ja' tem pronta.
+    ///
+    /// A `Position` actualiza `pawnKey` e `nonPawnKey[cor]` dentro do `do_move`,
+    /// incrementalmente. Le-las e' O(1). O Stockfish faz exactamente isto e
+    /// nunca varre pecas para indexar a correccao.
+    ///
+    /// **As classes de equivalencia ficam as MESMAS.** O `nonPawnKey` inclui o
+    /// rei e o nosso `FORCA[]` nao, por isso tira-se o rei com um XOR -- tambem
+    /// O(1). O que muda e' so' a funcao de dispersao: a chave passa a vir da
+    /// tabela `Zobrist::psq` em vez da nossa `ALEA`, portanto as MESMAS posicoes
+    /// continuam a partilhar indice, mas o indice concreto e' outro.
+    ///
+    /// Isso tem uma consequencia a ter em conta ao medir: **a arvore muda**, nao
+    /// por a busca decidir diferente mas por os baldes da correccao serem
+    /// reatribuidos. Nao se pode usar "nos identicos" como controlo aqui. O
+    /// controlo certo NAO e' "nos identicos" -- e a medida por no' tambem nao
+    /// serve, porque a composicao da arvore muda com os baldes: na kiwipete a
+    /// profundidade 14 deu -5,4% de instrucoes por no', e no conjunto de quatro
+    /// posicoes a profundidade 13 deu +9,6%. Mede-se a FUNCAO, nao o motor.
+    ///
+    /// MEDIDO assim, `perf record` na kiwipete a profundidade 14: a `indices()`
+    /// passa de **2,15% para 1,19%** dos ciclos. O mecanismo esta' certo e o
+    /// custo dela fica a metade.
+    ///
+    /// **Mas o premio e' 0,96% dos ciclos**, ou seja ~1% de nos por segundo, que
+    /// pela relacao habitual vale **~+0,2 Elo** -- abaixo do que um SPRT nosso
+    /// distingue. Fica a ZERO ate' haver com que o juntar: varias pecas de
+    /// velocidade medidas assim, ligadas de uma vez, ja' dao um efeito mensuravel.
+    /// Liga-la sozinha seria mudar o motor sem medida que o sustente.
+    int indices_rapido = 0;
     int usa_cuckoo    = 1;
     /// Futilidade inversa SO' quando nao ha' lance na tabela, ou quando o que
     /// la' esta' e' uma captura. 1 = o valor de producao.

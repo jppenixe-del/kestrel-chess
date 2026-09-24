@@ -30,6 +30,14 @@ extern std::atomic<unsigned long long> g_conta_refresh;
 
 namespace Kestrel {
 
+// A tabela de Zobrist do substrato. Esta' definida em `vendor/position.cpp` e
+// nao aparece em cabecalho nenhum -- mas tem ligacao externa, portanto declara-se
+// aqui em vez de se mexer no `vendor/`. Serve para tirar o rei do `nonPawnKey`,
+// que o traz e o nosso canal de forca nao quer. Ver `indices_rapido`.
+namespace Zobrist {
+extern Key psq[PIECE_NB][SQUARE_NB];
+}
+
 // QUANTO E' QUE A BUSCA DESMENTE A ESTATICA, por profundidade.
 //
 // E' isto que a margem da futilidade inversa tem de cobrir: ela diz "estou tao
@@ -652,9 +660,24 @@ void Busca::indices(const Position& pos, int ply, int fora[6]) const {
         fora[1] = corr_pos[ply][1];
         fora[2] = corr_pos[ply][2];
     } else {
-        std::uint64_t peoes = chave_de(pos, WHITE, PEAO, 1) ^ chave_de(pos, BLACK, PEAO, 1);
-        std::uint64_t fb    = chave_de(pos, WHITE, FORCA, 4);
-        std::uint64_t fp    = chave_de(pos, BLACK, FORCA, 4);
+        // Ver `indices_rapido` nos parametros: as tres chaves ou saem das que a
+        // `Position` ja' mantem a` custa do `do_move` -- O(1) --, ou refazem-se
+        // varrendo os bitboards, que e' 43% desta funcao.
+        //
+        // O `nonPawnKey` traz o rei e o nosso `FORCA[]` nao o tem; tira-se com
+        // um XOR, para as classes de equivalencia ficarem as mesmas.
+        std::uint64_t peoes, fb, fp;
+        if (p.indices_rapido) {
+            peoes = pos.pawn_key();
+            fb    = pos.non_pawn_key(WHITE)
+                  ^ Zobrist::psq[make_piece(WHITE, KING)][pos.square<KING>(WHITE)];
+            fp    = pos.non_pawn_key(BLACK)
+                  ^ Zobrist::psq[make_piece(BLACK, KING)][pos.square<KING>(BLACK)];
+        } else {
+            peoes = chave_de(pos, WHITE, PEAO, 1) ^ chave_de(pos, BLACK, PEAO, 1);
+            fb    = chave_de(pos, WHITE, FORCA, 4);
+            fp    = chave_de(pos, BLACK, FORCA, 4);
+        }
         fora[0] = int(mistura(peoes) & m);
         fora[1] = int(mistura(fb) & m);
         fora[2] = int(mistura(fp) & m);
@@ -2443,6 +2466,7 @@ void Busca::arranca(Position& pos, const Limites& lim, Avaliador& avaliador) {
     if (const char* v = std::getenv("KS_LMR_DELTA")) p.lmr_delta = std::atoi(v);
     if (const char* v = std::getenv("KS_LANCE_ALPHA")) p.lance_so_alpha = std::atoi(v);
     if (const char* v = std::getenv("KS_QS_GUARDA_AVAL")) p.qs_guarda_aval = std::atoi(v);
+    if (const char* v = std::getenv("KS_IND_RAPIDO")) p.indices_rapido = std::atoi(v);
     if (const char* v = std::getenv("KS_PODA_RED")) p.poda_red = std::atoi(v);
     if (const char* v = std::getenv("KS_LMR_EXT_MAX")) p.lmr_ext_max = std::atoi(v);
     if (const char* v = std::getenv("KS_LMR_PECAS_FIM")) p.lmr_pecas_fim = std::atoi(v);
