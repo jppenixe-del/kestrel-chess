@@ -78,10 +78,15 @@ meant inheriting someone else's tuning along with them.
 ## Building
 
     make                 build for this machine
-    make ARCH=avx2       x86-64 with AVX2     — runs on almost any modern x86
+    make ARCH=bmi2       x86-64 with AVX2 and PEXT — Intel since Haswell, AMD since Zen 3
+    make ARCH=avx2       x86-64 with AVX2, no PEXT — runs well on almost any modern x86
     make ARCH=avx512     x86-64 with AVX-512  — only where the CPU has it
     make ARCH=sse41      older x86-64, no AVX
-    make todos           all three, each named after its architecture
+    make todos           all four, each named after its architecture
+
+PEXT is what separates `bmi2` from `avx2`. AMD Zen 1 and Zen 2 implement it in
+microcode, many times slower than on other processors, and a PEXT build runs
+far below its speed there. If you do not know the processor, use `avx2`.
 
 The SIMD macros are not optional and they are not visible in the compiler
 flags. The NNUE reader in `vendor/nnue` does not rely on the compiler's

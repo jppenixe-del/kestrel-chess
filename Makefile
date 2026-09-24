@@ -1,10 +1,15 @@
 # KestrelStrike -- construcao.
 #
 #   make                 constroi para a maquina onde estiver (native)
-#   make ARCH=avx2       x86-64 com AVX2      -- corre em quase todo o x86 moderno
+#   make ARCH=bmi2       x86-64 com AVX2 e PEXT -- Intel desde Haswell, AMD desde Zen 3
+#   make ARCH=avx2       x86-64 com AVX2, SEM PEXT -- corre bem em quase todo o x86
 #   make ARCH=avx512     x86-64 com AVX-512   -- so' onde o processador o tem
 #   make ARCH=sse41      x86-64 antigo, sem AVX
-#   make todos           os tres de uma vez, com o nome da arquitectura no fim
+#   make todos           os quatro de uma vez, com o nome da arquitectura no fim
+#
+# O PEXT SEPARA O BMI2 DO AVX2. Os AMD Zen 1 e Zen 2 tem a instrucao, mas em
+# microcodigo, dezenas de vezes mais lenta; um binario com PEXT corre neles
+# muito abaixo do que devia. Quem nao sabe o processador escolhe o `avx2`.
 #
 # AS MACROS DA SIMD SAO OBRIGATORIAS E NAO SE VEEM.
 #
@@ -45,9 +50,12 @@ LDFLAGS  = -lpthread
 ifeq ($(ARCH),avx512)
   SIMD = -DUSE_AVX512 -DUSE_AVX2 -DUSE_SSE41 -DUSE_SSSE3 -DUSE_SSE2 -DUSE_POPCNT -DUSE_PEXT \
          -mavx512f -mavx512bw -mavx2 -mbmi -mbmi2 -msse4.1 -mssse3 -mpopcnt
-else ifeq ($(ARCH),avx2)
+else ifeq ($(ARCH),bmi2)
   SIMD = -DUSE_AVX2 -DUSE_SSE41 -DUSE_SSSE3 -DUSE_SSE2 -DUSE_POPCNT -DUSE_PEXT \
          -mavx2 -mbmi -mbmi2 -msse4.1 -mssse3 -mpopcnt
+else ifeq ($(ARCH),avx2)
+  SIMD = -DUSE_AVX2 -DUSE_SSE41 -DUSE_SSSE3 -DUSE_SSE2 -DUSE_POPCNT \
+         -mavx2 -mbmi -msse4.1 -mssse3 -mpopcnt
 else ifeq ($(ARCH),sse41)
   SIMD = -DUSE_SSE41 -DUSE_SSSE3 -DUSE_SSE2 -DUSE_POPCNT \
          -msse4.1 -mssse3 -mpopcnt
@@ -74,6 +82,7 @@ $(EXE): $(SUBSTRATO) $(NOSSO)
 
 todos:
 	$(MAKE) ARCH=avx512 EXE=$(NOME)-avx512
+	$(MAKE) ARCH=bmi2   EXE=$(NOME)-bmi2
 	$(MAKE) ARCH=avx2   EXE=$(NOME)-avx2
 	$(MAKE) ARCH=sse41  EXE=$(NOME)-sse41
 
