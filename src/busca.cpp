@@ -2611,7 +2611,20 @@ void Busca::arranca(Position& pos, const Limites& lim, Avaliador& avaliador) {
         int          lado = int(pos.side_to_move());
         std::int64_t t    = lim.tempo[lado];
         std::int64_t inc  = lim.inc[lado];
+        // OS LANCES ATE' AO CONTROLO.
+        //
+        // O `movestogo` nao era lido. Na 40/15 da CCRL o relogio volta a encher
+        // ao lance 40, e o motor orcava cada periodo como se o relogio tivesse
+        // de chegar ao fim da partida: ao lance 30, com 4 minutos e 10 lances
+        // ate' ao controlo, pensava ~6,5 s por lance em vez de ~20 s, e o que
+        // sobrava ia fora no controlo. Nenhum orcamento aqui passa do controlo.
+        //
+        // Dois lances de folga: o ultimo antes do controlo nao leva o relogio
+        // inteiro. Com `movestogo 1` orca-se um terco do que resta, e o tecto
+        // dos 80% guarda o resto.
+        const std::int64_t ate_controlo = lim.movestogo > 0 ? std::int64_t(lim.movestogo) + 2 : 0;
         std::int64_t n    = std::max(p.tm_bolo_n, 1);
+        if (ate_controlo > 0) n = std::min(n, ate_controlo);
         std::int64_t bolo = t + inc * (n - 1);
         std::int64_t optimo = std::max(bolo / n - sobrecarga, std::int64_t(1));
         // QUANTOS LANCES FALTAM MESMO. Ver `tm_curva` no `busca.h`.
@@ -2682,6 +2695,7 @@ void Busca::arranca(Position& pos, const Limites& lim, Avaliador& avaliador) {
             // dois lances e' pedir para cair.
             std::int64_t lc = std::max<std::int64_t>(faltam / 2, p.tm_curva_min);
             lc = std::max<std::int64_t>(lc * p.tm_curva_f / 100, 1);
+            if (ate_controlo > 0) lc = std::min(lc, ate_controlo);
             std::int64_t bolo2 = t + inc * (lc - 1);
             optimo = std::max(bolo2 / lc - sobrecarga, std::int64_t(1));
         }
@@ -2724,8 +2738,9 @@ void Busca::arranca(Position& pos, const Limites& lim, Avaliador& avaliador) {
         // O TECTO SEM INCREMENTO. Ver `tm_sem_inc_tecto` no `busca.h`.
         //
         // So' quando nao ha' incremento: com incremento o gasto e' reposto.
+        // E com controlo tambem -- o relogio volta a encher.
         // Corta o TECTO, nao o orcamento.
-        if (p.tm_sem_inc_tecto > 0 && inc == 0)
+        if (p.tm_sem_inc_tecto > 0 && inc == 0 && ate_controlo == 0)
             tecto = std::max(std::min(tecto, t * p.tm_sem_inc_tecto / 100), std::int64_t(1));
 
         std::int64_t seguro = std::max(t - sobrecarga - t / 20, std::int64_t(1));

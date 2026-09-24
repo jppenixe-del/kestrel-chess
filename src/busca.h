@@ -1511,6 +1511,11 @@ struct Parametros {
 
 struct Limites {
     std::int64_t tempo[2]{}, inc[2]{}, movetime = 0;
+    /// Lances ate' ao proximo controlo (`go ... movestogo N`), 0 = morte subita.
+    /// Nas cadencias por controlos -- a 40/15 da CCRL -- o relogio e' reposto
+    /// ao fim de N lances, e orcar como se tivesse de chegar ao fim da partida
+    /// deita fora o tempo que o controlo devolve.
+    int          movestogo = 0;
     int          profundidade = 0;
     std::int64_t nos          = 0;
     bool         infinito     = false;

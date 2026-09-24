@@ -131,6 +131,7 @@ void faz_go(std::istringstream& is) {
         else if (tok == "winc")      is >> lim.inc[WHITE];
         else if (tok == "binc")      is >> lim.inc[BLACK];
         else if (tok == "movetime")  is >> lim.movetime;
+        else if (tok == "movestogo") is >> lim.movestogo;
         else if (tok == "depth")     is >> lim.profundidade;
         else if (tok == "nodes")     is >> lim.nos;
         else if (tok == "infinite")  lim.infinito = true;
