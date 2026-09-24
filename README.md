@@ -83,10 +83,16 @@ meant inheriting someone else's tuning along with them.
     make ARCH=avx512     x86-64 with AVX-512  — only where the CPU has it
     make ARCH=sse41      older x86-64, no AVX
     make todos           all four, each named after its architecture
+    make windows         the same four as Windows .exe files, cross-compiled with
+                         mingw-w64: static, and with an 8 MB stack
 
 PEXT is what separates `bmi2` from `avx2`. AMD Zen 1 and Zen 2 implement it in
 microcode, many times slower than on other processors, and a PEXT build runs
 far below its speed there. If you do not know the processor, use `avx2`.
+
+The Windows builds ask for an 8 MB stack because a Windows thread starts with
+the stack the executable declares, 1 MB by default, and the search can recurse
+to about 1.6 MB in the worst case. Linux threads start with 8 MB already.
 
 The SIMD macros are not optional and they are not visible in the compiler
 flags. The NNUE reader in `vendor/nnue` does not rely on the compiler's

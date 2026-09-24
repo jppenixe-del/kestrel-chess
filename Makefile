@@ -86,7 +86,23 @@ todos:
 	$(MAKE) ARCH=avx2   EXE=$(NOME)-avx2
 	$(MAKE) ARCH=sse41  EXE=$(NOME)-sse41
 
-limpo:
-	rm -f $(NOME) $(NOME)-avx512 $(NOME)-avx2 $(NOME)-sse41
+# O WINDOWS, construido a partir do Linux com o mingw-w64.
+#
+# Estatico, para correr sem DLLs ao lado. E com a pilha de 8 MB: no Windows uma
+# thread nasce com a pilha que o executavel declara, 1 MB por omissao, e a
+# recursao da busca chega perto de 1,6 MB no pior caso (MAX_PLY). No Linux
+# nasce com 8 MB, que e' o que o Stockfish tambem pede.
+MINGW    ?= x86_64-w64-mingw32-g++
+WIN_LD    = -static -lpthread -Wl,--stack,8388608
 
-.PHONY: todos limpo
+windows:
+	$(MAKE) CXX=$(MINGW) ARCH=avx512 EXE=$(NOME)-avx512.exe LDFLAGS="$(WIN_LD)"
+	$(MAKE) CXX=$(MINGW) ARCH=bmi2   EXE=$(NOME)-bmi2.exe   LDFLAGS="$(WIN_LD)"
+	$(MAKE) CXX=$(MINGW) ARCH=avx2   EXE=$(NOME)-avx2.exe   LDFLAGS="$(WIN_LD)"
+	$(MAKE) CXX=$(MINGW) ARCH=sse41  EXE=$(NOME)-sse41.exe  LDFLAGS="$(WIN_LD)"
+
+limpo:
+	rm -f $(NOME) $(NOME)-avx512 $(NOME)-bmi2 $(NOME)-avx2 $(NOME)-sse41
+	rm -f $(NOME)-avx512.exe $(NOME)-bmi2.exe $(NOME)-avx2.exe $(NOME)-sse41.exe
+
+.PHONY: todos windows limpo
