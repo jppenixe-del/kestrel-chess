@@ -6,8 +6,16 @@
 #include "tt.h"
 
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <new>
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
+#if defined(_WIN32)
+#include <malloc.h>
+#endif
 
 namespace Kestrel {
 
@@ -166,6 +174,8 @@ std::size_t TranspositionTable::via_a_substituir(Balde& b, std::uint64_t chave,
 namespace {
 const int G_TT_LANCE = [] { const char* v = std::getenv("KS_TT_LANCE"); return v ? std::atoi(v) : 1; }();
 const int G_TT_PROF  = [] { const char* v = std::getenv("KS_TT_PROF");  return v ? std::atoi(v) : 1; }();
+// Paginas grandes para a tabela. Ver `aloca_baldes`. 0 = paginas normais.
+const int G_TT_GRANDE = [] { const char* v = std::getenv("KS_TT_GRANDE"); return v ? std::atoi(v) : 1; }();
 }  // namespace
 
 void TranspositionTable::guarda(std::uint64_t chave, int prof, int nota, Limite limite,
@@ -272,6 +282,59 @@ void* TranspositionTable::first_entry(std::uint64_t chave) const {
     return baldes ? static_cast<void*>(&baldes[chave & mascara]) : nullptr;
 }
 
+// PAGINAS GRANDES.
+//
+// Uma tabela de 64 MB em paginas de 4 KB sao 16.384 paginas -- muito mais do
+// que a TLB guarda. Cada sondagem a um balde qualquer paga entao duas idas a`
+// memoria em vez de uma: a do balde e a da traducao do endereco. Em paginas de
+// 2 MB os mesmos 64 MB sao 32 paginas, e a traducao fica sempre na TLB.
+//
+// Este sistema tem o THP em `madvise`: as paginas grandes so' se dao a` memoria
+// marcada com `madvise(MADV_HUGEPAGE)`. A tabela alocava-se com um `new` simples
+// e portanto NUNCA as recebia. O Stockfish aloca a dele assim de proposito.
+//
+// E' codigo nosso e nao o alocador do substrato, porque a tabela e' nossa. No
+// Windows fica o alinhamento a` linha de cache: la' as paginas grandes pedem um
+// privilegio que quase ninguem tem ligado, e o ganho perde-se de qualquer modo.
+namespace {
+Balde* aloca_baldes(std::size_t n, std::size_t& bytes_out) {
+    std::size_t alinha = alignof(Balde);
+#if defined(__linux__)
+    constexpr std::size_t DOIS_MB = std::size_t(2) * 1024 * 1024;
+    if (G_TT_GRANDE)
+        alinha = DOIS_MB;
+#endif
+    // O `aligned_alloc` exige um tamanho multiplo do alinhamento.
+    std::size_t bytes = (n * sizeof(Balde) + alinha - 1) / alinha * alinha;
+#if defined(_WIN32)
+    void* mem = _aligned_malloc(bytes, alinha);
+#else
+    void* mem = std::aligned_alloc(alinha, bytes);
+#endif
+    if (!mem)
+        return nullptr;
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+    if (G_TT_GRANDE)
+        madvise(mem, bytes, MADV_HUGEPAGE);
+#endif
+    Balde* b = static_cast<Balde*>(mem);
+    for (std::size_t i = 0; i < n; ++i)
+        new (&b[i]) Balde();
+    bytes_out = bytes;
+    return b;
+}
+
+void liberta_baldes(Balde* b) {
+    if (!b)
+        return;
+#if defined(_WIN32)
+    _aligned_free(b);
+#else
+    std::free(b);
+#endif
+}
+}  // namespace
+
 void TranspositionTable::redimensiona(std::size_t mb) {
     // Sem esta guarda, cada chamada libertava a tabela, realocava e chamava
     // `limpa` -- e o interface manda `setoption name Hash` mais do que uma vez.
@@ -282,9 +345,12 @@ void TranspositionTable::redimensiona(std::size_t mb) {
         limpa();
         return;
     }
-    delete[] baldes;
-    baldes  = new Balde[n];
-    mascara = n - 1;
+    liberta_baldes(baldes);
+    std::size_t bytes = 0;
+    baldes = aloca_baldes(n, bytes);
+    // Sem memoria, a tabela fica vazia em vez de o processo morrer: todas as
+    // funcoes daqui ja' sabem o que fazer com `baldes == nullptr`.
+    mascara = baldes ? n - 1 : 0;
     limpa();
 }
 
