@@ -109,7 +109,7 @@ existe a um fio, e a CCRL corre a 4. Falta: **`ks_modifs` (HEAD) contra
 | `alpha_desc = 1` (item 4) | **fechado por interrupcao, sem veredicto.** 1100 partidas a 10+0,1: +9,16 +/- 10,76, LLR 0,66. Parei-o para dar a maquina a outra coisa; o parcial fica em `/root/sprt_ad/ad_parcial_1010.*`. Continua na fila |
 | `lance_so_alpha` (novo) | **REJEITADO.** -26,02 +/- 14,59 em 602 partidas a 5+0,05, `Hash=16`, IC95% [-40,6; -11,4]. Ver `0d5f360` |
 | `ameaca_f` 10 contra 20 (novo) | **neutro, fica o 20.** +2,95 +/- 5,65 em 4002 partidas, IC95% [-2,7; +8,6]. Ver `d35bd60`. Fecha a pergunta de 18-09 |
-| `asp_sf` (item 7) | a correr, `/root/sprt_asp/` |
+| `asp_sf` (item 7) | **neutro, fica a zero.** -1,74 +/- 6,21 em 3202 partidas, IC95% [-8,0; +4,5]. Ver `d4a5183` |
 
 ### O que a auditoria da ordenacao diz hoje
 
@@ -149,3 +149,31 @@ ganho por essa via.
   crescer 15,6% -- ver `qs_guarda_aval`, fica a zero
 - **O RFP ja' devolve `beta + (aval - beta)/3`**, as continuacoes ja' sao
   `{1, 2, 4}`, a assimetria `hist_de`/`ordena` ja' esta' comentada
+
+### O que esta noite ELIMINOU como caminho
+
+Duas experiencias independentes atacaram o mesmo defeito -- o lance da tabela
+render 30-43% contra 52-63% da referencia -- e falharam do mesmo modo:
+
+- **`lance_so_alpha`** apaga o lance nos nos ALL: **-26 Elo**
+- **`tt_sup_nota`** desce-lhe a prioridade quando vem de limite superior: faz a
+  arvore crescer 33-55% e **nao tem meio-termo** -- a transicao esta entre
+  600.000 e 700.000, e abaixo dela o lance cai por baixo de TODAS as capturas
+  de uma vez (999k/950k/900k/800k/700k dao 295.733; 600k da' 459.853; 550k/300k/
+  60k dao ~394.600)
+
+A licao comum: **o lance guardado vale muito mais do que a sua taxa de corte
+sugere.** Mesmo vindo de um no' onde nada provou nada, e' a melhor pista que
+aquela posicao tem. O Stockfish e o Triumviratus podem dispensa-lo porque a
+preservacao do lance antigo lhes tapa o buraco; aqui a preservacao so' actua
+quando a via escolhida ja' tem ESTA chave.
+
+Portanto o buraco dos 8-12 pontos **nao e'** guardarmos lances a mais. E' outra
+coisa, e estes dois candidatos estao fechados.
+
+### O placar da noite
+
+Quatro medidas, ~11.000 partidas, **zero Elo ganho**: uma rejeicao clara
+(`lance_so_alpha`, -26) e tres neutros (`ameaca_f` 10, politica da TT ja' de
+ontem, `asp_sf`). O valor esta nos becos fechados e no contraste arvore/Elo,
+que hoje discordaram tres vezes em tres.
