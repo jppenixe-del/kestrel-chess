@@ -1074,6 +1074,50 @@ struct Parametros {
     /// velocidade medidas assim, ligadas de uma vez, ja' dao um efeito mensuravel.
     /// Liga-la sozinha seria mudar o motor sem medida que o sustente.
     int indices_rapido = 0;
+    /// Pede-se o balde da tabela do FILHO antes de jogar o lance, e nao depois.
+    /// 1 = como o binario de producao fazia.
+    ///
+    /// O `ks_1.20260919` fazia, na `quiescencia` (`4213d4`) e no `negamax`
+    /// (`43839c`), ANTES do `do_move`:
+    ///
+    ///     call prefetch_key(m)       ; a chave que o lance vai dar, sem o jogar
+    ///     and  0x8(%r12),%rax        ; & mascara
+    ///     lea  (%rax,%rax,8),%r11    ; * 9
+    ///     prefetcht0 (%r9,%r11,8)    ; * 8 -> o balde de 72 bytes
+    ///
+    /// Assim a ida a` memoria corre EM PARALELO com o `do_move` inteiro -- as
+    /// ameacas sujas, a pilha do acumulador, as chaves. A reconstrucao perdeu
+    /// isto de duas maneiras:
+    ///
+    ///  - na `quiescencia` nao havia prefetch nenhum;
+    ///  - no `negamax` havia, mas DEPOIS do `do_move`, com `pos.key()`: o balde
+    ///    certo, pedido quando ja' nao ha' trabalho nenhum para esconder a
+    ///    latencia -- a sondagem do filho vem logo a seguir.
+    ///
+    /// O comentario que la' estava ja' dizia o que isto vale: "essa ida era um
+    /// quinto da busca toda". Estava certo e o codigo nao lhe obedecia.
+    ///
+    /// As chaves batem: `Position::key()` e' `adjust_key50(st->key)`, e o
+    /// `prefetch_key(m)` devolve `adjust_key50<true>` calculado antes do lance,
+    /// que e' o mesmo numero. Nos lances especiais (roque, en passant, promocao,
+    /// e o lance a seguir a um avanco duplo) a chave do `prefetch_key` sai
+    /// aproximada e o pedido vai ao balde errado -- sem mal nenhum, porque um
+    /// prefetch e' so' um pedido.
+    ///
+    /// NAO muda a busca: um prefetch nao altera um unico valor. A arvore tem de
+    /// sair IDENTICA ao no' -- e' esse o controlo, e passou: 295.733 nos a
+    /// profundidade 12, e 1.785.977 a 15, com a manete ligada e desligada.
+    ///
+    /// E ficou mais eficaz com o balde de 64 bytes: agora o balde cabe numa
+    /// linha, e o `prefetcht0` traz o balde INTEIRO. Com 72 bytes trazia so'
+    /// parte dele.
+    ///
+    /// MEDIDO, oito voltas com a ordem rodada, arvores identicas, sobre o balde
+    /// de 64 bytes e as paginas grandes: mediana **3642 -> 3544 ms, -2,7%**,
+    /// mais rapido em 6 voltas de 8. E' o incremento mais pequeno dos tres e o
+    /// mais ruidoso; duas medicoes anteriores, so' com esta peca, deram -1,4%
+    /// de media e -3,0% de mediana.
+    int prefetch_antes = 1;
     int usa_cuckoo    = 1;
     /// Futilidade inversa SO' quando nao ha' lance na tabela, ou quando o que
     /// la' esta' e' uma captura. 1 = o valor de producao.

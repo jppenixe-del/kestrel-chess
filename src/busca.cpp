@@ -1139,6 +1139,10 @@ int Busca::quiescencia(Position& pos, int alpha, int beta, int ply) {
             continue;
 
         StateInfo st;
+        // Ver `prefetch_antes`: o balde do filho pede-se ja', para a ida a`
+        // memoria correr junto com o `do_move`.
+        if (p.prefetch_antes)
+            __builtin_prefetch(p_tab->first_entry(pos.prefetch_key(m)));
         chaves.push_back(pos.key());
         auto& sujas = av->pilha().push();
         pos.do_move(m, st, pos.gives_check(m), sujas, nullptr, nullptr);
@@ -1529,6 +1533,8 @@ int Busca::negamax(Position& pos, int prof, int alpha, int beta, int ply, bool p
         for (int ci = 0; ci < caps.n; ++ci) {
             Move mm = caps.lances[ci];
             StateInfo st2;
+            if (p.prefetch_antes)
+                __builtin_prefetch(p_tab->first_entry(pos.prefetch_key(mm)));
             chaves.push_back(pos.key());
             jogado_pc[ply]   = idx_pc(type_of(pos.moved_piece(mm)));
             jogado_para[ply] = int(mm.to_sq());
@@ -1810,6 +1816,11 @@ int Busca::negamax(Position& pos, int prof, int alpha, int beta, int ply, bool p
         }
 
         StateInfo st;
+        // Ver `prefetch_antes`. Com a manete ligada o pedido sai AQUI, antes do
+        // xeque e do `do_move`, que e' o trabalho que esconde a latencia; com ela
+        // desligada sai la' em baixo, depois do `do_move`, como estava.
+        if (p.prefetch_antes)
+            __builtin_prefetch(p_tab->first_entry(pos.prefetch_key(m)));
         chaves.push_back(pos.key());
         jogado_pc[ply]   = idx_pc(type_of(pos.moved_piece(m)));
         jogado_para[ply] = int(m.to_sq());
@@ -1826,7 +1837,8 @@ int Busca::negamax(Position& pos, int prof, int alpha, int beta, int ply, bool p
         // que joga e nao ve'.
         auto& sujas = av->pilha().push();
         pos.do_move(m, st, dava_xeque, sujas, nullptr, nullptr);
-        __builtin_prefetch(p_tab->first_entry(pos.key()));
+        if (!p.prefetch_antes)
+            __builtin_prefetch(p_tab->first_entry(pos.key()));
 
         // Extensao de xeque NAO: existe no half2k e esta' desligada
         // (`CheckExt=false`).
@@ -2467,6 +2479,7 @@ void Busca::arranca(Position& pos, const Limites& lim, Avaliador& avaliador) {
     if (const char* v = std::getenv("KS_LANCE_ALPHA")) p.lance_so_alpha = std::atoi(v);
     if (const char* v = std::getenv("KS_QS_GUARDA_AVAL")) p.qs_guarda_aval = std::atoi(v);
     if (const char* v = std::getenv("KS_IND_RAPIDO")) p.indices_rapido = std::atoi(v);
+    if (const char* v = std::getenv("KS_PREFETCH")) p.prefetch_antes = std::atoi(v);
     if (const char* v = std::getenv("KS_PODA_RED")) p.poda_red = std::atoi(v);
     if (const char* v = std::getenv("KS_LMR_EXT_MAX")) p.lmr_ext_max = std::atoi(v);
     if (const char* v = std::getenv("KS_LMR_PECAS_FIM")) p.lmr_pecas_fim = std::atoi(v);
