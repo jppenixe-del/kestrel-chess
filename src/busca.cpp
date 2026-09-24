@@ -456,6 +456,49 @@ constexpr int CONT_RECUO[5]  = {1, 2, 4, 3, 6};
 constexpr int CONT_PESO[5]   = {2, 1, 1, 1, 1};
 }  // namespace
 
+// Ver `hist_prefetch` nos parametros. So' pede: nao le nem escreve nada que
+// mude um valor. As linhas das continuacoes dependem do caminho e nao do lance,
+// por isso acham-se uma vez; do lance so' vem a coluna (peca e casa).
+void Busca::pede_historias(const Position& pos, const Move* ls, const int* ns,
+                           int de, int n, int ply) const {
+    garante_ameacas(pos, ply);
+    const int lado = int(pos.side_to_move());
+    const std::atomic<int>* linha[5];
+    int nl = 0;
+    for (int k = 0; k < p.cont_n && k < 5; ++k) {
+        int atras = ply - CONT_RECUO[k];
+        int apc, apara;
+        if (atras >= 0) {
+            if (jogado_pc[atras] < 0)
+                continue;
+            apc = jogado_pc[atras]; apara = jogado_para[atras];
+        } else {
+            int i = -atras - 1;
+            if (i >= pre_n)
+                continue;
+            apc = pre_pc[i]; apara = pre_para[i];
+        }
+        linha[nl++] = &(*cont_hist)[(k * (6 * 64) + apc * 64 + apara) * (6 * 64)];
+    }
+    const bool peao = p.peao_f > 0 && !hist_peao->empty();
+    const std::size_t base_peao =
+      peao ? (std::size_t(pos.pawn_key() & (std::uint64_t(p.peao_chaves) - 1)) * 12
+              + 6 * std::size_t(lado)) * 64
+           : 0;
+    for (int j = de; j < n; ++j) {
+        if (ns[j] != TRANQUILO_POR_PONTUAR)
+            continue;
+        const Move m  = ls[j];
+        const int  pa = int(m.to_sq());
+        const int  pc = idx_pc(type_of(pos.moved_piece(m)));
+        __builtin_prefetch(&principal[lado][int(m.from_sq())][pa][balde(m, ply)]);
+        for (int k = 0; k < nl; ++k)
+            __builtin_prefetch(linha[k] + pc * 64 + pa);
+        if (peao)
+            __builtin_prefetch(&(*hist_peao)[base_peao + std::size_t(pc) * 64 + pa]);
+    }
+}
+
 int Busca::conts(const Position& pos, Move m, int ply, int pc) const {
     int h = 0;
     for (int k = 0; k < p.cont_n; ++k) {
@@ -1624,6 +1667,8 @@ int Busca::negamax(Position& pos, int prof, int alpha, int beta, int ply, bool p
         // exactamente o momento em que a tabela, as capturas boas e as promocoes
         // se esgotaram. Perguntar antes obrigava a uma varredura por cada lance.
         if (!tranquilos_pontuados && notas[i] == TRANQUILO_POR_PONTUAR) {
+            if (p.hist_prefetch)
+                pede_historias(pos, lances, notas, i, L.n, ply);
             for (int j = i; j < L.n; ++j)
                 if (notas[j] == TRANQUILO_POR_PONTUAR) {
                     // A ordem e a poda leem o MESMO numero: `hist_de`, e nada
@@ -2485,6 +2530,7 @@ void Busca::arranca(Position& pos, const Limites& lim, Avaliador& avaliador) {
     if (const char* v = std::getenv("KS_QS_GUARDA_AVAL")) p.qs_guarda_aval = std::atoi(v);
     if (const char* v = std::getenv("KS_IND_RAPIDO")) p.indices_rapido = std::atoi(v);
     if (const char* v = std::getenv("KS_PREFETCH")) p.prefetch_antes = std::atoi(v);
+    if (const char* v = std::getenv("KS_HIST_PREFETCH")) p.hist_prefetch = std::atoi(v);
     if (const char* v = std::getenv("KS_PODA_RED")) p.poda_red = std::atoi(v);
     if (const char* v = std::getenv("KS_LMR_EXT_MAX")) p.lmr_ext_max = std::atoi(v);
     if (const char* v = std::getenv("KS_LMR_PECAS_FIM")) p.lmr_pecas_fim = std::atoi(v);

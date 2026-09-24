@@ -1150,6 +1150,18 @@ struct Parametros {
     /// contra `7c25e1c`: **+19,14 +/- 7,66 Elo** em 2108 partidas a 5+0,05,
     /// `Hash=16`, um fio, H1 aceite. A parte desta peca, pela velocidade: -2,7%.
     int prefetch_antes = 1;
+    /// PEDIR AS HISTORIAS DE TODOS OS TRANQUILOS ANTES DE AS LER. 1 = liga.
+    ///
+    /// O `hist_de` passa a maior parte do tempo a` espera da memoria: no perfil,
+    /// ~35% dele cai logo a seguir a` leitura da tabela principal e ~10% a` da
+    /// de peoes. A principal tem 128 KB e a de peoes 25 MB, e os pesos da rede,
+    /// muito maiores, varrem-nas das caches entre dois nos. Os tranquilos eram
+    /// pontuados um a um, cada leitura a` espera da sua.
+    ///
+    /// Com isto, uma passagem pede as entradas de todos (principal,
+    /// continuacoes, peoes) e so' depois se pontua: as esperas sobrepoem-se. Nao
+    /// muda um valor, portanto a arvore fica IGUAL ao no' -- e' o controlo.
+    int hist_prefetch = 1;
     int usa_cuckoo    = 1;
     /// Futilidade inversa SO' quando nao ha' lance na tabela, ou quando o que
     /// la' esta' e' uma captura. 1 = o valor de producao.
@@ -1651,6 +1663,8 @@ class Busca {
     void pontua(const Position& pos, Lista& l, int de, Move tt_lance,
                 Limite tt_limite, int ply, int prof) const;
     int  hist_de(const Position& pos, Move m, int ply) const;   // para a PODA
+    void pede_historias(const Position& pos, const Move* ls, const int* ns,
+                        int de, int n, int ply) const;
     int  ordena(const Position& pos, Move m, int ply) const;    // para a ORDEM
     int  conts(const Position& pos, Move m, int ply, int pc) const;
     int  otimismo_de(const Position& pos) const;
