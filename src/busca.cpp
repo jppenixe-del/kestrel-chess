@@ -38,6 +38,11 @@ namespace Zobrist {
 extern Key psq[PIECE_NB][SQUARE_NB];
 }
 
+std::mutex& trinco_saida() {
+    static std::mutex m;
+    return m;
+}
+
 // QUANTO E' QUE A BUSCA DESMENTE A ESTATICA, por profundidade.
 //
 // E' isto que a margem da futilidade inversa tem de cobrir: ela diz "estou tao
@@ -2496,7 +2501,11 @@ void Busca::arranca(Position& pos, const Limites& lim, Avaliador& avaliador) {
     pc_nos = pc_tentativas = pc_passou_qs = pc_cortes = n_aval = 0;
     n_aval_bs = n_hit_bs = n_aval_qs = n_hit_qs = 0;
     parado = false;
-    parar.store(false, std::memory_order_relaxed);
+    // O `parar` NAO se repoe aqui. Quem arranca a busca repoe-no ANTES de ela
+    // nascer: a thread dos comandos para a principal, o proprio `arranca` para
+    // cada ajudante (mais abaixo). Reposto aqui, um `stop` que chegasse entre o
+    // nascimento da thread e esta linha perdia-se -- e com `go infinite` a busca
+    // ficava a correr para sempre.
     inicio = std::chrono::steady_clock::now();
     melhor_raiz = Move::none();
     nota_raiz   = 0;
@@ -2939,6 +2948,15 @@ void Busca::arranca(Position& pos, const Limites& lim, Avaliador& avaliador) {
         if (passou + estim >= mole.count())
             break;
     }
+
+    // `go infinite`: o `bestmove` so' sai depois do `stop` (ou do `quit`), mesmo
+    // que a busca tenha acabado sozinha -- chegou a` profundidade maxima, ou a
+    // posicao e' trivial. O protocolo e' explicito: em modo infinito o motor
+    // nao manda `bestmove` antes de lho pedirem. Os ajudantes correm SEMPRE em
+    // modo infinito, de proposito, e quem os para e' a principal; nao esperam.
+    if (lim.infinito && !ajudante)
+        while (!parar.load(std::memory_order_relaxed))
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
 
     // Os ajudantes param quando a principal parou. Cada um le' a SUA bandeira,
     // e e' esta linha que as levanta todas -- sem ela ficavam a procurar para

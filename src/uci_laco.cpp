@@ -38,6 +38,36 @@ int                    g_hash_mb = 64;
 const int              FIOS_MAX = std::max(1, int(std::thread::hardware_concurrency()));
 int                    g_fios   = 1;
 
+// A BUSCA CORRE NUMA THREAD PROPRIA.
+//
+// Corria nesta, a que le' os comandos: enquanto buscava ninguem lia o `stdin`,
+// o `stop` so' era lido quando ela ja' tinha acabado, e um `go infinite` nunca
+// acabava. Nas partidas com relogio nao se notava -- o motor para sozinho pelo
+// tempo --, mas o `stop` e' obrigatorio no protocolo, e sem ele nao ha' analise
+// em interface nenhuma nem `ponder`.
+std::thread            g_fio_busca;
+bool                   g_busca_infinita = false;
+
+// Espera que a busca em curso acabe, SEM a mandar parar.
+void espera_busca() {
+    if (g_fio_busca.joinable())
+        g_fio_busca.join();
+}
+
+// Manda parar a busca em curso e espera por ela. Ela proprio escreve o
+// `bestmove` antes de acabar.
+void para_busca() {
+    g_busca.parar.store(true, std::memory_order_relaxed);
+    espera_busca();
+}
+
+// Uma linha escrita pela thread dos comandos, sob a mesma tranca da busca: o
+// `readyok` pode chegar a meio de uma busca e nao pode cortar uma linha `info`.
+void diz(const char* texto) {
+    std::lock_guard<std::mutex> g(trinco_saida());
+    std::cout << texto << std::endl;
+}
+
 const std::string INICIAL = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
 
 // Um lance em notacao UCI so' se traduz contra a posicao: `e1g1` pode ser rei
@@ -117,7 +147,12 @@ void faz_go(std::istringstream& is) {
     // carregada, e e' dela que cada um tira as suas caches. Prepara-los antes
     // da rede dava ajudantes a avaliar tudo a zero.
     g_busca.prepara_fios(g_fios, g_aval);
-    g_busca.arranca(g_pos, lim, g_aval);
+    // O `parar` repoe-se AQUI, antes de a thread nascer. Se fosse a propria
+    // busca a repo-lo, um `stop` que chegasse entre o nascimento dela e essa
+    // linha perdia-se.
+    g_busca.parar.store(false, std::memory_order_relaxed);
+    g_busca_infinita = lim.infinito;
+    g_fio_busca      = std::thread([lim] { g_busca.arranca(g_pos, lim, g_aval); });
 }
 
 void faz_setoption(std::istringstream& is) {
@@ -201,6 +236,23 @@ int main() {
         std::string tok;
         if (!(is >> tok))
             continue;
+        // Os tres comandos que o protocolo deixa chegar A MEIO de uma busca.
+        if (tok == "isready") {
+            diz("readyok");
+            continue;
+        }
+        if (tok == "stop") {
+            para_busca();
+            continue;
+        }
+        if (tok == "quit") {
+            para_busca();
+            break;
+        }
+        // Qualquer outro mexe no que a busca esta' a usar -- a posicao, a
+        // tabela, a rede, os parametros. Espera-se que ela acabe primeiro.
+        espera_busca();
+
         if (tok == "uci") {
             std::cout << "id name KestrelStrike " KS_VERSAO "\n"
                       << "id author Joao\n"
@@ -212,8 +264,6 @@ int main() {
                       << "option name Threads type spin default 1 min 1 max "
                       << FIOS_MAX << "\n"
                       << "uciok" << std::endl;
-        } else if (tok == "isready") {
-            std::cout << "readyok" << std::endl;
         } else if (tok == "ucinewgame") {
             g_busca.nova_partida();
             g_aval.repoe();
@@ -223,9 +273,15 @@ int main() {
             faz_position(is);
         } else if (tok == "go") {
             faz_go(is);
-        } else if (tok == "quit" || tok == "stop") {
-            if (tok == "quit") break;
         }
     }
+    // FIM DA ENTRADA. Nao e' um `quit`: quem fecha o cano depois de um
+    // `go depth N` quer a busca inteira -- e' assim que se mede a profundidade
+    // fixa. Uma busca finita acaba sozinha; so' a infinita se manda parar, senao
+    // o processo ficava vivo para sempre sem ninguem a ouvir.
+    if (g_busca_infinita)
+        para_busca();
+    else
+        espera_busca();
     return 0;
 }

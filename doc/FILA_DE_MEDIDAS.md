@@ -218,3 +218,36 @@ le' os comandos. Tres cuidados:
 terminar o processo, o `isready` durante a busca tem de responder, e a
 contagem de nos a profundidade fixa tem de ficar IDENTICA (a busca em si nao
 muda).
+
+### Corrigido
+
+A busca passou a correr numa thread propria; a dos comandos fica livre para o
+`stop`, o `quit` e o `isready`. Os mesmos oito testes, com relogio, antes e
+depois (`uci_teste.py`, que manda os comandos com intervalos e regista quando
+chega cada resposta):
+
+| teste | antes | depois |
+|---|---|---|
+| `stop` a meio de `go depth 30` | sem `bestmove` | `bestmove` em 0 ms |
+| `stop` a meio de `go infinite` | sem `bestmove` | `bestmove` em 0 ms |
+| `go infinite` numa posicao trivial espera pelo `stop` | sem `bestmove` | espera, e sai com o `stop` |
+| `isready` a meio de uma busca | sem `readyok` | `readyok` em 2 ms, e a busca continua |
+| `quit` a meio de uma busca | nao sai | sai em 37 ms |
+| fim do cano depois de `go depth 10` | passa | passa |
+| fim do cano depois de `go infinite` | nao sai | sai em 32 ms |
+| 40 `isready` seguidos no meio das linhas `info` | 1 `readyok` | 41, nenhuma linha partida |
+
+**A busca nao mudou:** 295.649 nos a profundidade 12 nas quatro posicoes de
+sempre, antes e depois, ao no'.
+
+**Mudou uma coisa para quem mede:** o `quit` agora para a busca, como o
+protocolo manda e o Stockfish faz. Um guiao que mande `go depth N` e `quit` de
+seguida por um cano recebe uma busca cortada. Para medir a profundidade fixa,
+**nao se manda `quit`: fecha-se o cano.** O fim da entrada espera que uma busca
+finita acabe (e so' para a infinita, senao o processo ficava vivo sem ninguem).
+
+**A pilha no Windows:** o quadro do `negamax` tem 6,7 KB e o da quiescencia
+3,3 KB; ate' `MAX_PLY = 246` o pior caso anda por 1,6 MB. No Linux a thread
+nasce com 8 MB. No Windows nasce com 1 MB -- mas ja' era assim para a thread
+principal e para os ajudantes do SMP, portanto nao piora. As compilacoes para
+Windows devem ligar com `-Wl,--stack,8388608`.

@@ -16,6 +16,7 @@
 #include <thread>
 #include <atomic>
 #include <chrono>
+#include <mutex>
 #include <cstdint>
 #include <vector>
 
@@ -25,6 +26,33 @@
 #include "types.h"
 
 namespace Kestrel {
+
+/// A tranca da saida do motor. Partilhada pela thread dos comandos e pela da
+/// busca. Definida em busca.cpp.
+std::mutex& trinco_saida();
+
+/// Uma linha de saida, escrita sob a tranca. Vive ate' ao fim da expressao que
+/// a usa -- `saida() << a << b << std::endl;` --, e e' ai' que larga a tranca.
+class Linha {
+   public:
+    Linha(std::ostream& o, std::mutex* m) : os(o) {
+        if (m)
+            tr = std::unique_lock<std::mutex>(*m);
+    }
+    template<class T>
+    Linha& operator<<(const T& v) {
+        os << v;
+        return *this;
+    }
+    Linha& operator<<(std::ostream& (*f)(std::ostream&)) {
+        f(os);
+        return *this;
+    }
+
+   private:
+    std::ostream&                os;
+    std::unique_lock<std::mutex> tr;
+};
 
 // `MAX_PLY`, `VALUE_MATE` and the mate bound come from the substrate. They are
 // not redefined here, so that there is only one truth about each number.
@@ -1515,7 +1543,17 @@ class Busca {
     /// buffer deita fora tudo o que la' se escreve. Proprio de cada busca e nao
     /// partilhado, senao os fios disputavam os bits de estado do mesmo stream.
     std::ostream  nulo{nullptr};
-    std::ostream& saida() { return ajudante ? nulo : std::cout; }
+    /// Com a busca numa thread propria, a thread dos comandos tambem escreve --
+    /// o `readyok` pode chegar a meio de uma busca. Sem tranca, sai a meio de
+    /// uma linha `info ... pv ...` e parte o protocolo. A `Linha` segura a
+    /// tranca durante a EXPRESSAO inteira `saida() << ... << std::endl`, e por
+    /// isso nenhum dos sitios que escrevem teve de mudar. O ajudante escreve
+    /// para o sorvedouro e nao tranca nada.
+    Linha saida() {
+        if (ajudante)
+            return Linha(nulo, nullptr);
+        return Linha(std::cout, &trinco_saida());
+    }
     void limpa();
     void nova_partida();
 
