@@ -1162,6 +1162,15 @@ struct Parametros {
     /// continuacoes, peoes) e so' depois se pontua: as esperas sobrepoem-se. Nao
     /// muda um valor, portanto a arvore fica IGUAL ao no' -- e' o controlo.
     int hist_prefetch = 1;
+    /// PEDIR A CORRECCAO ANTES DA AVALIACAO. 1 = liga.
+    ///
+    /// A `corrigida` le' seis entradas espalhadas por uma tabela de 768 KB, e
+    /// le'-as logo a seguir a` rede -- cada leitura a` espera da memoria. Os
+    /// indices ja' se sabem quando a tabela de transposicao responde; pedidas
+    /// ai, as entradas chegam enquanto a rede avalia. A `indices` guarda o que
+    /// calculou por ply, portanto a segunda chamada nao custa nada. Mesmos
+    /// valores, mesma arvore.
+    int corr_prefetch = 1;
     int usa_cuckoo    = 1;
     /// Futilidade inversa SO' quando nao ha' lance na tabela, ou quando o que
     /// la' esta' e' uma captura. 1 = o valor de producao.

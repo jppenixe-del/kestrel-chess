@@ -1326,6 +1326,17 @@ int Busca::negamax(Position& pos, int prof, int alpha, int beta, int ply, bool p
             return s;
     }
 
+    // Ver `corr_prefetch` nos parametros: a correccao pede-se ja', e chega
+    // enquanto a rede avalia.
+    if (p.corr_prefetch && !em_xeque && !DIAG.sem_corr && !corr->empty()) {
+        int idx[6];
+        indices(pos, ply, idx);
+        const int lado = int(pos.side_to_move());
+        for (int k = 0; k < CORR_FAM; ++k)
+            if (idx[k] >= 0)
+                __builtin_prefetch(&(*corr)[(k * 2 + lado) * CORR_TAM + idx[k]]);
+    }
+
     // O numero CRU fica a` parte, porque e' o que vai para a tabela la' em
     // baixo. Guardar o corrigido e' um desastre silencioso: a visita seguinte
     // le'-o, aplica a correccao outra vez, guarda isso, e o erro compoe-se a cada
@@ -2531,6 +2542,7 @@ void Busca::arranca(Position& pos, const Limites& lim, Avaliador& avaliador) {
     if (const char* v = std::getenv("KS_IND_RAPIDO")) p.indices_rapido = std::atoi(v);
     if (const char* v = std::getenv("KS_PREFETCH")) p.prefetch_antes = std::atoi(v);
     if (const char* v = std::getenv("KS_HIST_PREFETCH")) p.hist_prefetch = std::atoi(v);
+    if (const char* v = std::getenv("KS_CORR_PREFETCH")) p.corr_prefetch = std::atoi(v);
     if (const char* v = std::getenv("KS_PODA_RED")) p.poda_red = std::atoi(v);
     if (const char* v = std::getenv("KS_LMR_EXT_MAX")) p.lmr_ext_max = std::atoi(v);
     if (const char* v = std::getenv("KS_LMR_PECAS_FIM")) p.lmr_pecas_fim = std::atoi(v);
