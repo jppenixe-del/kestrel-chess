@@ -101,3 +101,51 @@ existe a um fio, e a CCRL corre a 4. Falta: **`ks_modifs` (HEAD) contra
   sitio onde cabe e' o PC (12 fios logicos), a uma partida de cada vez.
 - Binarios ja construidos, `ARCH=avx2`: `/root/sprt_bin/ks_modifs`
   (`9306c468`) e `/root/sprt_bin/ks_github` (`6cc3d431`) no `ob1`.
+
+## 24-09-2026 — o que se mediu e o que se fechou
+
+| o que | resultado |
+|---|---|
+| `alpha_desc = 1` (item 4) | **fechado por interrupcao, sem veredicto.** 1100 partidas a 10+0,1: +9,16 +/- 10,76, LLR 0,66. Parei-o para dar a maquina a outra coisa; o parcial fica em `/root/sprt_ad/ad_parcial_1010.*`. Continua na fila |
+| `lance_so_alpha` (novo) | **REJEITADO.** -26,02 +/- 14,59 em 602 partidas a 5+0,05, `Hash=16`, IC95% [-40,6; -11,4]. Ver `0d5f360` |
+| `ameaca_f` 10 contra 20 (novo) | **neutro, fica o 20.** +2,95 +/- 5,65 em 4002 partidas, IC95% [-2,7; +8,6]. Ver `d35bd60`. Fecha a pergunta de 18-09 |
+| `asp_sf` (item 7) | a correr, `/root/sprt_asp/` |
+
+### O que a auditoria da ordenacao diz hoje
+
+A taxa de corte ao primeiro lance **nao fechou** o buraco contra o SF19 com a
+NOSSA rede. Medida no HEAD, uma posicao por processo, `go depth 15`:
+
+| posicao | auditoria 22-09 | SF19 | HEAD 24-09 |
+|---|---|---|---|
+| inicial | 74,07 | 84,58 | 74,72 |
+| kiwipete | 75,77 | 85,62 | 76,17 |
+| siciliana | 71,87 | 82,34 | **74,98** |
+| aberta d4 | 72,17 | 83,35 | 72,33 |
+| final T+P | 78,31 | 90,79 | 78,18 |
+| final peoes | 67,22 | 83,57 | **72,86** |
+
+A `ameaca` corrigida deu +3,1 e +5,6 nas duas ultimas. Ficam 8 a 12 pontos.
+
+### Onde estao os ciclos
+
+Do `perf.data` que estava por analisar em `/root/perf_ks/` (seis posicoes,
+`go depth 15`): **53% em acumuladores NNUE**, com `apply_combined` sozinho a
+31,9%; a busca inteira e' 30%. O CPU do `ob1` e' AVX2 **sem AVX-512** (1.773
+`ymm`, zero `zmm` no binario), portanto `ARCH=avx2` ja' e' o tecto e nao ha'
+ganho por essa via.
+
+### Hipoteses eliminadas, para nao se repetirem
+
+- **As manetes desligadas nao sao um segundo `ameaca_f`.** Teste de inercia a
+  profundidade 12 (base 295.733): `KS_LMR_DELTA=100` 406.809, `KS_ASP_SF=1`
+  230.837, `KS_LMP_MELHORA=100` 256.900, `KS_PODA_RED=100` 326.764,
+  `KS_ALPHA_DESC=1` 315.349. Todas vivas. O `KS_TM_ADV_F` aparece inerte porque
+  e' do relogio e o teste e' a profundidade fixa
+- **`guarda_so_aval` nao expulsa entradas fundas desta busca**: a geracao avanca
+  uma vez por `go`, nao por iteracao, logo `velhice > 2` sao jogadas passadas
+- **A busca principal nao desperdica avaliacoes**: ja' le' a da tabela, 37-47%
+  poupadas. A quiescencia so' poupa 8-10%, mas gravar a dela faz a arvore
+  crescer 15,6% -- ver `qs_guarda_aval`, fica a zero
+- **O RFP ja' devolve `beta + (aval - beta)/3`**, as continuacoes ja' sao
+  `{1, 2, 4}`, a assimetria `hist_de`/`ordena` ja' esta' comentada
