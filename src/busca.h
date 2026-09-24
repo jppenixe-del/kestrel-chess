@@ -949,6 +949,21 @@ struct Parametros {
     /// O 40 ficou por decidir. Corria a +10,62 +/- 19,17 quando a maquina que
     /// o media morreu, e e' isso -- e nao o mecanismo -- o que os registos
     /// chamam "a retractacao do ameaca_f=40".
+    ///
+    /// VARRIDO NA ESCALA CORRIGIDA, 24-09-2026: o **20 fica**. O 10 mediu
+    /// **+2,95 +/- 5,65** em 4002 partidas a 5+0,05, `Hash=16`, um fio, IC95%
+    /// [-2,7; +8,6] -- neutro. Mesmo binario dos dois lados, o 10 por involucro.
+    ///
+    /// A pergunta era legitima e ficou respondida: o `4a21c2f` mediu a formula
+    /// NOVA contra a VELHA, nao mediu o 20 contra outros valores da formula
+    /// nova. Com `peso = ameaca_f * PieceValue[pt]` o 20 poe um cavalo a 15.620
+    /// e uma dama a 50.760, numa ordenacao onde a historia inteira vai ate'
+    /// +-15.000, e a suspeita era que 244 vezes mais forte tivesse passado do
+    /// ponto. Nao passou. A nota de 18-09 -- "o mecanismo esta' provado, falta
+    /// so' saber se 20 era o sitio certo" -- pode fechar-se.
+    ///
+    /// O varrimento por nos a profundidade 12 nao teria dado esta resposta: 0 da'
+    /// 269.203, 5 da' 313.450, 20 da' 295.733 e 30 da' 417.293, sem gradiente.
     int ameaca_f      = 20;
     /// Deitar fora o BALDE das ameacas na historia de continuacao: uma gaveta
     /// em vez de quatro, para as amostras deixarem de ser divididas. MEDIDO EM
