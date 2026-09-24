@@ -1104,6 +1104,16 @@ struct Parametros {
     ///
     /// O contador de falhas altas zera a cada falha baixa (`4400f3`) e sobe a
     /// cada falha alta (`4401c0`). A ZERO no molde do binario.
+    ///
+    /// MEDIDO, 24-09-2026: **neutro**, e fica a zero. -1,74 +/- 6,21 em 3202
+    /// partidas a 5+0,05, `Hash=16`, um fio, IC95% [-8,0; +4,5].
+    /// Foi medido como UM desenho e nao como tres manetes -- as tres pecas
+    /// ligam juntas, e separa-las seria repetir o erro que a nota do `tt.cpp`
+    /// regista sobre o par `KS_TT_LANCE`/`KS_TT_PROF`.
+    ///
+    /// Vale a pena guardar o contraste: a profundidade 12 e em quatro posicoes
+    /// isto encolhe a arvore **21,9%** (295.733 -> 230.837), e em partidas nao
+    /// vale nada. Terceira vez no mesmo dia que a arvore e o Elo discordam.
     int asp_sf        = 0;
     // Recusar a repeticao so' quando se esta' mesmo a ganhar, e aceitar um lance
     // ate' esta margem pior para a evitar.
