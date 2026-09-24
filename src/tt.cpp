@@ -88,6 +88,14 @@ static constexpr std::size_t VIAS = 3;
 // mesma logica de substituicao -- muda so' ONDE esta' cada byte. Com o mesmo
 // numero de baldes a arvore sai identica ao no'; com o mesmo `Hash` passa a
 // haver o dobro dos baldes, que e' o que o `Hash` sempre prometeu.
+//
+// MEDIDO EM PARTIDAS, as tres pecas de velocidade juntas -- este balde, as
+// paginas grandes e o prefetch antes do lance -- contra `7c25e1c` construido limpo:
+// **+19,14 +/- 7,66 Elo** em 2108 partidas a 5+0,05, `Hash=16`, um fio, LLR 2,95,
+// H1 aceite. Contagem propria do PGN, trinomial: IC95% [+8,9; +29,4].
+// A parte deste balde, pela velocidade com arvores identicas: -5,6% de tempo.
+// E a parte da capacidade, que essa medida nao ve: a `Hash=16` o motor antigo
+// usava 9 MB e este usa 16.
 struct alignas(64) Balde {
     Ranhura                   via[VIAS];
     std::atomic<std::uint8_t> ger[VIAS];
@@ -296,6 +304,12 @@ void* TranspositionTable::first_entry(std::uint64_t chave) const {
 // E' codigo nosso e nao o alocador do substrato, porque a tabela e' nossa. No
 // Windows fica o alinhamento a` linha de cache: la' as paginas grandes pedem um
 // privilegio que quase ninguem tem ligado, e o ganho perde-se de qualquer modo.
+//
+// MEDIDO EM PARTIDAS, as tres pecas de velocidade juntas -- este balde, as
+// paginas grandes e o prefetch antes do lance -- contra `7c25e1c` construido limpo:
+// **+19,14 +/- 7,66 Elo** em 2108 partidas a 5+0,05, `Hash=16`, um fio, LLR 2,95,
+// H1 aceite. Contagem propria do PGN, trinomial: IC95% [+8,9; +29,4].
+// A parte das paginas grandes, pela velocidade: -5,8% de tempo. So' no Linux.
 namespace {
 Balde* aloca_baldes(std::size_t n, std::size_t& bytes_out) {
     std::size_t alinha = alignof(Balde);

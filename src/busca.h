@@ -1145,6 +1145,10 @@ struct Parametros {
     /// mais rapido em 6 voltas de 8. E' o incremento mais pequeno dos tres e o
     /// mais ruidoso; duas medicoes anteriores, so' com esta peca, deram -1,4%
     /// de media e -3,0% de mediana.
+    ///
+    /// MEDIDO EM PARTIDAS, junto com o balde de 64 bytes e as paginas grandes,
+    /// contra `7c25e1c`: **+19,14 +/- 7,66 Elo** em 2108 partidas a 5+0,05,
+    /// `Hash=16`, um fio, H1 aceite. A parte desta peca, pela velocidade: -2,7%.
     int prefetch_antes = 1;
     int usa_cuckoo    = 1;
     /// Futilidade inversa SO' quando nao ha' lance na tabela, ou quando o que

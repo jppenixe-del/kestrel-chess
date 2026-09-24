@@ -178,7 +178,43 @@ Quatro medidas, ~11.000 partidas, **zero Elo ganho**: uma rejeicao clara
 ontem, `asp_sf`). O valor esta nos becos fechados e no contraste arvore/Elo,
 que hoje discordaram tres vezes em tres.
 
-## Fora da fila de Elo, mas antes da CCRL: o `stop` nao funciona
+## 24-09-2026, tarde -- a velocidade do NOSSO codigo: +19,14 Elo
+
+O Joao apontou o caminho: o que se pode melhorar esta' nos ficheiros que sao
+nossos, nao no `vendor/`. A rede e' 65,8% dos ciclos mas e' do Stockfish; o
+nosso codigo era 32,7%, e dentro dele a tabela de transposicao pagava duas
+idas a` memoria por sondagem.
+
+| commit | peca | velocidade, arvores identicas |
+|---|---|---|
+| `808fd8e` | balde de 64 bytes -- uma linha de cache, e o `Hash` passa a ser usado a 100% em vez de 56% | -5,6% |
+| `401d782` | paginas grandes para a tabela (`madvise`, so' Linux) | -5,8% |
+| `4785414` | o balde do filho pedido ANTES do `do_move`, como o binario fazia | -2,7% |
+| | as tres | **-13,5%** (8 voltas de 8) |
+
+**Em partidas, as tres contra `7c25e1c` construido limpo:**
+
+    Elo: +19,14 +/- 7,66   (nElo +37,12 +/- 14,83)   LOS 100%
+    2108 partidas  +559 =1106 -443   Ptnml [9, 197, 521, 323, 4]
+    5+0,05, Hash=16, um fio, UHO_4060_v2   LLR 2,95 -- H1 aceite
+    derrotas por tempo: 3 do novo, 4 da base; quedas: 0 e 0
+
+Contagem propria do PGN, a bater ao jogo; em trinomial, IC95% [+8,9; +29,4].
+
+E' o maior ganho medido do motor ate' hoje -- quase o dobro do `ameaca_f`. E
+nao mexeu numa unica decisao da busca: a arvore e' a mesma, so' chega mais
+depressa, e com o dobro da tabela a` mesma memoria.
+
+No perfil do motor novo o nosso codigo desce de 32,7% para 24,7% dos ciclos, e
+a `sonda` de 2,60% para 0,53%. O que sobra de nosso e' quase tudo consulta a
+tabelas de historico e correccao (`hist_de`, `conts`, `corrigida`, `indices`,
+`garante_ameacas`: ~9,5%) -- a proxima leva, se houver.
+
+No Windows as paginas grandes nao se aplicam (pedem um privilegio que quase
+ninguem tem); ficam o balde e o prefetch, -8% de tempo pela decomposicao acima,
+mais a capacidade.
+
+## Fora da fila de Elo, mas antes da CCRL: o `stop` nao funcionava
 
 Encontrado a 24-09-2026 ao medir as paginas grandes. **Com uma busca a correr,
 o motor nao responde ao `stop` nem ao `quit`.** O antigo e o novo, igual:
