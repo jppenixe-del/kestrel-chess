@@ -55,8 +55,9 @@ class TranspositionTable {
     void* first_entry(std::uint64_t chave) const;
 
    private:
-    // Three ways to a bucket of 72 bytes; each slot is 24 bytes,
-    // ranhura de 24, logo tres vias.
+    // Tres vias num balde de 64 bytes -- uma linha de cache. Eram 72 (tres
+    // ranhuras de 24) ate' a geracao sair de dentro de cada ranhura; ver a nota
+    // no `Balde`, em tt.cpp.
     std::size_t                via_a_substituir(Balde& b, std::uint64_t chave,
                                                 std::uint8_t ger) const;
     Balde*                     baldes  = nullptr;

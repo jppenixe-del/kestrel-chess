@@ -59,12 +59,32 @@ constexpr int PENA_VELHA   = 3;
 struct Ranhura {
     std::atomic<std::uint64_t> chave_xor{0};   // chave ^ dados
     std::atomic<std::uint64_t> dados{0};
-    std::atomic<std::uint8_t>  ger{0};
 };
 static constexpr std::size_t VIAS = 3;
-struct Balde {
-    Ranhura via[VIAS];
+// O BALDE CABE NUMA LINHA DE CACHE.
+//
+// A geracao vivia dentro de cada `Ranhura`, ao lado dos dois `uint64`: 17 bytes
+// que o alinhamento arredondava para 24, e tres vias davam um balde de 72. Isso
+// custava duas coisas, e o binario de producao tinha as duas -- nao e' trabalho
+// perdido a recuperar, e' o desenho original:
+//
+//  1. **So' se usava 56% da memoria pedida.** O `redimensiona` arredonda o numero
+//     de baldes a uma potencia de 2, e com 72 bytes a maior que cabe fica sempre
+//     em 56,25% do pedido: `Hash=64` usava 36 MB, `Hash=16` usava 9 MB. Em
+//     qualquer tamanho.
+//  2. **Cada sondagem tocava duas linhas de cache**, as vezes tres -- 72 bytes
+//     atravessam sempre uma fronteira de 64. O `prefetch` so' traz uma.
+//
+// Com a geracao num vector a parte no fim do balde: 3 x 16 + 3 = 51 bytes, que
+// o `alignas(64)` fecha em 64 certos. As mesmas tres vias, os mesmos campos, a
+// mesma logica de substituicao -- muda so' ONDE esta' cada byte. Com o mesmo
+// numero de baldes a arvore sai identica ao no'; com o mesmo `Hash` passa a
+// haver o dobro dos baldes, que e' o que o `Hash` sempre prometeu.
+struct alignas(64) Balde {
+    Ranhura                   via[VIAS];
+    std::atomic<std::uint8_t> ger[VIAS];
 };
+static_assert(sizeof(Balde) == 64, "o balde tem de ocupar exactamente uma linha de cache");
 
 // [BINARIO] A sonda, tal como o binario a faz: percorre as tres vias, e a via
 // e' desta chave quando `chave_xor ^ dados == chave`. Ao acertar, REFRESCA a
@@ -80,7 +100,7 @@ bool TranspositionTable::sonda(std::uint64_t chave, Entrada& e) const {
         std::uint64_t xr    = b.via[i].chave_xor.load(std::memory_order_relaxed);
         if ((xr ^ dados) != chave)
             continue;
-        b.via[i].ger.store(ger, std::memory_order_relaxed);
+        b.ger[i].store(ger, std::memory_order_relaxed);
         e.chave  = chave;
         e.prof   = prof_de(dados);
         e.nota   = int(std::int16_t((dados >> B_NOTA) & 0xFFFF));
@@ -105,7 +125,7 @@ std::size_t TranspositionTable::via_a_substituir(Balde& b, std::uint64_t chave,
         std::uint64_t xr    = b.via[i].chave_xor.load(std::memory_order_relaxed);
         if ((xr ^ dados) == chave)
             return i;
-        int velhice = std::uint8_t(ger - b.via[i].ger.load(std::memory_order_relaxed));
+        int velhice = std::uint8_t(ger - b.ger[i].load(std::memory_order_relaxed));
         // [BINARIO] NAO ha' curto-circuito na via vazia.  O ciclo de 420348 a
         // 42039d percorre sempre as tres e escolhe a de menor nota; uma via
         // vazia da' `0 - PENA_VELHA*velhice` e compete como qualquer outra.
@@ -154,7 +174,8 @@ void TranspositionTable::guarda(std::uint64_t chave, int prof, int nota, Limite 
         return;
     Balde&        b   = baldes[chave & mascara];
     std::uint8_t  ger = geracao.load(std::memory_order_relaxed);
-    Ranhura&      r   = b.via[via_a_substituir(b, chave, ger)];
+    std::size_t   k   = via_a_substituir(b, chave, ger);
+    Ranhura&      r   = b.via[k];
 
     if (G_TT_LANCE || G_TT_PROF) {
         std::uint64_t antigos = r.dados.load(std::memory_order_relaxed);
@@ -165,7 +186,7 @@ void TranspositionTable::guarda(std::uint64_t chave, int prof, int nota, Limite 
             melhor = Move(std::uint16_t(antigos & 0xFFFF));
 
         if (G_TT_PROF && mesma) {
-            int velhice = std::uint8_t(ger - r.ger.load(std::memory_order_relaxed));
+            int velhice = std::uint8_t(ger - b.ger[k].load(std::memory_order_relaxed));
             if (!(limite == Limite::Exacto || prof + 2 * int(pv) > prof_de(antigos) - 4
                   || velhice != 0))
                 return;
@@ -175,7 +196,7 @@ void TranspositionTable::guarda(std::uint64_t chave, int prof, int nota, Limite 
     std::uint64_t dados = empacota(prof, nota, limite, melhor, pv, aval);
     r.dados.store(dados, std::memory_order_relaxed);
     r.chave_xor.store(chave ^ dados, std::memory_order_relaxed);
-    r.ger.store(ger, std::memory_order_relaxed);
+    b.ger[k].store(ger, std::memory_order_relaxed);
 }
 
 // [FONTE] Se as tres vias estiverem ocupadas com trabalho a serio, deita-se fora
@@ -197,7 +218,7 @@ void TranspositionTable::guarda_so_aval(std::uint64_t chave, std::int16_t aval) 
         }
         if (alvo >= 0)
             continue;
-        int velhice = std::uint8_t(ger - b.via[i].ger.load(std::memory_order_relaxed));
+        int velhice = std::uint8_t(ger - b.ger[i].load(std::memory_order_relaxed));
         // [BINARIO] 42056d: `cmp $0xf9,%r8b` / `jl` -> prof < -7, estrito.
         // 420579: `cmp $0x2,%r8b` / `jbe` para RECUSAR -> serve com velhice > 2.
         if (dados == 0 || prof_de(dados) < PROF_DESCART || velhice > 2)
@@ -218,7 +239,7 @@ void TranspositionTable::guarda_so_aval(std::uint64_t chave, std::int16_t aval) 
     std::uint64_t dados = empacota(PROF_SO_AVAL, 0, Limite::Nenhum, antigo, false, aval);
     r.dados.store(dados, std::memory_order_relaxed);
     r.chave_xor.store(chave ^ dados, std::memory_order_relaxed);
-    r.ger.store(ger, std::memory_order_relaxed);
+    b.ger[alvo].store(ger, std::memory_order_relaxed);
 }
 
 // [FONTE] Mil baldes chegam para uma estimativa; varrer a tabela inteira a cada
