@@ -214,6 +214,29 @@ No Windows as paginas grandes nao se aplicam (pedem um privilegio que quase
 ninguem tem); ficam o balde e o prefetch, -8% de tempo pela decomposicao acima,
 mais a capacidade.
 
+### Medido e posto de lado: as historias em 16 bits
+
+As tres tabelas partilhadas (continuacoes, peoes, correccao) estao em
+`std::atomic<int>`, e todos os valores cabem em 16 bits: a gravidade
+`e += b - e*|b|/tecto` fica exactamente em [-tecto, tecto] -- verificado por
+forca bruta com a divisao inteira do codigo -- e o maior tecto e' 30.000. So' o
+`soma_hist`, o `aprende` e o `zera_partilhada` escrevem nelas. Em 16 bits a das
+continuacoes passava de 2,8 MB a 1,4 MB e a da correccao cabia inteira na L2.
+
+A conversao e' EXACTA: 295.649 nos a profundidade 12 e 1.289.947 a 15, iguais
+ao no'. **E nao da' nada.** Oito voltas alternadas, arvores identicas
+(1.489.177 nos em todas), profundidade 15:
+
+    32 bits   mediana 2840 ms   media 2920   minimo 2744
+    16 bits   mediana 2906 ms   media 2936   minimo 2720
+    o 16 bits ganhou 4 voltas de 8
+
+Ruido. As consultas a estas tabelas estao presas a` memoria, mas nao por as
+tabelas serem grandes de mais: o conjunto que a busca toca de facto ja' cabe na
+L3 nos dois casos, e ler 2 bytes custa o mesmo que ler 4. Nao se aplica --
+codigo que nao paga nao fica. O desenho esta' nesta nota se alguem quiser
+repetir com tabelas maiores.
+
 ## Fora da fila de Elo, mas antes da CCRL: o `stop` nao funcionava
 
 Encontrado a 24-09-2026 ao medir as paginas grandes. **Com uma busca a correr,
