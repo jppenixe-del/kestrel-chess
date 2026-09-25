@@ -2505,6 +2505,7 @@ void Busca::arranca(Position& pos, const Limites& lim, Avaliador& avaliador) {
     if (const char* v = std::getenv("KS_TM_ADV_MAX")) p.tm_adv_max = std::atoi(v);
     if (const char* v = std::getenv("KS_TM_CURVA_F")) p.tm_curva_f = std::atoi(v);
     if (const char* v = std::getenv("KS_TM_CURVA_PCT")) p.tm_curva_pct = std::atoi(v);
+    if (const char* v = std::getenv("KS_TM_CURVA_PCT_MS")) p.tm_curva_pct_ms = std::atoi(v);
     if (const char* v = std::getenv("KS_TM_CRESCE")) p.tm_cresce = std::atoi(v);
     if (const char* v = std::getenv("KS_TM_SEM_INC_TECTO")) p.tm_sem_inc_tecto = std::atoi(v);
     if (const char* v = std::getenv("KS_ORDEM_XEQUE")) p.ordem_xeque_f = std::atoi(v);
@@ -2623,6 +2624,9 @@ void Busca::arranca(Position& pos, const Limites& lim, Avaliador& avaliador) {
         // inteiro. Com `movestogo 1` orca-se um terco do que resta, e o tecto
         // dos 80% guarda o resto.
         const std::int64_t ate_controlo = lim.movestogo > 0 ? std::int64_t(lim.movestogo) + 2 : 0;
+        // MORTE SUBITA: sem incremento e sem controlo, o relogio so' desce. As
+        // tres pecas medidas a 60+0 so' actuam aqui -- ver `tm_sem_inc_tecto`.
+        const bool morte_subita = inc == 0 && ate_controlo == 0;
         std::int64_t n    = std::max(p.tm_bolo_n, 1);
         if (ate_controlo > 0) n = std::min(n, ate_controlo);
         std::int64_t bolo = t + inc * (n - 1);
@@ -2668,7 +2672,8 @@ void Busca::arranca(Position& pos, const Limites& lim, Avaliador& avaliador) {
               {164, 144, 125, 107,  91,  79,  69,  63,  61},   // p75
               {174, 154, 134, 118, 102,  88,  79,  73,  75},   // p80
             };
-            const int* FALTA = FALTA_P[std::clamp(p.tm_curva_pct, 0, 4)];
+            const int* FALTA = FALTA_P[std::clamp(
+              morte_subita ? p.tm_curva_pct_ms : p.tm_curva_pct, 0, 4)];
             const int N = int(sizeof(PLY) / sizeof(PLY[0]));
             int jogados = int(chaves_jogo.size());
             int faltam  = FALTA[N - 1];
@@ -2682,7 +2687,7 @@ void Busca::arranca(Position& pos, const Limites& lim, Avaliador& avaliador) {
             // Uma partida que passou o ultimo degrau PROVOU que e' das longas.
             // A clikKov5 (600+0) durou 254 plies contra uma mediana de 131 e
             // acabou com 1,0s. 100 = um por um.
-            if (jogados >= PLY[N - 1] && p.tm_cresce > 0)
+            if (morte_subita && jogados >= PLY[N - 1] && p.tm_cresce > 0)
                 faltam += (jogados - PLY[N - 1]) * p.tm_cresce / 100;
             for (int k = 0; k + 1 < N; ++k)
                 if (jogados < PLY[k + 1]) {
@@ -2740,7 +2745,7 @@ void Busca::arranca(Position& pos, const Limites& lim, Avaliador& avaliador) {
         // So' quando nao ha' incremento: com incremento o gasto e' reposto.
         // E com controlo tambem -- o relogio volta a encher.
         // Corta o TECTO, nao o orcamento.
-        if (p.tm_sem_inc_tecto > 0 && inc == 0 && ate_controlo == 0)
+        if (morte_subita && p.tm_sem_inc_tecto > 0)
             tecto = std::max(std::min(tecto, t * p.tm_sem_inc_tecto / 100), std::int64_t(1));
 
         std::int64_t seguro = std::max(t - sobrecarga - t / 20, std::int64_t(1));

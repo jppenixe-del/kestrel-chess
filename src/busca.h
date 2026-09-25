@@ -1355,11 +1355,19 @@ struct Parametros {
     ///     p80  67 lances   7,2s   rebentam 20%
     ///
     /// Nao gasta menos no total: distribui por um horizonte certo para tres
-    /// partidas em quatro em vez de uma em duas. 0 e' o que foi validado.
-    int tm_curva_pct  = 0;
+    /// partidas em quatro em vez de uma em duas.
+    ///
+    /// DUAS MANETES, porque so' uma das situacoes foi medida. `tm_curva_pct`
+    /// vale com incremento ou com controlo (`movestogo`) e fica no p50, que e'
+    /// o que foi validado ai'. `tm_curva_pct_ms` vale so' em MORTE SUBITA --
+    /// sem incremento e sem controlo -- e e' o p75, medido a 60+0 junto com o
+    /// `tm_cresce` e o `tm_sem_inc_tecto` (a medicao esta' no tecto, abaixo).
+    int tm_curva_pct    = 0;
+    int tm_curva_pct_ms = 3;
     /// O HORIZONTE CRESCE depois de a estimativa ser desmentida, em centesimos
-    /// de ply por ply de excesso. 0 = desligado. 100 = um por um.
-    int tm_cresce     = 0;
+    /// de ply por ply de excesso. 0 = desligado. 100 = um por um. So' em morte
+    /// subita: com incremento ou com controlo o relogio volta a encher.
+    int tm_cresce     = 100;
     /// O TECTO DURO SEM INCREMENTO, em percentagem do relogio. 0 = desligado.
     ///
     /// O nosso tecto e' um MULTIPLO do optimo, e um multiplo do optimo nao e'
@@ -1372,7 +1380,25 @@ struct Parametros {
     /// 50s e aquele lance nao tinha existido.
     ///
     /// A regra vem do CODA, que e' GPL-3 -- verificado antes de a usar.
-    int tm_sem_inc_tecto = 0;   // % do relogio; 10 = a regra do Coda
+    ///
+    /// LIGADAS POR OMISSAO desde 25-09, as tres pecas de morte subita juntas
+    /// (p75, horizonte que cresce, este tecto), contra o motor sem elas, 60+0,
+    /// Hash 16, um fio, o novo primeiro:
+    ///
+    ///     1200 partidas  +10,14 +/-  9,66  LLR 0,90  Ptnml [1,120,327,147,5]
+    ///      300 partidas  +23,20 +/- 19,81  (a primeira corrida, parada a meio)
+    ///
+    /// O SPRT [0, 5] nao fechou: acabou-lhe o numero de partidas. O que fecha
+    /// sem estatistica nenhuma e' a bandeira: o motor SEM as pecas perdeu 11
+    /// partidas no relogio, o motor COM elas nenhuma. Todas as onze depois do
+    /// ply 220 (231 a 347), com o relogio quase no fim e a jogar a poucos
+    /// milissegundos por lance. A tabela da curva acaba no ply 220 e dai' em
+    /// diante dizia sempre "faltam oito lances": um oitavo do relogio por
+    /// lance, ate' ao zero.
+    ///
+    /// Com incremento ou com controlo nada disto actua, e o motor e' o de
+    /// antes: 40/15 e 2+1 da CCRL nao mudam.
+    int tm_sem_inc_tecto = 10;   // % do relogio; 10 = a regra do Coda
     int tm_curva      = 1;
     int tm_curva_min  = 8;
     int tm_curva_f    = 100;   // x100
