@@ -616,6 +616,15 @@ struct Parametros {
     /// nao prejudicial.
     ///
     /// Duas leituras precipitadas na mesma manha, uma em cada motor.
+    ///
+    /// REABERTO E FECHADO A 25-09-2026. O 2048 voltou a ser medido sozinho, com
+    /// o `ttPv` fixo e o `ameaca_f` ja' corrigido, o mesmo binario (1391859) nas
+    /// duas pontas e `KS_CUT=2048` no remendo, 5+0,05, Hash=16, um fio:
+    ///
+    ///     2048 contra 1024: -2,90 +/- 6,68 Elo em 3000 partidas
+    ///     Ptnml [16, 374, 752, 335, 23], LLR -0,98 no SPRT [0, 5]
+    ///
+    /// Um ganho real de +5 estaria a mais de dois desvios disto. Fica o 1024.
     int lmr_cut_f     = 1024;
     int lmr_hist_div  = 22000;
     int lmr_pecas_fim = 0;
