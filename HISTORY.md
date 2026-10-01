@@ -12,8 +12,8 @@ That line is preserved: branch [`kestrel-rust`](../../tree/kestrel-rust), tagged
 `kestrel-rust-final`. The 467 commits under this one are its history.
 
 An earlier stage of the network work grew out of
-[`pawn`](https://github.com/ruicoelhopedro/pawn) by Rui Coelho, whose file
-format the networks are still trained against. See [`NOTICES.md`](NOTICES.md).
+[`pawn`](https://github.com/ruicoelhopedro/pawn) by Rui Coelho. See
+[`NOTICES.md`](NOTICES.md).
 
 ## KestrelStrike — C++, from 2026
 

@@ -62,10 +62,12 @@ small functions.
 
 ## The network
 
-The network is **ours** — see [`NETWORKS.md`](NETWORKS.md). Its file layout,
-feature indexing and quantisation follow the format used by
-[`pawn`](https://github.com/ruicoelhopedro/pawn) by Rui Coelho, GPLv3, which is
-the format the network was trained against.
+The network's **weights are ours**, trained here from random initialisation.
+What is not ours is listed in [`NETWORKS.md`](NETWORKS.md): the trainer
+([nnue-pytorch](https://github.com/official-stockfish/nnue-pytorch), GPLv3),
+Stockfish's recipe, the public Stockfish and Leela Chess Zero training data,
+and the architecture. Its file format, feature indexing and quantisation are
+Stockfish's.
 
 An earlier line of this work grew directly out of `pawn`, and for a period the
 bot that ran it identified itself as such and credited its author. That lineage

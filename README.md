@@ -58,9 +58,18 @@ because the substrate's own headers include them (`uci.h` pulls in `engine.h`,
 `search.h` and `thread.h`). The search is ours and so is the transposition
 table; bringing theirs in would mean carrying two of each.
 
-**The network is ours.** `f2e189.nnue` was trained from scratch for this engine.
-No Stockfish network was used as a seed or as a teacher. See
-[`NETWORKS.md`](NETWORKS.md).
+**The network's weights are ours.** `ks-cf796d1f923d.nnue`, embedded in the
+executable, was trained by this project from random initialisation — no
+Stockfish network was used as a starting point. It was trained with
+Stockfish's trainer and recipe on public Stockfish and Leela Chess Zero
+training data, which means its first-stage targets were Stockfish's own search
+scores. [`NETWORKS.md`](NETWORKS.md) sets out exactly what is ours and what is
+not.
+
+**Written with AI assistance.** Much of the code in `src/` was written in
+working sessions with Anthropic's Claude, directed by the author; the commits
+where that happened carry a `Co-Authored-By` line, and the measurements that
+decided what stayed are in the commit messages.
 
 ## Our own scale
 
@@ -79,14 +88,27 @@ meant inheriting someone else's tuning along with them.
 
 ## Building
 
+The network is not in git (95 MB). Fetch it first — it comes from this
+version's release and is checked against its full SHA-256:
+
+    make rede            download ks-cf796d1f923d.nnue and verify it
+
+Then:
+
     make                 build for this machine
     make ARCH=bmi2       x86-64 with AVX2 and PEXT — Intel since Haswell, AMD since Zen 3
     make ARCH=avx2       x86-64 with AVX2, no PEXT — runs well on almost any modern x86
     make ARCH=avx512     x86-64 with AVX-512  — only where the CPU has it
     make ARCH=sse41      older x86-64, no AVX
-    make todos           all four, each named after its architecture
+    make todos           all four, named kestrelstrike-1.0-<arch>
     make windows         the same four as Windows .exe files, cross-compiled with
-                         mingw-w64: static, and with an 8 MB stack
+                         mingw-w64: static, with an 8 MB stack, named
+                         KestrelStrike-1.0-<arch>.exe
+
+The version lives in one place, `VERSAO` in the Makefile, and goes both into
+the file names and into `id name`. Without the network file the build still
+works, says so, and gives an engine that plays only after
+`setoption name EvalFile`.
 
 PEXT is what separates `bmi2` from `avx2`. AMD Zen 1 and Zen 2 implement it in
 microcode, many times slower than on other processors, and a PEXT build runs
@@ -106,21 +128,36 @@ target defines its own macros and none of them is optional.
 
 ## Running
 
-The engine needs a network. It will refuse to search without one rather than
-silently evaluate everything as zero:
+The network is embedded, so the executable plays as it is: no file beside it
+and no option to set. At startup it says which network it carries:
 
-    setoption name EvalFile value /path/to/f2e189.nnue
+    info string embedded network: ks-cf796d1f923d.nnue
 
-UCI options: `Hash`, `Threads`, `EvalFile`, `SyzygyPath`, plus the search
-parameters listed by `uci`.
+| UCI option | default | |
+|---|---|---|
+| `Hash` | 256 | MB of transposition table |
+| `Threads` | 1 | search threads (lazy SMP) |
+| `SyzygyPath` | — | folder with Syzygy tablebases |
+| `Move Overhead` | 30 | ms kept back on every move for the GUI and the system |
+| `EvalFile` | the embedded network | a network file to play with instead |
+| `UCI_ShowWDL` | false | win/draw/loss estimates on the `info` lines |
+
+A GUI that sends `EvalFile` with its announced value gets the embedded
+network; a file that is missing or does not fit is reported, and the engine
+keeps playing with the network it had.
 
 ## Credits
 
 - **[Stockfish](https://github.com/official-stockfish/Stockfish)** (GPLv3) —
   the substrate in `vendor/`: board, move generation, position, NNUE inference.
+- **[nnue-pytorch](https://github.com/official-stockfish/nnue-pytorch)**
+  (GPLv3) — the trainer the network was trained with, following Stockfish's
+  recipe.
+- **Joost VandeVondele, linrock and xushawn**, who released the Stockfish and
+  Leela Chess Zero training data the network learned from — and the
+  **Leela Chess Zero** project, whose self-play games those are.
 - **[pawn](https://github.com/ruicoelhopedro/pawn)** by Rui Coelho (GPLv3) —
-  the network file format this project's networks are trained against, and the
-  engine an earlier line of this work grew out of.
+  the engine an earlier line of this work grew out of.
 - **[Fathom](https://github.com/jdart1/Fathom)** (MIT) — Syzygy tablebase
   probing.
 - **Jonathan Hallström**, for the pawn-pair features, invented for
