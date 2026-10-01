@@ -27,6 +27,11 @@ NOME     ?= kestrelstrike
 ARCH     ?= native
 EXE      ?= $(NOME)
 
+# A VERSAO, num so' sitio. Vai para o `id name` (por `KS_VERSAO`) e para o nome
+# dos executaveis de `todos` e `windows`: a CCRL pede a versao nos dois, porque
+# um testador com tres `kestrelstrike.exe` na pasta nao sabe qual e' qual.
+VERSAO   ?= 1.0
+
 # A REDE DENTRO DO EXECUTAVEL.
 #
 # Com a rede embebida o motor joga sozinho: sem `EvalFile`, sem ficheiro ao
@@ -43,7 +48,7 @@ else
   EMBEBE  = -DKESTREL_REDE_EMBEBIDA
 endif
 
-COMUM    = -std=c++20 -O3 -DNDEBUG $(EMBEBE) -Ivendor -Isrc \
+COMUM    = -std=c++20 -O3 -DNDEBUG $(EMBEBE) -DKS_VERSAO='"$(VERSAO)"' -Ivendor -Isrc \
            -funroll-loops -fno-exceptions -fno-rtti
 LDFLAGS  = -lpthread
 
@@ -85,10 +90,10 @@ $(EXE): $(SUBSTRATO) $(NOSSO)
 	$(CXX) $(COMUM) $(SIMD) -o $@ $^ $(LDFLAGS)
 
 todos:
-	$(MAKE) ARCH=avx512 EXE=$(NOME)-avx512
-	$(MAKE) ARCH=bmi2   EXE=$(NOME)-bmi2
-	$(MAKE) ARCH=avx2   EXE=$(NOME)-avx2
-	$(MAKE) ARCH=sse41  EXE=$(NOME)-sse41
+	$(MAKE) ARCH=avx512 EXE=$(NOME)-$(VERSAO)-avx512
+	$(MAKE) ARCH=bmi2   EXE=$(NOME)-$(VERSAO)-bmi2
+	$(MAKE) ARCH=avx2   EXE=$(NOME)-$(VERSAO)-avx2
+	$(MAKE) ARCH=sse41  EXE=$(NOME)-$(VERSAO)-sse41
 
 # O WINDOWS, construido a partir do Linux com o mingw-w64.
 #
@@ -99,14 +104,19 @@ todos:
 MINGW    ?= x86_64-w64-mingw32-g++
 WIN_LD    = -static -lpthread -Wl,--stack,8388608
 
+# Os .exe levam o nome com maiusculas, como o motor se apresenta: e' esse que
+# aparece na pasta de um testador e na lista.
+WIN_NOME ?= KestrelStrike
+
 windows:
-	$(MAKE) CXX=$(MINGW) ARCH=avx512 EXE=$(NOME)-avx512.exe LDFLAGS="$(WIN_LD)"
-	$(MAKE) CXX=$(MINGW) ARCH=bmi2   EXE=$(NOME)-bmi2.exe   LDFLAGS="$(WIN_LD)"
-	$(MAKE) CXX=$(MINGW) ARCH=avx2   EXE=$(NOME)-avx2.exe   LDFLAGS="$(WIN_LD)"
-	$(MAKE) CXX=$(MINGW) ARCH=sse41  EXE=$(NOME)-sse41.exe  LDFLAGS="$(WIN_LD)"
+	$(MAKE) CXX=$(MINGW) ARCH=avx512 EXE=$(WIN_NOME)-$(VERSAO)-avx512.exe LDFLAGS="$(WIN_LD)"
+	$(MAKE) CXX=$(MINGW) ARCH=bmi2   EXE=$(WIN_NOME)-$(VERSAO)-bmi2.exe   LDFLAGS="$(WIN_LD)"
+	$(MAKE) CXX=$(MINGW) ARCH=avx2   EXE=$(WIN_NOME)-$(VERSAO)-avx2.exe   LDFLAGS="$(WIN_LD)"
+	$(MAKE) CXX=$(MINGW) ARCH=sse41  EXE=$(WIN_NOME)-$(VERSAO)-sse41.exe  LDFLAGS="$(WIN_LD)"
 
 limpo:
-	rm -f $(NOME) $(NOME)-avx512 $(NOME)-bmi2 $(NOME)-avx2 $(NOME)-sse41
-	rm -f $(NOME)-avx512.exe $(NOME)-bmi2.exe $(NOME)-avx2.exe $(NOME)-sse41.exe
+	rm -f $(NOME) $(NOME)-$(VERSAO)-avx512 $(NOME)-$(VERSAO)-bmi2 $(NOME)-$(VERSAO)-avx2 $(NOME)-$(VERSAO)-sse41
+	rm -f $(WIN_NOME)-$(VERSAO)-avx512.exe $(WIN_NOME)-$(VERSAO)-bmi2.exe
+	rm -f $(WIN_NOME)-$(VERSAO)-avx2.exe $(WIN_NOME)-$(VERSAO)-sse41.exe
 
 .PHONY: todos windows limpo

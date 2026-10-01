@@ -2,9 +2,9 @@
 *.o
 *.d
 kestrelstrike
-kestrelstrike-avx2
-kestrelstrike-avx512
-kestrelstrike-sse41
+kestrelstrike-*
+KestrelStrike-*
+*.exe
 
 # Networks are distributed as release assets, not committed:
 # a 95 MB file does not belong in a git tree.
