@@ -1561,6 +1561,10 @@ class Busca {
     /// Ms retidos por lance para o lance chegar ao arbitro. 30 e' o que basta
     /// num duelo local por canos; um bot na internet paga a viagem e quer mais.
     std::int64_t sobrecarga_ms = 30;
+    /// O `wdl` nas linhas `info` so' quando a interface o pede: o protocolo diz
+    /// que o motor o envia apenas com `UCI_ShowWDL` ligado, e ha' interfaces
+    /// antigas que leem mal uma linha com um campo que nao esperam.
+    bool mostra_wdl = false;
     /// O limite de nos do `go nodes N`. Estava a ser LIDO do comando e nunca
     /// imposto: `lim.nos > 0` desligava o relogio e mais nada, portanto
     /// `go nodes 3000000` procurava ate' ao fim do mundo -- medido, 126 milhoes

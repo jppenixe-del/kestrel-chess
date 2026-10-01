@@ -32,7 +32,10 @@ Position               g_pos;
 std::deque<StateInfo>  g_pilha;
 Busca                  g_busca;
 Avaliador              g_aval;
-int                    g_hash_mb = 64;
+// 256 MB por omissao: e' o que a CCRL pede aos motores que lhe chegam, e o que
+// os testadores poem de qualquer maneira. Com 64 quem se esquecesse da opcao
+// jogava com um quarto da tabela.
+int                    g_hash_mb = 256;
 // O tecto dos fios sai da maquina e nao de um numero cravado: um `Threads` que
 // aceita mais fios do que ha' nucleos so' serve para os por a disputar cache.
 const int              FIOS_MAX = std::max(1, int(std::thread::hardware_concurrency()));
@@ -137,10 +140,10 @@ void faz_go(std::istringstream& is) {
         else if (tok == "infinite")  lim.infinito = true;
     }
     if (!g_aval.tem_rede) {
-        std::cout << "info string ERRO: sem rede -- este executavel foi "
-                     "construido sem rede embebida; use `setoption name EvalFile "
-                     "value <ficheiro>`. Sem rede a avaliacao seria zero em toda "
-                     "a parte." << std::endl;
+        std::cout << "info string ERROR: no network -- this executable was "
+                     "built without an embedded network; use `setoption name "
+                     "EvalFile value <file>`. Without one every evaluation "
+                     "would be zero." << std::endl;
         std::cout << "bestmove 0000" << std::endl;
         return;
     }
@@ -170,9 +173,9 @@ void faz_setoption(std::istringstream& is) {
         // A rede e' verificada AQUI: um motor que morre a arrancar nao
         // consegue dizer ao arbitro o que lhe falta.
         if (!g_aval.carrega(valor, erro))
-            std::cout << "info string ERRO: " << erro << std::endl;
+            std::cout << "info string ERROR: " << erro << std::endl;
         else {
-            std::cout << "info string rede carregada: " << valor << std::endl;
+            std::cout << "info string network loaded: " << valor << std::endl;
             // Os ajudantes guardam um ponteiro para a rede do dono. Trocada a
             // rede, esse ponteiro fica a apontar para a antiga -- deitam-se
             // fora, e o proximo `go` reconstroi-os sobre a nova.
@@ -194,10 +197,10 @@ void faz_setoption(std::istringstream& is) {
         // por onde isso entrava.
         Tablebases::init(valor);
         if (Tablebases::MaxCardinality > 0)
-            std::cout << "info string tablebases ate' " << Tablebases::MaxCardinality
-                      << " pecas" << std::endl;
+            std::cout << "info string tablebases up to " << Tablebases::MaxCardinality
+                      << " pieces" << std::endl;
         else
-            std::cout << "info string sem tablebases em " << valor << std::endl;
+            std::cout << "info string no tablebases found in " << valor << std::endl;
     } else if (nome == "move overhead") {
         // Quanto se guarda de cada orcamento para o que nao e' pensar: o
         // arbitro, a rede, o processo. Cravado a 30 e nao lido; a producao
@@ -206,6 +209,8 @@ void faz_setoption(std::istringstream& is) {
         g_busca.sobrecarga_ms = std::clamp(std::atoi(valor.c_str()), 0, 5000);
     } else if (nome == "threads") {
         g_fios = std::clamp(std::atoi(valor.c_str()), 1, FIOS_MAX);
+    } else if (nome == "uci_showwdl") {
+        g_busca.mostra_wdl = (valor == "true");
     }
 }
 
@@ -227,7 +232,7 @@ int main() {
     {
         std::string erro;
         if (g_aval.carrega_embebida(erro))
-            std::cout << "info string rede embebida: " << Avaliador::nome_por_omissao()
+            std::cout << "info string embedded network: " << Avaliador::nome_por_omissao()
                       << std::endl;
     }
 
@@ -256,14 +261,16 @@ int main() {
 
         if (tok == "uci") {
             std::cout << "id name KestrelStrike " KS_VERSAO "\n"
-                      << "id author Joao\n"
+                      << "id author Joao Penixe\n"
                       << "option name EvalFile type string default "
                       << Avaliador::nome_por_omissao() << "\n"
-                      << "option name Hash type spin default 64 min 1 max 65536\n"
+                      << "option name Hash type spin default " << g_hash_mb
+                      << " min 1 max 65536\n"
                       << "option name SyzygyPath type string default <empty>\n"
                       << "option name Move Overhead type spin default 30 min 0 max 5000\n"
                       << "option name Threads type spin default 1 min 1 max "
                       << FIOS_MAX << "\n"
+                      << "option name UCI_ShowWDL type check default false\n"
                       << "uciok" << std::endl;
         } else if (tok == "ucinewgame") {
             g_busca.nova_partida();

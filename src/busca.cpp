@@ -2294,7 +2294,7 @@ void Busca::prepara_fios(int n, Avaliador& av_dono) {
         if (!a->partilha_rede(av_dono, erro)) {
             // Sem rede o ajudante nao avalia nada. Melhor menos fios do que
             // fios a procurar com uma avaliacao a zeros.
-            saida() << "info string fio " << (i + 1) << " sem rede: " << erro << std::endl;
+            saida() << "info string thread " << (i + 1) << " has no network: " << erro << std::endl;
             break;
         }
         auto b = std::make_unique<Busca>();
@@ -2860,7 +2860,7 @@ void Busca::arranca(Position& pos, const Limites& lim, Avaliador& avaliador) {
             // afecta: este nao vem de la', vem do treino desta rede. Mudar um destes
             // numeros sem mudar o treino faz o motor anunciar probabilidades que a
             // rede nunca aprendeu a produzir.
-            {
+            if (mostra_wdl) {
                 // POR FAZER, e e' trabalho nosso e nao transcricao: estas duas
             // constantes sao FIXAS, e a referencia faz o mesmo modelo com um
             // `a` e um `b` que dependem do MATERIAL, por um polinomio em
@@ -3091,8 +3091,8 @@ void Busca::arranca(Position& pos, const Limites& lim, Avaliador& avaliador) {
                 // Anunciar: o lance vai mudar depois da ultima linha impressa,
                 // e sem isto o arbitro fica outra vez com uma variante que ja'
                 // nao e' a nossa -- o mesmo defeito, por um terceiro caminho.
-                saida() << "info string votacao: " << UCIEngine::move(v, false)
-                        << " com " << cand.size() << " fios" << std::endl;
+                saida() << "info string vote: " << UCIEngine::move(v, false)
+                        << " from " << cand.size() << " threads" << std::endl;
                 melhor_raiz = v;
                 pv_tab[0][0] = v;
                 pv_n[0]      = 1;
@@ -3125,8 +3125,8 @@ void Busca::arranca(Position& pos, const Limites& lim, Avaliador& avaliador) {
             // nao bate certo com ela -- o mesmo defeito do corte de iteracao,
             // por outro caminho. A variante aqui e' de um lance so': nao ha'
             // linha pesquisada para este, ha' a pontuacao que a raiz lhe deu.
-            saida() << "info string recusada a repeticao: "
-                    << UCIEngine::move(melhor_raiz, false) << " em vez do melhor"
+            saida() << "info string repetition refused: playing "
+                    << UCIEngine::move(melhor_raiz, false) << " instead"
                     << std::endl;
             saida() << "info depth " << sel_prof << " score cp " << melhor_alt / 2
                     << " pv " << UCIEngine::move(melhor_raiz, false) << std::endl;

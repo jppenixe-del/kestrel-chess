@@ -18,7 +18,7 @@ bool Avaliador::carrega(const std::string& caminho, std::string& erro) {
     // recusar com uma frase em vez de desaparecer.
     std::error_code ec;
     if (!std::filesystem::exists(std::filesystem::path(caminho), ec)) {
-        erro = "nao encontrei a rede em " + caminho;
+        erro = "network not found: " + caminho;
         return false;
     }
     // NAO se preenche o `current` antes de chamar. Ele e' a SAIDA -- diz o que
@@ -33,7 +33,7 @@ bool Avaliador::carrega(const std::string& caminho, std::string& erro) {
     // pesos a zero, e uma rede a zeros avalia tudo a zero sem levantar erro
     // nenhum. E' preciso perguntar-lhe se ela ficou mesmo la'.
     if (ficheiro.netDescription.empty()) {
-        erro = "a rede " + caminho + " nao foi aceite (arquitectura ou ficheiro truncado)";
+        erro = "network " + caminho + " rejected (wrong architecture or truncated file)";
         return false;
     }
     caches   = std::make_unique<Eval::NNUE::AccumulatorCaches>(*p_rede);
@@ -52,14 +52,14 @@ bool Avaliador::carrega_embebida(std::string& erro) {
     // E a mesma verificacao: a `load` falha sem dizer nada e deixa os pesos a
     // zero. Uma rede a zeros avalia tudo a zero e nada levanta erro.
     if (ficheiro.netDescription.empty()) {
-        erro = "a rede embebida nao foi aceite";
+        erro = "the embedded network was rejected";
         return false;
     }
     caches   = std::make_unique<Eval::NNUE::AccumulatorCaches>(*p_rede);
     tem_rede = true;
     return true;
 #else
-    erro = "este executavel foi construido sem rede embebida";
+    erro = "this executable was built without an embedded network";
     return false;
 #endif
 }
@@ -75,7 +75,7 @@ const char* Avaliador::nome_por_omissao() {
 bool Avaliador::partilha_rede(Avaliador& dono, std::string& erro) {
     tem_rede = false;
     if (!dono.tem_rede) {
-        erro = "o dono ainda nao tem rede carregada";
+        erro = "the main thread has no network loaded yet";
         return false;
     }
     p_rede   = dono.p_rede;
