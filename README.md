@@ -11,7 +11,7 @@
 ![UCI](https://img.shields.io/badge/protocol-UCI-brightgreen.svg)
 ![NNUE](https://img.shields.io/badge/evaluation-NNUE-orange.svg)
 
-**by João Penixe**
+**by João Cardoso**
 
 </div>
 

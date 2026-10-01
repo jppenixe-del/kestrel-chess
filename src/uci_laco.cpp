@@ -259,7 +259,7 @@ int main() {
 
         if (tok == "uci") {
             std::cout << "id name KestrelStrike " KS_VERSAO "\n"
-                      << "id author Joao Penixe\n"
+                      << "id author Joao Cardoso\n"
                       << "option name EvalFile type string default "
                       << Avaliador::nome_por_omissao() << "\n"
                       << "option name Hash type spin default " << g_hash_mb
