@@ -140,9 +140,8 @@ void faz_go(std::istringstream& is) {
         else if (tok == "infinite")  lim.infinito = true;
     }
     if (!g_aval.tem_rede) {
-        std::cout << "info string ERROR: no network -- this executable was "
-                     "built without an embedded network; use `setoption name "
-                     "EvalFile value <file>`. Without one every evaluation "
+        std::cout << "info string ERROR: no network loaded -- use `setoption "
+                     "name EvalFile value <file>`. Without one every evaluation "
                      "would be zero." << std::endl;
         std::cout << "bestmove 0000" << std::endl;
         return;
@@ -174,13 +173,12 @@ void faz_setoption(std::istringstream& is) {
         // consegue dizer ao arbitro o que lhe falta.
         if (!g_aval.carrega(valor, erro))
             std::cout << "info string ERROR: " << erro << std::endl;
-        else {
+        else
             std::cout << "info string network loaded: " << valor << std::endl;
-            // Os ajudantes guardam um ponteiro para a rede do dono. Trocada a
-            // rede, esse ponteiro fica a apontar para a antiga -- deitam-se
-            // fora, e o proximo `go` reconstroi-os sobre a nova.
-            g_busca.prepara_fios(1, g_aval);
-        }
+        // Os ajudantes guardam um ponteiro para a rede do dono e caches feitas
+        // a partir dela. Trocada a rede -- ou reposta a embebida depois de uma
+        // leitura falhada --, deitam-se fora, e o proximo `go` reconstroi-os.
+        g_busca.prepara_fios(1, g_aval);
     } else if (nome == "hash") {
         g_hash_mb = std::max(1, std::atoi(valor.c_str()));
         g_busca.minha_tabela()->redimensiona(std::size_t(g_hash_mb));

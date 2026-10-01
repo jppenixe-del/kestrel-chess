@@ -11,14 +11,25 @@ namespace Kestrel {
 Avaliador::Avaliador() = default;
 
 bool Avaliador::carrega(const std::string& caminho, std::string& erro) {
-    tem_rede = false;
+    // O NOME POR OMISSAO E' A REDE EMBEBIDA, nao um ficheiro.
+    //
+    // Ha' interfaces que mandam TODAS as opcoes ao arrancar, cada uma com o
+    // valor que o motor anunciou -- e o `EvalFile` anuncia o nome da rede que
+    // traz dentro, de que nao ha' ficheiro nenhum ao lado do executavel.
+    // Tratado como ficheiro dava "nao encontrado", o motor ficava sem rede e
+    // respondia `bestmove 0000` a todos os lances: partidas inteiras perdidas
+    // por uma opcao que ninguem mudou.
+    if (caminho.empty() || caminho == "<empty>" || caminho == nome_por_omissao())
+        return carrega_embebida(erro);
+
     // O ficheiro e' verificado AQUI e nao la' dentro: o substrato desiste do
     // processo quando nao encontra a rede, e um motor que morre a arrancar nao
     // consegue dizer ao arbitro o que lhe falta. Perguntar primeiro deixa-nos
-    // recusar com uma frase em vez de desaparecer.
+    // recusar com uma frase em vez de desaparecer -- e sem tocar na rede que
+    // estava, que continua a jogar.
     std::error_code ec;
     if (!std::filesystem::exists(std::filesystem::path(caminho), ec)) {
-        erro = "network not found: " + caminho;
+        erro = "network not found: " + caminho + " (the current network stays)";
         return false;
     }
     // NAO se preenche o `current` antes de chamar. Ele e' a SAIDA -- diz o que
@@ -28,12 +39,23 @@ bool Avaliador::carrega(const std::string& caminho, std::string& erro) {
     // avaliacao constante e nada levanta erro. Custou-me uma tarde a perceber
     // que a rede nunca chegava a ser lida.
     ficheiro.current.reset();
+    ficheiro.netDescription.clear();
     p_rede->load(std::filesystem::path("."), std::filesystem::path(caminho), ficheiro);
-    // A `load` do substrato falha CALADA: devolve sem descricao e deixa os
-    // pesos a zero, e uma rede a zeros avalia tudo a zero sem levantar erro
-    // nenhum. E' preciso perguntar-lhe se ela ficou mesmo la'.
-    if (ficheiro.netDescription.empty()) {
+    // A `load` do substrato falha CALADA, e o sucesso le'-se no `current`: so'
+    // fica preenchido quando o ficheiro foi lido inteiro e bateu certo ate' ao
+    // ultimo byte. A descricao NAO serve de prova -- ficava a da rede anterior,
+    // e um ficheiro truncado passava por "carregado" com metade dos pesos
+    // escritos por cima dos que la' estavam.
+    if (!ficheiro.current.has_value()) {
         erro = "network " + caminho + " rejected (wrong architecture or truncated file)";
+        // A leitura falhada pode ter escrito parte dos pesos. Volta-se a`
+        // embebida; sem ela fica-se sem rede, que o `go` recusa com uma frase
+        // em vez de jogar com pesos a meio.
+        std::string outro;
+        if (carrega_embebida(outro))
+            erro += "; back to the embedded network";
+        else
+            tem_rede = false;
         return false;
     }
     caches   = std::make_unique<Eval::NNUE::AccumulatorCaches>(*p_rede);
@@ -48,10 +70,11 @@ bool Avaliador::carrega_embebida(std::string& erro) {
     // de uma tentativa anterior, o substrato salta o carregamento calado e a
     // rede fica a zeros.
     ficheiro.current.reset();
+    ficheiro.netDescription.clear();
     p_rede->load_internal(ficheiro);
     // E a mesma verificacao: a `load` falha sem dizer nada e deixa os pesos a
     // zero. Uma rede a zeros avalia tudo a zero e nada levanta erro.
-    if (ficheiro.netDescription.empty()) {
+    if (!ficheiro.current.has_value()) {
         erro = "the embedded network was rejected";
         return false;
     }
