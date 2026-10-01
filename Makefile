@@ -41,9 +41,19 @@ VERSAO   ?= 1.0
 # O `incbin` resolve o caminho a partir do directorio onde o make corre, por
 # isso a rede tem de estar na raiz do repositorio. Se nao estiver, constroi-se
 # na mesma -- mas o motor passa a exigir `EvalFile`, e o aviso abaixo diz-lo.
+#
+# A REDE NAO ESTA' NO GIT: sao 95 MB. Esta' no release da versao, e `make rede`
+# vai busca-la e confere-a pelo SHA-256 inteiro -- o nome do ficheiro sao os
+# primeiros doze digitos dele. Sem isto quem construisse a partir da fonte
+# tinha um motor que recusa jogar e nenhuma indicacao de onde estava a rede.
 REDE     ?= ks-cf796d1f923d.nnue
+REDE_SHA ?= cf796d1f923df5f8b65a150d9425abb30800f51c31d8c0017bb826938cd8b07d
+REDE_URL ?= https://github.com/jppenixe-del/kestrel-chess/releases/download/v$(VERSAO)/$(REDE)
 ifeq ($(wildcard $(REDE)),)
   EMBEBE  = -DNNUE_EMBEDDING_OFF
+  ifeq ($(filter rede limpo,$(MAKECMDGOALS)),)
+    $(warning sem $(REDE) aqui: o executavel sai SEM rede e so' joga com `setoption name EvalFile`. Corra `make rede` primeiro.)
+  endif
 else
   EMBEBE  = -DKESTREL_REDE_EMBEBIDA
 endif
@@ -114,9 +124,20 @@ windows:
 	$(MAKE) CXX=$(MINGW) ARCH=avx2   EXE=$(WIN_NOME)-$(VERSAO)-avx2.exe   LDFLAGS="$(WIN_LD)"
 	$(MAKE) CXX=$(MINGW) ARCH=sse41  EXE=$(WIN_NOME)-$(VERSAO)-sse41.exe  LDFLAGS="$(WIN_LD)"
 
+rede:
+	@if [ -f $(REDE) ] && echo "$(REDE_SHA)  $(REDE)" | sha256sum -c --status; then \
+	    echo "$(REDE): ja' ca' esta', e confere"; \
+	else \
+	    echo "a buscar $(REDE_URL)"; \
+	    curl -fL --retry 3 -o $(REDE).parcial "$(REDE_URL)" \
+	    && echo "$(REDE_SHA)  $(REDE).parcial" | sha256sum -c --status \
+	    && mv $(REDE).parcial $(REDE) && echo "$(REDE): descarregada e conferida" \
+	    || { rm -f $(REDE).parcial; echo "falhou: $(REDE) nao veio, ou nao confere com o SHA-256"; exit 1; }; \
+	fi
+
 limpo:
 	rm -f $(NOME) $(NOME)-$(VERSAO)-avx512 $(NOME)-$(VERSAO)-bmi2 $(NOME)-$(VERSAO)-avx2 $(NOME)-$(VERSAO)-sse41
 	rm -f $(WIN_NOME)-$(VERSAO)-avx512.exe $(WIN_NOME)-$(VERSAO)-bmi2.exe
 	rm -f $(WIN_NOME)-$(VERSAO)-avx2.exe $(WIN_NOME)-$(VERSAO)-sse41.exe
 
-.PHONY: todos windows limpo
+.PHONY: todos windows limpo rede
