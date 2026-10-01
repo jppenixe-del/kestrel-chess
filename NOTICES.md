@@ -24,11 +24,14 @@ an idea. It provides:
 **What was changed:** the namespace, from `Stockfish` to `Kestrel`. The original
 licence header of every file is kept verbatim at the top of that file.
 
-**What is not compiled:** the Stockfish engine layer — `search.cpp`,
-`movepick.cpp`, `thread.cpp`, `engine.cpp`, `timeman.cpp`, `uci.cpp`. This
-program has its own search and its own transposition table, and theirs expect an
-interface (`probe`, `new_search`, `hashfull`) that ours does not have and should
-not have.
+**What is not here:** the Stockfish engine layer — `search.cpp`,
+`movepick.cpp`, `thread.cpp`, `engine.cpp`, `timeman.cpp`, `uci.cpp`,
+`benchmark.cpp`, `tune.cpp`. It was never compiled, and keeping it in the tree
+only made the program look like the whole of Stockfish. A few of its headers
+remain because headers the substrate does use include them. This program has
+its own search and its own transposition table, and theirs expect an interface
+(`probe`, `new_search`, `hashfull`) that ours does not have and should not
+have.
 
 ## The pawn-pair features
 

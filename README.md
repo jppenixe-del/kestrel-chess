@@ -52,9 +52,11 @@ every file. This is stated here rather than left to be discovered.
 | `uci_laco.cpp` | the UCI loop |
 
 The Stockfish engine layer — its `search.cpp`, `movepick.cpp`, `thread.cpp`,
-`engine.cpp`, `timeman.cpp`, `uci.cpp` — is **not compiled**. The search is
-ours and so is the transposition table; bringing theirs in would mean carrying
-two of each.
+`engine.cpp`, `timeman.cpp`, `uci.cpp`, `benchmark.cpp`, `tune.cpp` — is **not
+in this repository**. It was never compiled. A few of its headers remain
+because the substrate's own headers include them (`uci.h` pulls in `engine.h`,
+`search.h` and `thread.h`). The search is ours and so is the transposition
+table; bringing theirs in would mean carrying two of each.
 
 **The network is ours.** `f2e189.nnue` was trained from scratch for this engine.
 No Stockfish network was used as a seed or as a teacher. See

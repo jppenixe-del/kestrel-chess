@@ -64,10 +64,14 @@ else
          -march=native -mtune=native
 endif
 
-# O SUBSTRATO. Nao se compila a camada de motor do Stockfish -- `search.cpp`,
-# `engine.cpp`, `movepick.cpp`, `thread.cpp`, `timeman.cpp`, `uci.cpp`. A busca
-# e' nossa e a tabela de transposicao tambem, e a deles quer uma interface
-# (`probe`, `new_search`, `hashfull`) que a nossa nao tem nem deve ter.
+# O SUBSTRATO. A camada de motor do Stockfish -- `search.cpp`, `engine.cpp`,
+# `movepick.cpp`, `thread.cpp`, `timeman.cpp`, `uci.cpp`, `benchmark.cpp`,
+# `tune.cpp` -- nao esta' no repositorio: nunca se compilou, e te-la ca' dentro
+# so' fazia o motor parecer o Stockfish inteiro. Ficam alguns cabecalhos dela,
+# porque os do substrato os incluem (`uci.h` puxa `engine.h`, `search.h` e
+# `thread.h`). A busca e' nossa e a tabela de transposicao tambem, e a deles
+# quer uma interface (`probe`, `new_search`, `hashfull`) que a nossa nao tem
+# nem deve ter.
 SUBSTRATO = vendor/attacks.cpp vendor/bitboard.cpp vendor/memory.cpp vendor/misc.cpp \
             vendor/movegen.cpp vendor/position.cpp vendor/score.cpp vendor/evaluate.cpp \
             vendor/ucioption.cpp \
